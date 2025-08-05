@@ -1,0 +1,69 @@
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Fortran module files
+*.mod
+*.smod
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+
+# SST specific
+*.pyc
+__pycache__/
+*.csv
+*.log
+*.tmp
+
+# Build directories
+build/
+dist/
+.deps/
+.libs/
+autom4te.cache/
+
+# Generated files
+Makefile
+Makefile.in
+aclocal.m4
+configure
+config.log
+config.status
+libtool
+stamp-h1
+
+# Editor files
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Test outputs
+sst_output_data/
+*.stats
+*.trace
+
+# Configuration files
+config.h
+config.h.in
