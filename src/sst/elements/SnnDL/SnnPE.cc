@@ -18,6 +18,8 @@ using namespace SST::SnnDL;
 
 // ===== 构造函数 =====
 SnnPE::SnnPE(ComponentId_t id, Params& params) : Component(id) {
+    printf("DEBUG: SnnPE constructor called\n");
+    fflush(stdout);
     
     // 初始化输出对象
     int verbose_level = params.find<int>("verbose", 0);
@@ -40,9 +42,12 @@ SnnPE::SnnPE(ComponentId_t id, Params& params) : Component(id) {
     tau_mem = params.find<float>("tau_mem", 20.0f);
     t_ref = params.find<uint32_t>("t_ref", 2);
     
+    // 获取权重文件路径
+    weights_file_path = params.find<std::string>("weights_file", "");
+    
     output->verbose(CALL_INFO, 2, 0, 
-        "神经元参数: num=%u, node_id=%u, v_thresh=%.3f, v_reset=%.3f, v_rest=%.3f, tau_mem=%.1fms, t_ref=%u\n",
-        num_neurons, node_id, v_thresh, v_reset, v_rest, tau_mem, t_ref);
+        "神经元参数: num=%u, node_id=%u, v_thresh=%.3f, v_reset=%.3f, v_rest=%.3f, tau_mem=%.1fms, t_ref=%u, weights_file=%s\n",
+        num_neurons, node_id, v_thresh, v_reset, v_rest, tau_mem, t_ref, weights_file_path.c_str());
     
     // 预计算泄漏因子（将在setup()中根据实际时钟频率调整）
     leak_factor = exp(-1.0f / tau_mem);  // 临时值，setup()中会重新计算
@@ -51,17 +56,16 @@ SnnPE::SnnPE(ComponentId_t id, Params& params) : Component(id) {
     neurons.resize(num_neurons, NeuronState(v_rest));
     output->verbose(CALL_INFO, 2, 0, "初始化了%u个神经元状态\n", num_neurons);
     
-    // 尝试加载SubComponent接口（暂时注释掉）
-    // snn_interface = loadUserSubComponent<SnnInterface>("interface", ComponentInfo::SHARE_NONE);
+    // 尝试加载SubComponent接口（待修复）
+    // SST::Params empty_params;
+    // snn_interface = loadUserSubComponent<SnnInterface>("interface", ComponentInfo::SHARE_NONE, empty_params);
     
     // if (snn_interface) {
-    use_interface_mode = false;  // 暂时强制使用传统模式
-    if (false) {
+    if (false) {  // 暂时禁用SubComponent模式
         use_interface_mode = true;
         output->verbose(CALL_INFO, 1, 0, "使用SubComponent接口模式\n");
         
         // 配置接口
-        // snn_interface->setNodeId(node_id);
         // snn_interface->setSpikeHandler(
         //     [this](SpikeEvent* spike) { this->handleInterfaceSpike(spike); }
         // );
@@ -75,14 +79,16 @@ SnnPE::SnnPE(ComponentId_t id, Params& params) : Component(id) {
         
         // 配置传统链接和事件处理器
         spike_input_link = configureLink("spike_input", 
-            new Event::Handler<SnnPE>(this, &SnnPE::handleSpikeEvent));
+            new Event::Handler2<SnnPE,&SnnPE::handleSpikeEvent>(this));
         if (!spike_input_link) {
             output->fatal(CALL_INFO, -1, "错误: 无法配置spike_input链接\n");
         }
         
         spike_output_link = configureLink("spike_output");
         if (!spike_output_link) {
-            output->fatal(CALL_INFO, -1, "错误: 无法配置spike_output链接\n");
+            output->verbose(CALL_INFO, 1, 0, "警告: 无法配置spike_output链接，将无法发送脉冲到其他组件\n");
+        } else {
+            output->verbose(CALL_INFO, 2, 0, "成功配置spike_output链接\n");
         }
         
         output->verbose(CALL_INFO, 2, 0, "配置了输入和输出链接\n");
@@ -90,7 +96,7 @@ SnnPE::SnnPE(ComponentId_t id, Params& params) : Component(id) {
     
     // 注册时钟处理器
     std::string clock_freq = params.find<std::string>("clock", "1GHz");
-    registerClock(clock_freq, new Clock::Handler<SnnPE>(this, &SnnPE::clockTick));
+    registerClock(clock_freq, new Clock::Handler2<SnnPE,&SnnPE::clockTick>(this));
     output->verbose(CALL_INFO, 2, 0, "注册了时钟处理器，频率: %s\n", clock_freq.c_str());
     
     // 初始化统计计数器
@@ -114,6 +120,8 @@ SnnPE::SnnPE(ComponentId_t id, Params& params) : Component(id) {
     }
     
     output->verbose(CALL_INFO, 1, 0, "SnnPE组件构造完成\n");
+    printf("DEBUG: SnnPE constructor completed successfully\n");
+    fflush(stdout);
 }
 
 // ===== 析构函数 =====
@@ -127,20 +135,25 @@ SnnPE::~SnnPE() {
 void SnnPE::init(unsigned int phase) {
     output->verbose(CALL_INFO, 2, 0, "进入init阶段 %u\n", phase);
     
-    // 如果使用SubComponent接口，则初始化接口（暂时注释）
-    // if (use_interface_mode && snn_interface) {
-    //     snn_interface->init(phase);
-    // }
+    // 如果使用SubComponent接口，则初始化接口
+    // 暂时禁用SubComponent检查
+    if (false) { // use_interface_mode && snn_interface
+        // snn_interface->init(phase);
+    }
 }
 
 void SnnPE::setup() {
     output->verbose(CALL_INFO, 1, 0, "进入setup阶段\n");
     
-    // 如果使用SubComponent接口，则设置接口（暂时注释）
-    // if (use_interface_mode && snn_interface) {
-    //     snn_interface->setup();
-    //     output->verbose(CALL_INFO, 1, 0, "SubComponent接口设置完成\n");
-    // }
+    printf("DEBUG: SnnPE setup() called, weights_file_path='%s'\n", weights_file_path.c_str());
+    fflush(stdout);
+    
+    // 如果使用SubComponent接口，则设置接口
+    // 暂时禁用SubComponent检查
+    if (false) { // use_interface_mode && snn_interface
+        // snn_interface->setup();
+        output->verbose(CALL_INFO, 1, 0, "SubComponent接口设置完成\n");
+    }
     
     // 重新计算泄漏因子（基于实际的时钟频率）
     // 注意：这里我们假设时钟频率已知，实际实现中可能需要从时钟对象获取
@@ -151,13 +164,22 @@ void SnnPE::setup() {
                    leak_factor, dt_ms, tau_mem);
     
     // 加载权重文件
-    std::string weights_file = "";  // 简化：暂时不读取权重文件
-    if (!weights_file.empty()) {
-        if (loadWeights(weights_file)) {
-            output->verbose(CALL_INFO, 1, 0, "成功加载权重文件\n");
+    printf("DEBUG: Loading weights file: '%s'\n", weights_file_path.c_str());
+    fflush(stdout);
+    
+    output->verbose(CALL_INFO, 1, 0, "权重文件参数: '%s'\n", weights_file_path.c_str());
+    
+    if (!weights_file_path.empty()) {
+        if (loadWeights(weights_file_path)) {
+            output->verbose(CALL_INFO, 1, 0, "成功加载权重文件: %s\n", weights_file_path.c_str());
+            printf("DEBUG: 权重加载成功，连接数: %zu\n", csr_weights.size());
         } else {
-            output->verbose(CALL_INFO, 1, 0, "权重文件加载失败，使用空权重矩阵\n");
+            output->verbose(CALL_INFO, 1, 0, "权重文件加载失败: %s，使用空权重矩阵\n", weights_file_path.c_str());
+            printf("DEBUG: 权重加载失败，使用空权重矩阵\n");
         }
+    } else {
+        printf("DEBUG: 未指定权重文件，使用空权重矩阵\n");
+        output->verbose(CALL_INFO, 1, 0, "未指定权重文件，使用空权重矩阵\n");
     }
     
     // 如果没有权重文件，初始化空的CSR矩阵
@@ -226,6 +248,7 @@ void SnnPE::handleSpikeEvent(Event* ev) {
     uint32_t pre_syn_id = spike_ev->neuron_id;
     spikes_received_count++;
     
+    printf("DEBUG: 接收到脉冲 - 神经元%u，权重矩阵大小: %zu\n", pre_syn_id, csr_weights.size());
     output->verbose(CALL_INFO, 3, 0, "接收到脉冲事件: 神经元%u\n", pre_syn_id);
     
     // 检查神经元ID是否有效
@@ -236,14 +259,23 @@ void SnnPE::handleSpikeEvent(Event* ev) {
         return;
     }
     
+    output->verbose(CALL_INFO, 2, 0, "处理神经元%u的脉冲，CSR行范围: [%lu, %lu)\n", 
+                   pre_syn_id, csr_row_ptr[pre_syn_id], csr_row_ptr[pre_syn_id + 1]);
+    
     // 使用CSR格式查找所有突触后神经元
     uint64_t row_start = csr_row_ptr[pre_syn_id];
     uint64_t row_end = csr_row_ptr[pre_syn_id + 1];
+    
+    printf("DEBUG: 神经元%u的连接范围: [%lu, %lu)，连接数: %lu\n", 
+           pre_syn_id, row_start, row_end, row_end - row_start);
     
     // 遍历所有连接
     for (uint64_t i = row_start; i < row_end; i++) {
         uint32_t post_syn_id = csr_col_indices[i];
         float weight = csr_weights[i];
+        
+        output->verbose(CALL_INFO, 3, 0, "突触连接: %u -> %u，权重: %.2f\n", 
+                       pre_syn_id, post_syn_id, weight);
         
         // 检查突触后神经元是否处于不应期
         if (neurons[post_syn_id].refractory_timer == 0) {
@@ -323,11 +355,14 @@ bool SnnPE::loadWeights(const std::string& file_path) {
         return false;
     }
     
+    output->verbose(CALL_INFO, 1, 0, "开始加载权重文件: %s\n", file_path.c_str());
+    
     // 临时存储权重数据
     std::vector<std::vector<std::pair<uint32_t, float>>> temp_weights(num_neurons);
     
     std::string line;
     uint32_t line_count = 0;
+    uint32_t connections_loaded = 0;
     
     while (std::getline(file, line)) {
         line_count++;
@@ -338,19 +373,23 @@ bool SnnPE::loadWeights(const std::string& file_path) {
         float weight;
         
         if (!(iss >> pre_id >> post_id >> weight)) {
-            output->verbose(CALL_INFO, 1, 0, "权重文件第%u行格式错误\n", line_count);
+            output->verbose(CALL_INFO, 1, 0, "权重文件第%u行格式错误: %s\n", line_count, line.c_str());
             continue;
         }
         
         if (pre_id >= num_neurons || post_id >= num_neurons) {
-            output->verbose(CALL_INFO, 1, 0, "权重文件第%u行神经元ID超出范围\n", line_count);
+            output->verbose(CALL_INFO, 1, 0, "权重文件第%u行神经元ID超出范围: pre=%u, post=%u, max=%u\n", 
+                           line_count, pre_id, post_id, num_neurons);
             continue;
         }
         
         temp_weights[pre_id].push_back(std::make_pair(post_id, weight));
+        connections_loaded++;
+        output->verbose(CALL_INFO, 2, 0, "加载突触连接: %u -> %u, 权重: %.2f\n", pre_id, post_id, weight);
     }
     
     file.close();
+    output->verbose(CALL_INFO, 1, 0, "权重文件加载完成，共%u行，%u个连接\n", line_count, connections_loaded);
     
     // 构建CSR格式
     csr_row_ptr.clear();
@@ -367,10 +406,13 @@ bool SnnPE::loadWeights(const std::string& file_path) {
             csr_weights.push_back(conn.second);
             nnz++;
         }
+        if (!temp_weights[i].empty()) {
+            output->verbose(CALL_INFO, 2, 0, "神经元%u有%zu个输出连接\n", i, temp_weights[i].size());
+        }
     }
     csr_row_ptr[num_neurons] = nnz;
     
-    output->verbose(CALL_INFO, 1, 0, "加载了%zu个突触连接\n", nnz);
+    output->verbose(CALL_INFO, 1, 0, "CSR格式构建完成，共%lu个突触连接\n", nnz);
     return true;
 }
 
@@ -385,10 +427,9 @@ void SnnPE::checkAndFireSpike(uint32_t neuron_idx) {
         // 发放脉冲
         SpikeEvent* new_spike = new SpikeEvent(neuron_idx);
         
-        // 根据模式选择发送方式
-        // if (use_interface_mode && snn_interface) {
-        if (false) {
-            // 使用SubComponent接口发送（暂时注释）
+        // 暂时禁用SubComponent检查
+        if (false) { // use_interface_mode && snn_interface
+            // 使用SubComponent接口发送
             // snn_interface->sendSpike(new_spike);
         } else if (spike_output_link) {
             // 使用传统Link发送

@@ -5,6 +5,38 @@ All notable changes to the SnnDL project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2025-08-05
+
+### Added
+- ✅ **完全功能的基础神经网络系统**
+- 🚀 **Handler2迁移**: 现代SST事件处理机制
+- 🔧 **序列化修复**: SpikeEvent支持网络传输
+- 📁 **权重加载系统**: 从文件正确加载神经连接
+- ⏰ **时间同步机制**: SpikeSource和SnnPE时钟协调
+- 🌐 **节点间通信**: 多SnnPE组件脉冲传播
+- 📊 **统计监控**: 完整的性能指标收集
+- 🧠 **LIF神经元模型**: 正确的发放和传播机制
+- 🔗 **传统Link模式**: 完全正常工作的链接系统
+- 🧪 **2节点测试**: 验证扩展SpikeEvent传播
+
+### Fixed
+- 🐛 **权重文件加载**: 修复空字符串导致的加载失败
+- ⏱️ **时间单位转换**: 修正SpikeSource时钟周期到纳秒的转换
+- 🔧 **程序挂起问题**: 解决2节点配置中的执行停滞
+- 📝 **调试输出**: 添加完整的执行流程跟踪
+
+### Changed
+- 🔄 **Clock::Handler** → **Clock::Handler2** 迁移
+- 📦 **ImplementSerializable** 宏用于现代序列化
+- 🎯 **神经元参数优化**: 降低阈值，提高权重，减少不应期
+- 📈 **增强调试**: 详细的printf调试信息
+
+### Technical Details
+- **验证的数据流**: SpikeSource(3) → SnnPE0(3→5) → SnnPE1(5→0)
+- **神经元活动**: 5个神经元发放，5次突触操作
+- **库状态**: libSnnDL.so正确编译和安装
+- **统计完整性**: CSV格式性能指标导出
+
 ## [1.0.0] - 2025-08-05
 
 ### Added

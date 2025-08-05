@@ -20,7 +20,8 @@
 #include <cstdint>
 
 #include "SpikeEvent.h"
-// #include "SnnInterface.h"  // 暂时注释掉
+// 暂时注释掉SubComponent相关代码，等待修复
+// #include "SnnInterface.h"
 
 namespace SST {
 namespace SnnDL {
@@ -74,7 +75,7 @@ public:
         {"verbose",      "日志详细级别", "0"}
     )
 
-    // SubComponent槽位文档（暂时注释）
+    // SubComponent槽位文档（待修复）
     // SST_ELI_DOCUMENT_SUBCOMPONENT_SLOTS(
     //     {"interface", "SNN网络接口插槽", "SST::SnnDL::SnnInterface"}
     // )
@@ -160,7 +161,7 @@ private:
     SST::Link* spike_input_link;            ///< 输入脉冲链接（传统模式）
     SST::Link* spike_output_link;           ///< 输出脉冲链接（传统模式）
     
-    // SubComponent接口（新模式）- 暂时注释
+    // SubComponent接口（新模式）- 待修复
     // SnnInterface* snn_interface;            ///< SNN网络接口
     uint32_t node_id;                       ///< 网络节点ID
     bool use_interface_mode;                ///< 是否使用SubComponent接口模式
@@ -173,6 +174,7 @@ private:
     float tau_mem;                          ///< 膜时间常数
     uint32_t t_ref;                         ///< 不应期时长
     float leak_factor;                      ///< 预计算的泄漏因子
+    std::string weights_file_path;          ///< 权重文件路径
     
     // 神经元状态单元（NSU）
     std::vector<NeuronState> neurons;       ///< 神经元状态数组

@@ -49,7 +49,7 @@ SpikeSource::SpikeSource(ComponentId_t id, Params& params) : Component(id) {
     output->verbose(CALL_INFO, 2, 0, "配置了输出链接\n");
     
     // 注册时钟处理器（使用较高频率以确保精确的事件时序）
-    registerClock("1MHz", new Clock::Handler<SpikeSource>(this, &SpikeSource::clockTick));
+    registerClock("1MHz", new Clock::Handler2<SpikeSource,&SpikeSource::clockTick>(this));
     output->verbose(CALL_INFO, 2, 0, "注册了时钟处理器，频率: 1MHz\n");
     
     // 初始化状态变量
@@ -111,8 +111,11 @@ bool SpikeSource::clockTick(Cycle_t current_cycle) {
         return false;
     }
     
-    // 更新当前仿真时间（假设1MHz时钟，每个周期1微秒）
-    current_sim_time = current_cycle;
+    // 更新当前仿真时间（1MHz时钟，每个周期1微秒 = 1000纳秒）
+    current_sim_time = current_cycle * 1000;  // 转换为纳秒
+    
+    printf("DEBUG: SpikeSource时钟 - 周期: %lu, 当前时间(ns): %lu, 队列大小: %zu\n", 
+           current_cycle, current_sim_time, spike_queue.size());
     
     // 发送所有到期的脉冲事件
     while (!spike_queue.empty() && spike_queue.top().timestamp <= current_sim_time) {
@@ -187,6 +190,9 @@ bool SpikeSource::loadTextFormat(const std::string& file_path) {
         spike_queue.push(SpikeData(adjusted_neuron_id, adjusted_timestamp));
         events_count++;
         events_loaded_count++;
+        
+        printf("DEBUG: 加载脉冲事件 - 神经元: %u, 时间戳: %lu\n", 
+               adjusted_neuron_id, adjusted_timestamp);
     }
     
     file.close();
@@ -237,7 +243,7 @@ bool SpikeSource::loadNMNISTFormat(const std::string& file_path) {
     return true;
 }
 
-bool SpikeSource::loadSHDFormat(const std::string& file_path) {
+bool SpikeSource::loadSHDFormat(const std::string& /* file_path */) {
     // SHD HDF5格式的实现
     // 需要链接HDF5库，这里提供一个占位实现
     

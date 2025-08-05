@@ -9,6 +9,7 @@
 #define _SPIKEVENT_H
 
 #include <sst/core/event.h>
+#include <sst/core/serialization/serialize.h>
 
 namespace SST {
 namespace SnnDL {
@@ -80,23 +81,23 @@ public:
      */
     void serialize_order(SST::Core::Serialization::serializer &ser) override {
         Event::serialize_order(ser);  // 先序列化基类
-        ser & neuron_id;
-        ser & timestamp;
-        ser & dest_neuron;
-        ser & dest_node;
-        ser & weight;
+        SST_SER(neuron_id);
+        SST_SER(timestamp);
+        SST_SER(dest_neuron); 
+        SST_SER(dest_node);
+        SST_SER(weight);
     }
 
 private:
     uint32_t dest_neuron;      ///< 目标神经元ID
     uint32_t dest_node;        ///< 目标节点ID
     double weight;             ///< 突触权重
+    
+    // 注册序列化支持
+    ImplementSerializable(SST::SnnDL::SpikeEvent)
 };
 
 } // namespace SnnDL
 } // namespace SST
-
-// 注册序列化支持
-SST_ELI_REGISTER_SERDE(SST::SnnDL::SpikeEvent)
 
 #endif /* _SPIKEVENT_H */
