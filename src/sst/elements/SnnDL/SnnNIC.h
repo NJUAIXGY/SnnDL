@@ -11,6 +11,7 @@
 #include <sst/core/interfaces/simpleNetwork.h>
 #include <sst/core/link.h>
 #include <sst/core/output.h>
+#include <sst/core/statapi/statbase.h>
 #include <queue>
 #include "SnnInterface.h"
 #include "SpikeEvent.h"
@@ -24,7 +25,7 @@ namespace SnnDL {
  * 该组件实现了SnnInterface接口，作为SnnPE与merlin网络之间的适配器。
  * 它将SpikeEvent转换为网络数据包，并处理网络通信的复杂性。
  */
-class SnnNIC : public SnnInterface, public SST::Interfaces::SimpleNetwork::Handler {
+class SnnNIC : public SnnInterface {
 public:
     // SST组件注册宏
     SST_ELI_REGISTER_SUBCOMPONENT(
@@ -42,12 +43,18 @@ public:
         {"link_bw", "网络链路带宽", "40GiB/s"},
         {"input_buf_size", "输入缓冲区大小", "1KiB"},
         {"output_buf_size", "输出缓冲区大小", "1KiB"},
+        {"use_direct_link", "是否使用直接Link模式", "true"},
         {"verbose", "日志详细级别", "0"}
     )
 
     // 端口文档
     SST_ELI_DOCUMENT_PORTS(
         {"network", "连接到merlin.linkcontrol或路由器的端口", {"SimpleNetwork"}}
+    )
+
+    // SubComponent槽位文档
+    SST_ELI_DOCUMENT_SUBCOMPONENT_SLOTS(
+        {"linkcontrol", "merlin LinkControl子组件", "SST::Interfaces::SimpleNetwork"}
     )
 
     // 统计信息文档
@@ -77,8 +84,12 @@ public:
     uint32_t getNodeId() const override;
     std::string getNetworkStatus() const override;
 
-    // === SimpleNetwork::Handler 接口实现 ===
-    bool handle(int vn, SST::Interfaces::SimpleNetwork::Request* req) override;
+    // === SimpleNetwork 回调方法 ===
+    bool handleIncoming(int vn);
+    bool spaceAvailable(int vn);
+    
+    // === 直接Link 回调方法 ===
+    void handleDirectSpikeEvent(SST::Event* event);
 
     // === SST组件生命周期方法 ===
     void init(unsigned int phase) override;
@@ -109,12 +120,14 @@ private:
     // SST基础设施
     SST::Output* output;                        ///< 日志输出对象
     SST::Interfaces::SimpleNetwork* network;   ///< 网络接口
+    SST::Link* direct_link;                     ///< 直接链接接口
     
     // 网络配置
     uint32_t node_id;                          ///< 本节点ID
     std::string link_bw;                       ///< 链路带宽
     std::string input_buf_size;                ///< 输入缓冲区大小
     std::string output_buf_size;               ///< 输出缓冲区大小
+    bool use_direct_link;                      ///< 是否使用直接链接模式
     
     // 回调处理器
     SpikeHandler spike_handler;                ///< 脉冲接收处理器
@@ -126,10 +139,10 @@ private:
     uint64_t packets_received_count;
     
     // 统计对象
-    SST::Statistic<uint64_t>* stat_spikes_sent;
-    SST::Statistic<uint64_t>* stat_spikes_received;
-    SST::Statistic<uint64_t>* stat_packets_sent;
-    SST::Statistic<uint64_t>* stat_packets_received;
+    Statistic<uint64_t>* stat_spikes_sent;
+    Statistic<uint64_t>* stat_spikes_received;
+    Statistic<uint64_t>* stat_packets_sent;
+    Statistic<uint64_t>* stat_packets_received;
     
     // 待发送队列（可选，用于流量控制）
     std::queue<SpikeEvent*> pending_spikes;

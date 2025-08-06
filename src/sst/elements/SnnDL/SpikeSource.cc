@@ -43,10 +43,10 @@ SpikeSource::SpikeSource(ComponentId_t id, Params& params) : Component(id) {
     // 配置输出链接
     spike_output_link = configureLink("spike_output");
     if (!spike_output_link) {
-        output->fatal(CALL_INFO, -1, "错误: 无法配置spike_output链接\n");
+        output->verbose(CALL_INFO, 1, 0, "警告: 无法配置spike_output链接，将在运行时跳过事件发送\n");
+    } else {
+        output->verbose(CALL_INFO, 2, 0, "配置了输出链接\n");
     }
-    
-    output->verbose(CALL_INFO, 2, 0, "配置了输出链接\n");
     
     // 注册时钟处理器（使用较高频率以确保精确的事件时序）
     registerClock("1MHz", new Clock::Handler2<SpikeSource,&SpikeSource::clockTick>(this));
@@ -123,12 +123,19 @@ bool SpikeSource::clockTick(Cycle_t current_cycle) {
         
         // 创建并发送脉冲事件
         SpikeEvent* spike_event = new SpikeEvent(spike_data.neuron_id, spike_data.timestamp);
-        spike_output_link->send(spike_event);
         
-        events_sent_count++;
-        
-        output->verbose(CALL_INFO, 4, 0, "发送脉冲: 神经元%u, 时间%" PRIu64 "\n",
-                       spike_data.neuron_id, spike_data.timestamp);
+        // 检查链接是否有效
+        if (spike_output_link) {
+            spike_output_link->send(spike_event);
+            events_sent_count++;
+            
+            output->verbose(CALL_INFO, 4, 0, "发送脉冲: 神经元%u, 时间%" PRIu64 "\n",
+                           spike_data.neuron_id, spike_data.timestamp);
+        } else {
+            output->verbose(CALL_INFO, 2, 0, "警告: 脉冲输出链接为空，丢弃事件: 神经元%u, 时间%" PRIu64 "\n",
+                           spike_data.neuron_id, spike_data.timestamp);
+            delete spike_event;  // 清理事件内存
+        }
         
         spike_queue.pop();
     }

@@ -35,7 +35,7 @@ public:
     /**
      * @brief 构造函数
      * @param id 组件ID
-     * @param params 配置参数
+     * @param params 参数集合
      */
     SnnInterface(SST::ComponentId_t id, SST::Params& params)
         : SST::SubComponent(id)
@@ -47,6 +47,9 @@ public:
      * @brief 虚析构函数
      */
     virtual ~SnnInterface() {}
+
+    // === ELI注册宏 ===
+    SST_ELI_REGISTER_SUBCOMPONENT_API(SST::SnnDL::SnnInterface)
 
     // === 纯虚接口方法 ===
 

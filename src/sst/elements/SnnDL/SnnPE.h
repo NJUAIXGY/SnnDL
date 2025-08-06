@@ -20,8 +20,7 @@
 #include <cstdint>
 
 #include "SpikeEvent.h"
-// 暂时注释掉SubComponent相关代码，等待修复
-// #include "SnnInterface.h"
+#include "SnnInterface.h"
 
 namespace SST {
 namespace SnnDL {
@@ -75,10 +74,10 @@ public:
         {"verbose",      "日志详细级别", "0"}
     )
 
-    // SubComponent槽位文档（待修复）
-    // SST_ELI_DOCUMENT_SUBCOMPONENT_SLOTS(
-    //     {"interface", "SNN网络接口插槽", "SST::SnnDL::SnnInterface"}
-    // )
+    // SubComponent槽位文档
+    SST_ELI_DOCUMENT_SUBCOMPONENT_SLOTS(
+        {"network_interface", "SNN网络接口插槽", "SST::SnnDL::SnnInterface"}
+    )
 
     // 端口文档 (兼容性，优先使用SubComponent接口)
     SST_ELI_DOCUMENT_PORTS(
@@ -161,8 +160,8 @@ private:
     SST::Link* spike_input_link;            ///< 输入脉冲链接（传统模式）
     SST::Link* spike_output_link;           ///< 输出脉冲链接（传统模式）
     
-    // SubComponent接口（新模式）- 待修复
-    // SnnInterface* snn_interface;            ///< SNN网络接口
+    // SubComponent接口（新模式）
+    SnnInterface* snn_interface;            ///< SNN网络接口
     uint32_t node_id;                       ///< 网络节点ID
     bool use_interface_mode;                ///< 是否使用SubComponent接口模式
     

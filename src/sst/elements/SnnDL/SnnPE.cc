@@ -56,19 +56,17 @@ SnnPE::SnnPE(ComponentId_t id, Params& params) : Component(id) {
     neurons.resize(num_neurons, NeuronState(v_rest));
     output->verbose(CALL_INFO, 2, 0, "初始化了%u个神经元状态\n", num_neurons);
     
-    // 尝试加载SubComponent接口（待修复）
-    // SST::Params empty_params;
-    // snn_interface = loadUserSubComponent<SnnInterface>("interface", ComponentInfo::SHARE_NONE, empty_params);
+    // 尝试加载SubComponent接口
+    snn_interface = loadUserSubComponent<SnnInterface>("network_interface", ComponentInfo::SHARE_NONE);
     
-    // if (snn_interface) {
-    if (false) {  // 暂时禁用SubComponent模式
+    if (snn_interface) {
         use_interface_mode = true;
         output->verbose(CALL_INFO, 1, 0, "使用SubComponent接口模式\n");
         
         // 配置接口
-        // snn_interface->setSpikeHandler(
-        //     [this](SpikeEvent* spike) { this->handleInterfaceSpike(spike); }
-        // );
+        snn_interface->setSpikeHandler(
+            [this](SpikeEvent* spike) { this->handleInterfaceSpike(spike); }
+        );
         
         // 传统链接设为nullptr
         spike_input_link = nullptr;
@@ -225,6 +223,16 @@ bool SnnPE::clockTick(Cycle_t current_cycle) {
         } else {
             // 应用泄漏动态
             applyLeak(i);
+        }
+    }
+    
+    // 简单的测试脉冲生成（仅用于测试网络通信）
+    if (use_interface_mode && snn_interface && node_id == 0) {
+        // 只在节点0生成测试脉冲
+        if (current_cycle == 1000) { // 在第1000个周期生成脉冲
+            output->verbose(CALL_INFO, 1, 0, "生成测试脉冲：节点%u的神经元0\n", node_id);
+            neurons[0].v_mem = v_thresh + 0.1; // 强制触发脉冲
+            checkAndFireSpike(0);
         }
     }
     
@@ -427,10 +435,18 @@ void SnnPE::checkAndFireSpike(uint32_t neuron_idx) {
         // 发放脉冲
         SpikeEvent* new_spike = new SpikeEvent(neuron_idx);
         
-        // 暂时禁用SubComponent检查
-        if (false) { // use_interface_mode && snn_interface
+        if (use_interface_mode && snn_interface) {
             // 使用SubComponent接口发送
-            // snn_interface->sendSpike(new_spike);
+            // 设置目标节点（简单测试：发送到下一个节点）
+            uint32_t dest_node = (node_id + 1) % 2; // 在节点0和1之间轮换
+            new_spike->setDestinationNode(dest_node);
+            new_spike->setDestinationNeuron(neuron_idx); // 发送到相同ID的神经元
+            new_spike->setWeight(1.0); // 设置权重
+            
+            snn_interface->sendSpike(new_spike);
+            
+            output->verbose(CALL_INFO, 2, 0, "通过网络发送脉冲：神经元%u -> 节点%u神经元%u\n",
+                           neuron_idx, dest_node, neuron_idx);
         } else if (spike_output_link) {
             // 使用传统Link发送
             spike_output_link->send(new_spike);

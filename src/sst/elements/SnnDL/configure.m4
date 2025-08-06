@@ -41,9 +41,6 @@ AC_DEFUN([SST_SnnDL_CONFIG], [
   dnl Set conditional for HDF5 support in Makefiles
   AM_CONDITIONAL([HAVE_HDF5], [test "x$HDF5_LIBS" != "x"])
   
-  dnl Configure output files
-  AC_CONFIG_FILES([src/sst/elements/SnnDL/Makefile])
-  
   dnl Execute success/failure actions
   AS_IF([test "$sst_check_SnnDL" = "yes"], [$1], [$2])
 ])
