@@ -1,0 +1,266 @@
+=== Direct Link模式连接测试 ===
+
+🔸 创建direct_link模式的2x2网格
+✅ 节点0配置为direct_link模式
+✅ 节点1配置为direct_link模式
+✅ 节点2配置为direct_link模式
+✅ 节点3配置为direct_link模式
+
+🔗 建立direct_link物理链路连接
+🔗 双向Direct链路: 节点0[east] ↔ 节点1[west]
+🔗 双向Direct链路: 节点0[north] ↔ 节点2[south]
+🔗 双向Direct链路: 节点1[north] ↔ 节点3[south]
+🔗 双向Direct链路: 节点2[east] ↔ 节点3[west]
+
+📊 预期direct_link连接拓扑:
+┌─────┬─────┐
+│  0──┤  1  │  0-1: 东西连接
+│  │  │  │  │
+├──┼──┼──┼──┤
+│  2──┤  3  │  2-3: 东西连接
+└─────┴─────┘  0-2, 1-3: 南北连接
+
+🎯 测试说明:
+- 节点0将发送脉冲到节点3
+- 使用direct_link模式，避免Merlin路由器复杂性
+- 应该看到真实的SST链路传输数据
+- 无路由器SubComponent，直接节点间通信
+MultiCorePE[MultiCorePE:29]: 🚀 初始化MultiCorePE组件 (ID: 0)
+MultiCorePE[MultiCorePE:98]: ✅ MultiCorePE基础初始化完成
+MultiCorePE[MultiCorePE:29]: 🚀 初始化MultiCorePE组件 (ID: 1)
+MultiCorePE[MultiCorePE:98]: ✅ MultiCorePE基础初始化完成
+MultiCorePE[MultiCorePE:29]: 🚀 初始化MultiCorePE组件 (ID: 2)
+MultiCorePE[MultiCorePE:98]: ✅ MultiCorePE基础初始化完成
+MultiCorePE[MultiCorePE:29]: 🚀 初始化MultiCorePE组件 (ID: 3)
+MultiCorePE[MultiCorePE:98]: ✅ MultiCorePE基础初始化完成
+MultiCorePE[initializeDirectionLinks:1121]: 🔗 方向链路代理配置完成: 2个活跃链路
+MultiCorePE[initializeProcessingUnits:560]: [core0] 槽位可按 API 加载: no
+SnnPESubComponent[SnnPESubComponent:61]: 🔧 初始化SnnPE SubComponent (核心0, 8个神经元)
+MultiCorePE[initializeProcessingUnits:574]: [core0] 匿名加载成功
+MultiCorePE[initializeProcessingUnits:588]: [core0] memory link = none
+MultiCorePE[init:163]: ✅ MultiCorePE阶段0初始化完成
+SnnPESubComponent[init:124]: 🔄 核心0 init phase 0
+SnnPESubComponent[init:142]: ⚠️ 核心0未加载StandardMem，将使用默认权重
+MultiCorePE[initializeDirectionLinks:1121]: 🔗 方向链路代理配置完成: 2个活跃链路
+MultiCorePE[initializeProcessingUnits:560]: [core0] 槽位可按 API 加载: no
+SnnPESubComponent[SnnPESubComponent:61]: 🔧 初始化SnnPE SubComponent (核心0, 8个神经元)
+MultiCorePE[initializeProcessingUnits:574]: [core0] 匿名加载成功
+MultiCorePE[initializeProcessingUnits:588]: [core0] memory link = none
+MultiCorePE[init:163]: ✅ MultiCorePE阶段0初始化完成
+SnnPESubComponent[init:124]: 🔄 核心0 init phase 0
+SnnPESubComponent[init:142]: ⚠️ 核心0未加载StandardMem，将使用默认权重
+MultiCorePE[initializeDirectionLinks:1121]: 🔗 方向链路代理配置完成: 2个活跃链路
+MultiCorePE[initializeProcessingUnits:560]: [core0] 槽位可按 API 加载: no
+SnnPESubComponent[SnnPESubComponent:61]: 🔧 初始化SnnPE SubComponent (核心0, 8个神经元)
+MultiCorePE[initializeProcessingUnits:574]: [core0] 匿名加载成功
+MultiCorePE[initializeProcessingUnits:588]: [core0] memory link = none
+MultiCorePE[init:163]: ✅ MultiCorePE阶段0初始化完成
+SnnPESubComponent[init:124]: 🔄 核心0 init phase 0
+SnnPESubComponent[init:142]: ⚠️ 核心0未加载StandardMem，将使用默认权重
+MultiCorePE[initializeDirectionLinks:1121]: 🔗 方向链路代理配置完成: 2个活跃链路
+MultiCorePE[initializeProcessingUnits:560]: [core0] 槽位可按 API 加载: no
+SnnPESubComponent[SnnPESubComponent:61]: 🔧 初始化SnnPE SubComponent (核心0, 8个神经元)
+MultiCorePE[initializeProcessingUnits:574]: [core0] 匿名加载成功
+MultiCorePE[initializeProcessingUnits:588]: [core0] memory link = none
+MultiCorePE[init:163]: ✅ MultiCorePE阶段0初始化完成
+SnnPESubComponent[init:124]: 🔄 核心0 init phase 0
+SnnPESubComponent[init:142]: ⚠️ 核心0未加载StandardMem，将使用默认权重
+MultiCorePE[setup:189]: 🔧 MultiCorePE setup阶段
+SnnPESubComponent[setup:182]: 🔧 核心0 setup 进入
+SnnPESubComponent[setup:183]: 🧩 参数: init_default_weight=0.500, fallback=0, merge_row=0, merge_cl=1, line=64B, base_addr=24000, N=8
+SnnPESubComponent[setup:193]: ⚠️ 核心0未配置StandardMem，后续将使用默认权重
+SnnPESubComponent[setup:196]: ✅ SnnPE SubComponent核心0 setup完成
+SnnNetworkAdapter[SnnNetworkAdapter:97]: 📝 north方向端口未连接
+SnnNetworkAdapter[SnnNetworkAdapter:97]: 📝 south方向端口未连接
+SnnNetworkAdapter[SnnNetworkAdapter:97]: 📝 east方向端口未连接
+SnnNetworkAdapter[SnnNetworkAdapter:97]: 📝 west方向端口未连接
+SnnNetworkAdapter[SnnNetworkAdapter:101]: 🔗 多端口模式：创建了0个方向链路
+SnnNetworkAdapter[SnnNetworkAdapter:150]: SnnNetworkAdapter initialized for node 3 with topology mesh2d
+MultiCorePE[initializeNetworkInterface:1132]: ✅ 通过用户配置成功加载网络接口适配器
+SnnNetworkAdapter[initializeTopologyHandler:348]: Topology handler initialized: Mesh2D[2x2] Node(1,1)
+SnnNetworkAdapter[init:169]: Phase 0: Topology handler initialized
+SnnNetworkAdapter[setup:198]: 📊 网络适配器setup阶段完成
+SnnNetworkAdapter[setup:202]: Setup complete: Mesh2D[2x2] Node(1,1)
+MultiCorePE[initializeNetworkInterface:1155]: 🔗 网络接口配置完成: SnnNetworkAdapter[3] - Routed: 0, Local: 0, Remote: 0, Topology: Mesh2D[2x2] Node(1,1)
+SnnNetworkAdapter[injectDirectionLink:713]: ✅ 父组件注入south方向链路成功
+SnnNetworkAdapter[injectDirectionLink:713]: ✅ 父组件注入west方向链路成功
+MultiCorePE[initializeNetworkInterface:1186]: 🔄 端口代理机制配置完成
+MultiCorePE[setup:213]: 📊 MultiCorePE配置摘要:
+MultiCorePE[setup:214]:    - 处理单元数: 1
+MultiCorePE[setup:215]:    - 每核神经元数: 8
+MultiCorePE[setup:216]:    - 总神经元数: 8
+MultiCorePE[setup:217]:    - 节点ID: 3
+MultiCorePE[setup:218]:    - NUMA优化: 启用
+MultiCorePE[setup:219]:    - 测试流量: 禁用
+MultiCorePE[setup:221]: ✅ MultiCorePE setup完成
+MultiCorePE[setup:189]: 🔧 MultiCorePE setup阶段
+SnnPESubComponent[setup:182]: 🔧 核心0 setup 进入
+SnnPESubComponent[setup:183]: 🧩 参数: init_default_weight=0.500, fallback=0, merge_row=0, merge_cl=1, line=64B, base_addr=16000, N=8
+SnnPESubComponent[setup:193]: ⚠️ 核心0未配置StandardMem，后续将使用默认权重
+SnnPESubComponent[setup:196]: ✅ SnnPE SubComponent核心0 setup完成
+SnnNetworkAdapter[SnnNetworkAdapter:97]: 📝 north方向端口未连接
+SnnNetworkAdapter[SnnNetworkAdapter:97]: 📝 south方向端口未连接
+SnnNetworkAdapter[SnnNetworkAdapter:97]: 📝 east方向端口未连接
+SnnNetworkAdapter[SnnNetworkAdapter:97]: 📝 west方向端口未连接
+SnnNetworkAdapter[SnnNetworkAdapter:101]: 🔗 多端口模式：创建了0个方向链路
+SnnNetworkAdapter[SnnNetworkAdapter:150]: SnnNetworkAdapter initialized for node 2 with topology mesh2d
+MultiCorePE[initializeNetworkInterface:1132]: ✅ 通过用户配置成功加载网络接口适配器
+SnnNetworkAdapter[initializeTopologyHandler:348]: Topology handler initialized: Mesh2D[2x2] Node(0,1)
+SnnNetworkAdapter[init:169]: Phase 0: Topology handler initialized
+SnnNetworkAdapter[setup:198]: 📊 网络适配器setup阶段完成
+SnnNetworkAdapter[setup:202]: Setup complete: Mesh2D[2x2] Node(0,1)
+MultiCorePE[initializeNetworkInterface:1155]: 🔗 网络接口配置完成: SnnNetworkAdapter[2] - Routed: 0, Local: 0, Remote: 0, Topology: Mesh2D[2x2] Node(0,1)
+SnnNetworkAdapter[injectDirectionLink:713]: ✅ 父组件注入south方向链路成功
+SnnNetworkAdapter[injectDirectionLink:713]: ✅ 父组件注入east方向链路成功
+MultiCorePE[initializeNetworkInterface:1186]: 🔄 端口代理机制配置完成
+MultiCorePE[setup:213]: 📊 MultiCorePE配置摘要:
+MultiCorePE[setup:214]:    - 处理单元数: 1
+MultiCorePE[setup:215]:    - 每核神经元数: 8
+MultiCorePE[setup:216]:    - 总神经元数: 8
+MultiCorePE[setup:217]:    - 节点ID: 2
+MultiCorePE[setup:218]:    - NUMA优化: 启用
+MultiCorePE[setup:219]:    - 测试流量: 禁用
+MultiCorePE[setup:221]: ✅ MultiCorePE setup完成
+MultiCorePE[setup:189]: 🔧 MultiCorePE setup阶段
+SnnPESubComponent[setup:182]: 🔧 核心0 setup 进入
+SnnPESubComponent[setup:183]: 🧩 参数: init_default_weight=0.500, fallback=0, merge_row=0, merge_cl=1, line=64B, base_addr=8000, N=8
+SnnPESubComponent[setup:193]: ⚠️ 核心0未配置StandardMem，后续将使用默认权重
+SnnPESubComponent[setup:196]: ✅ SnnPE SubComponent核心0 setup完成
+SnnNetworkAdapter[SnnNetworkAdapter:97]: 📝 north方向端口未连接
+SnnNetworkAdapter[SnnNetworkAdapter:97]: 📝 south方向端口未连接
+SnnNetworkAdapter[SnnNetworkAdapter:97]: 📝 east方向端口未连接
+SnnNetworkAdapter[SnnNetworkAdapter:97]: 📝 west方向端口未连接
+SnnNetworkAdapter[SnnNetworkAdapter:101]: 🔗 多端口模式：创建了0个方向链路
+SnnNetworkAdapter[SnnNetworkAdapter:150]: SnnNetworkAdapter initialized for node 1 with topology mesh2d
+MultiCorePE[initializeNetworkInterface:1132]: ✅ 通过用户配置成功加载网络接口适配器
+SnnNetworkAdapter[initializeTopologyHandler:348]: Topology handler initialized: Mesh2D[2x2] Node(1,0)
+SnnNetworkAdapter[init:169]: Phase 0: Topology handler initialized
+SnnNetworkAdapter[setup:198]: 📊 网络适配器setup阶段完成
+SnnNetworkAdapter[setup:202]: Setup complete: Mesh2D[2x2] Node(1,0)
+MultiCorePE[initializeNetworkInterface:1155]: 🔗 网络接口配置完成: SnnNetworkAdapter[1] - Routed: 0, Local: 0, Remote: 0, Topology: Mesh2D[2x2] Node(1,0)
+SnnNetworkAdapter[injectDirectionLink:713]: ✅ 父组件注入north方向链路成功
+SnnNetworkAdapter[injectDirectionLink:713]: ✅ 父组件注入west方向链路成功
+MultiCorePE[initializeNetworkInterface:1186]: 🔄 端口代理机制配置完成
+MultiCorePE[setup:213]: 📊 MultiCorePE配置摘要:
+MultiCorePE[setup:214]:    - 处理单元数: 1
+MultiCorePE[setup:215]:    - 每核神经元数: 8
+MultiCorePE[setup:216]:    - 总神经元数: 8
+MultiCorePE[setup:217]:    - 节点ID: 1
+MultiCorePE[setup:218]:    - NUMA优化: 启用
+MultiCorePE[setup:219]:    - 测试流量: 禁用
+MultiCorePE[setup:221]: ✅ MultiCorePE setup完成
+MultiCorePE[setup:189]: 🔧 MultiCorePE setup阶段
+SnnPESubComponent[setup:182]: 🔧 核心0 setup 进入
+SnnPESubComponent[setup:183]: 🧩 参数: init_default_weight=0.500, fallback=0, merge_row=0, merge_cl=1, line=64B, base_addr=0, N=8
+SnnPESubComponent[setup:193]: ⚠️ 核心0未配置StandardMem，后续将使用默认权重
+SnnPESubComponent[setup:196]: ✅ SnnPE SubComponent核心0 setup完成
+SnnNetworkAdapter[SnnNetworkAdapter:97]: 📝 north方向端口未连接
+SnnNetworkAdapter[SnnNetworkAdapter:97]: 📝 south方向端口未连接
+SnnNetworkAdapter[SnnNetworkAdapter:97]: 📝 east方向端口未连接
+SnnNetworkAdapter[SnnNetworkAdapter:97]: 📝 west方向端口未连接
+SnnNetworkAdapter[SnnNetworkAdapter:101]: 🔗 多端口模式：创建了0个方向链路
+SnnNetworkAdapter[SnnNetworkAdapter:150]: SnnNetworkAdapter initialized for node 0 with topology mesh2d
+MultiCorePE[initializeNetworkInterface:1132]: ✅ 通过用户配置成功加载网络接口适配器
+SnnNetworkAdapter[initializeTopologyHandler:348]: Topology handler initialized: Mesh2D[2x2] Node(0,0)
+SnnNetworkAdapter[init:169]: Phase 0: Topology handler initialized
+SnnNetworkAdapter[setup:198]: 📊 网络适配器setup阶段完成
+SnnNetworkAdapter[setup:202]: Setup complete: Mesh2D[2x2] Node(0,0)
+MultiCorePE[initializeNetworkInterface:1155]: 🔗 网络接口配置完成: SnnNetworkAdapter[0] - Routed: 0, Local: 0, Remote: 0, Topology: Mesh2D[2x2] Node(0,0)
+SnnNetworkAdapter[injectDirectionLink:713]: ✅ 父组件注入north方向链路成功
+SnnNetworkAdapter[injectDirectionLink:713]: ✅ 父组件注入east方向链路成功
+MultiCorePE[initializeNetworkInterface:1186]: 🔄 端口代理机制配置完成
+MultiCorePE[setup:213]: 📊 MultiCorePE配置摘要:
+MultiCorePE[setup:214]:    - 处理单元数: 1
+MultiCorePE[setup:215]:    - 每核神经元数: 8
+MultiCorePE[setup:216]:    - 总神经元数: 8
+MultiCorePE[setup:217]:    - 节点ID: 0
+MultiCorePE[setup:218]:    - NUMA优化: 启用
+MultiCorePE[setup:219]:    - 测试流量: 启用
+MultiCorePE[setup:221]: ✅ MultiCorePE setup完成
+SnnNetworkAdapter[sendSpike:235]: Sending spike from neuron 0 to neuron 24 (node 3)
+SnnNetworkAdapter[routeSpike:399]: Route calculated: dest_node 3 -> port 1, hops 2, latency 20
+SnnNetworkAdapter[sendViaMultiPortLink:732]: 🔍 检查sendViaMultiPortLink: parent_links=2, self_links=0, next_port=1
+SnnNetworkAdapter[sendViaMultiPortLink:759]: 📡 准备通过east方向发送脉冲: 源=0, 目标=3, 神经元=0
+SnnNetworkAdapter[sendViaMultiPortLink:765]: 🔄 使用父组件注入的east方向链路发送
+SnnNetworkAdapter[sendEventToDirection:722]: 📡 通过父组件链路发送事件到east方向
+SnnNetworkAdapter[sendViaMultiPortLink:783]: ✅ 脉冲通过east方向发送成功
+SnnNetworkAdapter[sendSpike:235]: Sending spike from neuron 1 to neuron 25 (node 3)
+SnnNetworkAdapter[routeSpike:399]: Route calculated: dest_node 3 -> port 1, hops 2, latency 20
+SnnNetworkAdapter[sendViaMultiPortLink:732]: 🔍 检查sendViaMultiPortLink: parent_links=2, self_links=0, next_port=1
+SnnNetworkAdapter[sendViaMultiPortLink:759]: 📡 准备通过east方向发送脉冲: 源=0, 目标=3, 神经元=1
+SnnNetworkAdapter[sendViaMultiPortLink:765]: 🔄 使用父组件注入的east方向链路发送
+SnnNetworkAdapter[sendEventToDirection:722]: 📡 通过父组件链路发送事件到east方向
+SnnNetworkAdapter[sendViaMultiPortLink:783]: ✅ 脉冲通过east方向发送成功
+SnnNetworkAdapter[sendSpike:235]: Sending spike from neuron 0 to neuron 24 (node 3)
+SnnNetworkAdapter[routeSpike:399]: Route calculated: dest_node 3 -> port 1, hops 2, latency 20
+SnnNetworkAdapter[sendViaMultiPortLink:732]: 🔍 检查sendViaMultiPortLink: parent_links=2, self_links=0, next_port=1
+SnnNetworkAdapter[sendViaMultiPortLink:759]: 📡 准备通过east方向发送脉冲: 源=0, 目标=3, 神经元=0
+SnnNetworkAdapter[sendViaMultiPortLink:765]: 🔄 使用父组件注入的east方向链路发送
+SnnNetworkAdapter[sendEventToDirection:722]: 📡 通过父组件链路发送事件到east方向
+SnnNetworkAdapter[sendViaMultiPortLink:783]: ✅ 脉冲通过east方向发送成功
+SnnNetworkAdapter[sendSpike:235]: Sending spike from neuron 1 to neuron 25 (node 3)
+SnnNetworkAdapter[routeSpike:399]: Route calculated: dest_node 3 -> port 1, hops 2, latency 20
+SnnNetworkAdapter[sendViaMultiPortLink:732]: 🔍 检查sendViaMultiPortLink: parent_links=2, self_links=0, next_port=1
+SnnNetworkAdapter[sendViaMultiPortLink:759]: 📡 准备通过east方向发送脉冲: 源=0, 目标=3, 神经元=1
+SnnNetworkAdapter[sendViaMultiPortLink:765]: 🔄 使用父组件注入的east方向链路发送
+SnnNetworkAdapter[sendEventToDirection:722]: 📡 通过父组件链路发送事件到east方向
+SnnNetworkAdapter[sendViaMultiPortLink:783]: ✅ 脉冲通过east方向发送成功
+SnnNetworkAdapter[sendSpike:235]: Sending spike from neuron 0 to neuron 24 (node 3)
+SnnNetworkAdapter[routeSpike:399]: Route calculated: dest_node 3 -> port 1, hops 2, latency 20
+SnnNetworkAdapter[sendViaMultiPortLink:732]: 🔍 检查sendViaMultiPortLink: parent_links=2, self_links=0, next_port=1
+SnnNetworkAdapter[sendViaMultiPortLink:759]: 📡 准备通过east方向发送脉冲: 源=0, 目标=3, 神经元=0
+SnnNetworkAdapter[sendViaMultiPortLink:765]: 🔄 使用父组件注入的east方向链路发送
+SnnNetworkAdapter[sendEventToDirection:722]: 📡 通过父组件链路发送事件到east方向
+SnnNetworkAdapter[sendViaMultiPortLink:783]: ✅ 脉冲通过east方向发送成功
+SnnNetworkAdapter[sendSpike:235]: Sending spike from neuron 1 to neuron 25 (node 3)
+SnnNetworkAdapter[routeSpike:399]: Route calculated: dest_node 3 -> port 1, hops 2, latency 20
+SnnNetworkAdapter[sendViaMultiPortLink:732]: 🔍 检查sendViaMultiPortLink: parent_links=2, self_links=0, next_port=1
+SnnNetworkAdapter[sendViaMultiPortLink:759]: 📡 准备通过east方向发送脉冲: 源=0, 目标=3, 神经元=1
+SnnNetworkAdapter[sendViaMultiPortLink:765]: 🔄 使用父组件注入的east方向链路发送
+SnnNetworkAdapter[sendEventToDirection:722]: 📡 通过父组件链路发送事件到east方向
+SnnNetworkAdapter[sendViaMultiPortLink:783]: ✅ 脉冲通过east方向发送成功
+MultiCorePE[finish:225]: 🏁 MultiCorePE完成仿真
+MultiCorePE[finish:231]: 📊 MultiCorePE性能摘要:
+MultiCorePE[finish:232]:    - 总周期数: 1999
+MultiCorePE[finish:241]:    - 处理的脉冲总数: 69
+MultiCorePE[finish:242]:    - 发放的神经元总数: 69
+MultiCorePE[finish:243]:    - 核间消息数: 0
+MultiCorePE[finish:250]:    - 平均核心利用率: 0.00%
+MultiCorePE[finish:255]:    处理单元0: 脉冲=69, 发放=69, 利用率=0.00
+MultiCorePE[finish:259]: ✅ MultiCorePE统计输出完成
+MultiCorePE[finish:225]: 🏁 MultiCorePE完成仿真
+MultiCorePE[finish:231]: 📊 MultiCorePE性能摘要:
+MultiCorePE[finish:232]:    - 总周期数: 1999
+MultiCorePE[finish:241]:    - 处理的脉冲总数: 69
+MultiCorePE[finish:242]:    - 发放的神经元总数: 69
+MultiCorePE[finish:243]:    - 核间消息数: 0
+MultiCorePE[finish:250]:    - 平均核心利用率: 0.00%
+MultiCorePE[finish:255]:    处理单元0: 脉冲=69, 发放=69, 利用率=0.00
+MultiCorePE[finish:259]: ✅ MultiCorePE统计输出完成
+MultiCorePE[finish:225]: 🏁 MultiCorePE完成仿真
+MultiCorePE[finish:231]: 📊 MultiCorePE性能摘要:
+MultiCorePE[finish:232]:    - 总周期数: 1999
+MultiCorePE[finish:241]:    - 处理的脉冲总数: 69
+MultiCorePE[finish:242]:    - 发放的神经元总数: 69
+MultiCorePE[finish:243]:    - 核间消息数: 0
+MultiCorePE[finish:250]:    - 平均核心利用率: 0.00%
+MultiCorePE[finish:255]:    处理单元0: 脉冲=69, 发放=69, 利用率=0.00
+MultiCorePE[finish:259]: ✅ MultiCorePE统计输出完成
+MultiCorePE[finish:225]: 🏁 MultiCorePE完成仿真
+MultiCorePE[finish:231]: 📊 MultiCorePE性能摘要:
+MultiCorePE[finish:232]:    - 总周期数: 1999
+MultiCorePE[finish:241]:    - 处理的脉冲总数: 69
+MultiCorePE[finish:242]:    - 发放的神经元总数: 69
+MultiCorePE[finish:243]:    - 核间消息数: 0
+MultiCorePE[finish:250]:    - 平均核心利用率: 0.00%
+MultiCorePE[finish:255]:    处理单元0: 脉冲=69, 发放=69, 利用率=0.00
+MultiCorePE[finish:259]: ✅ MultiCorePE统计输出完成
+MultiCorePE[~MultiCorePE:105]: 🗑️ 销毁MultiCorePE组件
+SnnPESubComponent[~SnnPESubComponent:107]: 🗑️ 销毁SnnPE SubComponent核心0
+MultiCorePE[~MultiCorePE:105]: 🗑️ 销毁MultiCorePE组件
+SnnPESubComponent[~SnnPESubComponent:107]: 🗑️ 销毁SnnPE SubComponent核心0
+MultiCorePE[~MultiCorePE:105]: 🗑️ 销毁MultiCorePE组件
+SnnPESubComponent[~SnnPESubComponent:107]: 🗑️ 销毁SnnPE SubComponent核心0
+MultiCorePE[~MultiCorePE:105]: 🗑️ 销毁MultiCorePE组件
+SnnPESubComponent[~SnnPESubComponent:107]: 🗑️ 销毁SnnPE SubComponent核心0
+Simulation is complete, simulated time: 2 us

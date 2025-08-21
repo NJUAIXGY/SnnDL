@@ -1,0 +1,1099 @@
+// -*- c++ -*-
+//
+// Copyright 2025 SST Contributors
+//
+// MultiCorePE.cc: 真正的多核脉冲神经网络处理单元实现文件
+//
+
+#include <sst/core/sst_config.h>
+#include "MultiCorePE.h"
+
+#include <fstream>
+#include <sstream>
+#include <iostream>
+#include <cmath>
+#include <algorithm>
+#include <functional>
+
+using namespace SST;
+using namespace SST::SnnDL;
+
+// ===== MultiCorePE 主组件实现 =====
+
+MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
+    // 初始化输出对象
+    int verbose_level = params.find<int>("verbose", 0);
+    output_ = new Output("MultiCorePE[@p:@l]: ", verbose_level, 0, Output::STDOUT);
+    
+    output_->verbose(CALL_INFO, 1, 0, "🚀 初始化MultiCorePE组件 (ID: %" PRIu64 ")\n", id);
+    
+    // 读取基础配置参数
+    num_cores_ = params.find<int>("num_cores", 4);
+    neurons_per_core_ = params.find<int>("neurons_per_core", 64);
+    total_neurons_ = num_cores_ * neurons_per_core_;
+    node_id_ = params.find<int>("node_id", 0);
+    verbose_ = verbose_level;
+    weights_file_ = params.find<std::string>("weights_file", "");
+    enable_numa_ = params.find<bool>("enable_numa", true);
+    
+    // 神经元参数
+    v_thresh_ = params.find<float>("v_thresh", 1.0f);
+    v_reset_ = params.find<float>("v_reset", 0.0f);
+    v_rest_ = params.find<float>("v_rest", 0.0f);
+    tau_mem_ = params.find<float>("tau_mem", 20.0f);
+    t_ref_ = params.find<int>("t_ref", 2);
+    
+    // 测试流量参数
+    enable_test_traffic_ = params.find<bool>("enable_test_traffic", false);
+    test_target_node_ = params.find<int>("test_target_node", 0);
+    test_period_ = params.find<int>("test_period", 100);
+    test_spikes_per_burst_ = params.find<int>("test_spikes_per_burst", 4);
+    test_weight_ = params.find<float>("test_weight", 0.2f);
+    
+    output_->verbose(CALL_INFO, 2, 0, 
+        "🔧 多核PE配置: cores=%d, neurons_per_core=%d, total_neurons=%d, node_id=%d\n",
+        num_cores_, neurons_per_core_, total_neurons_, node_id_);
+    
+    output_->verbose(CALL_INFO, 2, 0, 
+        "🧠 神经元参数: v_thresh=%.3f, v_reset=%.3f, v_rest=%.3f, tau_mem=%.1fms, t_ref=%d\n",
+        v_thresh_, v_reset_, v_rest_, tau_mem_, t_ref_);
+    
+    // 验证参数合理性
+    if (num_cores_ <= 0 || num_cores_ > 64) {
+        output_->fatal(CALL_INFO, -1, "❌ 错误: num_cores必须在1-64之间，当前值=%d\n", num_cores_);
+    }
+    if (neurons_per_core_ <= 0 || neurons_per_core_ > 1024) {
+        output_->fatal(CALL_INFO, -1, "❌ 错误: neurons_per_core必须在1-1024之间，当前值=%d\n", neurons_per_core_);
+    }
+    
+    // 初始化时钟计数器
+    current_cycle_ = 0;
+    test_cycle_counter_ = 0;
+    
+    // 初始化处理单元状态追踪
+    unit_states_.resize(num_cores_);
+    for (int i = 0; i < num_cores_; i++) {
+        unit_states_[i].unit_id = i;
+        unit_states_[i].neuron_id_start = i * neurons_per_core_;
+        unit_states_[i].neuron_count = neurons_per_core_;
+        unit_states_[i].is_active = false;
+        unit_states_[i].spikes_processed = 0;
+        unit_states_[i].neurons_fired = 0;
+        unit_states_[i].utilization = 0.0;
+    }
+    
+    // 初始化组件指针为空
+    l2_cache_ = nullptr;
+    memory_interface_ = nullptr;
+    external_nic_ = nullptr;
+    internal_ring_ = nullptr;
+    controller_ = nullptr;
+    clock_handler_ = nullptr;
+    
+    // 初始化端口指针为空
+    external_spike_input_link_ = nullptr;
+    external_spike_output_link_ = nullptr;
+    mem_link_ = nullptr;
+    
+    output_->verbose(CALL_INFO, 1, 0, "✅ MultiCorePE基础初始化完成\n");
+}
+
+MultiCorePE::~MultiCorePE() {
+    output_->verbose(CALL_INFO, 1, 0, "🗑️ 销毁MultiCorePE组件\n");
+    
+    // 清理处理单元
+    for (auto* unit : processing_units_) {
+        delete unit;
+    }
+    processing_units_.clear();
+    
+    // 清理内部组件
+    delete internal_ring_;
+    delete controller_;
+    delete output_;
+    
+    // 清理外部脉冲队列
+    while (!external_spike_queue_.empty()) {
+        delete external_spike_queue_.front();
+        external_spike_queue_.pop();
+    }
+    
+    // 清理挂起的内存请求
+    for (auto& pair : pending_memory_requests_) {
+        delete pair.second;
+    }
+    pending_memory_requests_.clear();
+}
+
+void MultiCorePE::init(unsigned int phase) {
+    output_->verbose(CALL_INFO, 2, 0, "🔄 MultiCorePE初始化阶段 %d\n", phase);
+    
+    if (phase == 0) {
+        // 阶段0：初始化基础组件和端口
+        
+        // 配置时钟
+        std::string clock_freq = "1GHz";  // 默认时钟频率
+        clock_handler_ = new Clock::Handler<MultiCorePE>(this, &MultiCorePE::clockTick);
+        registerClock(clock_freq, clock_handler_);
+        
+        output_->verbose(CALL_INFO, 2, 0, "⏰ 配置时钟频率: %s\n", clock_freq.c_str());
+        
+        // 初始化统计收集
+        initializeStatistics();
+        
+        // 初始化端口连接
+        external_spike_input_link_ = configureLink("external_spike_input", 
+            new Event::Handler<MultiCorePE>(this, &MultiCorePE::handleExternalSpikeEvent));
+        external_spike_output_link_ = configureLink("external_spike_output");
+        mem_link_ = configureLink("mem_link");
+        
+        output_->verbose(CALL_INFO, 2, 0, "🔗 配置外部端口连接\n");
+        
+        // 初始化处理单元
+        initializeProcessingUnits();
+        
+        // 初始化内部互连
+        initializeInternalRing();
+        
+        // 初始化多核控制器
+        controller_ = new MultiCoreController(this, output_);
+        
+        output_->verbose(CALL_INFO, 1, 0, "✅ MultiCorePE阶段0初始化完成\n");
+    }
+    else if (phase == 1) {
+        // 阶段1：加载权重和配置子组件
+        loadAndDistributeWeights();
+        output_->verbose(CALL_INFO, 1, 0, "✅ MultiCorePE阶段1初始化完成\n");
+    }
+}
+
+void MultiCorePE::setup() {
+    output_->verbose(CALL_INFO, 1, 0, "🔧 MultiCorePE setup阶段\n");
+    
+    // 验证所有组件初始化完成
+    if (processing_units_.size() != static_cast<size_t>(num_cores_)) {
+        output_->fatal(CALL_INFO, -1, "❌ 错误: 处理单元数量不匹配，期望%d，实际%zu\n", 
+                      num_cores_, processing_units_.size());
+    }
+    
+    if (!internal_ring_) {
+        output_->fatal(CALL_INFO, -1, "❌ 错误: 内部互连未初始化\n");
+    }
+    
+    if (!controller_) {
+        output_->fatal(CALL_INFO, -1, "❌ 错误: 多核控制器未初始化\n");
+    }
+    
+    // 打印组件配置摘要
+    output_->verbose(CALL_INFO, 1, 0, "📊 MultiCorePE配置摘要:\n");
+    output_->verbose(CALL_INFO, 1, 0, "   - 处理单元数: %d\n", num_cores_);
+    output_->verbose(CALL_INFO, 1, 0, "   - 每核神经元数: %d\n", neurons_per_core_);
+    output_->verbose(CALL_INFO, 1, 0, "   - 总神经元数: %d\n", total_neurons_);
+    output_->verbose(CALL_INFO, 1, 0, "   - 节点ID: %d\n", node_id_);
+    output_->verbose(CALL_INFO, 1, 0, "   - NUMA优化: %s\n", enable_numa_ ? "启用" : "禁用");
+    output_->verbose(CALL_INFO, 1, 0, "   - 测试流量: %s\n", enable_test_traffic_ ? "启用" : "禁用");
+    
+    output_->verbose(CALL_INFO, 1, 0, "✅ MultiCorePE setup完成\n");
+}
+
+void MultiCorePE::finish() {
+    output_->verbose(CALL_INFO, 1, 0, "🏁 MultiCorePE完成仿真\n");
+    
+    // 更新最终统计信息
+    updateStatistics();
+    
+    // 打印性能摘要
+    output_->verbose(CALL_INFO, 1, 0, "📊 MultiCorePE性能摘要:\n");
+    output_->verbose(CALL_INFO, 1, 0, "   - 总周期数: %" PRIu64 "\n", current_cycle_);
+    output_->verbose(CALL_INFO, 1, 0, "   - 处理的脉冲总数: %" PRIu64 "\n", 
+                    stat_spikes_processed_->getAccumulatedValue());
+    output_->verbose(CALL_INFO, 1, 0, "   - 发放的神经元总数: %" PRIu64 "\n", 
+                    stat_neurons_fired_->getAccumulatedValue());
+    output_->verbose(CALL_INFO, 1, 0, "   - 核间消息数: %" PRIu64 "\n", 
+                    stat_inter_core_messages_->getAccumulatedValue());
+    output_->verbose(CALL_INFO, 1, 0, "   - 平均核心利用率: %.2f%%\n", 
+                    stat_avg_utilization_->getAccumulatedValue());
+    
+    // 打印各处理单元统计
+    for (int i = 0; i < num_cores_; i++) {
+        const auto& state = unit_states_[i];
+        output_->verbose(CALL_INFO, 1, 0, "   处理单元%d: 脉冲=%" PRIu64 ", 发放=%" PRIu64 ", 利用率=%.2f%%\n",
+                        i, state.spikes_processed, state.neurons_fired, state.utilization * 100.0);
+    }
+    
+    output_->verbose(CALL_INFO, 1, 0, "✅ MultiCorePE统计输出完成\n");
+}
+
+bool MultiCorePE::clockTick(Cycle_t current_cycle) {
+    current_cycle_ = current_cycle;
+    
+    // 详细调试信息（仅在高详细度时输出）
+    if (verbose_ >= 4 && current_cycle % 1000 == 0) {
+        output_->verbose(CALL_INFO, 4, 0, "⏰ MultiCorePE时钟周期 %" PRIu64 "\n", current_cycle);
+    }
+    
+    // 1. 处理外部脉冲队列
+    while (!external_spike_queue_.empty()) {
+        SpikeEvent* spike = external_spike_queue_.front();
+        external_spike_queue_.pop();
+        
+        int target_unit = determineTargetUnit(spike->getDestinationNeuron());
+        if (target_unit >= 0 && target_unit < num_cores_) {
+            processing_units_[target_unit]->processSpike(spike);
+            stat_spikes_processed_->addData(1);
+        } else {
+            output_->verbose(CALL_INFO, 2, 0, "⚠️ 丢弃无效目标的脉冲: 神经元%d, 目标单元%d\n", 
+                           spike->getDestinationNeuron(), target_unit);
+            delete spike;
+        }
+    }
+    
+    // 2. 处理单元时钟滴答
+    for (int i = 0; i < num_cores_; i++) {
+        processing_units_[i]->tick(current_cycle);
+        
+        // 更新处理单元状态
+        unit_states_[i].spikes_processed = processing_units_[i]->getSpikesProcessed();
+        unit_states_[i].neurons_fired = processing_units_[i]->getNeuronsFired();
+        unit_states_[i].utilization = processing_units_[i]->getUtilization();
+        unit_states_[i].is_active = processing_units_[i]->hasWork();
+    }
+    
+    // 3. 内部互连时钟滴答
+    if (internal_ring_) {
+        internal_ring_->tick();
+        
+        // 处理跨核脉冲路由
+        handleCrossCoreRouting();
+    }
+    
+    // 4. 多核控制器时钟滴答
+    if (controller_) {
+        controller_->tick();
+        
+        // 每100周期进行一次负载均衡检查
+        if (current_cycle % 100 == 0) {
+            checkLoadBalance();
+        }
+    }
+    
+    // 5. 生成测试流量
+    if (enable_test_traffic_) {
+        generateTestTraffic();
+    }
+    
+    // 6. 更新统计信息（每1000周期一次）
+    if (current_cycle % 1000 == 0) {
+        updateStatistics();
+    }
+    
+    // 继续仿真
+    return false;
+}
+
+void MultiCorePE::handleExternalSpikeEvent(Event* ev) {
+    SpikeEvent* spike = dynamic_cast<SpikeEvent*>(ev);
+    if (!spike) {
+        output_->verbose(CALL_INFO, 1, 0, "⚠️ 接收到非SpikeEvent事件\n");
+        delete ev;
+        return;
+    }
+    
+    output_->verbose(CALL_INFO, 3, 0, "📨 接收外部脉冲: 源神经元%d -> 目标神经元%d, 权重%.3f\n",
+                    spike->getSourceNeuron(), spike->getDestinationNeuron(), spike->getWeight());
+    
+    stat_external_spikes_received_->addData(1);
+    
+    // 检查是否为本地神经元
+    if (isLocalNeuron(spike->getDestinationNeuron())) {
+        // 本地脉冲，加入队列处理
+        external_spike_queue_.push(spike);
+    } else {
+        // 非本地脉冲，转发或丢弃
+        output_->verbose(CALL_INFO, 2, 0, "⚠️ 丢弃非本地目标的脉冲: 神经元%d\n", 
+                       spike->getDestinationNeuron());
+        delete spike;
+    }
+}
+
+void MultiCorePE::handleExternalSpike(SpikeEvent* spike) {
+    if (!spike) return;
+    
+    output_->verbose(CALL_INFO, 3, 0, "🔄 处理外部脉冲: 目标神经元%d\n", spike->getDestinationNeuron());
+    
+    // 将脉冲加入外部队列，由时钟处理器处理
+    external_spike_queue_.push(spike);
+    stat_external_spikes_received_->addData(1);
+}
+
+void MultiCorePE::sendExternalSpike(SpikeEvent* spike) {
+    if (!spike || !external_spike_output_link_) return;
+    
+    output_->verbose(CALL_INFO, 3, 0, "📤 发送外部脉冲: 源神经元%d -> 目标神经元%d\n",
+                    spike->getSourceNeuron(), spike->getDestinationNeuron());
+    
+    external_spike_output_link_->send(spike);
+    stat_external_spikes_sent_->addData(1);
+}
+
+void MultiCorePE::routeInternalSpike(int src_core, int dst_core, SpikeEvent* spike) {
+    if (!spike || !internal_ring_) return;
+    
+    if (src_core < 0 || src_core >= num_cores_ || dst_core < 0 || dst_core >= num_cores_) {
+        output_->verbose(CALL_INFO, 1, 0, "⚠️ 无效的核心ID: src=%d, dst=%d\n", src_core, dst_core);
+        delete spike;
+        return;
+    }
+    
+    output_->verbose(CALL_INFO, 4, 0, "🔄 路由内部脉冲: 核心%d -> 核心%d, 神经元%d\n",
+                    src_core, dst_core, spike->getDestinationNeuron());
+    
+    // 创建内部消息
+    RingMessage msg;
+    msg.type = RingMessageType::SPIKE_MESSAGE;
+    msg.src_unit = src_core;
+    msg.dst_unit = dst_core;
+    msg.timestamp = current_cycle_;
+    msg.payload.spike_data = spike;
+    
+    // 发送到内部环形网络
+    if (internal_ring_->sendMessage(msg)) {
+        stat_inter_core_messages_->addData(1);
+    } else {
+        output_->verbose(CALL_INFO, 2, 0, "⚠️ 内部环形网络发送失败\n");
+        delete spike;
+    }
+}
+
+int MultiCorePE::determineTargetUnit(int neuron_id) const {
+    // 假设神经元ID按照连续分配：PE0管理0-63，PE1管理64-127，等等
+    int local_neuron_id = neuron_id - (node_id_ * total_neurons_);
+    
+    if (local_neuron_id < 0 || local_neuron_id >= total_neurons_) {
+        return -1;  // 非本MultiCorePE的神经元
+    }
+    
+    int target_unit = local_neuron_id / neurons_per_core_;
+    return (target_unit >= 0 && target_unit < num_cores_) ? target_unit : -1;
+}
+
+bool MultiCorePE::isLocalNeuron(int neuron_id) const {
+    int start_id = node_id_ * total_neurons_;
+    int end_id = start_id + total_neurons_;
+    return (neuron_id >= start_id && neuron_id < end_id);
+}
+
+const ProcessingUnitState& MultiCorePE::getProcessingUnitState(int unit_id) const {
+    static ProcessingUnitState empty_state;
+    if (unit_id >= 0 && unit_id < num_cores_) {
+        return unit_states_[unit_id];
+    }
+    return empty_state;
+}
+
+void MultiCorePE::getStatistics(std::map<std::string, uint64_t>& stats) const {
+    stats["total_spikes_processed"] = stat_spikes_processed_->getAccumulatedValue();
+    stats["inter_core_messages"] = stat_inter_core_messages_->getAccumulatedValue();
+    stats["total_neurons_fired"] = stat_neurons_fired_->getAccumulatedValue();
+    stats["external_spikes_sent"] = stat_external_spikes_sent_->getAccumulatedValue();
+    stats["external_spikes_received"] = stat_external_spikes_received_->getAccumulatedValue();
+    stats["current_cycle"] = current_cycle_;
+}
+
+void MultiCorePE::initializeStatistics() {
+    output_->verbose(CALL_INFO, 2, 0, "📊 初始化统计收集\n");
+    
+    stat_spikes_processed_ = registerStatistic<uint64_t>("total_spikes_processed");
+    stat_inter_core_messages_ = registerStatistic<uint64_t>("inter_core_messages");
+    stat_l2_hits_ = registerStatistic<uint64_t>("l2_cache_hits");
+    stat_l2_misses_ = registerStatistic<uint64_t>("l2_cache_misses");
+    stat_memory_requests_ = registerStatistic<uint64_t>("memory_requests");
+    stat_avg_utilization_ = registerStatistic<double>("avg_core_utilization");
+    stat_neurons_fired_ = registerStatistic<uint64_t>("total_neurons_fired");
+    stat_external_spikes_sent_ = registerStatistic<uint64_t>("external_spikes_sent");
+    stat_external_spikes_received_ = registerStatistic<uint64_t>("external_spikes_received");
+    
+    output_->verbose(CALL_INFO, 2, 0, "✅ 统计收集初始化完成\n");
+}
+
+void MultiCorePE::initializeProcessingUnits() {
+    output_->verbose(CALL_INFO, 2, 0, "🔧 初始化%d个处理单元\n", num_cores_);
+    
+    processing_units_.reserve(num_cores_);
+    
+    for (int i = 0; i < num_cores_; i++) {
+        int neuron_id_start = node_id_ * total_neurons_ + i * neurons_per_core_;
+        
+        // 创建处理单元参数
+        Params unit_params;
+        unit_params.insert("unit_id", std::to_string(i));
+        unit_params.insert("neuron_id_start", std::to_string(neuron_id_start));
+        unit_params.insert("neuron_count", std::to_string(neurons_per_core_));
+        unit_params.insert("v_thresh", std::to_string(v_thresh_));
+        unit_params.insert("v_reset", std::to_string(v_reset_));
+        unit_params.insert("v_rest", std::to_string(v_rest_));
+        unit_params.insert("tau_mem", std::to_string(tau_mem_));
+        unit_params.insert("t_ref", std::to_string(t_ref_));
+        unit_params.insert("verbose", std::to_string(verbose_));
+        
+        ProcessingUnit* unit = new ProcessingUnit(i, neuron_id_start, neurons_per_core_, 
+                                                 this, unit_params);
+        processing_units_.push_back(unit);
+        
+        output_->verbose(CALL_INFO, 3, 0, "   处理单元%d: 神经元ID范围[%d, %d)\n",
+                        i, neuron_id_start, neuron_id_start + neurons_per_core_);
+    }
+    
+    output_->verbose(CALL_INFO, 2, 0, "✅ 处理单元初始化完成\n");
+}
+
+void MultiCorePE::initializeInternalRing() {
+    output_->verbose(CALL_INFO, 2, 0, "🔗 初始化内部环形互连\n");
+    
+    int ring_latency = 1;  // 1周期延迟
+    internal_ring_ = new InternalRing(num_cores_, ring_latency, output_);
+    
+    output_->verbose(CALL_INFO, 2, 0, "✅ 内部环形互连初始化完成（%d节点，%d周期延迟）\n", 
+                    num_cores_, ring_latency);
+}
+
+void MultiCorePE::loadAndDistributeWeights() {
+    if (weights_file_.empty()) {
+        output_->verbose(CALL_INFO, 2, 0, "⚠️ 未指定权重文件，使用默认权重\n");
+        return;
+    }
+    
+    output_->verbose(CALL_INFO, 2, 0, "📥 加载权重文件: %s\n", weights_file_.c_str());
+    
+    // TODO: 实现权重加载和分布逻辑
+    // 这里应该从文件加载权重并分发到各个处理单元
+    
+    output_->verbose(CALL_INFO, 2, 0, "✅ 权重加载和分布完成\n");
+}
+
+void MultiCorePE::updateStatistics() {
+    // 收集处理单元统计信息
+    uint64_t total_spikes = 0;
+    uint64_t total_fired = 0;
+    double total_utilization = 0.0;
+    
+    for (int i = 0; i < num_cores_; i++) {
+        total_spikes += unit_states_[i].spikes_processed;
+        total_fired += unit_states_[i].neurons_fired;
+        total_utilization += unit_states_[i].utilization;
+    }
+    
+    // 更新统计信息
+    stat_neurons_fired_->addData(total_fired);
+    stat_avg_utilization_->addData(total_utilization / num_cores_);
+    
+    // 详细调试信息
+    if (verbose_ >= 3 && current_cycle_ % 10000 == 0) {
+        output_->verbose(CALL_INFO, 3, 0, "📊 周期%" PRIu64 "统计: 脉冲=%" PRIu64 ", 发放=%" PRIu64 ", 利用率=%.2f%%\n",
+                        current_cycle_, total_spikes, total_fired, (total_utilization / num_cores_) * 100.0);
+    }
+}
+
+void MultiCorePE::generateTestTraffic() {
+    test_cycle_counter_++;
+    
+    if (test_cycle_counter_ >= static_cast<uint64_t>(test_period_)) {
+        test_cycle_counter_ = 0;
+        
+        output_->verbose(CALL_INFO, 4, 0, "🔥 生成测试流量: %d个脉冲\n", test_spikes_per_burst_);
+        
+        for (int i = 0; i < test_spikes_per_burst_; i++) {
+            // 创建测试脉冲
+            int src_neuron = node_id_ * total_neurons_ + (i % total_neurons_);
+            int dst_neuron = test_target_node_ * total_neurons_ + (i % total_neurons_);
+            
+            SpikeEvent* test_spike = new SpikeEvent(src_neuron, dst_neuron, test_weight_, current_cycle_);
+            
+            // 发送外部脉冲
+            sendExternalSpike(test_spike);
+        }
+    }
+}
+
+void MultiCorePE::handleCrossCoreRouting() {
+    if (!internal_ring_) return;
+    
+    // 检查每个处理单元是否有跨核消息
+    for (int i = 0; i < num_cores_; i++) {
+        RingMessage msg;
+        if (internal_ring_->receiveMessage(i, msg)) {
+            if (msg.type == RingMessageType::SPIKE_MESSAGE && msg.payload.spike_data) {
+                // 将脉冲传递给目标处理单元
+                int target_unit = msg.dst_unit;
+                if (target_unit >= 0 && target_unit < num_cores_) {
+                    processing_units_[target_unit]->processSpike(msg.payload.spike_data);
+                    stat_spikes_processed_->addData(1);
+                    
+                    output_->verbose(CALL_INFO, 4, 0, "🔄 跨核脉冲路由: 核心%d -> 核心%d\n", 
+                                   msg.src_unit, msg.dst_unit);
+                } else {
+                    output_->verbose(CALL_INFO, 2, 0, "⚠️ 无效的目标单元: %d\n", target_unit);
+                    delete msg.payload.spike_data;
+                }
+            }
+        }
+    }
+}
+
+void MultiCorePE::checkLoadBalance() {
+    if (!controller_) return;
+    
+    // 计算负载差异
+    double max_util = 0.0, min_util = 1.0;
+    for (int i = 0; i < num_cores_; i++) {
+        double util = unit_states_[i].utilization;
+        max_util = std::max(max_util, util);
+        min_util = std::min(min_util, util);
+    }
+    
+    double load_imbalance = max_util - min_util;
+    if (load_imbalance > 0.3) {  // 30%负载差异阈值
+        output_->verbose(CALL_INFO, 3, 0, "⚖️ 检测到负载不均衡: %.2f%% (最大%.2f%%, 最小%.2f%%)\n",
+                        load_imbalance * 100.0, max_util * 100.0, min_util * 100.0);
+        
+        controller_->balanceLoad();
+    }
+}
+
+// ===== ProcessingUnit 实现 =====
+
+ProcessingUnit::ProcessingUnit(int unit_id, int neuron_id_start, int neuron_count, 
+                               MultiCorePE* parent, Params& params) 
+    : unit_id_(unit_id), neuron_id_start_(neuron_id_start), neuron_count_(neuron_count), parent_pe_(parent) {
+    
+    // 初始化输出对象
+    int verbose = params.find<int>("verbose", 0);
+    output_ = new Output("ProcessingUnit[@p:@l]: ", verbose, 0, Output::STDOUT);
+    
+    // 读取神经元参数
+    v_thresh_ = params.find<float>("v_thresh", 1.0f);
+    v_reset_ = params.find<float>("v_reset", 0.0f);
+    v_rest_ = params.find<float>("v_rest", 0.0f);
+    tau_mem_ = params.find<float>("tau_mem", 20.0f);
+    t_ref_ = params.find<int>("t_ref", 2);
+    
+    // 初始化神经元状态
+    neuron_states_.resize(neuron_count);
+    for (int i = 0; i < neuron_count; i++) {
+        neuron_states_[i].v_mem = v_rest_;
+        neuron_states_[i].ref_count = 0;
+        neuron_states_[i].last_spike_time = 0;
+    }
+    
+    // 初始化权重映射的哈希函数
+    weights_ = std::unordered_map<std::pair<int, int>, float, 
+                                  std::function<size_t(const std::pair<int, int>&)>>(
+        100,  // 初始bucket数量
+        [](const std::pair<int, int>& p) -> size_t {
+            return std::hash<int>()(p.first) ^ (std::hash<int>()(p.second) << 1);
+        }
+    );
+    
+    // 初始化统计变量
+    spikes_processed_ = 0;
+    neurons_fired_ = 0;
+    total_cycles_ = 0;
+    active_cycles_ = 0;
+    
+    output_->verbose(CALL_INFO, 2, 0, "✅ 处理单元%d初始化完成: 神经元[%d, %d), 参数(thresh=%.3f, reset=%.3f, rest=%.3f)\n",
+                    unit_id_, neuron_id_start_, neuron_id_start_ + neuron_count_, v_thresh_, v_reset_, v_rest_);
+}
+
+ProcessingUnit::~ProcessingUnit() {
+    // 清理本地脉冲队列
+    while (!local_spike_queue_.empty()) {
+        delete local_spike_queue_.front();
+        local_spike_queue_.pop();
+    }
+    
+    // 清理输出脉冲
+    for (auto* spike : outgoing_spikes_) {
+        delete spike;
+    }
+    outgoing_spikes_.clear();
+    
+    delete output_;
+}
+
+void ProcessingUnit::processSpike(SpikeEvent* spike) {
+    if (!spike) return;
+    
+    // 将脉冲加入本地队列
+    local_spike_queue_.push(spike);
+    spikes_processed_++;
+    
+    output_->verbose(CALL_INFO, 4, 0, "📨 处理单元%d接收脉冲: 目标神经元%d, 权重%.3f\n",
+                    unit_id_, spike->getDestinationNeuron(), spike->getWeight());
+}
+
+void ProcessingUnit::tick(Cycle_t cycle) {
+    total_cycles_++;
+    bool has_activity = false;
+    
+    // 处理本地脉冲队列
+    while (!local_spike_queue_.empty()) {
+        SpikeEvent* spike = local_spike_queue_.front();
+        local_spike_queue_.pop();
+        
+        int local_neuron_id = spike->getDestinationNeuron() - neuron_id_start_;
+        if (local_neuron_id >= 0 && local_neuron_id < neuron_count_) {
+            processSpikeForNeuron(local_neuron_id, spike->getWeight());
+            has_activity = true;
+        }
+        
+        delete spike;
+    }
+    
+    // 更新神经元状态
+    updateNeuronStates();
+    
+    // 检查并生成输出脉冲
+    checkAndGenerateSpikes();
+    
+    // 发送输出脉冲
+    sendOutputSpikes();
+    
+    if (has_activity || !outgoing_spikes_.empty()) {
+        active_cycles_++;
+    }
+}
+
+bool ProcessingUnit::hasWork() const {
+    return !local_spike_queue_.empty() || !outgoing_spikes_.empty() ||
+           std::any_of(neuron_states_.begin(), neuron_states_.end(),
+                      [](const NeuronState& state) { return state.v_mem > 0.1f; });
+}
+
+double ProcessingUnit::getUtilization() const {
+    if (total_cycles_ == 0) return 0.0;
+    return static_cast<double>(active_cycles_) / static_cast<double>(total_cycles_);
+}
+
+void ProcessingUnit::loadWeights(const std::vector<float>& weights, int start_index) {
+    // TODO: 实现权重加载逻辑
+    output_->verbose(CALL_INFO, 3, 0, "📥 处理单元%d加载权重: 起始索引%d, 权重数%zu\n",
+                    unit_id_, start_index, weights.size());
+}
+
+float ProcessingUnit::getWeight(int pre_neuron, int post_neuron) const {
+    auto it = weights_.find(std::make_pair(pre_neuron, post_neuron));
+    return (it != weights_.end()) ? it->second : 0.0f;
+}
+
+void ProcessingUnit::resetNeuron(int local_neuron_id) {
+    if (local_neuron_id >= 0 && local_neuron_id < neuron_count_) {
+        neuron_states_[local_neuron_id].v_mem = v_rest_;
+        neuron_states_[local_neuron_id].ref_count = 0;
+    }
+}
+
+float ProcessingUnit::getNeuronVoltage(int local_neuron_id) const {
+    if (local_neuron_id >= 0 && local_neuron_id < neuron_count_) {
+        return neuron_states_[local_neuron_id].v_mem;
+    }
+    return 0.0f;
+}
+
+void ProcessingUnit::updateNeuronStates() {
+    // 更新所有神经元的膜电位和不应期
+    for (int i = 0; i < neuron_count_; i++) {
+        auto& neuron = neuron_states_[i];
+        
+        // 处理不应期
+        if (neuron.ref_count > 0) {
+            neuron.ref_count--;
+            continue;
+        }
+        
+        // 膜电位泄漏
+        if (neuron.v_mem > v_rest_) {
+            neuron.v_mem = v_rest_ + (neuron.v_mem - v_rest_) * exp(-1.0f / tau_mem_);
+        }
+    }
+}
+
+void ProcessingUnit::processSpikeForNeuron(int neuron_id, float weight) {
+    if (neuron_id < 0 || neuron_id >= neuron_count_) return;
+    
+    auto& neuron = neuron_states_[neuron_id];
+    
+    // 检查是否在不应期
+    if (neuron.ref_count > 0) return;
+    
+    // 添加权重到膜电位
+    neuron.v_mem += weight;
+    
+    output_->verbose(CALL_INFO, 5, 0, "⚡ 处理单元%d神经元%d: v_mem=%.3f (添加权重%.3f)\n",
+                    unit_id_, neuron_id, neuron.v_mem, weight);
+}
+
+void ProcessingUnit::checkAndGenerateSpikes() {
+    for (int i = 0; i < neuron_count_; i++) {
+        auto& neuron = neuron_states_[i];
+        
+        if (neuron.v_mem >= v_thresh_ && neuron.ref_count == 0) {
+            // 神经元发放脉冲
+            neuron.v_mem = v_reset_;
+            neuron.ref_count = t_ref_;
+            neuron.last_spike_time = total_cycles_;
+            neurons_fired_++;
+            
+            int global_neuron_id = neuron_id_start_ + i;
+            
+            output_->verbose(CALL_INFO, 3, 0, "🔥 处理单元%d神经元%d发放脉冲! (全局ID=%d)\n",
+                           unit_id_, i, global_neuron_id);
+            
+            // 创建输出脉冲（这里简化为发送给相邻神经元）
+            int target_neuron = global_neuron_id + 1;
+            if (target_neuron < neuron_id_start_ + neuron_count_) {
+                SpikeEvent* output_spike = new SpikeEvent(global_neuron_id, target_neuron, 0.5f, total_cycles_);
+                outgoing_spikes_.push_back(output_spike);
+            }
+        }
+    }
+}
+
+void ProcessingUnit::sendOutputSpikes() {
+    for (auto* spike : outgoing_spikes_) {
+        // 确定目标是本地还是远程
+        int target_unit = parent_pe_->determineTargetUnit(spike->getDestinationNeuron());
+        
+        if (target_unit == unit_id_) {
+            // 本地连接，直接处理
+            local_spike_queue_.push(spike);
+        } else if (target_unit >= 0) {
+            // 跨核连接，通过内部互连发送
+            parent_pe_->routeInternalSpike(unit_id_, target_unit, spike);
+        } else {
+            // 外部连接，通过外部接口发送
+            parent_pe_->sendExternalSpike(spike);
+        }
+    }
+    
+    outgoing_spikes_.clear();
+}
+
+// ===== InternalRing 实现 =====
+
+InternalRing::InternalRing(int num_nodes, int latency_cycles, SST::Output* output)
+    : num_nodes_(num_nodes), latency_cycles_(latency_cycles), output_(output) {
+    
+    // 初始化每个节点的输入输出队列
+    node_input_queues_.resize(num_nodes_);
+    node_output_queues_.resize(num_nodes_);
+    
+    // 初始化统计变量
+    total_messages_routed_ = 0;
+    total_latency_cycles_ = 0;
+    
+    output_->verbose(CALL_INFO, 2, 0, "🔗 内部环形网络初始化: %d个节点, %d周期延迟\n", 
+                    num_nodes_, latency_cycles_);
+}
+
+InternalRing::~InternalRing() {
+    // 清理所有队列中的消息
+    for (int i = 0; i < num_nodes_; i++) {
+        while (!node_input_queues_[i].empty()) {
+            RingMessage& msg = node_input_queues_[i].front();
+            if (msg.type == RingMessageType::SPIKE_MESSAGE && msg.payload.spike_data) {
+                delete msg.payload.spike_data;
+            }
+            node_input_queues_[i].pop();
+        }
+        
+        while (!node_output_queues_[i].empty()) {
+            RingMessage& msg = node_output_queues_[i].front();
+            if (msg.type == RingMessageType::SPIKE_MESSAGE && msg.payload.spike_data) {
+                delete msg.payload.spike_data;
+            }
+            node_output_queues_[i].pop();
+        }
+    }
+    
+    // 清理环形缓冲区
+    while (!ring_buffer_.empty()) {
+        RingMessage& msg = ring_buffer_.front();
+        if (msg.type == RingMessageType::SPIKE_MESSAGE && msg.payload.spike_data) {
+            delete msg.payload.spike_data;
+        }
+        ring_buffer_.pop();
+    }
+}
+
+bool InternalRing::sendMessage(const RingMessage& msg) {
+    if (msg.src_unit < 0 || msg.src_unit >= num_nodes_ || 
+        msg.dst_unit < 0 || msg.dst_unit >= num_nodes_) {
+        output_->verbose(CALL_INFO, 1, 0, "⚠️ 内部环形网络: 无效的节点ID (src=%d, dst=%d)\n", 
+                       msg.src_unit, msg.dst_unit);
+        return false;
+    }
+    
+    // 检查输出队列是否有空间
+    if (node_output_queues_[msg.src_unit].size() >= 100) {  // 限制队列大小
+        output_->verbose(CALL_INFO, 2, 0, "⚠️ 内部环形网络: 节点%d输出队列已满\n", msg.src_unit);
+        return false;
+    }
+    
+    // 将消息加入源节点的输出队列
+    node_output_queues_[msg.src_unit].push(msg);
+    
+    output_->verbose(CALL_INFO, 4, 0, "📤 内部环形网络: 节点%d发送消息到节点%d\n", 
+                    msg.src_unit, msg.dst_unit);
+    
+    return true;
+}
+
+bool InternalRing::receiveMessage(int node_id, RingMessage& msg) {
+    if (node_id < 0 || node_id >= num_nodes_) {
+        return false;
+    }
+    
+    if (node_input_queues_[node_id].empty()) {
+        return false;
+    }
+    
+    msg = node_input_queues_[node_id].front();
+    node_input_queues_[node_id].pop();
+    
+    output_->verbose(CALL_INFO, 4, 0, "📨 内部环形网络: 节点%d接收消息\n", node_id);
+    
+    return true;
+}
+
+void InternalRing::tick() {
+    // 简化的环形网络实现：直接路由消息
+    for (int src = 0; src < num_nodes_; src++) {
+        while (!node_output_queues_[src].empty()) {
+            RingMessage msg = node_output_queues_[src].front();
+            node_output_queues_[src].pop();
+            
+            routeMessage(msg);
+            total_messages_routed_++;
+        }
+    }
+    
+    // 处理环形缓冲区中的延迟消息
+    std::queue<RingMessage> delayed_messages;
+    while (!ring_buffer_.empty()) {
+        RingMessage msg = ring_buffer_.front();
+        ring_buffer_.pop();
+        
+        // 检查延迟是否满足
+        uint64_t current_time = 0;  // 这里简化，实际应该获取当前时钟
+        if (current_time - msg.timestamp >= static_cast<uint64_t>(latency_cycles_)) {
+            // 延迟满足，发送到目标节点
+            node_input_queues_[msg.dst_unit].push(msg);
+            total_latency_cycles_ += (current_time - msg.timestamp);
+        } else {
+            // 延迟未满足，重新加入缓冲区
+            delayed_messages.push(msg);
+        }
+    }
+    
+    // 将延迟消息重新加入缓冲区
+    ring_buffer_ = delayed_messages;
+}
+
+bool InternalRing::hasTrafficForNode(int node_id) const {
+    if (node_id < 0 || node_id >= num_nodes_) {
+        return false;
+    }
+    return !node_input_queues_[node_id].empty();
+}
+
+int InternalRing::getPendingMessageCount() const {
+    int total = ring_buffer_.size();
+    for (int i = 0; i < num_nodes_; i++) {
+        total += node_input_queues_[i].size() + node_output_queues_[i].size();
+    }
+    return total;
+}
+
+double InternalRing::getAverageLatency() const {
+    if (total_messages_routed_ == 0) return 0.0;
+    return static_cast<double>(total_latency_cycles_) / static_cast<double>(total_messages_routed_);
+}
+
+int InternalRing::getNextNode(int current_node) const {
+    return (current_node + 1) % num_nodes_;
+}
+
+void InternalRing::routeMessage(const RingMessage& msg) {
+    if (latency_cycles_ <= 0) {
+        // 零延迟，直接发送
+        node_input_queues_[msg.dst_unit].push(msg);
+    } else {
+        // 有延迟，加入环形缓冲区
+        ring_buffer_.push(msg);
+    }
+}
+
+// ===== MultiCoreController 实现 =====
+
+MultiCoreController::MultiCoreController(MultiCorePE* parent, SST::Output* output)
+    : parent_pe_(parent), output_(output) {
+    
+    // 初始化负载均衡状态
+    core_utilization_history_.resize(parent_pe_->num_cores_, 0.0);
+    core_work_count_.resize(parent_pe_->num_cores_, 0);
+    
+    // 初始化统计变量
+    total_work_distributed_ = 0;
+    load_imbalance_count_ = 0;
+    load_balance_threshold_ = 0.2;  // 20%负载差异阈值
+    
+    output_->verbose(CALL_INFO, 2, 0, "⚖️ 多核控制器初始化: %d个核心\n", parent_pe_->num_cores_);
+}
+
+MultiCoreController::~MultiCoreController() {
+    output_->verbose(CALL_INFO, 2, 0, "🗑️ 销毁多核控制器\n");
+}
+
+void MultiCoreController::scheduleWork() {
+    // 简单的轮询调度策略
+    // 实际实现中可以根据负载情况进行智能调度
+    
+    static int next_core = 0;
+    
+    // 轮询分配工作到下一个核心
+    next_core = (next_core + 1) % parent_pe_->num_cores_;
+    core_work_count_[next_core]++;
+    total_work_distributed_++;
+    
+    output_->verbose(CALL_INFO, 5, 0, "📋 调度工作到核心%d (总工作量%" PRIu64 ")\n", 
+                    next_core, total_work_distributed_);
+}
+
+void MultiCoreController::balanceLoad() {
+    output_->verbose(CALL_INFO, 3, 0, "⚖️ 执行负载均衡\n");
+    
+    int most_loaded = findMostLoadedCore();
+    int least_loaded = findLeastLoadedCore();
+    
+    if (most_loaded != least_loaded && most_loaded >= 0 && least_loaded >= 0) {
+        double load_diff = core_utilization_history_[most_loaded] - core_utilization_history_[least_loaded];
+        
+        if (load_diff > load_balance_threshold_) {
+            redistributeWork();
+            load_imbalance_count_++;
+            
+            output_->verbose(CALL_INFO, 3, 0, "⚖️ 负载重分布: 核心%d(%.2f%%) -> 核心%d(%.2f%%)\n",
+                           most_loaded, core_utilization_history_[most_loaded] * 100.0,
+                           least_loaded, core_utilization_history_[least_loaded] * 100.0);
+        }
+    }
+}
+
+void MultiCoreController::tick() {
+    // 每个时钟周期更新性能计数器
+    updatePerformanceCounters();
+}
+
+void MultiCoreController::updatePerformanceCounters() {
+    // 更新每个核心的利用率历史
+    for (int i = 0; i < parent_pe_->num_cores_; i++) {
+        const auto& state = parent_pe_->getProcessingUnitState(i);
+        
+        // 使用指数移动平均更新利用率历史
+        double alpha = 0.1;  // 平滑因子
+        core_utilization_history_[i] = alpha * state.utilization + 
+                                      (1.0 - alpha) * core_utilization_history_[i];
+    }
+}
+
+double MultiCoreController::getCoreUtilization(int core_id) const {
+    if (core_id >= 0 && core_id < parent_pe_->num_cores_) {
+        return core_utilization_history_[core_id];
+    }
+    return 0.0;
+}
+
+double MultiCoreController::getOverallUtilization() const {
+    if (parent_pe_->num_cores_ == 0) return 0.0;
+    
+    double total_util = 0.0;
+    for (int i = 0; i < parent_pe_->num_cores_; i++) {
+        total_util += core_utilization_history_[i];
+    }
+    
+    return total_util / parent_pe_->num_cores_;
+}
+
+void MultiCoreController::redistributeWork() {
+    // 简化的工作重分布策略
+    // 实际实现中可能需要迁移脉冲队列或调整权重分布
+    
+    int most_loaded = findMostLoadedCore();
+    int least_loaded = findLeastLoadedCore();
+    
+    if (most_loaded >= 0 && least_loaded >= 0 && most_loaded != least_loaded) {
+        // 将一些工作从最繁忙的核心转移到最空闲的核心
+        uint64_t work_to_transfer = core_work_count_[most_loaded] / 10;  // 转移10%的工作
+        
+        core_work_count_[most_loaded] -= work_to_transfer;
+        core_work_count_[least_loaded] += work_to_transfer;
+        
+        output_->verbose(CALL_INFO, 4, 0, "📋 工作重分布: 核心%d -> 核心%d (转移%" PRIu64 "个工作单元)\n",
+                        most_loaded, least_loaded, work_to_transfer);
+    }
+}
+
+int MultiCoreController::findLeastLoadedCore() const {
+    int least_loaded = 0;
+    double min_utilization = core_utilization_history_[0];
+    
+    for (int i = 1; i < parent_pe_->num_cores_; i++) {
+        if (core_utilization_history_[i] < min_utilization) {
+            min_utilization = core_utilization_history_[i];
+            least_loaded = i;
+        }
+    }
+    
+    return least_loaded;
+}
+
+int MultiCoreController::findMostLoadedCore() const {
+    int most_loaded = 0;
+    double max_utilization = core_utilization_history_[0];
+    
+    for (int i = 1; i < parent_pe_->num_cores_; i++) {
+        if (core_utilization_history_[i] > max_utilization) {
+            max_utilization = core_utilization_history_[i];
+            most_loaded = i;
+        }
+    }
+    
+    return most_loaded;
+}
+
+// ===== 内存响应处理 =====
+
+void MultiCorePE::handleMemoryResponse(SST::Interfaces::StandardMem::Request* resp) {
+    if (!resp) return;
+    
+    output_->verbose(CALL_INFO, 4, 0, "📨 收到内存响应: 地址=0x%lx, 大小=%zu\n", 
+                    resp->getAddr(), resp->getSize());
+    
+    // 查找对应的挂起请求
+    auto it = pending_memory_requests_.find(resp->getID());
+    if (it != pending_memory_requests_.end()) {
+        SpikeEvent* original_spike = it->second;
+        pending_memory_requests_.erase(it);
+        
+        // 处理原始脉冲事件
+        if (original_spike) {
+            handleExternalSpike(original_spike);
+        }
+        
+        stat_memory_requests_->addData(1);
+    } else {
+        output_->verbose(CALL_INFO, 2, 0, "⚠️ 未找到对应的挂起内存请求: ID=%" PRIu64 "\n", resp->getID());
+    }
+    
+    delete resp;
+}

@@ -1,0 +1,18 @@
+AM_CPPFLAGS += \
+	-I$(top_srcdir)/src
+
+compdir = $(pkglibdir)
+comp_LTLIBRARIES = libSnnDL.la
+libSnnDL_la_SOURCES = \
+	SnnPE.cc \
+	SnnPE.h \
+	SpikeSource.cc \
+	SpikeSource.h \
+	SnnNIC.cc \
+	SnnNIC.h \
+	SpikeMux.cc \
+	SpikeMux.h \
+	SnnInterface.h \
+	SpikeEvent.h
+
+libSnnDL_la_LDFLAGS = -module -avoid-version
