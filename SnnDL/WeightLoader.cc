@@ -58,7 +58,7 @@ void WeightLoader::init(unsigned int phase) {
 }
 
 void WeightLoader::setup() {
-    output_->verbose(CALL_INFO, 1, 0, "✅ WeightLoader setup完成\n");
+    // output_->verbose(CALL_INFO, 1, 0, "✅ WeightLoader setup完成\n");
     
     if (!clock_registered_) {
         registerClock("1GHz", new SST::Clock::Handler<WeightLoader>(this, &WeightLoader::onClockTick));
@@ -78,7 +78,7 @@ bool WeightLoader::onClockTick(SST::Cycle_t cycle) {
     
     // 在运行时第一个周期进行权重加载
     if (runtime_load_needed_) {
-        output_->verbose(CALL_INFO, 2, 0, "🔄 在运行时第一个周期进行权重加载\n");
+        // output_->verbose(CALL_INFO, 2, 0, "🔄 在运行时第一个周期进行权重加载\n");
         runtime_load_needed_ = false;
         loaded_ = false;  // 重置标志以允许重新加载
         loadFileOnceRuntime();  // 使用运行时加载函数
@@ -331,11 +331,13 @@ void WeightLoader::issueWritesForCoreFloatsRuntime(int core, const std::vector<f
             memory_->send(w);
             pending_writes_++;  // 增加待处理写入计数
             
+            /*
             output_->verbose(CALL_INFO, 2, 0, "💾 运行时写入: core=%d pre=%u post=%u addr=0x%lx val=%.6f pending=%u\n", 
                             core, pre, post, addr, val, pending_writes_);
+            */
             idx++;
         }
     }
-    output_->verbose(CALL_INFO, 2, 0, "✅ 运行时核心%d权重写入完成: %u x %u\n", core, N, N);
+    // output_->verbose(CALL_INFO, 2, 0, "✅ 运行时核心%d权重写入完成: %u x %u\n", core, N, N);
 }
 

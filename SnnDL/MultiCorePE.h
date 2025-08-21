@@ -257,6 +257,11 @@ private:
     float expected_weight_value_;
     bool verify_log_each_sample_;
     
+    // 权重回退参数
+    bool use_event_weight_fallback_;
+    bool enable_memory_weights_;
+    bool write_weights_on_init_;
+    
     // ===== 组件对象 =====
     
     // 时钟和输出

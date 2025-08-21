@@ -110,8 +110,8 @@ OptimizedInternalRing::OptimizedInternalRing(int num_nodes, int num_vcs,
       output_(output), last_stats_cycle_(0) {
     
     if (output_) {
-        output_->verbose(CALL_INFO, 1, 0, "🔗 初始化优化的内部环形网络: %d节点, %d VCs, %d信用/VC\n",
-                        num_nodes_, num_vcs_, credits_per_vc_);
+        // output_->verbose(CALL_INFO, 1, 0, "🔗 初始化优化的内部环形网络: %d节点, %d VCs, %d信用/VC\n",
+        //                 num_nodes_, num_vcs_, credits_per_vc_);
     }
     
     // 验证参数
@@ -141,17 +141,17 @@ OptimizedInternalRing::OptimizedInternalRing(int num_nodes, int num_vcs,
     route_cache_.resize(num_nodes_ * num_nodes_, 0);
     
     if (output_) {
-        output_->verbose(CALL_INFO, 1, 0, "✅ 优化的环形网络初始化完成\n");
+        // output_->verbose(CALL_INFO, 1, 0, "✅ 优化的环形网络初始化完成\n");
     }
 }
 
 OptimizedInternalRing::~OptimizedInternalRing() {
     if (output_) {
-        output_->verbose(CALL_INFO, 1, 0, "🗑️ 销毁优化的环形网络\n");
+        // output_->verbose(CALL_INFO, 1, 0, "🗑️ 销毁优化的环形网络\n");
         
         // 输出最终统计信息
-        output_->verbose(CALL_INFO, 1, 0, "📊 最终统计: 总消息数=%" PRIu64 ", 平均延迟=%.2f周期\n",
-                        total_messages_routed_.load(), getAverageLatency());
+        // output_->verbose(CALL_INFO, 1, 0, "📊 最终统计: 总消息数=%" PRIu64 ", 平均延迟=%.2f周期\n",
+        //                 total_messages_routed_.load(), getAverageLatency());
     }
     
     // 清理所有节点（unique_ptr会自动清理）
@@ -175,7 +175,7 @@ void OptimizedInternalRing::initializeTopology() {
     }
     
     if (output_) {
-        output_->verbose(CALL_INFO, 2, 0, "🔗 环形拓扑初始化完成: %d节点双向环\n", num_nodes_);
+        // output_->verbose(CALL_INFO, 2, 0, "🔗 环形拓扑初始化完成: %d节点双向环\n", num_nodes_);
     }
     
     // 验证拓扑完整性
@@ -559,8 +559,8 @@ void OptimizedInternalRing::updateStatistics(uint64_t current_cycle) {
     total_messages_routed_.store(total_routed);
     
     if (output_ && current_cycle % 10000 == 0) {
-        output_->verbose(CALL_INFO, 2, 0, "📊 环形网络统计[周期%" PRIu64 "]: 消息=%" PRIu64 ", 延迟=%.2f, 利用率=%.2f%%\n",
-                        current_cycle, total_routed, getAverageLatency(), getNetworkUtilization() * 100.0);
+        // output_->verbose(CALL_INFO, 2, 0, "📊 环形网络统计[周期%" PRIu64 "]: 消息=%" PRIu64 ", 延迟=%.2f, 利用率=%.2f%%\n",
+        //                 current_cycle, total_routed, getAverageLatency(), getNetworkUtilization() * 100.0);
     }
 }
 
@@ -640,20 +640,20 @@ bool OptimizedInternalRing::detectDeadlock() const {
 void OptimizedInternalRing::printNetworkState() const {
     if (!output_) return;
     
-    output_->verbose(CALL_INFO, 1, 0, "=== 环形网络状态 ===\n");
-    for (int i = 0; i < num_nodes_; i++) {
-        const RingNode* node = nodes_[i].get();
-        output_->verbose(CALL_INFO, 1, 0, "节点%d: 注入=%" PRIu64 ", 弹出=%" PRIu64 ", 转发=%" PRIu64 "\n",
-                        i, node->messages_injected, node->messages_ejected, node->messages_forwarded);
+    // output_->verbose(CALL_INFO, 1, 0, "=== 环形网络状态 ===\n");
+    // for (int i = 0; i < num_nodes_; i++) {
+    //     const RingNode* node = nodes_[i].get();
+    //     output_->verbose(CALL_INFO, 1, 0, "节点%d: 注入=%" PRIu64 ", 弹出=%" PRIu64 ", 转发=%" PRIu64 "\n",
+    //                     i, node->messages_injected, node->messages_ejected, node->messages_forwarded);
         
-        // 显示VC状态
-        for (size_t j = 0; j < node->cw_vcs.size(); j++) {
-            const VirtualChannel& vc = node->cw_vcs[j];
-            output_->verbose(CALL_INFO, 1, 0, "  CW_VC%zu: 缓冲=%zu, 信用=%u\n",
-                           j, vc.buffer.size(), vc.credits);
-        }
-    }
-    output_->verbose(CALL_INFO, 1, 0, "==================\n");
+    //     // 显示VC状态
+    //     for (size_t j = 0; j < node->cw_vcs.size(); j++) {
+    //         const VirtualChannel& vc = node->cw_vcs[j];
+    //         output_->verbose(CALL_INFO, 1, 0, "  CW_VC%zu: 缓冲=%zu, 信用=%u\n",
+    //                        j, vc.buffer.size(), vc.credits);
+    //     }
+    // }
+    // output_->verbose(CALL_INFO, 1, 0, "==================\n");
 }
 
 // 添加缺失的方法实现

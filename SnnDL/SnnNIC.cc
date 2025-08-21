@@ -36,8 +36,8 @@ SnnNIC::SnnNIC(ComponentId_t id, Params& params)
     // 初始化日志输出
     output = new Output("SnnNIC[@p:@l]: ", verbose, 0, Output::STDOUT);
     
-    output->verbose(CALL_INFO, 1, 0, "初始化SnnNIC组件，节点ID=%u，直接链接模式=%s\n", 
-                    node_id, use_direct_link ? "是" : "否");
+    // output->verbose(CALL_INFO, 1, 0, "初始化SnnNIC组件，节点ID=%u，直接链接模式=%s\n", 
+    //                 node_id, use_direct_link ? "是" : "否");
     
     if (use_direct_link) {
         // 使用直接Link模式
@@ -45,20 +45,20 @@ SnnNIC::SnnNIC(ComponentId_t id, Params& params)
             new Event::Handler2<SnnNIC,&SnnNIC::handleDirectSpikeEvent>(this));
         
         if (direct_link) {
-            output->verbose(CALL_INFO, 1, 0, "直接Link网络接口创建成功\n");
+            // output->verbose(CALL_INFO, 1, 0, "直接Link网络接口创建成功\n");
         } else {
-            output->verbose(CALL_INFO, 1, 0, "警告：直接Link创建失败\n");
+            // output->verbose(CALL_INFO, 1, 0, "警告：直接Link创建失败\n");
         }
     } else {
         // 使用SimpleNetwork模式 - 参考MemNIC的成功实现
-        output->verbose(CALL_INFO, 1, 0, "尝试加载网络接口...\n");
+        // output->verbose(CALL_INFO, 1, 0, "尝试加载网络接口...\n");
         
         // 首先尝试加载用户定义的网络接口 (推荐方式)
         network = loadUserSubComponent<SimpleNetwork>("linkcontrol", ComponentInfo::SHARE_NONE, 1);
         
         if (!network) {
             // 如果没有用户定义的接口，创建默认的merlin.linkcontrol
-            output->verbose(CALL_INFO, 1, 0, "未找到用户定义的linkcontrol，创建默认merlin.linkcontrol\n");
+            // output->verbose(CALL_INFO, 1, 0, "未找到用户定义的linkcontrol，创建默认merlin.linkcontrol\n");
             
             Params net_params;
             net_params.insert("port_name", params.find<std::string>("port_name", "network"));
@@ -74,8 +74,8 @@ SnnNIC::SnnNIC(ComponentId_t id, Params& params)
             net_params.insert("job_size", std::to_string(total_nodes));
             net_params.insert("logical_nid", std::to_string(node_id));
             
-            output->verbose(CALL_INFO, 1, 0, "🔧 LinkControl参数: port_name=%s, job_id=0, job_size=%u, logical_nid=%u\n",
-                           params.find<std::string>("port_name", "network").c_str(), total_nodes, node_id);
+            // output->verbose(CALL_INFO, 1, 0, "🔧 LinkControl参数: port_name=%s, job_id=0, job_size=%u, logical_nid=%u\n",
+            //                params.find<std::string>("port_name", "network").c_str(), total_nodes, node_id);
             
             // 使用与MemNIC相同的标志和参数
             network = loadAnonymousSubComponent<SimpleNetwork>("merlin.linkcontrol", "linkcontrol", 0, 
@@ -83,18 +83,18 @@ SnnNIC::SnnNIC(ComponentId_t id, Params& params)
         }
         
         if (network) {
-            output->verbose(CALL_INFO, 1, 0, "网络接口创建成功，设置回调处理器\n");
+            // output->verbose(CALL_INFO, 1, 0, "网络接口创建成功，设置回调处理器\n");
             
             // 设置网络回调处理器 - 只设置接收回调，发送回调是可选的
             network->setNotifyOnReceive(new SimpleNetwork::Handler2<SnnNIC,&SnnNIC::handleIncoming>(this));
             // 启用发送可用回调以便处理待发送队列
             network->setNotifyOnSend(new SimpleNetwork::Handler2<SnnNIC,&SnnNIC::spaceAvailable>(this));
         } else {
-            output->fatal(CALL_INFO, -1, "错误：无法创建网络接口，网络通信将不可用\n");
+            // output->fatal(CALL_INFO, -1, "错误：无法创建网络接口，网络通信将不可用\n");
         }
     }
     
-    output->verbose(CALL_INFO, 1, 0, "SnnNIC初始化完成\n");
+    // output->verbose(CALL_INFO, 1, 0, "SnnNIC初始化完成\n");
     
     // 注册统计信息
     stat_spikes_sent = registerStatistic<uint64_t>("spikes_sent");
@@ -102,7 +102,7 @@ SnnNIC::SnnNIC(ComponentId_t id, Params& params)
     stat_packets_sent = registerStatistic<uint64_t>("packets_sent");
     stat_packets_received = registerStatistic<uint64_t>("packets_received");
     
-    output->verbose(CALL_INFO, 1, 0, "SnnNIC初始化完成\n");
+    // output->verbose(CALL_INFO, 1, 0, "SnnNIC初始化完成\n");
 }
 
 SnnNIC::~SnnNIC()
@@ -144,8 +144,8 @@ void SnnNIC::sendSpike(SpikeEvent* spike_event)
     
     if (use_direct_link && direct_link) {
         // 使用直接Link模式发送脉冲
-        output->verbose(CALL_INFO, 3, 0, "通过直接Link发送脉冲：节点%u -> 节点%u，神经元%u\n",
-                       node_id, dest_node, spike_event->getNeuronId());
+        // output->verbose(CALL_INFO, 3, 0, "通过直接Link发送脉冲：节点%u -> 节点%u，神经元%u\n",
+        //                node_id, dest_node, spike_event->getNeuronId());
         
         // 创建包装的SpikeEvent用于网络传输
         SpikeEvent* network_spike = new SpikeEvent(*spike_event);  // 复制构造
@@ -158,7 +158,7 @@ void SnnNIC::sendSpike(SpikeEvent* spike_event)
         stat_spikes_sent->addData(1);
         stat_packets_sent->addData(1);
         
-        output->verbose(CALL_INFO, 3, 0, "直接Link发送成功\n");
+        // output->verbose(CALL_INFO, 3, 0, "直接Link发送成功\n");
         
     } else if (!use_direct_link && network) {
         // 使用SimpleNetwork模式发送脉冲
@@ -201,7 +201,7 @@ void SnnNIC::sendSpike(SpikeEvent* spike_event)
 void SnnNIC::setNodeId(uint32_t new_node_id)
 {
     node_id = new_node_id;
-    output->verbose(CALL_INFO, 1, 0, "更新节点ID为%u\n", node_id);
+    // output->verbose(CALL_INFO, 1, 0, "更新节点ID为%u\n", node_id);
 }
 
 uint32_t SnnNIC::getNodeId() const
@@ -285,21 +285,21 @@ bool SnnNIC::spaceAvailable(int vn)
 
 void SnnNIC::init(unsigned int phase)
 {
-    output->verbose(CALL_INFO, 1, 0, "🔄 SnnNIC[节点%u] 初始化阶段%u开始\n", node_id, phase);
+    // output->verbose(CALL_INFO, 1, 0, "🔄 SnnNIC[节点%u] 初始化阶段%u开始\n", node_id, phase);
     
     if (!use_direct_link && network) {
-        output->verbose(CALL_INFO, 1, 0, "🔧 调用LinkControl.init(%u)\n", phase);
+        // output->verbose(CALL_INFO, 1, 0, "🔧 调用LinkControl.init(%u)\n", phase);
         
         try {
             // 只调用网络接口的init，不进行复杂的初始化数据交换
             network->init(phase);
-            output->verbose(CALL_INFO, 1, 0, "✅ LinkControl.init(%u)成功完成\n", phase);
+            // output->verbose(CALL_INFO, 1, 0, "✅ LinkControl.init(%u)成功完成\n", phase);
         } catch (const std::exception& e) {
             output->verbose(CALL_INFO, 0, 0, "❌ LinkControl.init(%u)异常: %s\n", phase, e.what());
             throw;
         }
         
-        output->verbose(CALL_INFO, 1, 0, "✅ SnnNIC[节点%u] 网络接口初始化完成，阶段%u\n", node_id, phase);
+        // output->verbose(CALL_INFO, 1, 0, "✅ SnnNIC[节点%u] 网络接口初始化完成，阶段%u\n", node_id, phase);
     } else {
         output->verbose(CALL_INFO, 2, 0, "⏭️ SnnNIC[节点%u] 跳过网络接口初始化 (direct_link=%s)\n", 
                        node_id, use_direct_link ? "true" : "false");
@@ -308,22 +308,22 @@ void SnnNIC::init(unsigned int phase)
 
 void SnnNIC::setup()
 {
-    output->verbose(CALL_INFO, 1, 0, "🔧 SnnNIC[节点%u] 设置阶段开始\n", node_id);
+    // output->verbose(CALL_INFO, 1, 0, "🔧 SnnNIC[节点%u] 设置阶段开始\n", node_id);
     
     if (!use_direct_link && network) {
-        output->verbose(CALL_INFO, 1, 0, "🔧 调用LinkControl.setup()\n");
+        // output->verbose(CALL_INFO, 1, 0, "🔧 调用LinkControl.setup()\n");
         
         try {
             network->setup();
-            output->verbose(CALL_INFO, 1, 0, "✅ LinkControl.setup()成功完成\n");
+            // output->verbose(CALL_INFO, 1, 0, "✅ LinkControl.setup()成功完成\n");
         } catch (const std::exception& e) {
             output->verbose(CALL_INFO, 0, 0, "❌ LinkControl.setup()异常: %s\n", e.what());
             throw;
         }
     }
     
-    output->verbose(CALL_INFO, 1, 0, "✅ SnnNIC[节点%u] 设置完成，模式=%s\n", 
-                    node_id, use_direct_link ? "直接Link" : "SimpleNetwork");
+    // output->verbose(CALL_INFO, 1, 0, "✅ SnnNIC[节点%u] 设置完成，模式=%s\n", 
+    //                 node_id, use_direct_link ? "直接Link" : "SimpleNetwork");
 }
 
 void SnnNIC::finish()

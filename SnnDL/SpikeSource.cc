@@ -23,7 +23,7 @@ SpikeSource::SpikeSource(ComponentId_t id, Params& params) : Component(id) {
     int verbose_level = params.find<int>("verbose", 0);
     output = new Output("SpikeSource[@p:@l]: ", verbose_level, 0, Output::STDOUT);
     
-    output->verbose(CALL_INFO, 1, 0, "初始化SpikeSource组件 (ID: %" PRIu64 ")\n", id);
+    // output->verbose(CALL_INFO, 1, 0, "初始化SpikeSource组件 (ID: %" PRIu64 ")\n", id);
     
     // 读取配置参数
     dataset_path = params.find<std::string>("dataset_path", "");
@@ -37,22 +37,22 @@ SpikeSource::SpikeSource(ComponentId_t id, Params& params) : Component(id) {
     max_events = params.find<uint32_t>("max_events", 0);
     neurons_per_core = params.find<uint32_t>("neurons_per_core", 4);  // 添加neurons_per_core参数
     
-    output->verbose(CALL_INFO, 2, 0,
-        "数据集参数: path=%s, format=%s, time_scale=%.3f, offset=%u, max_events=%u, neurons_per_core=%u\n",
-        dataset_path.c_str(), dataset_format.c_str(), time_scale, neuron_offset, max_events, neurons_per_core);
+    // output->verbose(CALL_INFO, 2, 0,
+    //     "数据集参数: path=%s, format=%s, time_scale=%.3f, offset=%u, max_events=%u, neurons_per_core=%u\n",
+    //     dataset_path.c_str(), dataset_format.c_str(), time_scale, neuron_offset, max_events, neurons_per_core);
     
     // 配置输出链接
     spike_output_link = configureLink("spike_output");
     if (!spike_output_link) {
         output->verbose(CALL_INFO, 1, 0, "警告: 无法配置spike_output链接，将在运行时跳过事件发送\n");
     } else {
-        output->verbose(CALL_INFO, 2, 0, "配置了输出链接\n");
+        // output->verbose(CALL_INFO, 2, 0, "配置了输出链接\n");
     }
     
     // 注册时钟处理器（使用较高频率以确保精确的事件时序）
     std::string clock_freq = params.find<std::string>("clock", "1MHz");
     registerClock(clock_freq, new Clock::Handler2<SpikeSource,&SpikeSource::clockTick>(this));
-    output->verbose(CALL_INFO, 2, 0, "注册了时钟处理器，频率: %s\n", clock_freq.c_str());
+    // output->verbose(CALL_INFO, 2, 0, "注册了时钟处理器，频率: %s\n", clock_freq.c_str());
     
     // 初始化状态变量
     current_sim_time = 0;
@@ -67,7 +67,7 @@ SpikeSource::SpikeSource(ComponentId_t id, Params& params) : Component(id) {
     stat_events_loaded = registerStatistic<uint64_t>("events_loaded");
     stat_events_sent = registerStatistic<uint64_t>("events_sent");
     
-    output->verbose(CALL_INFO, 1, 0, "SpikeSource组件构造完成\n");
+    // output->verbose(CALL_INFO, 1, 0, "SpikeSource组件构造完成\n");
 }
 
 // ===== 析构函数 =====
@@ -79,16 +79,16 @@ SpikeSource::~SpikeSource() {
 
 // ===== 生命周期方法 =====
 void SpikeSource::init(unsigned int phase) {
-    output->verbose(CALL_INFO, 2, 0, "进入init阶段 %u\n", phase);
+    // output->verbose(CALL_INFO, 2, 0, "进入init阶段 %u\n", phase);
 }
 
 void SpikeSource::setup() {
-    output->verbose(CALL_INFO, 1, 0, "进入setup阶段\n");
+    // output->verbose(CALL_INFO, 1, 0, "进入setup阶段\n");
     
     // 加载数据集
     if (loadDataset()) {
         data_loaded = true;
-        output->verbose(CALL_INFO, 1, 0, "数据集加载成功，共%zu个事件\n", spike_queue.size());
+        // output->verbose(CALL_INFO, 1, 0, "数据集加载成功，共%zu个事件\n", spike_queue.size());
     } else {
         output->fatal(CALL_INFO, -1, "数据集加载失败\n");
     }
@@ -170,8 +170,8 @@ bool SpikeSource::clockTick(Cycle_t current_cycle) {
 
 // ===== 私有辅助方法 =====
 bool SpikeSource::loadDataset() {
-    output->verbose(CALL_INFO, 1, 0, "开始加载数据集: %s (格式: %s)\n", 
-                   dataset_path.c_str(), dataset_format.c_str());
+    // output->verbose(CALL_INFO, 1, 0, "开始加载数据集: %s (格式: %s)\n", 
+    //                dataset_path.c_str(), dataset_format.c_str());
     
     if (dataset_format == "TEXT") {
         return loadTextFormat(dataset_path);
@@ -238,7 +238,7 @@ bool SpikeSource::loadTextFormat(const std::string& file_path) {
     
     file.close();
     
-    output->verbose(CALL_INFO, 1, 0, "TEXT格式加载完成: %u个事件\n", events_count);
+    // output->verbose(CALL_INFO, 1, 0, "TEXT格式加载完成: %u个事件\n", events_count);
     return true;
 }
 

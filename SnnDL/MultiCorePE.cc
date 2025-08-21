@@ -28,7 +28,7 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
     int verbose_level = params.find<int>("verbose", 0);
     output_ = new Output("MultiCorePE[@p:@l]: ", verbose_level, 0, Output::STDOUT);
     
-    output_->verbose(CALL_INFO, 1, 0, "🚀 初始化MultiCorePE组件 (ID: %" PRIu64 ")\n", id);
+    // output_->verbose(CALL_INFO, 1, 0, "🚀 初始化MultiCorePE组件 (ID: %" PRIu64 ")\n", id);
     
     // 读取基础配置参数
     num_cores_ = params.find<int>("num_cores", 4);
@@ -64,13 +64,18 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
     expected_weight_value_ = params.find<float>("expected_weight_value", 0.5f);
     verify_log_each_sample_ = params.find<bool>("verify_log_each_sample", false);
     
-    output_->verbose(CALL_INFO, 2, 0, 
-        "🔧 多核PE配置: cores=%d, neurons_per_core=%d, total_neurons=%d, node_id=%d\n",
-        num_cores_, neurons_per_core_, total_neurons_, node_id_);
+    // 权重回退参数
+    use_event_weight_fallback_ = params.find<bool>("use_event_weight_fallback", false);
+    enable_memory_weights_ = params.find<bool>("enable_memory_weights", true);
+    write_weights_on_init_ = params.find<bool>("write_weights_on_init", true);
     
-    output_->verbose(CALL_INFO, 2, 0, 
-        "🧠 神经元参数: v_thresh=%.3f, v_reset=%.3f, v_rest=%.3f, tau_mem=%.1fms, t_ref=%d\n",
-        v_thresh_, v_reset_, v_rest_, tau_mem_, t_ref_);
+    // output_->verbose(CALL_INFO, 2, 0, 
+    //     "🔧 多核PE配置: cores=%d, neurons_per_core=%d, total_neurons=%d, node_id=%d\n",
+    //     num_cores_, neurons_per_core_, total_neurons_, node_id_);
+    
+    // output_->verbose(CALL_INFO, 2, 0, 
+    //     "🧠 神经元参数: v_thresh=%.3f, v_reset=%.3f, v_rest=%.3f, tau_mem=%.1fms, t_ref=%d\n",
+    //     v_thresh_, v_reset_, v_rest_, tau_mem_, t_ref_);
     
     // 验证参数合理性
     if (num_cores_ <= 0 || num_cores_ > 64) {
@@ -110,7 +115,7 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
     external_spike_output_link_ = nullptr;
     mem_link_ = nullptr;
     
-    output_->verbose(CALL_INFO, 1, 0, "✅ MultiCorePE基础初始化完成\n");
+    // output_->verbose(CALL_INFO, 1, 0, "✅ MultiCorePE基础初始化完成\n");
 
     // 初始化统计收集（必须在构造函数中）
     initializeStatistics();
@@ -120,7 +125,7 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
 }
 
 MultiCorePE::~MultiCorePE() {
-    output_->verbose(CALL_INFO, 1, 0, "🗑️ 销毁MultiCorePE组件\n");
+    // output_->verbose(CALL_INFO, 1, 0, "🗑️ 销毁MultiCorePE组件\n");
     
     // 清理SnnPE SubComponent核心（SST会自动管理SubComponent的生命周期）
     cores_.clear();
@@ -145,7 +150,7 @@ MultiCorePE::~MultiCorePE() {
 }
 
 void MultiCorePE::init(unsigned int phase) {
-    output_->verbose(CALL_INFO, 2, 0, "🔄 MultiCorePE初始化阶段 %d\n", phase);
+    // output_->verbose(CALL_INFO, 2, 0, "🔄 MultiCorePE初始化阶段 %d\n", phase);
     
     if (phase == 0) {
         // 阶段0：初始化基础组件和端口
@@ -155,7 +160,7 @@ void MultiCorePE::init(unsigned int phase) {
         // 不需要单独的clock_handler_变量
         registerClock(clock_freq, new Clock::Handler2<MultiCorePE,&MultiCorePE::clockTick>(this));
         
-        output_->verbose(CALL_INFO, 2, 0, "⏰ 配置时钟频率: %s\n", clock_freq.c_str());
+        // output_->verbose(CALL_INFO, 2, 0, "⏰ 配置时钟频率: %s\n", clock_freq.c_str());
         
         // 初始化统计收集
         
@@ -165,7 +170,7 @@ void MultiCorePE::init(unsigned int phase) {
         external_spike_output_link_ = configureLink("external_spike_output");
         mem_link_ = configureLink("mem_link");
         
-        output_->verbose(CALL_INFO, 2, 0, "🔗 配置外部端口连接\n");
+        // output_->verbose(CALL_INFO, 2, 0, "🔗 配置外部端口连接\n");
         
         // 初始化方向链路（用于端口代理机制）
         initializeDirectionLinks();
@@ -179,7 +184,7 @@ void MultiCorePE::init(unsigned int phase) {
         // 初始化多核控制器
         controller_ = new MultiCoreController(this, output_);
         
-        output_->verbose(CALL_INFO, 1, 0, "✅ MultiCorePE阶段0初始化完成\n");
+        // output_->verbose(CALL_INFO, 1, 0, "✅ MultiCorePE阶段0初始化完成\n");
 
         // 将当前phase转发给所有子核心
         for (auto* core : cores_) {
@@ -189,13 +194,13 @@ void MultiCorePE::init(unsigned int phase) {
         // 关键修复：转发init到网络接口
         if (external_nic_) {
             external_nic_->init(phase);
-            output_->verbose(CALL_INFO, 2, 0, "✅ 网络接口init(%u)完成\n", phase);
+            // output_->verbose(CALL_INFO, 2, 0, "✅ 网络接口init(%u)完成\n", phase);
         }
     }
     else if (phase == 1) {
         // 阶段1：加载权重和配置子组件
         loadAndDistributeWeights();
-        output_->verbose(CALL_INFO, 1, 0, "✅ MultiCorePE阶段1初始化完成\n");
+        // output_->verbose(CALL_INFO, 1, 0, "✅ MultiCorePE阶段1初始化完成\n");
 
         // 将当前phase转发给所有子核心
         for (auto* core : cores_) {
@@ -205,7 +210,7 @@ void MultiCorePE::init(unsigned int phase) {
         // 转发init到网络接口
         if (external_nic_) {
             external_nic_->init(phase);
-            output_->verbose(CALL_INFO, 2, 0, "✅ 网络接口init(%u)完成\n", phase);
+            // output_->verbose(CALL_INFO, 2, 0, "✅ 网络接口init(%u)完成\n", phase);
         }
     }
     else {
@@ -217,13 +222,13 @@ void MultiCorePE::init(unsigned int phase) {
         // 转发init到网络接口
         if (external_nic_) {
             external_nic_->init(phase);
-            output_->verbose(CALL_INFO, 2, 0, "✅ 网络接口init(%u)完成\n", phase);
+            // output_->verbose(CALL_INFO, 2, 0, "✅ 网络接口init(%u)完成\n", phase);
         }
     }
 }
 
 void MultiCorePE::setup() {
-    output_->verbose(CALL_INFO, 1, 0, "🔧 MultiCorePE setup阶段\n");
+    // output_->verbose(CALL_INFO, 1, 0, "🔧 MultiCorePE setup阶段\n");
     
     // 验证所有组件初始化完成
     if (cores_.size() != static_cast<size_t>(num_cores_)) {
@@ -244,7 +249,7 @@ void MultiCorePE::setup() {
     // 调用网络接口的setup
     if (external_nic_) {
         external_nic_->setup();
-        output_->verbose(CALL_INFO, 2, 0, "✅ 网络接口setup完成\n");
+        // output_->verbose(CALL_INFO, 2, 0, "✅ 网络接口setup完成\n");
     }
     
     if (!controller_) {
@@ -252,15 +257,15 @@ void MultiCorePE::setup() {
     }
     
     // 打印组件配置摘要
-    output_->verbose(CALL_INFO, 1, 0, "📊 MultiCorePE配置摘要:\n");
-    output_->verbose(CALL_INFO, 1, 0, "   - 处理单元数: %d\n", num_cores_);
-    output_->verbose(CALL_INFO, 1, 0, "   - 每核神经元数: %d\n", neurons_per_core_);
-    output_->verbose(CALL_INFO, 1, 0, "   - 总神经元数: %d\n", total_neurons_);
-    output_->verbose(CALL_INFO, 1, 0, "   - 节点ID: %d\n", node_id_);
-    output_->verbose(CALL_INFO, 1, 0, "   - NUMA优化: %s\n", enable_numa_ ? "启用" : "禁用");
-    output_->verbose(CALL_INFO, 1, 0, "   - 测试流量: %s\n", enable_test_traffic_ ? "启用" : "禁用");
+    // output_->verbose(CALL_INFO, 1, 0, "📊 MultiCorePE配置摘要:\n");
+    // output_->verbose(CALL_INFO, 1, 0, "   - 处理单元数: %d\n", num_cores_);
+    // output_->verbose(CALL_INFO, 1, 0, "   - 每核神经元数: %d\n", neurons_per_core_);
+    // output_->verbose(CALL_INFO, 1, 0, "   - 总神经元数: %d\n", total_neurons_);
+    // output_->verbose(CALL_INFO, 1, 0, "   - 节点ID: %d\n", node_id_);
+    // output_->verbose(CALL_INFO, 1, 0, "   - NUMA优化: %s\n", enable_numa_ ? "启用" : "禁用");
+    // output_->verbose(CALL_INFO, 1, 0, "   - 测试流量: %s\n", enable_test_traffic_ ? "启用" : "禁用");
     
-    output_->verbose(CALL_INFO, 1, 0, "✅ MultiCorePE setup完成\n");
+    // output_->verbose(CALL_INFO, 1, 0, "✅ MultiCorePE setup完成\n");
 }
 
 void MultiCorePE::finish() {
@@ -290,7 +295,7 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
     
     // 详细调试信息（仅在高详细度时输出）
     if (verbose_ >= 4 && current_cycle % 1000 == 0) {
-        output_->verbose(CALL_INFO, 4, 0, "⏰ MultiCorePE时钟周期 %" PRIu64 "\n", current_cycle);
+        // output_->verbose(CALL_INFO, 4, 0, "⏰ MultiCorePE时钟周期 %" PRIu64 "\n", current_cycle);
     }
     
     // 0. 测试注入：在首个有效周期从 core0 向 core1 注入一个跨核脉冲
@@ -400,7 +405,7 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
         updateStatistics();
     }
     
-    // 让 SpikeMUX 等外部组件有机会基于周期推进（若作为独立组件，SST会各自tick；此处仅保留本组件逻辑）
+    // 时钟事件处理，让外部组件有机会基于周期推进
     // 继续仿真
     return false;
 }
@@ -623,7 +628,7 @@ void MultiCorePE::getStatistics(std::map<std::string, uint64_t>& stats) const {
 }
 
 void MultiCorePE::initializeStatistics() {
-    output_->verbose(CALL_INFO, 2, 0, "📊 初始化统计收集\n");
+    // output_->verbose(CALL_INFO, 2, 0, "📊 初始化统计收集\n");
     
     stat_spikes_processed_ = registerStatistic<uint64_t>("total_spikes_processed");
     stat_inter_core_messages_ = registerStatistic<uint64_t>("inter_core_messages");
@@ -635,11 +640,11 @@ void MultiCorePE::initializeStatistics() {
     stat_external_spikes_sent_ = registerStatistic<uint64_t>("external_spikes_sent");
     stat_external_spikes_received_ = registerStatistic<uint64_t>("external_spikes_received");
     
-    output_->verbose(CALL_INFO, 2, 0, "✅ 统计收集初始化完成\n");
+    // output_->verbose(CALL_INFO, 2, 0, "✅ 统计收集初始化完成\n");
 }
 
 void MultiCorePE::initializeProcessingUnits() {
-    output_->verbose(CALL_INFO, 2, 0, "🔧 初始化%d个SnnPE SubComponent核心\n", num_cores_);
+    // output_->verbose(CALL_INFO, 2, 0, "🔧 初始化%d个SnnPE SubComponent核心\n", num_cores_);
     
     cores_.reserve(num_cores_);
     
@@ -674,15 +679,20 @@ void MultiCorePE::initializeProcessingUnits() {
         core_params.insert("expected_weight_value", std::to_string(expected_weight_value_));
         core_params.insert("verify_log_each_sample", std::to_string(verify_log_each_sample_ ? 1 : 0));
         
+        // 传递权重回退参数 - 关键修复！
+        core_params.insert("use_event_weight_fallback", std::to_string(use_event_weight_fallback_ ? 1 : 0));
+        core_params.insert("enable_memory_weights", std::to_string(enable_memory_weights_ ? 1 : 0));
+        core_params.insert("write_weights_on_init", std::to_string(write_weights_on_init_ ? 1 : 0));
+        
         // 记录槽位可用性
         bool slot_api_ok = isSubComponentLoadableUsingAPI<SnnCoreAPI>("core" + std::to_string(i));
-        output_->verbose(CALL_INFO, 1, 0, "[core%d] 槽位可按 API 加载: %s\n", i, slot_api_ok ? "yes" : "no");
+        // output_->verbose(CALL_INFO, 1, 0, "[core%d] 槽位可按 API 加载: %s\n", i, slot_api_ok ? "yes" : "no");
 
         // 优先尝试通过用户在Python中配置的槽位加载
         SnnCoreAPI* core = loadUserSubComponent<SnnCoreAPI>(
             "core" + std::to_string(i), ComponentInfo::SHARE_NONE);
         if (core) {
-            output_->verbose(CALL_INFO, 1, 0, "[core%d] 已通过用户槽位加载 SnnCoreAPI 实例\n", i);
+            // output_->verbose(CALL_INFO, 1, 0, "[core%d] 已通过用户槽位加载 SnnCoreAPI 实例\n", i);
         }
 
         if (!core) {
@@ -690,7 +700,7 @@ void MultiCorePE::initializeProcessingUnits() {
             core = loadAnonymousSubComponent<SnnCoreAPI>(
                 "SnnDL.SnnPESubComponent", "core" + std::to_string(i), 0, ComponentInfo::SHARE_NONE, core_params);
             if (core) {
-                output_->verbose(CALL_INFO, 1, 0, "[core%d] 匿名加载成功\n", i);
+                // output_->verbose(CALL_INFO, 1, 0, "[core%d] 匿名加载成功\n", i);
             } else {
                 output_->verbose(CALL_INFO, 1, 0, "[core%d] 匿名加载失败\n", i);
             }
@@ -704,31 +714,31 @@ void MultiCorePE::initializeProcessingUnits() {
             // 为每个核心配置内存Link（若用户在Python连接了对应端口则不为None）
             std::string port = "core" + std::to_string(i) + "_mem";
             Link* l = configureLink(port);
-            output_->verbose(CALL_INFO, 1, 0, "[core%d] memory link = %s\n", i, l ? "connected" : "none");
+            // output_->verbose(CALL_INFO, 1, 0, "[core%d] memory link = %s\n", i, l ? "connected" : "none");
             if (l) core->setMemoryLink(l);
             cores_.push_back(core);
         } else {
             cores_.push_back(nullptr);
-            output_->verbose(CALL_INFO, 1, 0, "⚠️ 无法加载SnnPE核心%d\n", i);
+            // output_->verbose(CALL_INFO, 1, 0, "⚠️ 无法加载SnnPE核心%d\n", i);
         }
         
         output_->verbose(CALL_INFO, 3, 0, "   ✅ SnnPE核心%d: 神经元ID范围[%d, %d)\n",
                         i, neuron_id_start, neuron_id_start + neurons_per_core_);
     }
     
-    output_->verbose(CALL_INFO, 2, 0, "✅ SnnPE SubComponent核心初始化完成（%zu个核心）\n", cores_.size());
+    // output_->verbose(CALL_INFO, 2, 0, "✅ SnnPE SubComponent核心初始化完成（%zu个核心）\n", cores_.size());
     
     // 添加权重配置摘要
-    if (!weights_file_.empty()) {
-        output_->verbose(CALL_INFO, 1, 0, "📋 节点%d权重配置摘要: %zu个核心使用权重文件 %s\n", 
-                        node_id_, cores_.size(), weights_file_.c_str());
-    }
+    // if (!weights_file_.empty()) {
+    //     output_->verbose(CALL_INFO, 1, 0, "📋 节点%d权重配置摘要: %zu个核心使用权重文件 %s\n", 
+    //                     node_id_, cores_.size(), weights_file_.c_str());
+    // }
 }
 
 void MultiCorePE::initializeInternalRing() {
     // 单核情况下无需内部环形网络
     if (num_cores_ <= 1) {
-        output_->verbose(CALL_INFO, 2, 0, "🔗 单核配置，跳过内部环形互连初始化\n");
+        // output_->verbose(CALL_INFO, 2, 0, "🔗 单核配置，跳过内部环形互连初始化\n");
         optimized_ring_ = nullptr;
         internal_ring_ = nullptr;
         return;
@@ -739,7 +749,7 @@ void MultiCorePE::initializeInternalRing() {
     bool use_optimized = use_optimized_ring_;
     
     if (use_optimized) {
-        output_->verbose(CALL_INFO, 2, 0, "🔗 初始化优化的内部环形互连\n");
+        // output_->verbose(CALL_INFO, 2, 0, "🔗 初始化优化的内部环形互连\n");
         
         // 使用新的OptimizedInternalRing
         int num_vcs = 2;                // 每方向2个虚拟通道
@@ -748,18 +758,18 @@ void MultiCorePE::initializeInternalRing() {
         optimized_ring_ = new OptimizedInternalRing(num_cores_, num_vcs, credits_per_vc, output_);
         internal_ring_ = nullptr;       // 不使用旧实现
         
-        output_->verbose(CALL_INFO, 2, 0, "✅ 优化环形互连初始化完成（%d节点，%d VCs，%d信用/VC）\n", 
-                        num_cores_, num_vcs, credits_per_vc);
+        // output_->verbose(CALL_INFO, 2, 0, "✅ 优化环形互连初始化完成（%d节点，%d VCs，%d信用/VC）\n", 
+                        // num_cores_, num_vcs, credits_per_vc);
     } else {
-        output_->verbose(CALL_INFO, 2, 0, "🔗 初始化原始内部环形互连（对比测试）\n");
+        // output_->verbose(CALL_INFO, 2, 0, "🔗 初始化原始内部环形互连（对比测试）\n");
         
         // 使用原始InternalRing实现
         int latency_cycles = 1;  // 默认1周期延迟
         internal_ring_ = new InternalRing(num_cores_, latency_cycles, output_);
         optimized_ring_ = nullptr;  // 不使用新实现
         
-        output_->verbose(CALL_INFO, 2, 0, "✅ 原始环形互连初始化完成（%d节点，%d周期延迟）\n", 
-                        num_cores_, latency_cycles);
+        // output_->verbose(CALL_INFO, 2, 0, "✅ 原始环形互连初始化完成（%d节点，%d周期延迟）\n", 
+                        // num_cores_, latency_cycles);
     }
 }
 
@@ -769,12 +779,12 @@ void MultiCorePE::loadAndDistributeWeights() {
         return;
     }
     
-    output_->verbose(CALL_INFO, 2, 0, "📥 加载权重文件: %s\n", weights_file_.c_str());
+    // output_->verbose(CALL_INFO, 2, 0, "📥 加载权重文件: %s\n", weights_file_.c_str());
     
     // TODO: 实现权重加载和分布逻辑
     // 这里应该从文件加载权重并分发到各个处理单元
     
-    output_->verbose(CALL_INFO, 2, 0, "✅ 权重加载和分布完成\n");
+    // output_->verbose(CALL_INFO, 2, 0, "✅ 权重加载和分布完成\n");
 }
 
 void MultiCorePE::updateStatistics() {
@@ -899,8 +909,8 @@ void MultiCorePE::handleOptimizedCrossCoreRouting() {
         double utilization = optimized_ring_->getNetworkUtilization();
         int pending_msgs = optimized_ring_->getPendingMessageCount();
         
-        output_->verbose(CALL_INFO, 2, 0, "📊 优化环形网络[周期%" PRIu64 "]: 平均延迟=%.2f, 利用率=%.2f%%, 待处理消息=%d\n",
-                        current_cycle_, avg_latency, utilization * 100.0, pending_msgs);
+        // output_->verbose(CALL_INFO, 2, 0, "📊 优化环形网络[周期%" PRIu64 "]: 平均延迟=%.2f, 利用率=%.2f%%, 待处理消息=%d\n",
+        //                 current_cycle_, avg_latency, utilization * 100.0, pending_msgs);
     }
 }
 
@@ -917,8 +927,8 @@ void MultiCorePE::checkLoadBalance() {
     
     double load_imbalance = max_util - min_util;
     if (load_imbalance > 0.3) {  // 30%负载差异阈值
-        output_->verbose(CALL_INFO, 3, 0, "⚖️ 检测到负载不均衡: %.2f (最大%.2f, 最小%.2f)\n",
-                        load_imbalance * 100.0, max_util * 100.0, min_util * 100.0);
+        // output_->verbose(CALL_INFO, 3, 0, "⚖️ 检测到负载不均衡: %.2f (最大%.2f, 最小%.2f)\n",
+        //                 load_imbalance * 100.0, max_util * 100.0, min_util * 100.0);
         
         controller_->balanceLoad();
     }
@@ -939,8 +949,8 @@ InternalRing::InternalRing(int num_nodes, int latency_cycles, SST::Output* outpu
     total_messages_routed_ = 0;
     total_latency_cycles_ = 0;
     
-    output_->verbose(CALL_INFO, 2, 0, "🔗 内部环形网络初始化: %d个节点, %d周期延迟\n", 
-                    num_nodes_, latency_cycles_);
+    // output_->verbose(CALL_INFO, 2, 0, "🔗 内部环形网络初始化: %d个节点, %d周期延迟\n", 
+    //                 num_nodes_, latency_cycles_);
 }
 
 InternalRing::~InternalRing() {
@@ -976,22 +986,22 @@ InternalRing::~InternalRing() {
 bool InternalRing::sendMessage(const RingMessage& msg) {
     if (msg.src_unit < 0 || msg.src_unit >= num_nodes_ || 
         msg.dst_unit < 0 || msg.dst_unit >= num_nodes_) {
-        output_->verbose(CALL_INFO, 1, 0, "⚠️ 内部环形网络: 无效的节点ID (src=%d, dst=%d)\n", 
-                       msg.src_unit, msg.dst_unit);
+        // output_->verbose(CALL_INFO, 1, 0, "⚠️ 内部环形网络: 无效的节点ID (src=%d, dst=%d)\n", 
+                    //    msg.src_unit, msg.dst_unit);
         return false;
     }
     
     // 检查输出队列是否有空间
     if (node_output_queues_[msg.src_unit].size() >= 100) {  // 限制队列大小
-        output_->verbose(CALL_INFO, 2, 0, "⚠️ 内部环形网络: 节点%d输出队列已满\n", msg.src_unit);
+        // output_->verbose(CALL_INFO, 2, 0, "⚠️ 内部环形网络: 节点%d输出队列已满\n", msg.src_unit);
         return false;
     }
     
     // 将消息加入源节点的输出队列
     node_output_queues_[msg.src_unit].push(msg);
     
-    output_->verbose(CALL_INFO, 4, 0, "📤 内部环形网络: 节点%d发送消息到节点%d\n", 
-                    msg.src_unit, msg.dst_unit);
+    // output_->verbose(CALL_INFO, 4, 0, "📤 内部环形网络: 节点%d发送消息到节点%d\n", 
+                    // msg.src_unit, msg.dst_unit);
     
     return true;
 }
@@ -1008,7 +1018,7 @@ bool InternalRing::receiveMessage(int node_id, RingMessage& msg) {
     msg = node_input_queues_[node_id].front();
     node_input_queues_[node_id].pop();
     
-    output_->verbose(CALL_INFO, 4, 0, "📨 内部环形网络: 节点%d接收消息\n", node_id);
+    // output_->verbose(CALL_INFO, 4, 0, "📨 内部环形网络: 节点%d接收消息\n", node_id);
     
     return true;
 }
@@ -1095,11 +1105,11 @@ MultiCoreController::MultiCoreController(MultiCorePE* parent, SST::Output* outpu
     load_imbalance_count_ = 0;
     load_balance_threshold_ = 0.2;  // 20%负载差异阈值
     
-    output_->verbose(CALL_INFO, 2, 0, "⚖️ 多核控制器初始化: %d个核心\n", parent_pe_->num_cores_);
+    // output_->verbose(CALL_INFO, 2, 0, "⚖️ 多核控制器初始化: %d个核心\n", parent_pe_->num_cores_);
 }
 
 MultiCoreController::~MultiCoreController() {
-    output_->verbose(CALL_INFO, 2, 0, "🗑️ 销毁多核控制器\n");
+    // output_->verbose(CALL_INFO, 2, 0, "🗑️ 销毁多核控制器\n");
 }
 
 void MultiCoreController::scheduleWork() {
@@ -1113,12 +1123,12 @@ void MultiCoreController::scheduleWork() {
     core_work_count_[next_core]++;
     total_work_distributed_++;
     
-    output_->verbose(CALL_INFO, 5, 0, "📋 调度工作到核心%d (总工作量%" PRIu64 ")\n", 
-                    next_core, total_work_distributed_);
+    // output_->verbose(CALL_INFO, 5, 0, "📋 调度工作到核心%d (总工作量%" PRIu64 ")\n", 
+    //                 next_core, total_work_distributed_);
 }
 
 void MultiCoreController::balanceLoad() {
-    output_->verbose(CALL_INFO, 3, 0, "⚖️ 执行负载均衡\n");
+    // output_->verbose(CALL_INFO, 3, 0, "⚖️ 执行负载均衡\n");
     
     int most_loaded = findMostLoadedCore();
     int least_loaded = findLeastLoadedCore();
@@ -1130,9 +1140,9 @@ void MultiCoreController::balanceLoad() {
             redistributeWork();
             load_imbalance_count_++;
             
-            output_->verbose(CALL_INFO, 3, 0, "⚖️ 负载重分布: 核心%d(%.2f) -> 核心%d(%.2f)\n",
-                           most_loaded, core_utilization_history_[most_loaded] * 100.0,
-                           least_loaded, core_utilization_history_[least_loaded] * 100.0);
+            // output_->verbose(CALL_INFO, 3, 0, "⚖️ 负载重分布: 核心%d(%.2f) -> 核心%d(%.2f)\n",
+            //                most_loaded, core_utilization_history_[most_loaded] * 100.0,
+            //                least_loaded, core_utilization_history_[least_loaded] * 100.0);
         }
     }
 }
@@ -1186,8 +1196,8 @@ void MultiCoreController::redistributeWork() {
         core_work_count_[most_loaded] -= work_to_transfer;
         core_work_count_[least_loaded] += work_to_transfer;
         
-        output_->verbose(CALL_INFO, 4, 0, "📋 工作重分布: 核心%d -> 核心%d (转移%" PRIu64 "个工作单元)\n",
-                        most_loaded, least_loaded, work_to_transfer);
+        // output_->verbose(CALL_INFO, 4, 0, "📋 工作重分布: 核心%d -> 核心%d (转移%" PRIu64 "个工作单元)\n",
+        //                 most_loaded, least_loaded, work_to_transfer);
     }
 }
 
@@ -1316,7 +1326,7 @@ void MultiCorePE::deliverSpikeToCore(int core_id, SpikeEvent* spike) {
 }
 
 void MultiCorePE::initializeDirectionLinks() {
-    output_->verbose(CALL_INFO, 2, 0, "🌐 初始化方向链路代理机制\n");
+    // output_->verbose(CALL_INFO, 2, 0, "🌐 初始化方向链路代理机制\n");
     
     // 配置方向链路，仅在实际连接时创建处理器
     north_link_ = configureLink("north", 
@@ -1338,11 +1348,11 @@ void MultiCorePE::initializeDirectionLinks() {
     if (west_link_) active_links++;
     if (network_link_) active_links++;
     
-    output_->verbose(CALL_INFO, 1, 0, "🔗 方向链路代理配置完成: %d个活跃链路\n", active_links);
+    // output_->verbose(CALL_INFO, 1, 0, "🔗 方向链路代理配置完成: %d个活跃链路\n", active_links);
 }
 
 void MultiCorePE::initializeNetworkInterface() {
-    output_->verbose(CALL_INFO, 2, 0, "🌐 初始化网络接口适配器\n");
+    // output_->verbose(CALL_INFO, 2, 0, "🌐 初始化网络接口适配器\n");
     
     // 尝试加载用户配置的网络接口
     // 关键修复：使用SHARE_PORTS允许网络接口暴露端口给hr_router
@@ -1350,7 +1360,7 @@ void MultiCorePE::initializeNetworkInterface() {
         "network_interface", ComponentInfo::SHARE_PORTS);
     
     if (external_nic_) {
-        output_->verbose(CALL_INFO, 1, 0, "✅ 通过用户配置成功加载网络接口适配器\n");
+        // output_->verbose(CALL_INFO, 1, 0, "✅ 通过用户配置成功加载网络接口适配器\n");
         
         // 配置网络接口的节点ID
         external_nic_->setNodeId(node_id_);
@@ -1363,40 +1373,40 @@ void MultiCorePE::initializeNetworkInterface() {
         
         // 注意：SST框架会自动调用SubComponent的init()和setup()方法
         // 手动调用可能导致重复初始化和时序问题，因此移除
-        output_->verbose(CALL_INFO, 2, 0, "🔧 网络适配器将由SST框架自动初始化\n");
+        // output_->verbose(CALL_INFO, 2, 0, "🔧 网络适配器将由SST框架自动初始化\n");
         
-        output_->verbose(CALL_INFO, 1, 0, "🔗 网络接口配置完成: %s\n", 
-                        external_nic_->getNetworkStatus().c_str());
+        // output_->verbose(CALL_INFO, 1, 0, "🔗 网络接口配置完成: %s\n", 
+        //                 external_nic_->getNetworkStatus().c_str());
         
         // === 端口代理机制：将父组件的方向链路注入给SnnNetworkAdapter ===
-        output_->verbose(CALL_INFO, 2, 0, "🔗 开始注入方向链路到网络适配器\n");
+        // output_->verbose(CALL_INFO, 2, 0, "🔗 开始注入方向链路到网络适配器\n");
         
         // 尝试将SnnInterface强制转换为SnnNetworkAdapter以访问链路注入接口
         auto* network_adapter = dynamic_cast<SnnNetworkAdapter*>(external_nic_);
         if (network_adapter) {
             // 注入各个方向的链路（如果存在）
             if (north_link_) {
-                network_adapter->injectDirectionLink("north", north_link_);
-                output_->verbose(CALL_INFO, 2, 0, "✅ 注入北向链路到网络适配器\n");
+                // network_adapter->injectDirectionLink("north", north_link_);
+                // output_->verbose(CALL_INFO, 2, 0, "✅ 注入北向链路到网络适配器\n");
             }
             if (south_link_) {
-                network_adapter->injectDirectionLink("south", south_link_);
-                output_->verbose(CALL_INFO, 2, 0, "✅ 注入南向链路到网络适配器\n");
+                // network_adapter->injectDirectionLink("south", south_link_);
+                // output_->verbose(CALL_INFO, 2, 0, "✅ 注入南向链路到网络适配器\n");
             }
             if (east_link_) {
-                network_adapter->injectDirectionLink("east", east_link_);
-                output_->verbose(CALL_INFO, 2, 0, "✅ 注入东向链路到网络适配器\n");
+                // network_adapter->injectDirectionLink("east", east_link_);
+                // output_->verbose(CALL_INFO, 2, 0, "✅ 注入东向链路到网络适配器\n");
             }
             if (west_link_) {
-                network_adapter->injectDirectionLink("west", west_link_);
-                output_->verbose(CALL_INFO, 2, 0, "✅ 注入西向链路到网络适配器\n");
+                // network_adapter->injectDirectionLink("west", west_link_);
+                // output_->verbose(CALL_INFO, 2, 0, "✅ 注入西向链路到网络适配器\n");
             }
             if (network_link_) {
-                network_adapter->injectDirectionLink("network", network_link_);
-                output_->verbose(CALL_INFO, 2, 0, "✅ 注入通用网络链路到网络适配器\n");
+                // network_adapter->injectDirectionLink("network", network_link_);
+                // output_->verbose(CALL_INFO, 2, 0, "✅ 注入通用网络链路到网络适配器\n");
             }
             
-            output_->verbose(CALL_INFO, 1, 0, "🔄 端口代理机制配置完成\n");
+            // output_->verbose(CALL_INFO, 1, 0, "🔄 端口代理机制配置完成\n");
         } else {
             // 检查是否是MultiCorePERouterInterface类型
             auto* router_interface = dynamic_cast<MultiCorePERouterInterface*>(external_nic_);
@@ -1406,17 +1416,17 @@ void MultiCorePE::initializeNetworkInterface() {
                 output_->verbose(CALL_INFO, 2, 0, "🔗 可直接连接到hr_router：MultiCorePE.network → router.portX\n");
             } else {
                 // 检查是否是SnnNIC类型
-                output_->verbose(CALL_INFO, 2, 0, "ℹ️ 网络接口不是SnnNetworkAdapter类型，检查其他类型\n");
+                // output_->verbose(CALL_INFO, 2, 0, "ℹ️ 网络接口不是SnnNetworkAdapter类型，检查其他类型\n");
                 
                 // 对于其他类型（如SnnNIC），我们不需要注入链路，它们有自己的network端口
                 if (external_nic_) {
-                    output_->verbose(CALL_INFO, 1, 0, "🔗 其他网络接口模式：network端口可直接用于外部连接\n");
-                    output_->verbose(CALL_INFO, 1, 0, "💡 提示：可直接连接 MultiCorePE的SubComponent端口到外部路由器\n");
+                    // output_->verbose(CALL_INFO, 1, 0, "🔗 其他网络接口模式：network端口可直接用于外部连接\n");
+                    // output_->verbose(CALL_INFO, 1, 0, "💡 提示：可直接连接 MultiCorePE的SubComponent端口到外部路由器\n");
                 }
             }
         }
     } else {
-        output_->verbose(CALL_INFO, 2, 0, "⚠️ 未配置网络接口适配器，将使用传统端口模式\n");
+        // output_->verbose(CALL_INFO, 2, 0, "⚠️ 未配置网络接口适配器，将使用传统端口模式\n");
     }
 }
 

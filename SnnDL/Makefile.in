@@ -180,7 +180,7 @@ am_libSnnDL_la_OBJECTS = SnnPE.lo SnnPESubComponent.lo SpikeSource.lo \
 	SnnNIC.lo SnnNetworkAdapter.lo SimpleNetworkWrapper.lo \
 	MultiCorePE.lo MultiCorePERouterInterface.lo \
 	OptimizedInternalRing.lo SpikeEventWrapper.lo \
-	SimpleTestEvent.lo WeightLoader.lo SpikeMUX.lo
+	SimpleTestEvent.lo WeightLoader.lo
 libSnnDL_la_OBJECTS = $(am_libSnnDL_la_OBJECTS)
 AM_V_lt = $(am__v_lt_@AM_V@)
 am__v_lt_ = $(am__v_lt_@AM_DEFAULT_V@)
@@ -211,8 +211,8 @@ am__depfiles_remade = ./$(DEPDIR)/MultiCorePE.Plo \
 	./$(DEPDIR)/SimpleTestEvent.Plo ./$(DEPDIR)/SnnNIC.Plo \
 	./$(DEPDIR)/SnnNetworkAdapter.Plo ./$(DEPDIR)/SnnPE.Plo \
 	./$(DEPDIR)/SnnPESubComponent.Plo \
-	./$(DEPDIR)/SpikeEventWrapper.Plo ./$(DEPDIR)/SpikeMUX.Plo \
-	./$(DEPDIR)/SpikeSource.Plo ./$(DEPDIR)/WeightLoader.Plo
+	./$(DEPDIR)/SpikeEventWrapper.Plo ./$(DEPDIR)/SpikeSource.Plo \
+	./$(DEPDIR)/WeightLoader.Plo
 am__mv = mv -f
 CXXCOMPILE = $(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) \
 	$(AM_CPPFLAGS) $(CPPFLAGS) $(AM_CXXFLAGS) $(CXXFLAGS)
@@ -557,9 +557,7 @@ libSnnDL_la_SOURCES = \
 	SimpleTestEvent.h \
 	SimpleTestEvent.cc \
 	WeightLoader.cc \
-	WeightLoader.h \
-	SpikeMUX.cc \
-	SpikeMUX.h
+	WeightLoader.h
 
 libSnnDL_la_LDFLAGS = -module -avoid-version
 all: all-am
@@ -650,7 +648,6 @@ distclean-compile:
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/SnnPE.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/SnnPESubComponent.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/SpikeEventWrapper.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/SpikeMUX.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/SpikeSource.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/WeightLoader.Plo@am__quote@ # am--include-marker
 
@@ -828,7 +825,6 @@ distclean: distclean-am
 	-rm -f ./$(DEPDIR)/SnnPE.Plo
 	-rm -f ./$(DEPDIR)/SnnPESubComponent.Plo
 	-rm -f ./$(DEPDIR)/SpikeEventWrapper.Plo
-	-rm -f ./$(DEPDIR)/SpikeMUX.Plo
 	-rm -f ./$(DEPDIR)/SpikeSource.Plo
 	-rm -f ./$(DEPDIR)/WeightLoader.Plo
 	-rm -f Makefile
@@ -886,7 +882,6 @@ maintainer-clean: maintainer-clean-am
 	-rm -f ./$(DEPDIR)/SnnPE.Plo
 	-rm -f ./$(DEPDIR)/SnnPESubComponent.Plo
 	-rm -f ./$(DEPDIR)/SpikeEventWrapper.Plo
-	-rm -f ./$(DEPDIR)/SpikeMUX.Plo
 	-rm -f ./$(DEPDIR)/SpikeSource.Plo
 	-rm -f ./$(DEPDIR)/WeightLoader.Plo
 	-rm -f Makefile

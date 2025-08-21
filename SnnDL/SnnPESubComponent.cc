@@ -47,11 +47,11 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     line_size_bytes_ = params.find<uint32_t>("line_size_bytes", 64);
     enable_detailed_map_log_ = params.find<int>("enable_detailed_map_log", 0) != 0;
     // 权重验证参数
-    verify_weights_ = params.find<int>("verify_weights", 0) != 0;
-    weight_verify_samples_ = params.find<uint32_t>("weight_verify_samples", 16);
-    expected_weight_value_ = params.find<float>("expected_weight_value", 0.0f);
-    verify_epsilon_ = params.find<float>("verify_epsilon", 1e-4f);
-    verify_log_each_sample_ = params.find<int>("verify_log_each_sample", 0) != 0;
+    // verify_weights_ = params.find<int>("verify_weights", 0) != 0;
+    // weight_verify_samples_ = params.find<uint32_t>("weight_verify_samples", 16);
+    // expected_weight_value_ = params.find<float>("expected_weight_value", 0.0f);
+    // verify_epsilon_ = params.find<float>("verify_epsilon", 1e-4f);
+    // verify_log_each_sample_ = params.find<int>("verify_log_each_sample", 0) != 0;
     
     // 获取权重文件路径
     weights_file_path_ = params.find<std::string>("weights_file", "");
@@ -61,12 +61,12 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     // 初始化输出对象
     output_ = new Output("SnnPESubComponent[@p:@l]: ", verbose_, 0, Output::STDOUT);
     
-    output_->verbose(CALL_INFO, 1, 0, "🔧 初始化SnnPE SubComponent (核心%d, %u个神经元)\n", 
-                    core_id_, num_neurons_);
+    // output_->verbose(CALL_INFO, 1, 0, "🔧 初始化SnnPE SubComponent (核心%d, %u个神经元)\n", 
+    //                 core_id_, num_neurons_);
     
     // 输出权重验证参数以便调试
-    output_->verbose(CALL_INFO, 1, 0, "🔍 权重验证配置: verify_weights=%d, samples=%u, expected=%.3f, log_each=%d\n",
-                    verify_weights_ ? 1 : 0, weight_verify_samples_, expected_weight_value_, verify_log_each_sample_ ? 1 : 0);
+    // output_->verbose(CALL_INFO, 1, 0, "🔍 权重验证配置: verify_weights=%d, samples=%u, expected=%.3f, log_each=%d\n",
+    //                 verify_weights_ ? 1 : 0, weight_verify_samples_, expected_weight_value_, verify_log_each_sample_ ? 1 : 0);
     
     // 初始化神经元状态（复用SnnPE逻辑）
     neuron_states_.resize(num_neurons_);
@@ -78,6 +78,8 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     memory_link_ = nullptr;
     memory_ = nullptr;
     next_request_id_ = 1;
+
+
     
     // 初始化统计变量
     total_cycles_ = 0;
@@ -113,11 +115,11 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     // 立即注册统计，避免在调用 getStatistics 前指针为空
     initializeStatistics();
 
-    output_->verbose(CALL_INFO, 2, 0, "✅ SnnPE SubComponent核心%d初始化完成\n", core_id_);
+    // output_->verbose(CALL_INFO, 2, 0, "✅ SnnPE SubComponent核心%d初始化完成\n", core_id_);
 }
 
 SnnPESubComponent::~SnnPESubComponent() {
-    output_->verbose(CALL_INFO, 1, 0, "🗑️ 销毁SnnPE SubComponent核心%d\n", core_id_);
+    // output_->verbose(CALL_INFO, 1, 0, "🗑️ 销毁SnnPE SubComponent核心%d\n", core_id_);
     
     // 清理脉冲队列
     while (!incoming_spikes_.empty()) {
@@ -130,11 +132,11 @@ SnnPESubComponent::~SnnPESubComponent() {
 
 void SnnPESubComponent::setParentInterface(SnnPEParentInterface* parent) {
     parent_ = parent;
-    output_->verbose(CALL_INFO, 2, 0, "🔗 核心%d设置父级接口\n", core_id_);
+    // output_->verbose(CALL_INFO, 2, 0, "🔗 核心%d设置父级接口\n", core_id_);
 }
 
 void SnnPESubComponent::init(unsigned int phase) {
-    output_->verbose(CALL_INFO, 1, 0, "🔄 核心%d init phase %u\n", core_id_, phase);
+    // output_->verbose(CALL_INFO, 1, 0, "🔄 核心%d init phase %u\n", core_id_, phase);
     
     if (phase == 0) {
         // 初始化统计收集
@@ -202,7 +204,7 @@ void SnnPESubComponent::setup() {
 }
 
 void SnnPESubComponent::finish() {
-    output_->verbose(CALL_INFO, 1, 0, "🏁 SnnPE SubComponent核心%d完成仿真\n", core_id_);
+    // output_->verbose(CALL_INFO, 1, 0, "🏁 SnnPE SubComponent核心%d完成仿真\n", core_id_);
     
     // 输出统计信息（使用内部计数器获得正确值）
     output_->verbose(CALL_INFO, 1, 0, "📊 核心%d统计: 接收脉冲=%" PRIu64 ", 生成脉冲=%" PRIu64 ", 神经元发放=%" PRIu64 "\n",
@@ -223,11 +225,13 @@ bool SnnPESubComponent::clockTick(Cycle_t current_cycle) {
     bool has_activity = false;
     
     // 调试权重验证状态 (仅在前几个周期输出)
+    /*
     if (verify_weights_ && total_cycles_ < 10) {
         output_->verbose(CALL_INFO, 2, 0, "🔍 核心%d状态检查: verify_weights=%d, memory_link=%s, memory_ready=%d, cycles=%lu, warmup=%lu\n",
                         core_id_, verify_weights_ ? 1 : 0, memory_link_ ? "yes" : "no", memory_ready_ ? 1 : 0, 
                         total_cycles_, memory_warmup_cycles_);
     }
+    */
     
     // 处理输入脉冲队列
     while (!incoming_spikes_.empty()) {
@@ -331,7 +335,7 @@ void SnnPESubComponent::setMemoryLink(SST::Link* link) {
     
     // ★ 关键修正：直接使用提供的Link进行内存操作 ★
     if (memory_link_) {
-        output_->verbose(CALL_INFO, 2, 0, "🔗 核心%d设置内存连接成功\n", core_id_);
+        // output_->verbose(CALL_INFO, 2, 0, "🔗 核心%d设置内存连接成功\n", core_id_);
         memory_ready_ = true;  // 标记内存已准备就绪
     } else {
         output_->verbose(CALL_INFO, 2, 0, "🔗 核心%d设置内存连接失败 (link=nullptr)\n", core_id_);
@@ -416,7 +420,7 @@ void SnnPESubComponent::checkAndFireSpike(uint32_t neuron_idx) {
         // 确定目标神经元和节点基于网络层次结构
         uint32_t target_neuron = 0;
         uint32_t target_node = node_id_;
-        float output_weight = 0.0f;
+        float output_weight = 1.0f;  // 使用默认有效权重而不是0
         
         // 网络连接模式：
         // 输入层 (节点0-3, 神经元0-7) -> 隐藏层 (节点4-11, 神经元8-39)
@@ -429,7 +433,7 @@ void SnnPESubComponent::checkAndFireSpike(uint32_t neuron_idx) {
             uint32_t target_hidden_base = (node_id_ < 2) ? 4 : 8;  // 前两个输入节点连到4-7，后两个连到8-11
             uint32_t target_hidden_node = target_hidden_base + (node_id_ % 2) * 2 + (neuron_idx % 2);  
             target_node = target_hidden_node;
-            target_neuron = 8 + (target_hidden_node - 4) * 4 + neuron_idx;  // 隐藏层神经元8-39
+            target_neuron = target_hidden_node * 16 + neuron_idx;  // 使用正确的全局神经元ID计算
             
             output_->verbose(CALL_INFO, 2, 0, "🔥 输入层节点%d神经元%d -> 隐藏层节点%d神经元%d\n",
                            node_id_, neuron_idx, target_node, target_neuron);
@@ -438,7 +442,7 @@ void SnnPESubComponent::checkAndFireSpike(uint32_t neuron_idx) {
             // 简化连接：每两个隐藏层节点连接到一个输出层节点
             uint32_t target_output_node = 12 + ((node_id_ - 4) / 2);  // 节点4,5->12; 6,7->13; 8,9->14; 10,11->15
             target_node = target_output_node;
-            target_neuron = 40 + (target_output_node - 12) * 2 + (neuron_idx % 2);  // 输出层神经元40-47
+            target_neuron = target_output_node * 16 + (neuron_idx % 16);  // 使用正确的全局神经元ID计算
             
             output_->verbose(CALL_INFO, 2, 0, "🔥 隐藏层节点%d神经元%d -> 输出层节点%d神经元%d\n",
                            node_id_, neuron_idx, target_node, target_neuron);
@@ -552,7 +556,7 @@ void SnnPESubComponent::processLocalSpike(SpikeEvent* spike_event) {
         if (use_event_weight_fallback_) {
             weight = spike_event->getWeight();
             if (!event_weight_fallback_warned_) {
-                output_->verbose(CALL_INFO, 1, 0, "⚠️ 核心%d启用事件权重回退，优先级低于内存权重且仅在未命中时使用\n", core_id_);
+                output_->verbose(CALL_INFO, 1, 0, "⚠️ 核心%d启用事件权重回退，事件权重=%.3f\n", core_id_, weight);
                 event_weight_fallback_warned_ = true;
             }
         } else {
@@ -571,6 +575,9 @@ void SnnPESubComponent::processLocalSpike(SpikeEvent* spike_event) {
         uint32_t post_local_dbg = target_neuron;
         uint64_t offset_dbg = static_cast<uint64_t>(pre_local_dbg) * static_cast<uint64_t>(num_neurons_) + post_local_dbg;
         uint64_t addr_dbg = base_addr_ + offset_dbg * sizeof(float);
+        output_->verbose(CALL_INFO, 1, 0,
+            "🧪 详细权重调试: 事件权重=%.3f, 内存权重=%s, 最终权重=%.3f, 回退=%s\n",
+            spike_event->getWeight(), have_mem_weight ? "有" : "无", weight, use_event_weight_fallback_ ? "启用" : "禁用");
         output_->verbose(CALL_INFO, 1, 0,
             "🧪 一次性详细映射: pre_g=%u->pre_l=%u, post_g=%u->post_l=%u, base=%" PRIu64 ", off=%" PRIu64 ", addr=%" PRIu64 ", weight=%.3f\n",
             pre_global, pre_local_dbg, post_global, post_local_dbg, base_addr_, offset_dbg, addr_dbg, weight);
@@ -714,7 +721,7 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
 }
 
 void SnnPESubComponent::initializeStatistics() {
-    output_->verbose(CALL_INFO, 2, 0, "📊 核心%d初始化统计收集\n", core_id_);
+    // output_->verbose(CALL_INFO, 2, 0, "📊 核心%d初始化统计收集\n", core_id_);
     
     stat_spikes_received_ = registerStatistic<uint64_t>("spikes_received");
     stat_spikes_generated_ = registerStatistic<uint64_t>("spikes_generated");
@@ -728,5 +735,5 @@ void SnnPESubComponent::initializeStatistics() {
     stat_weights_mismatch_count_ = registerStatistic<uint64_t>("weights_mismatch_count");
     stat_weights_verify_sum_ = registerStatistic<double>("weights_verify_sum");
     
-    output_->verbose(CALL_INFO, 2, 0, "✅ 核心%d统计收集初始化完成\n", core_id_);
+    // output_->verbose(CALL_INFO, 2, 0, "✅ 核心%d统计收集初始化完成\n", core_id_);
 }

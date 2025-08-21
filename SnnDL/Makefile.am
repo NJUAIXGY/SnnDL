@@ -32,9 +32,7 @@ libSnnDL_la_SOURCES = \
 	SimpleTestEvent.h \
 	SimpleTestEvent.cc \
 	WeightLoader.cc \
-	WeightLoader.h \
-	SpikeMUX.cc \
-	SpikeMUX.h
+	WeightLoader.h
 
 libSnnDL_la_LDFLAGS = -module -avoid-version
 
