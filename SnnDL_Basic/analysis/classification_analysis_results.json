@@ -1,0 +1,119 @@
+{
+  "input_layer": {
+    "0": {
+      "class": "类别A",
+      "processed": 4,
+      "received": 3,
+      "sent": 4
+    },
+    "1": {
+      "class": "类别A",
+      "processed": 3,
+      "received": 3,
+      "sent": 2
+    },
+    "2": {
+      "class": "类别B",
+      "processed": 3,
+      "received": 3,
+      "sent": 2
+    },
+    "3": {
+      "class": "类别B",
+      "processed": 3,
+      "received": 3,
+      "sent": 2
+    }
+  },
+  "hidden_layer_1": {
+    "4": {
+      "processed": 3,
+      "sent": 3
+    },
+    "5": {
+      "processed": 0,
+      "sent": 0
+    },
+    "6": {
+      "processed": 0,
+      "sent": 0
+    },
+    "7": {
+      "processed": 0,
+      "sent": 0
+    }
+  },
+  "hidden_layer_2": {
+    "8": {
+      "processed": 0,
+      "sent": 0
+    },
+    "9": {
+      "processed": 0,
+      "sent": 0
+    },
+    "10": {
+      "processed": 0,
+      "sent": 0
+    },
+    "11": {
+      "processed": 1,
+      "sent": 1
+    }
+  },
+  "output_layer": {
+    "12": {
+      "processed": 3,
+      "received": 3,
+      "utilization": 0.00223
+    },
+    "13": {
+      "processed": 0,
+      "received": 0,
+      "utilization": 0.0
+    },
+    "14": {
+      "processed": 0,
+      "received": 0,
+      "utilization": 0.0
+    },
+    "15": {
+      "processed": 1,
+      "received": 1,
+      "utilization": 0.00057
+    }
+  },
+  "spike_sources": {
+    "0": {
+      "class": "类别A",
+      "loaded": 3,
+      "sent": 3
+    },
+    "1": {
+      "class": "类别A",
+      "loaded": 3,
+      "sent": 3
+    },
+    "2": {
+      "class": "类别B",
+      "loaded": 3,
+      "sent": 3
+    },
+    "3": {
+      "class": "类别B",
+      "loaded": 3,
+      "sent": 3
+    }
+  },
+  "network_stats": {
+    "total_sent": 14,
+    "total_received": 20,
+    "efficiency": 1.4285714285714286
+  },
+  "layer_activities": {
+    "input": 13,
+    "hidden1": 3,
+    "hidden2": 1,
+    "output": 4
+  }
+}
