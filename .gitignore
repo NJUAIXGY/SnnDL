@@ -1,0 +1,18 @@
+# General build artifacts
+**/*.o
+**/*.so
+**/*.a
+**/*.la
+**/*.lai
+**/*.lo
+**/.deps/
+**/.libs/
+
+# neuron_mapping_framework compiled binaries (top-level executables)
+/experimental_features/neuron_mapping_framework/test_community_detection
+/experimental_features/neuron_mapping_framework/test_graph_complete
+/experimental_features/neuron_mapping_framework/test_logger_linking
+/experimental_features/neuron_mapping_framework/test_simulated_annealing
+
+# Logs
+**/*.log
