@@ -1,0 +1,29 @@
+# Build artifacts
+*.o
+*.lo
+*.la
+.deps/
+.libs/
+*.so
+*.so.*
+
+# Backup files
+*.backup
+*~
+
+# Test outputs
+*.log
+test_output.log
+weight_verification_test.log
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Compiled objects
+*.a
+
+# Temporary files
+/tmp/
