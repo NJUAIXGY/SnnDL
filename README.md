@@ -1,320 +1,102 @@
-# SnnDL - Spiking Neural Network Simulation Library for SST
+# SnnDL Submission Package
 
-## 1. Overview
+本目录为提交到 GitHub 的最小自包含包，包含：
 
-SnnDL is a component library for the Structural Simulation Toolkit (SST), designed for simulating large-scale Spiking Neural Networks (SNNs), particularly those implemented on Network-on-Chip (NoC) architectures.
+- `SnnDL/`：SST 元素库 SnnDL 的源码（仅源码，已剔除构建产物）。
+- `SnnDL_Basic/`：规范的 4x4 分层分类示例与脚本（后续开发的基线模板）。
+- `experimental_features/`：实验性/研究性功能与示例（映射框架、学习测试、网络校验等）。
 
-It provides the fundamental building blocks for SNN simulations, including processing elements (PEs), network interfaces (NICs), and spike data sources. This library enables research into SNN models, learning algorithms, and the underlying hardware architectures.
+## 目录结构
 
-## 2. Core Components
-
-The library consists of three main components:
-
-### a. `SnnPE` (Spiking Neural Network Processing Element)
-
-The `SnnPE` is the core computational unit, simulating a cluster of neurons.
-
-- **Functionality**:
-    - Implements the Leaky Integrate-and-Fire (LIF) neuron model.
-    - Operates in a hybrid event-driven and clock-driven mode.
-    - Stores synaptic weights in a Compressed Sparse Row (CSR) format for efficiency.
-    - Manages the complete state of each neuron (membrane potential, refractory period, etc.).
-- **Configuration Parameters**:
-    - `clock`: Clock frequency of the PE (e.g., "1GHz").
-    - `num_neurons`: **(Required)** Total number of neurons in this PE.
-    - `weights_file`: **(Required)** Path to the synaptic weight file.
-    - `v_thresh`: Firing threshold voltage (Default: `1.0`).
-    - `tau_mem`: Membrane time constant in ms (Default: `20.0`).
-    - `verbose`: Verbosity level for logging (Default: `0`).
-- **Ports**:
-    - `spike_input`: Receives incoming `SpikeEvent`s from the `SnnNIC`.
-    - `spike_output`: Sends outgoing `SpikeEvent`s to the `SnnNIC`.
-
-### b. `SnnNIC` (Spiking Neural Network Network Interface Card)
-
-The `SnnNIC` acts as the bridge between a `SnnPE` and the simulated network (e.g., a mesh or torus built with `merlin`).
-
-- **Functionality**:
-    - Forwards incoming spikes from the `SnnPE` to the network.
-    - Receives spikes from the network and delivers them to the connected `SnnPE`.
-    - Translates between SST `SpikeEvent`s and network packets.
-- **Ports**:
-    - `spike_input`: Connects to the `SnnPE`'s `spike_output` port.
-    - `spike_output`: Connects to the `SnnPE`'s `spike_input` port.
-    - `port_network`: Connects to a network component (e.g., `merlin.hr_router`).
-
-### c. `SpikeSource`
-
-This component reads spike data from a file and injects it into the simulation at precise times.
-
-- **Functionality**:
-    - Acts as a data loader and spike generator.
-    - Supports multiple input formats (e.g., TEXT, N-MNIST).
-    - Generates precisely timed `SpikeEvent`s based on the input data.
-- **Configuration Parameters**:
-    - `dataset_path`: **(Required)** Path to the spike data file.
-    - `dataset_format`: Format of the dataset (Default: `"TEXT"`).
-    - `time_scale`: Scaling factor for timestamps in the data (Default: `1.0`).
-    - `verbose`: Verbosity level for logging (Default: `0`).
-- **Ports**:
-    - `spike_output`: Sends `SpikeEvent`s to a target component (typically an `SnnNIC` or `SnnPE`).
-
-## 3. Event Structure: `SpikeEvent`
-
-A lightweight, serializable event used to represent a single spike. It contains the ID of the neuron that fired.
-
-## 4. Workflow
-
-A typical simulation workflow is as follows:
-1.  `SpikeSource` reads spike data and sends `SpikeEvent`s to a target `SnnPE` (via its `SnnNIC`).
-2.  The `SnnNIC` receives the event and passes it to the `SnnPE`.
-3.  The `SnnPE` processes the spike, updating the membrane potential of connected neurons.
-4.  If any neuron's potential exceeds `v_thresh`, it fires and generates a new `SpikeEvent`.
-5.  The `SnnPE` sends the new `SpikeEvent` to its `SnnNIC`.
-6.  The `SnnNIC` packetizes the event and routes it through the network to the destination `SnnNIC`, which then delivers it to the final `SnnPE`.
-
-## 5. Data Formats
-
-### Weight File (CSR-like)
-A text file where each line represents a synaptic connection.
 ```
-# from_neuron to_neuron weight
-0 10 0.75
-0 12 0.5
-1 15 0.9
+github_submission/
+├── SnnDL/                       # SST 元素：SnnDL 源码（放入 sst-elements 后构建）
+├── SnnDL_Basic/                 # 规范 4x4 分类示例（脚本、权重、脉冲数据、分析）
+└── experimental_features/
+    ├── neuron_mapping_framework # 神经元到 PE 映射框架（独立 C++ 项目）
+    ├── snnDL_learning_tests     # 学习特性实验脚本（试验性）
+    ├── snnDL_network_validator  # 网络配置校验工具（试验性）
+    └── snnDL_neuron_dynamics_tests # 神经元动力学实验脚本（试验性）
 ```
 
-### Spike Input File (`TEXT` format)
-A text file where each line represents a spike event.
+## 环境与依赖
+
+- 已安装或可构建的 SST 框架（sst-core 与 sst-elements）。
+- 推荐安装前缀：`/home/<user>/SST/sst_install`（如下示例可替换为你的路径）。
+- 运行 Python 脚本需要 Python 3.x。
+
+## 构建 SnnDL 元素
+
+方式 A：在已有的 sst-elements 工作区内增量构建（推荐）
+
+1) 将本目录下的 `SnnDL/` 拷贝至你的 sst-elements：
+
 ```
-# neuron_id timestamp(microseconds)
-0 1000
-5 1250
-8 3000
-```
-
-## 6. Python API Usage Example
-
-Here is an example of setting up a simple network with one `SpikeSource` and one `SnnPE`.
-
-```python
-import sst
-from sst.merlin import *
-
-# Define the network topology
-topo = topoTorus()
-topo.setShape([2, 2, 1]) # Example 2x2 torus
-topo.setWidth([1, 1, 0])
-topo.setLocalPortCount(1)
-
-# Set up the network endpoint
-netif = buildSimpleNetworkInterface("networkIF", "firefly", 1, 1)
-netif.addParam("link_bw", "10GB/s")
-
-# Create a Spike Source
-source = sst.Component("source_0", "SnnDL.SpikeSource")
-source.addParams({
-    "dataset_path": "input_spikes.txt",
-    "dataset_format": "TEXT"
-})
-
-# Create an SNN Processing Element and its NIC
-pe_0 = sst.Component("pe_0", "SnnDL.SnnPE")
-pe_0.addParams({
-    "num_neurons": 100,
-    "weights_file": "weights.txt"
-})
-
-nic_0 = sst.Component("nic_0", "SnnDL.SnnNIC")
-
-# Connect the components
-# Source -> NIC -> PE
-link_in = sst.Link("spike_input_link_0")
-link_in.connect(
-    (source, "spike_output", "1ns"),
-    (nic_0, "spike_input", "1ns")
-)
-
-link_pe = sst.Link("pe_link_0")
-link_pe.connect(
-    (nic_0, "spike_output", "1ns"),
-    (pe_0, "spike_input", "1ns")
-)
-link_pe.connect(
-    (pe_0, "spike_output", "1ns"),
-    (nic_0, "spike_input", "1ns")
-)
-
-# Connect the NIC to the network router
-router_0 = sst.Component("router_0", "merlin.hr_router")
-router_0.addParams(topo.getRouterParams(0))
-router_0.setSubComponent("networkIF", netif)
-
-net_link = sst.Link("network_link_0")
-net_link.connect(
-    (nic_0, "port_network", "2ns"),
-    (router_0, "port0", "2ns")
-)
+cp -a github_submission/SnnDL <你的>/sst-elements/src/sst/elements/SnnDL
 ```
 
-## 7. Build and Installation
+2) 安装 sst-core 与 sst-elements（如已安装可跳过）：
 
-This component is part of the `sst-elements` library and is compiled along with it. Ensure that `SnnDL` is included in the build configuration when running `configure` for `sst-elements`.
-
-### 2. SpikeSource - 脉冲数据源
-
-**功能特性：**
-- 支持多种神经形态数据集格式
-- 精确的时序控制和事件调度
-- 可配置的时间缩放和神经元ID映射
-- 事件数量限制支持
-
-**配置参数：**
-- `dataset_path`: 数据集文件路径（必需）
-- `dataset_format`: 数据格式 ("TEXT"|"NMNIST_AER"|"SHD_HDF5")
-- `time_scale`: 时间缩放因子（默认: 1.0）
-- `neuron_offset`: 神经元ID偏移（默认: 0）
-- `max_events`: 最大事件数限制（默认: 0，无限制）
-- `verbose`: 日志详细级别（默认: 0）
-
-**端口：**
-- `spike_output`: 发送脉冲事件的输出端口
-
-### 3. SpikeEvent - 脉冲事件类
-
-**功能特性：**
-- 轻量级的脉冲事件表示
-- 支持SST并行仿真的序列化
-- 包含神经元ID和时间戳信息
-
-## 数据格式
-
-### TEXT格式
-简单的文本格式，每行包含：
 ```
-neuron_id timestamp
+cd <你的>/sst-core
+./configure --prefix=/home/<user>/SST/sst_install
+make -j4 && make install
+
+cd <你的>/sst-elements
+./configure --prefix=/home/<user>/SST/sst_install --with-sst-core=/home/<user>/SST/sst_install
+make -j4 && make install
 ```
 
-示例：
+3) 增量构建 SnnDL 元素：
+
 ```
-0 1000
-1 1500
-0 2000
-2 2200
-```
-
-### N-MNIST AER格式
-地址事件表示格式，适用于N-MNIST数据集。
-格式：x, y, timestamp, polarity
-
-### SHD HDF5格式
-Spiking Heidelberg Digits数据集的HDF5格式（需要HDF5库支持）。
-
-## 权重文件格式
-
-突触权重文件采用简单的文本格式：
-```
-pre_neuron_id post_neuron_id weight
+cd <你的>/sst-elements/src/sst/elements/SnnDL
+make -j4 && make install
 ```
 
-示例：
+方式 B：全量构建（当需要重新配置/安装整个 SST 环境时）
+
+参考方式 A 的完整 configure + make + install 流程。
+
+提示：运行时确保环境变量可找到安装位置：
+
 ```
-0 1 0.5
-0 2 0.3
-1 2 0.8
-1 3 0.2
-```
-
-## 使用示例
-
-### Python配置脚本
-
-```python
-import sst
-
-# 创建脉冲数据源
-spike_source = sst.Component("spike_source", "SnnDL.SpikeSource")
-spike_source.addParams({
-    "dataset_path": "/path/to/dataset.txt",
-    "dataset_format": "TEXT",
-    "time_scale": "1.0",
-    "verbose": "1"
-})
-
-# 创建SNN处理单元
-snn_pe = sst.Component("snn_pe", "SnnDL.SnnPE")
-snn_pe.addParams({
-    "clock": "1GHz",
-    "num_neurons": "100",
-    "v_thresh": "1.0",
-    "v_reset": "0.0",
-    "v_rest": "0.0",
-    "tau_mem": "20.0",
-    "t_ref": "2",
-    "weights_file": "/path/to/weights.txt",
-    "verbose": "1"
-})
-
-# 连接组件
-link = sst.Link("spike_link")
-link.connect(
-    (spike_source, "spike_output", "100ps"),
-    (snn_pe, "spike_input", "100ps")
-)
-
-# 配置统计输出
-sst.setStatisticOutput("sst.statOutputCSV", {"filepath": "snn_stats.csv"})
-sst.enableAllStatisticsForComponentType("SnnDL.SnnPE")
-sst.enableAllStatisticsForComponentType("SnnDL.SpikeSource")
-
-# 运行仿真
-sst.setProgramOption("stop-at", "1ms")
+export PATH=/home/<user>/SST/sst_install/bin:$PATH
+export LD_LIBRARY_PATH=/home/<user>/SST/sst_install/lib:/home/<user>/SST/sst_install/lib/sst-elements-library:$LD_LIBRARY_PATH
 ```
 
-## 编译和安装
+## 运行 4x4 分类示例（规范模板）
 
-1. 确保SST核心和SST元素库已正确安装
-2. 在SnnDL目录中运行：
-```bash
-make
-make install
+```
+cd github_submission/SnnDL_Basic/scripts
+sst test_classification_4x4.py
+
+# 分析输出（CSV 写在当前目录）
+python analyze_classification_results.py
 ```
 
-3. 或者在sst-elements根目录重新构建：
-```bash
-./configure --prefix=/path/to/sst/install
-make
-make install
+说明：示例脚本使用就地输出 `./complex_classification_stats.csv`，不依赖外部 `sst_output_data/` 目录。
+
+## 实验性功能（experimental_features）
+
+1) 映射框架（neuron_mapping_framework）编译校验：
+
+```
+cd github_submission/experimental_features/neuron_mapping_framework
+make test-compile
 ```
 
-## 扩展和开发
+2) 学习测试（snnDL_learning_tests）：
 
-### 添加新的神经元模型
-1. 修改`NeuronState`结构体添加新的状态变量
-2. 在`SnnPE::clockTick()`中实现新的动力学方程
-3. 更新相关的配置参数
+- 示例脚本 `scripts/test_learning_min.py` 使用绝对路径指向本仓 `experimental_features/snnDL_learning_tests` 下的数据/误差文件。
+- 若你在不同路径运行，请相应调整脚本中的路径参数或在根目录下运行以保持路径一致。
 
-### 添加新的数据格式
-1. 在`SpikeSource`中添加新的加载函数
-2. 更新`dataset_format`参数的文档
-3. 实现相应的解析逻辑
+## 常见问题
 
-### 性能优化
-- 考虑使用SIMD指令优化神经元更新
-- 实现更高效的稀疏矩阵格式
-- 添加GPU加速支持
+- 若 `sst` 运行时报 MPI/PMIx 相关错误，通常是环境限制导致。可在支持 OpenMPI/PMIx 的环境下运行，或在简单用例中设置单分区（`sst.single`）后再试（并非所有脚本都适用）。
+- 如需更换安装前缀，请同步调整环境变量 `PATH` 与 `LD_LIBRARY_PATH`。
 
-## 许可证
+## 许可与贡献
 
-该项目遵循SST的许可证条款。
+- 源码以研究/实验为主，欢迎在独立分支上提交 PR 讨论改进。
 
-## 贡献
-
-欢迎提交问题报告和改进建议。在提交代码之前，请确保：
-1. 代码符合SST的编码规范
-2. 添加适当的测试用例
-3. 更新相关文档
-
-## 联系方式
-
-如有问题或建议，请通过SST社区渠道联系。
