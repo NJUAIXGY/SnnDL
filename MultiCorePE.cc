@@ -22,6 +22,8 @@
 #include <iomanip>
 #include <cstdlib>
 #include <random>
+#include <cstdlib>
+#include <climits>
 
 using namespace SST;
 using namespace SST::SnnDL;
@@ -49,6 +51,7 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
     node_id_ = params.find<int>("node_id", 0);
     total_nodes_ = params.find<int>("total_nodes", 1);
     global_neuron_base_ = params.find<uint64_t>("global_neuron_base", 0);
+    sim_stop_ns_ = params.find<uint64_t>("sim_stop_ns", 0);
     verbose_ = verbose_level;
     weights_file_ = params.find<std::string>("weights_file", "");
     enable_numa_ = params.find<bool>("enable_numa", true);
@@ -211,7 +214,7 @@ MultiCorePE::~MultiCorePE() {
 void MultiCorePE::init(unsigned int phase) {
     if (output_) { output_->output("[[sentinel-pe-init]] node=%d phase=%u enter\n", node_id_, phase); }
     if (phase == 0) {
-        if (primary_keepalive_) {
+        if (primary_keepalive_ || sim_stop_ns_ > 0) {
             registerAsPrimaryComponent();
             primaryComponentDoNotEndSim();
         }
@@ -262,6 +265,8 @@ void MultiCorePE::init(unsigned int phase) {
             external_nic_->init(phase);
         }
         if (output_) { output_->output("[[sentinel-pe-init]] node=%d phase=0 nic-init-done\n", node_id_); }
+        // 标记Step注入就绪（保证NIC已完成init）
+        step_injection_ready_ = true;
     }
     else if (phase == 1) {
         if (output_) { output_->output("[[sentinel-pe-init]] node=%d phase=1 enter\n", node_id_); }
@@ -451,15 +456,24 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
     // 详细调试信息（仅在高详细度时输出）
     static bool first_tick_logged = false;
     if (!first_tick_logged) {
-        // 使用直接printf避免受verbose等级影响
-        printf("[[sentinel-pe-clock]] node=%d first_tick cyc=%" PRIu64 "\n",
-               node_id_, (uint64_t)current_cycle_);
-        fflush(stdout);
+        const char* sent_env = std::getenv("SNNDL_SENTINEL_ENABLE");
+        if (sent_env && std::atoi(sent_env) != 0) {
+            printf("[[sentinel-pe-clock]] node=%d first_tick cyc=%" PRIu64 "\n",
+                   node_id_, (uint64_t)current_cycle_);
+            fflush(stdout);
+        }
         PE_LOG(0, "[diag-PE] clockTick start node=%d\n", node_id_);
         first_tick_logged = true;
     }
     
-    // 0. 测试注入：在首个有效周期从 core0 向 core1 注入一个跨核脉冲（仅当启用测试流量时）
+    // 0a. 若存在延迟的Step注入且已就绪，优先补发
+    if (pending_step_inject_ && step_injection_ready_) {
+        injectStepActivations(pending_step_seq_, current_cycle_);
+        last_step_injection_seq_ = pending_step_seq_;
+        pending_step_inject_ = false;
+    }
+
+    // 0b. 测试注入：在首个有效周期从 core0 向 core1 注入一个跨核脉冲（仅当启用测试流量时）
     if (enable_test_traffic_ && !test_injected_ && num_cores_ > 1 && current_cycle_ == 5000) {
         // 构造一个从全局神经元0 -> 全局神经元(neurons_per_core_) 的脉冲
         SpikeEvent* test_spike = new SpikeEvent(0, neurons_per_core_, 0, 0.5f, current_cycle_);
@@ -695,10 +709,12 @@ void MultiCorePE::sendExternalSpike(SpikeEvent* spike) {
                      spike->getSourceNeuron(), spike->getDestinationNeuron(), spike->getHopCount());
 
     // 优先使用网络适配器，如果未配置则回退到传统链接
+    static uint64_t s_nic_send_log_count = 0;
     if (external_nic_) {
         // 使用网络适配器发送脉冲（这将触发路由计算和统计收集）
         external_nic_->sendSpike(spike);
         PE_LOG(3, "🌐 通过网络适配器发送脉冲\n");
+        // debug nic-send removed for production
     } else if (external_spike_output_link_) {
         // 回退到传统链接模式
         external_spike_output_link_->send(spike);
@@ -934,8 +950,14 @@ void MultiCorePE::notifyStageEvent(uint32_t seq, const std::string& event, uint6
 
     if (step_activation_enable_ && event == "BeginGather") {
         if (last_step_injection_seq_ != seq) {
-            injectStepActivations(seq, ts_ns);
-            last_step_injection_seq_ = seq;
+            if (step_injection_ready_) {
+                injectStepActivations(seq, ts_ns);
+                last_step_injection_seq_ = seq;
+            } else {
+                pending_step_inject_ = true;
+                pending_step_seq_ = seq;
+                pending_step_ts_ns_ = ts_ns;
+            }
         }
     }
     if (step_reset_mem_each_step_ && event == "EndScatter") {
@@ -1024,7 +1046,10 @@ void MultiCorePE::initializeProcessingUnits() {
         core_params.insert("tau_mem", std::to_string(tau_mem_));
         core_params.insert("t_ref", std::to_string(t_ref_));
         core_params.insert("node_id", std::to_string(node_id_));
-        core_params.insert("base_addr", std::to_string(neuron_id_start * 1000)); // 简单地址映射
+        // 若 Python 侧未提供 base_addr，则退回旧的简单映射；否则尊重传入值
+        if (!core_params.contains("base_addr")) {
+            core_params.insert("base_addr", std::to_string(neuron_id_start * 1000)); // 简单地址映射（仅兜底）
+        }
         core_params.insert("verbose", std::to_string(verbose_));
         
         // 传递权重文件参数
@@ -1675,6 +1700,12 @@ void MultiCorePE::injectStepActivations(uint32_t seq, uint64_t sim_time_ns) {
     const uint64_t max_global = (total_nodes_ > 0 && neurons_per_pe > 0)
         ? static_cast<uint64_t>(total_nodes_) * neurons_per_pe
         : 0ULL;
+    static long diag_cap_cache = LONG_MIN;
+    if (diag_cap_cache == LONG_MIN) {
+        const char* env = std::getenv("STEP_ACTIVATION_DIAG_CAP");
+        diag_cap_cache = env ? std::strtol(env, nullptr, 10) : -1;
+    }
+    const uint64_t diag_cap = (diag_cap_cache > 0) ? static_cast<uint64_t>(diag_cap_cache) : 0ULL;
     std::mt19937_64 rng(step_activation_seed_ ^ (static_cast<uint64_t>(seq) + (static_cast<uint64_t>(node_id_) << 32)));
     std::uniform_int_distribution<uint64_t> post_dist(0, local_total - 1);
     std::bernoulli_distribution pick(fraction);
@@ -1685,10 +1716,18 @@ void MultiCorePE::injectStepActivations(uint32_t seq, uint64_t sim_time_ns) {
     uint64_t route_hits = 0;
     uint64_t route_misses = 0;
     uint64_t local_drops = 0;
+    bool diag_cap_hit = false;
 
     // 诊断：仅在 node_id_=0 且 seq 较小时，对路由表做一次全局采样，避免日志爆炸
     static bool route_diag_done = false;
-    if (!route_diag_done && node_id_ == 0 && seq <= 1 && step_activation_use_bcsr_routes_) {
+    static int diag_enable_cache = INT_MIN;
+    if (diag_enable_cache == INT_MIN) {
+        const char* env = std::getenv("STEP_ACTIVATION_DIAG_ENABLE");
+        diag_enable_cache = env ? std::atoi(env) : 0;
+    }
+    const bool step_diag_enabled = (diag_enable_cache != 0);
+
+    if (step_diag_enabled && !route_diag_done && node_id_ == 0 && seq <= 1 && step_activation_use_bcsr_routes_) {
         uint64_t with_routes = 0;
         uint64_t max_routes = 0;
         for (size_t i = 0; i < step_activation_routes_.size(); ++i) {
@@ -1716,7 +1755,7 @@ void MultiCorePE::injectStepActivations(uint32_t seq, uint64_t sim_time_ns) {
             const auto* routes = use_routes ? &step_activation_routes_[pre_global] : nullptr;
             // 诊断：采样少量带路由的 pre，观察路由规模
             static uint64_t route_sampled = 0;
-            if (use_routes && routes && !routes->empty() &&
+            if (step_diag_enabled && use_routes && routes && !routes->empty() &&
                 node_id_ == 0 && seq <= 1 && route_sampled < 16) {
                 printf("[[step-diag-pre]] node=%d seq=%u pre_global=%u routes=%zu\n",
                        node_id_, seq, pre_global, routes->size());
@@ -1753,8 +1792,15 @@ void MultiCorePE::injectStepActivations(uint32_t seq, uint64_t sim_time_ns) {
                     sendExternalSpike(spike);
                     spikes_injected++;
                 }
+
+                if (diag_cap && spikes_injected >= diag_cap) {
+                    diag_cap_hit = true;
+                    break;
+                }
             }
+            if (diag_cap_hit) break;
         }
+        if (diag_cap_hit) break;
     }
 
     if (stat_step_activation_pre_selected_ && sources_selected) {
@@ -1789,6 +1835,19 @@ void MultiCorePE::injectStepActivations(uint32_t seq, uint64_t sim_time_ns) {
             fraction,
             step_activation_fanout_,
             step_activation_use_bcsr_routes_ ? 1 : 0);
+    }
+
+    if (node_id_ == 0 && seq <= 1) {
+        printf("[[step-diag-stats]] node=%d seq=%u sources=%llu attempts=%llu spikes=%llu hits=%llu miss=%llu cap=%" PRIu64 " cap_hit=%d\n",
+               node_id_, seq,
+               static_cast<unsigned long long>(sources_selected),
+               static_cast<unsigned long long>(spike_attempts),
+               static_cast<unsigned long long>(spikes_injected),
+               static_cast<unsigned long long>(route_hits),
+               static_cast<unsigned long long>(route_misses),
+               diag_cap,
+               diag_cap_hit ? 1 : 0);
+        fflush(stdout);
     }
 }
 
@@ -2052,10 +2111,17 @@ bool MultiCorePE::buildRoutesFromBcsrFile_(const std::string& path, uint32_t cor
     return true;
 }
 
-    bool MultiCorePE::loadBcsrReachability_() {
-        if (step_activation_bcsr_template_.empty()) {
-            output_->verbose(CALL_INFO, 0, 0, "⚠️ 未提供 step_activation_bcsr_template，无法加载BCSR索引\n");
-            return false;
+bool MultiCorePE::loadBcsrReachability_() {
+    if (output_) {
+        output_->verbose(CALL_INFO, 0, 0,
+            "[step-activation] node=%d loadBcsrReachability enable=%d use_bcsr=%d template=%s build_local_only=%d rows_per_core=%u br=%u bc=%u\n",
+            node_id_, (int)step_activation_enable_, (int)step_activation_use_bcsr_routes_,
+            step_activation_bcsr_template_.c_str(), (int)step_activation_build_local_only_,
+            step_activation_bcsr_rows_per_core_, step_activation_bcsr_br_, step_activation_bcsr_bc_);
+    }
+    if (step_activation_bcsr_template_.empty()) {
+        output_->verbose(CALL_INFO, 0, 0, "⚠️ 未提供 step_activation_bcsr_template，无法加载BCSR索引\n");
+        return false;
         }
         const uint64_t total_pre = static_cast<uint64_t>(global_neuron_base_) + static_cast<uint64_t>(total_neurons_);
         step_activation_routes_.assign(static_cast<size_t>(total_pre), {});
@@ -2083,9 +2149,15 @@ bool MultiCorePE::buildRoutesFromBcsrFile_(const std::string& path, uint32_t cor
             output_->verbose(CALL_INFO, 1, 0,
                 "[step-activation] BCSR reachability loaded: pre_with_routes=%zu total_pre=%zu\n",
                 with_routes, step_activation_routes_.size());
+            // 每个节点仅打印一次远端/本地比例摘要，确认跨PE路由是否存在
+            computeRouteRatios_();
             step_activation_route_ack_logged_ = true;
         }
-        computeRouteRatios_();
+        if (output_) {
+            output_->verbose(CALL_INFO, 0, 0,
+                "[step-activation] node=%d loadBcsrReachability success route_vectors=%zu\n",
+                node_id_, step_activation_routes_.size());
+        }
     } else {
         if (!step_activation_route_warned_) {
             output_->verbose(CALL_INFO, 0, 0,
@@ -2093,6 +2165,11 @@ bool MultiCorePE::buildRoutesFromBcsrFile_(const std::string& path, uint32_t cor
             step_activation_route_warned_ = true;
         }
         step_activation_routes_.clear();
+        if (output_) {
+            output_->verbose(CALL_INFO, 0, 0,
+                "[step-activation] node=%d loadBcsrReachability FAILED\n",
+                node_id_);
+        }
     }
     return success;
 }
@@ -2113,9 +2190,11 @@ void MultiCorePE::computeRouteRatios_() const {
     }
     double local_ratio = (total_edges ? (double)local_edges / (double)total_edges : 0.0);
     double remote_ratio = (total_edges ? (double)remote_edges / (double)total_edges : 0.0);
-    output_->verbose(CALL_INFO, 1, 0,
-        "[step-activation] route_ratio: node=%d local_edges=%" PRIu64 " remote_edges=%" PRIu64 " total=%" PRIu64 " local_ratio=%.4f remote_ratio=%.4f\n",
-        node_id_, local_edges, remote_edges, total_edges, local_ratio, remote_ratio);
+    if (output_) {
+        output_->verbose(CALL_INFO, 1, 0,
+            "[step-activation] route_ratio: node=%d local_edges=%" PRIu64 " remote_edges=%" PRIu64 " total=%" PRIu64 " local_ratio=%.4f remote_ratio=%.4f\n",
+            node_id_, local_edges, remote_edges, total_edges, local_ratio, remote_ratio);
+    }
 }
 
 void MultiCorePE::initializeDirectionLinks() {

@@ -756,6 +756,11 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     bcsr_colidx_addr_ = base_addr_ + ci_off;
     bcsr_blockdata_addr_ = base_addr_ + bd_off;
     bcsr_blockids_addr_ = (id_off > 0) ? (base_addr_ + id_off) : 0;
+    SNNDL_LOG(1, "[diag-bcsr-base] node=%u core=%u base=0x%lx rowptr=0x%lx colidx=0x%lx blockdata=0x%lx blockids=0x%lx (off rp=%lu ci=%lu bd=%lu id=%lu)\n",
+        node_id_, core_id_, (unsigned long)base_addr_, (unsigned long)bcsr_rowptr_addr_,
+        (unsigned long)bcsr_colidx_addr_, (unsigned long)bcsr_blockdata_addr_,
+        (unsigned long)bcsr_blockids_addr_,
+        (unsigned long)rp_off, (unsigned long)ci_off, (unsigned long)bd_off, (unsigned long)id_off);
     bcsr_row_index_cache_cap_ = params.find<uint32_t>("bcsr_row_index_cache_cap", 64);
     bcsr_block_cache_cap_ = params.find<uint32_t>("bcsr_block_cache_cap", 256);
     if (aosoa_block_rows_ == 0) aosoa_block_rows_ = (bcsr_br_ > 0) ? bcsr_br_ : 16;
@@ -817,6 +822,10 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     routing_weight_driven_ = (routing_mode == "weight_driven");
     weights_template_ = params.find<std::string>("weights_template", "");
     total_nodes_cfg_ = params.find<uint32_t>("total_nodes", 16);
+    // 默认按 num_cores * num_neurons 推导；但允许Python侧显式传入 neurons_per_pe
+    uint32_t np_from_params = params.find<uint32_t>("neurons_per_pe", 0);
+    if (np_from_params > 0) neurons_per_pe_cfg_ = np_from_params;
+    else neurons_per_pe_cfg_ = static_cast<uint32_t>(total_cores_) * static_cast<uint32_t>(num_neurons_);
     routing_epsilon_ = params.find<float>("routing_epsilon", 1e-8f);
     routing_topk_ = params.find<uint32_t>("routing_topk", 0);
     routing_topk_per_pe_ = params.find<uint32_t>("routing_topk_per_pe", 0);
@@ -1146,8 +1155,18 @@ void SnnPESubComponent::init(unsigned int phase) {
                     // 统计
                     uint64_t total_entries = 0; for (auto &kv : *routes_shared_) total_entries += (uint64_t)kv.second.size();
                     if (stat_routes_entries_) stat_routes_entries_->addData(total_entries);
-                    SNNDL_LOG(1, "✅ 核心%d构建共享路由: 源条目=%zu, 总目的=%" PRIu64 "\n",
-                              core_id_, routes_shared_->size(), total_entries);
+                    // 统计本地/远端目的比例（仅一次性日志，调试用）
+                    uint64_t local_edges = 0, remote_edges = 0;
+                    const uint32_t denom = (neurons_per_pe_cfg_ > 0) ? neurons_per_pe_cfg_ : num_neurons_;
+                    for (const auto &kv : *routes_shared_) {
+                        for (auto post_global : kv.second) {
+                            uint32_t pe_of_post = (denom ? (post_global / denom) : 0);
+                            if (pe_of_post == node_id_) ++local_edges; else ++remote_edges;
+                        }
+                    }
+                    // 路由摘要（调试用，保持低噪）：
+                    SNNDL_LOG(1, "[route-summary] node=%u core=%d entries=%zu total=%" PRIu64 " local=%" PRIu64 " remote=%" PRIu64 "\n",
+                              node_id_, core_id_, routes_shared_->size(), total_entries, local_edges, remote_edges);
                     // 发布到进程级缓存
                     std::string cache_key = buildRouteCacheKey();
                     if (!cache_key.empty()) {
@@ -2007,7 +2026,9 @@ void SnnPESubComponent::handleNeuronFire_(uint32_t neuron_idx, float v_before, f
                 const auto& dests = itrt->second;
                 if (stat_fanout_per_spike_) stat_fanout_per_spike_->addData((uint64_t)dests.size());
                 for (uint32_t dest_global : dests) {
-                    uint32_t dest_node = dest_global / num_neurons_;
+                    // 注意：这里要用每个PE的神经元数来计算目的节点，而不是本core行数
+                    uint32_t denom = (neurons_per_pe_cfg_ > 0) ? neurons_per_pe_cfg_ : num_neurons_;
+                    uint32_t dest_node = dest_global / denom;
                     float output_weight = 1.0f;
                     SpikeEvent* output_spike = new SpikeEvent(
                         source_global,
@@ -2324,6 +2345,9 @@ void SnnPESubComponent::processLocalSpike(SpikeEvent* spike_event) {
                     "[GAS][Delta][cache-hit] core=%u post=%u dv=%.6f (key-cached)\n",
                     core_id_, post_local, weight);
             }
+            // 诊断：累计ΔV
+            diag_dv_sum_window_ += (double)weight;
+            if (weight != 0.0f) diag_dv_updates_nonzero_++;
             accUpdate_(post_local, weight);
         }
         recordSynapticAccess_();
@@ -2500,6 +2524,15 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                                 "[diag-edges] BeginGather seq=%u edges_curr=%zu edges_prev=%zu\n",
                                 curr_stage_seq_, edge_collector_.currSize(), edge_collector_.prevSize());
                         }
+                        if (!base_addr_log_once_) {
+                            base_addr_log_once_ = true;
+                            std::printf("[diag-base] node=%u core=%u base_addr=0x%lx rowptr=0x%lx colidx=0x%lx block=0x%lx\n",
+                                node_id_, core_id_,
+                                (unsigned long)base_addr_,
+                                (unsigned long)bcsr_rowptr_addr_,
+                                (unsigned long)bcsr_colidx_addr_,
+                                (unsigned long)bcsr_blockdata_addr_);
+                        }
                         if (window_read_debug_) {
                         SNNDL_LOG(1, "[diag-stage] BeginGather window=%" PRIu64 " stage=%d posts_prev=%zu active_prev=%zu posts_curr=%zu active_curr=%zu qsize=%zu\n",
                             (uint64_t)op->superstep, static_cast<int>(gas_stage_),
@@ -2547,14 +2580,13 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                                 uint32_t post_local = 0;
                                 for (uint32_t pre = 0; pre < 8; ++pre) {
                                     requestWeightBCSR(pre, post_local, [this, pre, post_local](float w){
+                                        float fv = readBcsrWeightFromFile_(post_local, pre);
+                                        std::printf("[VERIFY][probe-bcsr-forced] node=%u core=%u post=%u pre=%u mem=%.6f file=%.6f\n",
+                                                   node_id_, core_id_, post_local, pre, w, fv);
                                         if (output_) {
                                             output_->verbose(CALL_INFO, 1, 0,
-                                                "[VERIFY][probe-bcsr-forced] post=%u pre=%u value=%.6f\n",
-                                                post_local, pre, w);
-                                            float fv = readBcsrWeightFromFile_(post_local, pre);
-                                            output_->verbose(CALL_INFO, 1, 0,
-                                                "[VERIFY][file-probe-forced] post=%u pre=%u file_value=%.6f\n",
-                                                post_local, pre, fv);
+                                                "[VERIFY][probe-bcsr-forced] post=%u pre=%u value=%.6f file=%.6f\n",
+                                                post_local, pre, w, fv);
                                         }
                                     });
                                 }
@@ -2612,6 +2644,9 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                                 "[GAS][Delta] core=%u seq=%u updates=%" PRIu64 ", posts=%" PRIu64 ", hwm_bytes=%" PRIu64 ", spill_records=%" PRIu64 ", spilled_bytes=%" PRIu64 "\n",
                                 core_id_, curr_stage_seq_, acc_updates_count_, acc_posts_touched_count_,
                                 acc_hwm_bytes_max_, acc_spill_records_count_, acc_spilled_bytes_sum_);
+                            output_->verbose(CALL_INFO, 1, 0,
+                                "[GAS][Delta][sum] core=%u seq=%u dv_sum=%.6f nonzero_updates=%" PRIu64 "\n",
+                                core_id_, curr_stage_seq_, diag_dv_sum_window_, diag_dv_updates_nonzero_);
                         }
                         if (!acc_spill_log_.empty()) {
                             // Merge spill into map: sort by post and reduce
@@ -3798,7 +3833,7 @@ bool SnnPESubComponent::appendRoutesFromBcsrFile(const std::string& path, uint32
     const size_t floats_per_block = static_cast<size_t>(br) * static_cast<size_t>(bc);
     std::vector<float> blockdata(floats_per_block, 0.0f);
     std::vector<uint32_t> blockids(floats_per_block, BCSR_SENTINEL_ID);
-    const uint64_t total_global_neurons = static_cast<uint64_t>(total_nodes_cfg_) * static_cast<uint64_t>(num_neurons_);
+    const uint64_t total_global_neurons = static_cast<uint64_t>(total_nodes_cfg_) * static_cast<uint64_t>(neurons_per_pe_cfg_ > 0 ? neurons_per_pe_cfg_ : num_neurons_);
     uint64_t block_counter = 0;
     for (uint32_t block_row = 0; block_row < n_block_rows; ++block_row) {
         uint32_t begin = rowptr[block_row];

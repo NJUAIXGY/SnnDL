@@ -194,6 +194,8 @@ SnnNIC::SnnNIC(ComponentId_t id, Params& params)
     nodes_per_rank_ = 0;
     
     int verbose = params.find<int>("verbose", 0);
+    const char* sent_env = std::getenv("SNNDL_SENTINEL_ENABLE");
+    if (sent_env && std::atoi(sent_env) != 0 && verbose == 0) verbose = 1;
     
     // 初始化日志输出
     output = new Output("SnnNIC[@p:@l]: ", verbose, 0, Output::STDOUT);
@@ -309,8 +311,12 @@ void SnnNIC::sendSpike(SpikeEvent* spike_event)
     if (vn_use >= static_cast<int>(effective_num_vns_)) vn_use = 0;
     req->vn = vn_use;
     bool sent = false;
-    if (network && network->spaceToSend(req->vn, req->size_in_bits)) {
-        sent = network->send(req, req->vn);
+    bool canSpace = false;
+    if (network) {
+        canSpace = network->spaceToSend(req->vn, req->size_in_bits);
+        if (canSpace) {
+            sent = network->send(req, req->vn);
+        }
     }
     if (sent) {
         stat_packets_sent->addData(1);
@@ -318,10 +324,12 @@ void SnnNIC::sendSpike(SpikeEvent* spike_event)
         spikes_sent_count++;
         // 成功发送后，NIC 接管了该脉冲的生命周期，释放本地对象
         delete spike_event;
+        // debug print removed for production
     } else {
         // 无空间，进入待发送队列
         pending_spikes.push(spike_event);
         delete req;
+        // debug print removed for production
     }
 }
 

@@ -136,11 +136,14 @@ GatherBufferIF::~GatherBufferIF() {
 
 void GatherBufferIF::init(unsigned int phase) {
     backend_->init(phase);
-    // 记录所有 phase 的初始化情况，便于确认 window_auto 是否正确生效
-    printf("[[sentinel-gbi-init]] phase=%u window_auto=%d manual=%d clock=%s win_cyc_g=%" PRIu64 " win_cyc_a=%" PRIu64 " win_cyc_s=%" PRIu64 " auto_bytes=%" PRIu64 " auto_reads=%" PRIu64 " defer=%d\n",
-           phase, window_auto_ ? 1 : 0, manual_window_drive_ ? 1 : 0, clock_freq_.c_str(),
-           win_cyc_gather_, win_cyc_apply_, win_cyc_scatter_,
-           gather_auto_end_bytes_, gather_auto_end_reads_, defer_issue_until_apply_ ? 1 : 0);
+    // 记录所有 phase 的初始化情况（仅在显式启用时打印）
+    const char* sent_env = std::getenv("SNNDL_SENTINEL_ENABLE");
+    if (sent_env && std::atoi(sent_env) != 0) {
+        printf("[[sentinel-gbi-init]] phase=%u window_auto=%d manual=%d clock=%s win_cyc_g=%" PRIu64 " win_cyc_a=%" PRIu64 " win_cyc_s=%" PRIu64 " auto_bytes=%" PRIu64 " auto_reads=%" PRIu64 " defer=%d\n",
+               phase, window_auto_ ? 1 : 0, manual_window_drive_ ? 1 : 0, clock_freq_.c_str(),
+               win_cyc_gather_, win_cyc_apply_, win_cyc_scatter_,
+               gather_auto_end_bytes_, gather_auto_end_reads_, defer_issue_until_apply_ ? 1 : 0);
+    }
     if (phase == 0 && window_auto_) {
         out_.verbose(CALL_INFO, 0, 0,
             "[diag-gbi-init] window_auto=%d manual=%d clock=%s win_cyc_g=%" PRIu64 " win_cyc_a=%" PRIu64 " win_cyc_s=%" PRIu64 " auto_bytes=%" PRIu64 " auto_reads=%" PRIu64 " defer=%d\n",
@@ -856,7 +859,8 @@ void GatherBufferIF::emitApplyResponsesBuf_(int buf) {
                 uint64_t abs_addr = g.base + (uint64_t)s.offset;
                 out_.verbose(CALL_INFO, 1, 0,
                     "[VERIFY][probe-gas] granule_base=0x%lx sub_off=%u abs=0x%lx size=%u f0=%.6f\n",
-                    (unsigned long)g.base, (unsigned)s.offset, (unsigned long)abs_addr, (unsigned)s.size, f0);
+                    (unsigned long)g.base, (unsigned)s.offset,
+                    (unsigned long)abs_addr, (unsigned)s.size, f0);
             }
             if (!probe_csv_path_.empty()) {
                 // write one line per sub-read with addr,size,first-float (read from SRAM block)
@@ -973,17 +977,21 @@ bool GatherBufferIF::clockTick(Cycle_t) {
     else if (stage_ == Stage::Apply) stage_cycles_accum_[1]++;
     else if (stage_ == Stage::Scatter) stage_cycles_accum_[2]++;
     if (stage_ == Stage::Gather) {
-        // 若本窗无任何需求（无granule/无required），避免因时间门限空转切窗
-        if (sb_[gather_buf_index_].granules.empty() && sb_[gather_buf_index_].required_set.empty()) {
-            // 保持在 Gather 等待实际请求到来
-            return false;
-        }
-        if (win_cyc_gather_ && stage_counter_ >= win_cyc_gather_) {
-            sb_[gather_buf_index_].end_gather_seen = true;
-            maybeEnterApply_();
-            // in immediate path stage_ may now be Idle or Scatter; optional wait handled there
+        const bool empty_window = sb_[gather_buf_index_].granules.empty() && sb_[gather_buf_index_].required_set.empty();
+        if (empty_window) {
+            // 尝试主动结束 Gather 并进入 Apply（即便没有边），保持窗口推进
+            if (win_cyc_gather_ == 0 || stage_counter_ >= win_cyc_gather_) {
+                sb_[gather_buf_index_].end_gather_seen = true;
+                maybeEnterApply_();
+            }
         } else {
-            tryAutoEndGather_();
+            if (win_cyc_gather_ && stage_counter_ >= win_cyc_gather_) {
+                sb_[gather_buf_index_].end_gather_seen = true;
+                maybeEnterApply_();
+                // in immediate path stage_ may now be Idle or Scatter; optional wait handled there
+            } else {
+                tryAutoEndGather_();
+            }
         }
     } else if (stage_ == Stage::Apply) {
         // 并行：在Apply阶段也推进下一窗口的Gather构建与下发

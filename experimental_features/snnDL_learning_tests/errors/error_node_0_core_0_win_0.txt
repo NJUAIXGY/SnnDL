@@ -1,2 +1,0 @@
-# local_neuron_id  error_value
-0 1.0

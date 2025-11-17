@@ -399,6 +399,12 @@ private:
     // 本地统计：仅在环形跨核投递成功时累加
     uint64_t inter_core_messages_count_ = 0;
 
+    // === 新增：Step 注入就绪与延迟注入缓冲 ===
+    bool step_injection_ready_ = false;         // 在外部NIC完成init之后置为true
+    bool pending_step_inject_ = false;          // 是否有延迟注入待执行
+    uint32_t pending_step_seq_ = 0;             // 待注入的窗口序号
+    uint64_t pending_step_ts_ns_ = 0;           // 待注入的时间戳（ns）
+
     // PE-level per-window spikes aggregation
     std::unordered_map<uint32_t, uint64_t> window_spikes_pe_;
     std::string stage_events_csv_path_;

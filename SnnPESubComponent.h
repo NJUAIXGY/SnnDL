@@ -702,6 +702,8 @@ private:
     uint64_t base_addr_;
     uint32_t node_id_;
     int verbose_;
+    // 路由/目的节点计算所需：每个PE的神经元数（与 num_neurons_ 不同，后者为本core行数）
+    uint32_t neurons_per_pe_cfg_ = 0;
     bool enable_weight_fetch_;
     bool write_weights_on_init_;
     uint64_t memory_warmup_cycles_;
@@ -709,6 +711,7 @@ private:
     uint32_t max_outstanding_requests_;
     uint32_t max_cache_entries_;
     bool use_event_weight_fallback_;
+    bool base_addr_log_once_ = false;
     bool event_weight_fallback_warned_;
     bool merge_read_cacheline_;
     bool merge_read_row_;
@@ -755,6 +758,10 @@ private:
 
     // 新增：全网读取模式参数
     uint32_t weights_cols_;   // 列数（例如16x256中的256）
+    // 诊断：ΔV 汇总（每窗复位）
+    double diag_dv_sum_window_ = 0.0;
+    uint64_t diag_dv_updates_nonzero_ = 0;
+    uint64_t diag_posts_acc_nonzero_ = 0;
     bool use_post_row_pre_col_; // 索引模式：false=pre_row_post_col，true=post_row_pre_col
     bool enable_detailed_map_log_;
     bool log_weight_details_;

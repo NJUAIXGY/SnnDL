@@ -439,7 +439,7 @@ PINTOOL3_RUNTIME =
 PINTOOL_CPPFLAGS = 
 PINTOOL_DIR = 
 PINTOOL_LDFLAGS = 
-PINTOOL_PATH = /usr/lib/jvm/java-17-openjdk-amd64/bin:/home/xgy/remote/sst_install/bin:/home/xgy/remote/sst_install/bin:/home/xgy/.vscode-server/cli/servers/Stable-0f0d87fa9e96c856c5212fc86db137ac0d783365/server/bin/remote-cli:/home/xgy/remote/sst_install/bin:/tmp/.tmpns6GeD:/home/xgy/codex-0.45.0/vendor/x86_64-unknown-linux-musl/path:/home/xgy/remote/sst_install/bin:/home/xgy/.vscode-server/cli/servers/Stable-0f0d87fa9e96c856c5212fc86db137ac0d783365/server/bin/remote-cli:/home/xgy/miniconda3/bin:/home/xgy/miniconda3/condabin:/home/xgy/.nvm/versions/node/v22.20.0/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/home/xgy/.vscode-server/data/User/globalStorage/github.copilot-chat/debugCommand:/home/xgy/.vscode-server/extensions/ms-python.debugpy-2025.14.1-linux-x64/bundled/scripts/noConfigScripts:/home/xgy/.vscode-server/data/User/globalStorage/github.copilot-chat/debugCommand
+PINTOOL_PATH = /usr/lib/jvm/java-17-openjdk-amd64/bin:/home/xgy/remote/sst_install/bin:/home/xgy/remote/sst_install/bin:/home/xgy/.vscode-server/cli/servers/Stable-0f0d87fa9e96c856c5212fc86db137ac0d783365/server/bin/remote-cli:/home/xgy/.local/bin:/home/xgy/remote/sst_install/bin:/tmp/.tmpns6GeD:/home/xgy/codex-0.45.0/vendor/x86_64-unknown-linux-musl/path:/home/xgy/remote/sst_install/bin:/home/xgy/.vscode-server/cli/servers/Stable-0f0d87fa9e96c856c5212fc86db137ac0d783365/server/bin/remote-cli:/home/xgy/miniconda3/bin:/home/xgy/miniconda3/condabin:/home/xgy/.nvm/versions/node/v22.20.0/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/home/xgy/.vscode-server/data/User/globalStorage/github.copilot-chat/debugCommand:/home/xgy/.vscode-server/data/User/globalStorage/github.copilot-chat/debugCommand
 PINTOOL_RUNTIME = 
 PIN_CPPFLAGS = -g   -Wall   -Werror   -Wno-unknown-pragmas   -D__PIN__=1 -DPIN_CRT=1   -fno-stack-protector   -fno-exceptions   -funwind-tables   -fasynchronous-unwind-tables   -fomit-frame-pointer   -fno-strict-aliasing   -fno-rtti   -faligned-new   -fpic   -DTARGET_IA32E   -DHOST_IA32E   -DTARGET_LINUX   -DPIN_VERSION_MINOR=
 PIN_CPPFLAGS_COMPILER = -fno-exceptions          -fabi-version=2
@@ -457,8 +457,8 @@ SET_MAKE =
 SHELL = /bin/bash
 SHM_LIB =  
 SSTELEMENTS_GIT_BRANCH = HEAD
-SSTELEMENTS_GIT_COMMITCOUNT = 15376
-SSTELEMENTS_GIT_HEADSHA = d713776ea861fa343fea45cbdd4f48021898d338
+SSTELEMENTS_GIT_COMMITCOUNT = 15377
+SSTELEMENTS_GIT_HEADSHA = b86eb21b52465e4c69eb90edaf7a423896f3838e
 SST_ACTIVE_ELEMENT_LIBRARIES =  ariel cacheTracer cassini cramSim ember firefly gensa golem hermes iris kingsley mask-mpi memHierarchy mercury merlin messier miranda mmu osseous prospero rdmaNic samba shogun simpleElementExample simpleSimulation SnnDL thornhill vanadis vaultsim zodiac
 SST_CONFIG_TOOL = /home/xgy/remote/sst_install/bin/sst-config
 SST_DIST_ELEMENT_LIBRARIES =  ariel balar cacheTracer cassini cramSim ember firefly gensa golem hermes iris kingsley mask-mpi memHierarchy mercury merlin messier miranda mmu osseous prospero rdmaNic samba shogun simpleElementExample simpleSimulation SnnDL thornhill vanadis vaultsim zodiac
