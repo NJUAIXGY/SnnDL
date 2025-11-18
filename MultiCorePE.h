@@ -309,6 +309,7 @@ private:
     int num_cores_;
     int neurons_per_core_;
     int total_neurons_;
+    uint32_t neurons_per_pe_cfg_ = 0; // 脚本可传入，否则按 num_cores*neurons_per_core 推导（Step/NIC 计算用）
     int node_id_;
     int total_nodes_ = 1;
     uint64_t sim_stop_ns_ = 0;      // 组件主控停止时间（ns）；>0 启用

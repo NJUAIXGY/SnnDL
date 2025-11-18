@@ -37,6 +37,17 @@ bool snndl_rowptr_fallback_disable_flag = false;
 using namespace SST;
 using namespace SST::SnnDL;
 
+namespace {
+inline bool snndlDiagEnabled() {
+    static int cached = -1;
+    if (cached == -1) {
+        const char* env = std::getenv("SNNDL_DIAG_ENABLE");
+        cached = (env && std::atoi(env) != 0) ? 1 : 0;
+    }
+    return cached == 1;
+}
+}
+
 #include "GasCustomCmd.h"
 
 // Lightweight logging helpers (file-local). Use consistent style across SnnDL.
@@ -616,9 +627,15 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
       memory_(nullptr),
       gather_buffer_if_(nullptr),
       memory_link_(nullptr) {
-    // 构造期最早哨兵（避免依赖 output_ 未就绪）
-    fprintf(stdout, "[[sentinel-core-ctor]] core_ctor enter\n");
-    fflush(stdout);
+    // 构造期最早哨兵（避免依赖 output_ 未就绪）——默认静默，除非显式启用 SNNDL_SENTINEL_ENABLE
+    static const bool kSentinelOn = [](){
+        const char* env = std::getenv("SNNDL_SENTINEL_ENABLE");
+        return env && std::atoi(env) != 0;
+    }();
+    if (kSentinelOn) {
+        fprintf(stdout, "[[sentinel-core-ctor]] core_ctor enter\n");
+        fflush(stdout);
+    }
     // 提前构建一个最低等级的输出对象，避免后续早期初始化路径使用 output_ 时发生空指针
     // 真实 verbose 等级稍后在解析完参数后再生效（此处仅用于早期诊断与防护）
     if (!output_) {
@@ -632,7 +649,9 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     
     // 读取配置参数
     core_id_ = params.find<int>("core_id", 0);
-    fprintf(stdout, "[[sentinel-core-ctor]] after params: core_id=%d\n", core_id_);
+    if (kSentinelOn) {
+        fprintf(stdout, "[[sentinel-core-ctor]] after params: core_id=%d\n", core_id_);
+    }
     total_cores_ = params.find<int>("total_cores", 8);
     global_neuron_base_ = params.find<uint64_t>("global_neuron_base", 0);
     num_neurons_ = params.find<uint32_t>("num_neurons", 64);
@@ -644,8 +663,10 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     base_addr_ = params.find<uint64_t>("base_addr", 0);
     node_id_ = params.find<uint32_t>("node_id", 0);
     verbose_ = params.find<int>("verbose", 0);
-    fprintf(stdout, "[[sentinel-core-ctor]] after params2: node_id=%u num_neurons=%u base_addr=%" PRIu64 "\n",
-            node_id_, num_neurons_, (uint64_t)base_addr_);
+    if (kSentinelOn) {
+        fprintf(stdout, "[[sentinel-core-ctor]] after params2: node_id=%u num_neurons=%u base_addr=%" PRIu64 "\n",
+                node_id_, num_neurons_, (uint64_t)base_addr_);
+    }
     enable_weight_fetch_ = params.find<int>("enable_weight_fetch", 0) != 0;
     // 现在再初始化依赖core指针的轻量结构
     stage_event_hub_.init(this);
@@ -667,7 +688,14 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     weight_cache_.reserve(max_cache_entries_ ? max_cache_entries_ : 1);
     gas_enable_ = params.find<int>("gas_enable", 0) != 0; // 默认关闭
     gas_window_mode_ = params.find<int>("gas_window_mode", 0) != 0; // 当为true时采用GatherBufferIF的window驱动
-    gas_manual_window_drive_ = params.find<int>("gas_manual_window_drive", 0) != 0;
+    // Deprecate manual window driving: read param for compatibility but force-disable
+    bool manual_drive_param = params.find<int>("gas_manual_window_drive", 0) != 0;
+    gas_manual_window_drive_ = false;
+    if (manual_drive_param && output_) {
+        output_->verbose(CALL_INFO, 0, 0,
+            "[diag-gas-config] core=%d gas_manual_window_drive 已弃用，仍将使用自动窗口驱动\n",
+            core_id_);
+    }
     manual_gas_gather_cycles_cfg_ = params.find<uint64_t>("gas_window_cycles_gather", 200);
     if (manual_gas_gather_cycles_cfg_ == 0) manual_gas_gather_cycles_cfg_ = 1;
     // 方案1（slice顺序执行）
@@ -700,6 +728,13 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     edge_collector_max_capacity_ = static_cast<size_t>(params.find<uint64_t>("edge_collector_max_capacity", 1000000));
     if (window_read_enable_) {
         reserveWindowContainers_();
+        if (!record_edge_idle_enable_ && !record_edge_scatter_enable_ && window_read_debug_ && output_ && snndlDiagEnabled()) {
+            output_->verbose(CALL_INFO, 0, 0,
+                "[diag-record-edge] core=%d 仅在Gather阶段记录边 (Apply/Idle/Scatter=0)", core_id_);
+        }
+    } else if (window_read_debug_ && output_ && snndlDiagEnabled()) {
+        output_->verbose(CALL_INFO, 0, 0,
+            "[diag-record-edge] core=%d window_read_enable=0 => 忽略 window_read_debug", core_id_);
     }
     // 全网读取扩展参数
     weights_cols_ = params.find<uint32_t>("weights_cols", 0);
@@ -756,11 +791,29 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     bcsr_colidx_addr_ = base_addr_ + ci_off;
     bcsr_blockdata_addr_ = base_addr_ + bd_off;
     bcsr_blockids_addr_ = (id_off > 0) ? (base_addr_ + id_off) : 0;
-    SNNDL_LOG(1, "[diag-bcsr-base] node=%u core=%u base=0x%lx rowptr=0x%lx colidx=0x%lx blockdata=0x%lx blockids=0x%lx (off rp=%lu ci=%lu bd=%lu id=%lu)\n",
-        node_id_, core_id_, (unsigned long)base_addr_, (unsigned long)bcsr_rowptr_addr_,
-        (unsigned long)bcsr_colidx_addr_, (unsigned long)bcsr_blockdata_addr_,
-        (unsigned long)bcsr_blockids_addr_,
-        (unsigned long)rp_off, (unsigned long)ci_off, (unsigned long)bd_off, (unsigned long)id_off);
+    bool offsets_monotonic = (ci_off >= rp_off) && (bd_off >= ci_off);
+    bool offsets_aligned = ((rp_off | ci_off | bd_off | id_off) & 0x3FUL) == 0;
+    if (!base_addr_log_once_) {
+        base_addr_log_once_ = true;
+        if (window_read_debug_ && output_) {
+            output_->verbose(CALL_INFO, 0, 0,
+                "[diag-bcsr-base] node=%u core=%u base=0x%lx rp=0x%lx ci=0x%lx bd=0x%lx ids=0x%lx rp_off=%lu ci_off=%lu bd_off=%lu id_off=%lu align64=%d mono=%d\n",
+                node_id_, core_id_,
+                (unsigned long)base_addr_,
+                (unsigned long)bcsr_rowptr_addr_,
+                (unsigned long)bcsr_colidx_addr_,
+                (unsigned long)bcsr_blockdata_addr_,
+                (unsigned long)bcsr_blockids_addr_,
+                (unsigned long)rp_off, (unsigned long)ci_off, (unsigned long)bd_off, (unsigned long)id_off,
+                offsets_aligned ? 1 : 0,
+                offsets_monotonic ? 1 : 0);
+            if (!offsets_aligned || !offsets_monotonic) {
+                output_->verbose(CALL_INFO, 0, 0,
+                    "[diag-bcsr-base] ⚠️ node=%u core=%u BCSR offset异常：aligned=%d monotonic=%d\n",
+                    node_id_, core_id_, offsets_aligned ? 1 : 0, offsets_monotonic ? 1 : 0);
+            }
+        }
+    }
     bcsr_row_index_cache_cap_ = params.find<uint32_t>("bcsr_row_index_cache_cap", 64);
     bcsr_block_cache_cap_ = params.find<uint32_t>("bcsr_block_cache_cap", 256);
     if (aosoa_block_rows_ == 0) aosoa_block_rows_ = (bcsr_br_ > 0) ? bcsr_br_ : 16;
@@ -785,7 +838,12 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     quiet_finish_logs_ = params.find<int>("quiet_finish_logs", 0) != 0;
     const int record_apply_default = (gas_window_mode_ && apply_acc_enable_) ? 1 : 0;
     record_edge_apply_enable_ = params.find<int>("record_edge_apply_enable", record_apply_default) != 0;
-    record_edge_idle_enable_ = params.find<int>("record_edge_idle_enable", 1) != 0;
+    record_edge_idle_enable_ = params.find<int>("record_edge_idle_enable", 0) != 0;
+    if (record_edge_idle_enable_ && output_ && snndlDiagEnabled()) {
+        output_->verbose(CALL_INFO, 0, 0,
+            "[diag-gas-config] core=%d 已启用 record_edge_idle（诊断配置，回归默认关闭）\n",
+            core_id_);
+    }
     record_edge_scatter_enable_ = params.find<int>("record_edge_scatter_enable", 0) != 0;
 
     // ---- Profiling init (optional; minimal overhead when disabled) ----
@@ -824,8 +882,17 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     total_nodes_cfg_ = params.find<uint32_t>("total_nodes", 16);
     // 默认按 num_cores * num_neurons 推导；但允许Python侧显式传入 neurons_per_pe
     uint32_t np_from_params = params.find<uint32_t>("neurons_per_pe", 0);
-    if (np_from_params > 0) neurons_per_pe_cfg_ = np_from_params;
-    else neurons_per_pe_cfg_ = static_cast<uint32_t>(total_cores_) * static_cast<uint32_t>(num_neurons_);
+    uint32_t computed_neurons_per_pe = static_cast<uint32_t>(total_cores_) * static_cast<uint32_t>(num_neurons_);
+    if (np_from_params > 0) {
+        neurons_per_pe_cfg_ = np_from_params;
+        if (np_from_params != computed_neurons_per_pe && output_) {
+            output_->verbose(CALL_INFO, 0, 0,
+                "[diag-gas-config] core=%d neurons_per_pe=%u (脚本指定) ≠ cores*rows=%u\n",
+                core_id_, np_from_params, computed_neurons_per_pe);
+        }
+    } else {
+        neurons_per_pe_cfg_ = computed_neurons_per_pe;
+    }
     routing_epsilon_ = params.find<float>("routing_epsilon", 1e-8f);
     routing_topk_ = params.find<uint32_t>("routing_topk", 0);
     routing_topk_per_pe_ = params.find<uint32_t>("routing_topk_per_pe", 0);
@@ -1164,9 +1231,15 @@ void SnnPESubComponent::init(unsigned int phase) {
                             if (pe_of_post == node_id_) ++local_edges; else ++remote_edges;
                         }
                     }
-                    // 路由摘要（调试用，保持低噪）：
-                    SNNDL_LOG(1, "[route-summary] node=%u core=%d entries=%zu total=%" PRIu64 " local=%" PRIu64 " remote=%" PRIu64 "\n",
-                              node_id_, core_id_, routes_shared_->size(), total_entries, local_edges, remote_edges);
+                    if (!route_summary_logged_) {
+                        route_summary_logged_ = true;
+                        double local_ratio = (total_entries > 0) ? (double)local_edges / (double)total_entries : 0.0;
+                        double remote_ratio = (total_entries > 0) ? (double)remote_edges / (double)total_entries : 0.0;
+                        output_->verbose(CALL_INFO, 0, 0,
+                            "[route-summary] node=%u core=%d entries=%zu total=%" PRIu64 " local=%" PRIu64 " (%.2f) remote=%" PRIu64 " (%.2f)\n",
+                            node_id_, core_id_, routes_shared_->size(), total_entries,
+                            local_edges, local_ratio, remote_edges, remote_ratio);
+                    }
                     // 发布到进程级缓存
                     std::string cache_key = buildRouteCacheKey();
                     if (!cache_key.empty()) {
@@ -1306,7 +1379,7 @@ void SnnPESubComponent::finish() {
 bool SnnPESubComponent::clockTick(Cycle_t current_cycle) {
     total_cycles_++;
     bool has_activity = false;
-    if (!clock_tick_logged_) {
+    if (!clock_tick_logged_ && window_read_debug_) {
         output_->verbose(CALL_INFO, 0, 0,
             "[diag-gas] 核心%d clockTick start stage=%d gas_enable=%d window_mode=%d manual_drive=%d\n",
             core_id_, (int)gas_stage_, gas_enable_ ? 1 : 0, gas_window_mode_ ? 1 : 0,
@@ -2523,15 +2596,6 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                             output_->verbose(CALL_INFO, 0, 0,
                                 "[diag-edges] BeginGather seq=%u edges_curr=%zu edges_prev=%zu\n",
                                 curr_stage_seq_, edge_collector_.currSize(), edge_collector_.prevSize());
-                        }
-                        if (!base_addr_log_once_) {
-                            base_addr_log_once_ = true;
-                            std::printf("[diag-base] node=%u core=%u base_addr=0x%lx rowptr=0x%lx colidx=0x%lx block=0x%lx\n",
-                                node_id_, core_id_,
-                                (unsigned long)base_addr_,
-                                (unsigned long)bcsr_rowptr_addr_,
-                                (unsigned long)bcsr_colidx_addr_,
-                                (unsigned long)bcsr_blockdata_addr_);
                         }
                         if (window_read_debug_) {
                         SNNDL_LOG(1, "[diag-stage] BeginGather window=%" PRIu64 " stage=%d posts_prev=%zu active_prev=%zu posts_curr=%zu active_curr=%zu qsize=%zu\n",

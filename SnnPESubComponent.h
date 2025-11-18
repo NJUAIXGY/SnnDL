@@ -712,6 +712,7 @@ private:
     uint32_t max_cache_entries_;
     bool use_event_weight_fallback_;
     bool base_addr_log_once_ = false;
+    bool route_summary_logged_ = false;
     bool event_weight_fallback_warned_;
     bool merge_read_cacheline_;
     bool merge_read_row_;
@@ -720,7 +721,7 @@ private:
     // GAS control (component-driven phases)
     bool gas_enable_ = false; // enable GAS control-plane (v1: Begin/EndGather per tick)
     bool gas_window_mode_ = false; // 当为true时，不再每周期发送Begin/EndGather，由下游window驱动
-    bool gas_manual_window_drive_ = false;
+    bool gas_manual_window_drive_ = false; // 已弃用，保持字段以兼容旧配置
     uint64_t manual_gas_counter_ = 0;
     uint64_t manual_gas_gather_cycles_cfg_ = 200; // fallback
     bool manual_tick_sampled_ = false;

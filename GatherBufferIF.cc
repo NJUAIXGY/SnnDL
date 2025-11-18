@@ -42,7 +42,9 @@ GatherBufferIF::GatherBufferIF(ComponentId_t id, Params& params, TimeConverter* 
     strict_mode_ = params.find<int>("strict_mode", 1) != 0;
     double_buffer_enable_ = params.find<int>("double_buffer_enable", 1) != 0;
     window_auto_ = params.find<int>("window_auto", 0) != 0;
-    manual_window_drive_ = params.find<int>("manual_window_drive", 0) != 0;
+    // Deprecate manual_window_drive: keep param for compatibility but force-disable
+    (void)params.find<int>("manual_window_drive", 0);
+    manual_window_drive_ = false;
     win_cyc_gather_ = params.find<uint64_t>("window_cycles_gather", 0);
     win_cyc_apply_  = params.find<uint64_t>("window_cycles_apply", 0);
     win_cyc_scatter_= params.find<uint64_t>("window_cycles_scatter", 0);
@@ -54,7 +56,7 @@ GatherBufferIF::GatherBufferIF(ComponentId_t id, Params& params, TimeConverter* 
     stage_cycles_csv_ = params.find<std::string>("stage_cycles_csv", "");
     stage_cycles_export_enable_ = !stage_cycles_csv_.empty();
     probe_csv_path_ = params.find<std::string>("probe_gas_csv", "");
-    defer_issue_until_apply_ = params.find<int>("defer_issue_until_apply", 1) != 0;
+    defer_issue_until_apply_ = params.find<int>("defer_issue_until_apply", 0) != 0;
     gather_auto_end_bytes_ = params.find<uint64_t>("gather_auto_end_bytes", 0);
     gather_auto_end_reads_ = params.find<uint64_t>("gather_auto_end_reads", 0);
     // Gating: if k or Lmax invalid, disable gap merge
@@ -138,21 +140,21 @@ void GatherBufferIF::init(unsigned int phase) {
     backend_->init(phase);
     // 记录所有 phase 的初始化情况（仅在显式启用时打印）
     const char* sent_env = std::getenv("SNNDL_SENTINEL_ENABLE");
-    if (sent_env && std::atoi(sent_env) != 0) {
-        printf("[[sentinel-gbi-init]] phase=%u window_auto=%d manual=%d clock=%s win_cyc_g=%" PRIu64 " win_cyc_a=%" PRIu64 " win_cyc_s=%" PRIu64 " auto_bytes=%" PRIu64 " auto_reads=%" PRIu64 " defer=%d\n",
+        if (sent_env && std::atoi(sent_env) != 0) {
+            printf("[[sentinel-gbi-init]] phase=%u window_auto=%d manual=%d clock=%s win_cyc_g=%" PRIu64 " win_cyc_a=%" PRIu64 " win_cyc_s=%" PRIu64 " auto_bytes=%" PRIu64 " auto_reads=%" PRIu64 " defer=%d\n",
                phase, window_auto_ ? 1 : 0, manual_window_drive_ ? 1 : 0, clock_freq_.c_str(),
                win_cyc_gather_, win_cyc_apply_, win_cyc_scatter_,
                gather_auto_end_bytes_, gather_auto_end_reads_, defer_issue_until_apply_ ? 1 : 0);
-    }
-    if (phase == 0 && window_auto_) {
-        out_.verbose(CALL_INFO, 0, 0,
-            "[diag-gbi-init] window_auto=%d manual=%d clock=%s win_cyc_g=%" PRIu64 " win_cyc_a=%" PRIu64 " win_cyc_s=%" PRIu64 " auto_bytes=%" PRIu64 " auto_reads=%" PRIu64 " defer=%d\n",
-            window_auto_ ? 1 : 0, manual_window_drive_ ? 1 : 0, clock_freq_.c_str(), win_cyc_gather_, win_cyc_apply_, win_cyc_scatter_,
-            gather_auto_end_bytes_, gather_auto_end_reads_, defer_issue_until_apply_ ? 1 : 0);
-        if (!manual_window_drive_) {
-            // Register clock for time-driven windows
-            registerClock(clock_freq_, new Clock::Handler2<GatherBufferIF, &GatherBufferIF::clockTick>(this));
         }
+    if (phase == 0 && window_auto_) {
+        if (out_.getVerboseLevel() >= 2) {
+            out_.verbose(CALL_INFO, 0, 0,
+                "[diag-gbi-init] window_auto=%d manual=%d(clock-forced) clock=%s win_cyc_g=%" PRIu64 " win_cyc_a=%" PRIu64 " win_cyc_s=%" PRIu64 " auto_bytes=%" PRIu64 " auto_reads=%" PRIu64 " defer=%d\n",
+                window_auto_ ? 1 : 0, 0, clock_freq_.c_str(), win_cyc_gather_, win_cyc_apply_, win_cyc_scatter_,
+                gather_auto_end_bytes_, gather_auto_end_reads_, defer_issue_until_apply_ ? 1 : 0);
+        }
+        // Always register clock for time-driven windows (manual drive deprecated)
+        registerClock(clock_freq_, new Clock::Handler2<GatherBufferIF, &GatherBufferIF::clockTick>(this));
         stage_ = Stage::Gather; stage_counter_ = 0; current_gather_id_++;
         resetWindowMetrics_();
         resetGatherAutoCounters_();
@@ -185,13 +187,8 @@ void GatherBufferIF::setMemoryMappedAddressRegion(Addr start, Addr size) {
 }
 
 void GatherBufferIF::manualWindowTick() {
-    if (!window_auto_ || !manual_window_drive_) return;
-    clockTick(0);
-    if (out_.getVerboseLevel() >= 1) {
-        out_.verbose(CALL_INFO, 1, 0,
-            "[diag-gbi-clock] manual tick stage=%d counter=%" PRIu64 " win_cyc_g=%" PRIu64 "\n",
-            (int)stage_, stage_counter_, win_cyc_gather_);
-    }
+    // Deprecated no-op: manual window driving removed. Keep symbol for binary compatibility.
+    return;
 }
 
 void GatherBufferIF::send(Request* req) {
@@ -199,7 +196,16 @@ void GatherBufferIF::send(Request* req) {
     if (auto* cr = dynamic_cast<StandardMem::CustomReq*>(req)) {
         auto* data = dynamic_cast<GasOpData*>(&cr->getData());
         if (data) {
-            if (window_auto_ && !manual_window_drive_) { delete req; return; } // auto mode: ignore external unless manual drive enabled
+            // In auto mode, ignore external GasOp control requests (manual drive deprecated)
+            if (window_auto_) {
+                static bool warned_auto_custom = false;
+                if (!warned_auto_custom) {
+                    warned_auto_custom = true;
+                    out_.verbose(CALL_INFO, 0, 0,
+                        "[diag-gbi] CustomReq 被忽略：window_auto=1 manual_drive=0 (仅记录一次)");
+                }
+                delete req; return;
+            }
             if (out_.getVerboseLevel() >= 1) {
                 out_.verbose(CALL_INFO, 1, 0,
                     "[diag-gbi] CustomReq op=%d (manual=%d) stage=%d gid=%" PRIu64 "\n",
@@ -967,9 +973,11 @@ void GatherBufferIF::ensureCapacity_(int buf, uint64_t need) {
 bool GatherBufferIF::clockTick(Cycle_t) {
     if (!window_auto_) return false;
     if (!clock_tick_logged_) {
-        out_.verbose(CALL_INFO, 0, 0,
-            "[diag-gbi-clock] first tick stage=%d counter=%" PRIu64 " win_cyc_g=%" PRIu64 "\n",
-            (int)stage_, stage_counter_, win_cyc_gather_);
+        if (out_.getVerboseLevel() >= 2) {
+            out_.verbose(CALL_INFO, 0, 0,
+                "[diag-gbi-clock] first tick stage=%d counter=%" PRIu64 " win_cyc_g=%" PRIu64 "\n",
+                (int)stage_, stage_counter_, win_cyc_gather_);
+        }
         clock_tick_logged_ = true;
     }
     stage_counter_++;

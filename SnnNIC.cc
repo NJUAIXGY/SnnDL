@@ -140,10 +140,14 @@ SnnNIC::SnnNIC(ComponentId_t id, Params& params)
       packets_received_count(0),
       use_direct_link(false)
 {
-    // 构造期哨兵
-    // 注意：output 还未创建，暂用 fprintf 到 stdout 以确保写出
-    fprintf(stdout, "[[sentinel-nic-ctor]] enter\n");
-    fflush(stdout);
+    // 构造期哨兵（默认静默，仅当 SNNDL_SENTINEL_ENABLE 打开时打印）
+    do {
+        const char* _sent = std::getenv("SNNDL_SENTINEL_ENABLE");
+        if (_sent && std::atoi(_sent) != 0) {
+            fprintf(stdout, "[[sentinel-nic-ctor]] enter\n");
+            fflush(stdout);
+        }
+    } while(0);
     // 获取参数
     node_id = params.find<uint32_t>("node_id", 0);
     link_bw = params.find<std::string>("link_bw", "40GiB/s");
@@ -536,7 +540,10 @@ void SnnNIC::handleDirectSpikeEvent(SST::Event* event)
 // === SST lifecycle ===
 void SnnNIC::init(unsigned int phase)
 {
-    if (output) output->output("[[sentinel-nic-init]] node=%u phase=%u enter\n", node_id, phase);
+    if (output) {
+        const char* _sent = std::getenv("SNNDL_SENTINEL_ENABLE");
+        if (_sent && std::atoi(_sent) != 0) output->output("[[sentinel-nic-init]] node=%u phase=%u enter\n", node_id, phase);
+    }
     if (!use_direct_link && network) {
         network->init(phase);
     }
@@ -546,17 +553,34 @@ void SnnNIC::init(unsigned int phase)
         registerClock("1GHz", new Clock::Handler<SnnNIC>(this, &SnnNIC::flushClockTick));
     }
     if (phase >= 1) init_done_ = true;
-    if (output) output->output("[[sentinel-nic-init]] node=%u phase=%u done\n", node_id, phase);
+    if (output) {
+        const char* _sent = std::getenv("SNNDL_SENTINEL_ENABLE");
+        if (_sent && std::atoi(_sent) != 0) output->output("[[sentinel-nic-init]] node=%u phase=%u done\n", node_id, phase);
+    }
 }
 
 void SnnNIC::setup()
 {
-    if (output) output->output("[[sentinel-nic-setup]] node=%u enter\n", node_id);
+    if (output) {
+        const char* _sent = std::getenv("SNNDL_SENTINEL_ENABLE");
+        if (_sent && std::atoi(_sent) != 0) output->output("[[sentinel-nic-setup]] node=%u enter\n", node_id);
+    }
     if (!use_direct_link && network) {
         network->setup();
     }
     network_ready_ = true;
-    if (output) output->output("[[sentinel-nic-setup]] node=%u done\n", node_id);
+    if (output) {
+        output->verbose(CALL_INFO, 0, 0,
+            "[nic-config] node=%u mode=%s link_bw=%s in_buf=%s out_buf=%s vn=%u\n",
+            node_id,
+            use_direct_link ? "direct" : "SimpleNetwork",
+            link_bw.c_str(), input_buf_size.c_str(), output_buf_size.c_str(),
+            effective_num_vns_);
+    }
+    if (output) {
+        const char* _sent = std::getenv("SNNDL_SENTINEL_ENABLE");
+        if (_sent && std::atoi(_sent) != 0) output->output("[[sentinel-nic-setup]] node=%u done\n", node_id);
+    }
 }
 
 bool SnnNIC::flushClockTick(SST::Cycle_t /*currentCycle*/)

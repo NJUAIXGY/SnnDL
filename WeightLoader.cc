@@ -49,7 +49,6 @@ WeightLoader::WeightLoader(ComponentId_t id, Params& params)
     loader_done_key_ = params.find<std::string>("loader_done_key", "");
 
     output_ = new Output("WeightLoader[@p:@l]: ", verbose_, 0, Output::STDOUT);
-    output_->verbose(CALL_INFO, 1, 0, "🔧 初始化WeightLoader\n");
 
     if (!loader_done_key_.empty()) {
         loader_done_shared_.initialize(loader_done_key_, 1, 0);
@@ -84,7 +83,7 @@ void WeightLoader::init(unsigned int phase) {
     if (memory_) memory_->init(phase);
 
     if (phase == 0) {
-        if (output_) {
+        if (output_ && verbose_ >= 2) {
             output_->verbose(CALL_INFO, 1, 0,
                 "[WL-init] loader_done_key=%s timed=%d allow_cache=%d base=0x%llx stride=%" PRIu64 " cores=%d\n",
                 loader_done_key_.c_str(),
