@@ -23,6 +23,7 @@
 #include "SnnCoreAPI.h"
 #include "SnnNeuronModel.h"
 #include "SnnProfiler.h"  // 轻量级性能分析（条件编译）
+#include "SnnBcsrWeightManager.h"
 
 namespace SST {
 namespace SnnDL {
@@ -1005,7 +1006,6 @@ private:
     uint32_t bcsr_bc_ = 16;                 // block cols
     uint32_t bcsr_val_bytes_ = 4;           // FP32
     uint32_t bcsr_idx_bytes_ = 2;           // uint16
-    uint64_t bcsr_rowptr_addr_ = 0;         // rowptr 基地址（全局）
     uint64_t bcsr_colidx_addr_ = 0;         // colidx 基地址
     uint64_t bcsr_blockdata_addr_ = 0;      // blockdata 基地址
     uint64_t bcsr_blockids_addr_ = 0;       // blockids 基地址（可选）
@@ -1013,9 +1013,7 @@ private:
     bool bcsr_weight_guard_enable_ = true;
     float bcsr_weight_abs_max_ = 10.0f;
     uint64_t bcsr_bad_weight_count_ = 0;
-    std::vector<uint32_t> bcsr_rowptr_host_;// 缓存 rowptr 表（内存镜像）
-    bool bcsr_rowptr_ready_ = false;
-    bool bcsr_rowptr_read_pending_ = false;
+    BcsrWeightManager bcsr_weights_;
 
     // --- Verify (BCSR probe) state (diagnostic only; zero-cost when disabled) ---
     bool verify_bcsr_started_ = false;

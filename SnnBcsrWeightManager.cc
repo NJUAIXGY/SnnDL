@@ -14,6 +14,9 @@ void BcsrWeightManager::configure(uint64_t rowptr_addr,
     block_cols_ = block_cols;
     idx_bytes_ = idx_bytes;
     val_bytes_ = val_bytes;
+    rowptr_ready_ = false;
+    rowptr_read_pending_ = false;
+    bcsr_rowptr_host_.clear();
 }
 
 size_t BcsrWeightManager::expectedRowptrEntries(uint32_t num_neurons) const {

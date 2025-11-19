@@ -371,7 +371,7 @@ void SnnPESubComponent::ReadOrchestrator::issueFromEdges() {
             core->core_id_, core->curr_stage_seq_);
         return;
     }
-    if (core->use_bcsr_ && !core->bcsr_rowptr_ready_) {
+    if (core->use_bcsr_ && !core->bcsr_weights_.isRowptrReady()) {
         diag_.log(1, "[diag-window-read] BeginApply: core=%u window=%u defer edge issue (BCSR rowptr not ready)\n",
             core->core_id_, core->curr_stage_seq_);
         return;
@@ -401,9 +401,10 @@ void SnnPESubComponent::ReadOrchestrator::issueFromEdges() {
                 // 使用已加载的 rowptr_host_ 计算全局块索引
                 float resolved = 0.0f;
                 do {
-                    if (block_row + 1 > core->bcsr_rowptr_host_.size()) break;
-                    uint32_t start = core->bcsr_rowptr_host_[block_row];
-                    uint32_t end   = (block_row + 1 < core->bcsr_rowptr_host_.size() ? core->bcsr_rowptr_host_[block_row+1] : start);
+                    const auto& rowptr = core->bcsr_weights_.rowptrHost();
+                    if (block_row + 1 > rowptr.size()) break;
+                    uint32_t start = rowptr[block_row];
+                    uint32_t end   = (block_row + 1 < rowptr.size() ? rowptr[block_row+1] : start);
                     if (end <= start) break;
                     // 解析 meta + 读取 colidx 与对应块
                     std::string bin_path = core->resolveWeightTemplate(core->node_id_, core->core_id_);
@@ -563,7 +564,7 @@ void SnnPESubComponent::ReadOrchestrator::issueFromSetsBcsr(
     const std::vector<uint32_t>* posts_to_use,
     const std::unordered_set<uint32_t>* pres_to_use) {
     if (!core || !posts_to_use || !pres_to_use) return;
-    if (!core->bcsr_rowptr_ready_) {
+    if (!core->bcsr_weights_.isRowptrReady()) {
         diag_.log(1, "[diag-window-read] BeginApply: core=%u window=%u skip set-priming (BCSR rowptr not ready)\n",
             core->core_id_, core->curr_stage_seq_);
         return;
@@ -802,10 +803,11 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     bcsr_bc_ = bcsr_layout_.block_cols;
     bcsr_val_bytes_ = bcsr_layout_.val_bytes;
     bcsr_idx_bytes_ = bcsr_layout_.idx_bytes;
-    bcsr_rowptr_addr_ = base_addr_ + bcsr_layout_.rowptr_offset;
+    uint64_t bcsr_rowptr_addr = base_addr_ + bcsr_layout_.rowptr_offset;
     bcsr_colidx_addr_ = base_addr_ + bcsr_layout_.colidx_offset;
     bcsr_blockdata_addr_ = base_addr_ + bcsr_layout_.blockdata_offset;
     bcsr_blockids_addr_ = bcsr_layout_.blockids_offset ? base_addr_ + bcsr_layout_.blockids_offset : 0;
+    bcsr_weights_.configure(bcsr_rowptr_addr, bcsr_br_, bcsr_bc_, bcsr_idx_bytes_, bcsr_val_bytes_);
     bcsr_row_index_cache_cap_ = params.find<uint32_t>("bcsr_row_index_cache_cap", 64);
     bcsr_block_cache_cap_ = params.find<uint32_t>("bcsr_block_cache_cap", 256);
     if (aosoa_block_rows_ == 0) aosoa_block_rows_ = (bcsr_br_ > 0) ? bcsr_br_ : 16;
@@ -980,7 +982,7 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
             "[diag-bcsr-base] node=%u core=%d base=0x%llx rowptr=0x%llx colidx=0x%llx blockdata=0x%llx blockids=0x%llx\n",
             node_id_, core_id_,
             (unsigned long long)base_addr_,
-            (unsigned long long)bcsr_rowptr_addr_,
+            (unsigned long long)bcsr_weights_.rowptrAddr(),
             (unsigned long long)bcsr_colidx_addr_,
             (unsigned long long)bcsr_blockdata_addr_,
             (unsigned long long)bcsr_blockids_addr_);
@@ -990,14 +992,14 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
             output_->verbose(CALL_INFO, 0, 0,
                 "[diag-bcsr] node=%u core=%d warning: weights_template empty while BCSR enabled\n",
                 node_id_, core_id_);
-        } else if (bcsr_rowptr_file_fallback_enable_ && !weights_template_.empty() && !bcsr_rowptr_ready_ && loadBcsrRowptrFromFile_()) {
-            bcsr_rowptr_ready_ = true;
+        } else if (bcsr_rowptr_file_fallback_enable_ && !weights_template_.empty() &&
+                   !bcsr_weights_.isRowptrReady() && loadBcsrRowptrFromFile_()) {
             if (window_read_debug_) {
                 output_->verbose(CALL_INFO, 0, 0,
                     "[diag-bcsr] core=%u preload rowptr entries=%zu first=%u second=%u\n",
-                    core_id_, bcsr_rowptr_host_.size(),
-                    bcsr_rowptr_host_.empty()?0u:bcsr_rowptr_host_[0],
-                    bcsr_rowptr_host_.size()>1?bcsr_rowptr_host_[1]:0u);
+                    core_id_, bcsr_weights_.rowptrHost().size(),
+                    bcsr_weights_.rowptrHost().empty()?0u:bcsr_weights_.rowptrHost()[0],
+                    bcsr_weights_.rowptrHost().size()>1?bcsr_weights_.rowptrHost()[1]:0u);
             }
         }
     }
@@ -1448,18 +1450,19 @@ bool SnnPESubComponent::clockTick(Cycle_t current_cycle) {
     */
     
     // BCSR rowptr 预取（延迟到运行期且满足暖机与barrier）
-    if (use_bcsr_ && memory_ && memory_ready_ && !bcsr_rowptr_ready_ && !bcsr_rowptr_read_pending_ &&
+    if (use_bcsr_ && memory_ && memory_ready_ && !bcsr_weights_.isRowptrReady() &&
+        !bcsr_weights_.isRowptrReadPending() &&
         total_cycles_ >= memory_warmup_cycles_ &&
         (loader_barrier_cycles_ == 0 || total_cycles_ >= loader_barrier_cycles_)) {
         uint32_t rows = num_neurons_;
         uint32_t br = (bcsr_br_ > 0) ? bcsr_br_ : 16;
         uint32_t nBlockRows = (rows + br - 1) / br;
         size_t bytes = static_cast<size_t>(nBlockRows + 1) * sizeof(uint32_t);
-        auto* read = new SST::Interfaces::StandardMem::Read(bcsr_rowptr_addr_, bytes);
+        auto* read = new SST::Interfaces::StandardMem::Read(bcsr_weights_.rowptrAddr(), bytes);
         auto reqId = read->getID();
         PendingMemoryRequest pmr;
         pmr.request_id = reqId;
-        pmr.address = bcsr_rowptr_addr_;
+        pmr.address = bcsr_weights_.rowptrAddr();
         pmr.size = bytes;
         pmr.bcsr_kind = 1;
         pmr.issue_cycle = total_cycles_;
@@ -1468,10 +1471,10 @@ bool SnnPESubComponent::clockTick(Cycle_t current_cycle) {
         if (window_read_debug_ && output_) {
             output_->verbose(CALL_INFO, 0, 0,
                 "[diag-bcsr] core=%u issue rowptr read addr=0x%llx bytes=%zu\n",
-                core_id_, (unsigned long long)bcsr_rowptr_addr_, bytes);
+                core_id_, (unsigned long long)bcsr_weights_.rowptrAddr(), bytes);
         }
         memory_->send(read);
-        bcsr_rowptr_read_pending_ = true;
+        bcsr_weights_.setRowptrReadPending(true);
     }
 
 
@@ -1589,17 +1592,18 @@ bool SnnPESubComponent::clockTick(Cycle_t current_cycle) {
     }
 
     // BCSR探针：尽力在同一窗口发起一次按边读，扫描一个块内的列，促成 1.0 样本出现（仅诊断；不影响GAS语义）
-    if (verify_weights_ && use_bcsr_ && memory_ && memory_ready_ && bcsr_rowptr_ready_ &&
+    if (verify_weights_ && use_bcsr_ && memory_ && memory_ready_ && bcsr_weights_.isRowptrReady() &&
         total_cycles_ >= memory_warmup_cycles_ && (loader_barrier_cycles_ == 0 || total_cycles_ >= loader_barrier_cycles_)) {
         if (!verify_bcsr_done_ && !verify_bcsr_inflight_) {
             uint32_t br = (bcsr_br_>0? bcsr_br_:16);
             uint32_t bc = (bcsr_bc_>0? bcsr_bc_:16);
             uint32_t nBlockRows = (num_neurons_ + br - 1) / br;
             if (!verify_bcsr_started_) {
+                const auto& rp = bcsr_weights_.rowptrHost();
                 for (uint32_t r = 0; r < nBlockRows; ++r) {
-                    if (r + 1 >= bcsr_rowptr_host_.size()) break;
-                    uint32_t start = bcsr_rowptr_host_[r];
-                    uint32_t end   = bcsr_rowptr_host_[r+1];
+                    if (r + 1 >= rp.size()) break;
+                    uint32_t start = rp[r];
+                    uint32_t end   = rp[r+1];
                     if (end > start) { verify_bcsr_post_local_ = r * br; verify_bcsr_block_col_ = 0; verify_bcsr_intra_col_ = 0; verify_bcsr_started_ = true; if (output_) output_->verbose(CALL_INFO, 1, 0, "[VERIFY][init-bcsr] core=%d post_local=%u rowptr=(%u,%u)\n", core_id_, verify_bcsr_post_local_, start, end); break; }
                 }
                 if (!verify_bcsr_started_) verify_bcsr_done_ = true;
@@ -1623,8 +1627,9 @@ bool SnnPESubComponent::clockTick(Cycle_t current_cycle) {
                             if (parseBcsrMeta(meta_path, rows, colsN, brM, bcM, idxB, valB, rp_off, ci_off, bd_off, id_off, totalB)) {
                                 std::ifstream fin(bin_path, std::ios::binary);
                                 if (fin.good()) {
-                                    uint32_t start = (r+1 < bcsr_rowptr_host_.size() ? bcsr_rowptr_host_[r] : 0);
-                                    uint32_t end   = (r+1 < bcsr_rowptr_host_.size() ? bcsr_rowptr_host_[r+1] : start);
+                                    const auto& rp = bcsr_weights_.rowptrHost();
+                                    uint32_t start = (r+1 < rp.size() ? rp[r] : 0);
+                                    uint32_t end   = (r+1 < rp.size() ? rp[r+1] : start);
                                     uint32_t brEff = (brM? brM : 1), bcEff = (bcM? bcM : 16);
                                     size_t blk_bytes = (size_t)brEff * (size_t)bcEff * (size_t)valB;
                                     uint32_t nblocks = (end > start ? (end - start) : 0);
@@ -1655,12 +1660,13 @@ bool SnnPESubComponent::clockTick(Cycle_t current_cycle) {
                 uint32_t bc_eff = (bcsr_bc_>0? bcsr_bc_:16);
                 uint32_t blk_col = (bc_eff? (pre_global / bc_eff) : 0);
                 size_t block_bytes = (size_t)(bcsr_br_>0?bcsr_br_:1) * (size_t)bc_eff * (size_t)bcsr_val_bytes_;
-                    uint32_t start = 0;
-                    uint64_t block_addr = 0;
-                    if (block_row + 1 < bcsr_rowptr_host_.size()) {
-                        start = bcsr_rowptr_host_[block_row];
-                        block_addr = bcsr_blockdata_addr_ + (uint64_t)(start + verify_bcsr_block_col_) * block_bytes;
-                    }
+                uint32_t start = 0;
+                uint64_t block_addr = 0;
+                const auto& rp = bcsr_weights_.rowptrHost();
+                if (block_row + 1 < rp.size()) {
+                    start = rp[block_row];
+                    block_addr = bcsr_blockdata_addr_ + (uint64_t)(start + verify_bcsr_block_col_) * block_bytes;
+                }
                 if (output_) {
                     output_->verbose(CALL_INFO, 0, 0,
                         "[VERIFY][mem-addr] core=%d post=%u pre=%u blk_row=%u blk_col=%u block_addr=0x%llx rowptr_start=%u block_bytes=%zu\n",
@@ -2912,11 +2918,12 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
 
         auto finalize_rowptr_ready = [&]() {
             if (window_read_debug_ && output_) {
+                const auto& rp = bcsr_weights_.rowptrHost();
                 output_->verbose(CALL_INFO, 0, 0,
                     "[diag-bcsr] core=%u rowptr ready entries=%zu first=%u second=%u\n",
-                    core_id_, bcsr_rowptr_host_.size(),
-                    bcsr_rowptr_host_.empty() ? 0u : bcsr_rowptr_host_[0],
-                    bcsr_rowptr_host_.size() > 1 ? bcsr_rowptr_host_[1] : 0u);
+                    core_id_, rp.size(),
+                    rp.empty() ? 0u : rp[0],
+                    rp.size() > 1 ? rp[1] : 0u);
             }
             bcsrPrefetchAll_();
             if (apply_acc_enable_ && gas_window_mode_ && gas_stage_ == GasStage::Apply) {
@@ -2940,7 +2947,7 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                 bytes.size());
         }
         if (pending_req.bcsr_kind == 1) {
-            bcsr_rowptr_read_pending_ = false;
+            bcsr_weights_.setRowptrReadPending(false);
         }
         if (readResp && !readResp->data.empty()) {
             const std::vector<uint8_t>& bytes = readResp->data;
@@ -3844,7 +3851,7 @@ bool SnnPESubComponent::appendRoutesFromBcsrFile(const std::string& path, uint32
     uint32_t bc = bcsr_bc_ ? bcsr_bc_ : 16;
     uint32_t idx_bytes = bcsr_idx_bytes_ ? bcsr_idx_bytes_ : 2;
     uint32_t val_bytes = bcsr_val_bytes_ ? bcsr_val_bytes_ : 4;
-    uint64_t rowptr_off = (bcsr_rowptr_addr_ > base_addr_) ? (bcsr_rowptr_addr_ - base_addr_) : 0;
+    uint64_t rowptr_off = (bcsr_weights_.rowptrAddr() > base_addr_) ? (bcsr_weights_.rowptrAddr() - base_addr_) : 0;
     uint64_t colidx_off = (bcsr_colidx_addr_ > base_addr_) ? (bcsr_colidx_addr_ - base_addr_) : 0;
     uint64_t blockdata_off = (bcsr_blockdata_addr_ > base_addr_) ? (bcsr_blockdata_addr_ - base_addr_) : 0;
     uint64_t blockids_off = (bcsr_blockids_addr_ > base_addr_) ? (bcsr_blockids_addr_ - base_addr_) : 0;
@@ -4129,7 +4136,7 @@ void SnnPESubComponent::requestWeightBCSR(uint32_t pre_global, uint32_t post_loc
         return;
     }
     // 前置检查
-    if (!bcsr_rowptr_ready_) {
+    if (!bcsr_weights_.isRowptrReady()) {
         bcsr_req_wait_rowptr_++;
         if (window_read_debug_ && output_) {
             output_->verbose(CALL_INFO, 0, 0,
@@ -4146,17 +4153,18 @@ void SnnPESubComponent::requestWeightBCSR(uint32_t pre_global, uint32_t post_loc
     uint32_t intra_row = post_local % br;
     uint32_t block_col = pre_global / bc;
     uint32_t intra_col = pre_global % bc;
-    if (block_row+1 >= bcsr_rowptr_host_.size()) {
+    const auto& rowptr_host = bcsr_weights_.rowptrHost();
+    if (block_row+1 >= rowptr_host.size()) {
         if (window_read_debug_ && output_) {
             output_->verbose(CALL_INFO, 0, 0,
                 "[diag-bcsr] core=%u block_row=%u rowptr_size=%zu out-of-range\n",
-                core_id_, block_row, bcsr_rowptr_host_.size());
+                core_id_, block_row, rowptr_host.size());
         }
         if (cb) cb(0.0f);
         return;
     }
-    uint32_t start = bcsr_rowptr_host_[block_row];
-    uint32_t end   = bcsr_rowptr_host_[block_row+1];
+    uint32_t start = rowptr_host[block_row];
+    uint32_t end   = rowptr_host[block_row+1];
     if (end <= start) {
         if (window_read_debug_ && output_) {
             output_->verbose(CALL_INFO, 0, 0,
@@ -4248,15 +4256,16 @@ void SnnPESubComponent::bcsrPrefetchAll_() {
     if (!bcsr_prefetch_all_) return;
     if (bcsr_prefetch_issued_) return;
     if (!memory_) return;
-    if (!bcsr_rowptr_ready_) return;
+    if (!bcsr_weights_.isRowptrReady()) return;
 
     uint32_t rows = num_neurons_;
     uint32_t br = (bcsr_br_>0? bcsr_br_:16);
     uint32_t nBlockRows = (rows + br - 1) / br;
     for (uint32_t block_row = 0; block_row < nBlockRows; ++block_row) {
-        if (block_row + 1 >= bcsr_rowptr_host_.size()) break;
-        uint32_t start = bcsr_rowptr_host_[block_row];
-        uint32_t end   = bcsr_rowptr_host_[block_row+1];
+        const auto& rp = bcsr_weights_.rowptrHost();
+        if (block_row + 1 >= rp.size()) break;
+        uint32_t start = rp[block_row];
+        uint32_t end   = rp[block_row+1];
         if (end <= start) continue;
         std::vector<uint32_t> cached_cols;
         if (bcsrRowIndexGet_(block_row, cached_cols)) {
@@ -4342,48 +4351,31 @@ void SnnPESubComponent::bcsrPopulateWeightCache_(uint32_t block_row, uint32_t bl
 }
 
 size_t SnnPESubComponent::expectedRowptrEntries_() const {
-    uint32_t rows = num_neurons_;
-    uint32_t br = (bcsr_br_ > 0 ? bcsr_br_ : 16);
-    uint32_t nBlockRows = (rows + br - 1) / br;
-    return static_cast<size_t>(nBlockRows + 1);
+    return bcsr_weights_.expectedRowptrEntries(num_neurons_);
 }
 
 size_t SnnPESubComponent::expectedRowptrBytes_() const {
-    return expectedRowptrEntries_() * sizeof(uint32_t);
+    return bcsr_weights_.expectedRowptrBytes(num_neurons_);
 }
 
 bool SnnPESubComponent::installRowptrFromBytes_(const uint8_t* data, size_t bytes, const char* source, bool count_stats) {
-    if (!data) return false;
-    const size_t expect = expectedRowptrBytes_();
-    if (bytes != expect) {
+    if (!bcsr_weights_.installRowptrFromBytes(data, bytes, num_neurons_)) {
         SNNDL_DEBUG_LOG(0,
-            "[diag-bcsr] core=%u rowptr bytes mismatch: got=%zu expect=%zu source=%s\n",
-            core_id_, bytes, expect, source ? source : "-" );
+            "[diag-bcsr] core=%u rowptr install failed source=%s bytes=%zu expect=%zu\n",
+            core_id_, source ? source : "-", bytes, expectedRowptrBytes_());
         return false;
     }
-    const size_t entries = expectedRowptrEntries_();
-    bcsr_rowptr_host_.resize(entries);
-    std::memcpy(bcsr_rowptr_host_.data(), data, bytes);
-    bool non_decreasing = true;
-    bool has_progress = false;
-    for (size_t idx = 0; idx + 1 < entries; ++idx) {
-        uint32_t cur = bcsr_rowptr_host_[idx];
-        uint32_t nxt = bcsr_rowptr_host_[idx + 1];
-        if (nxt < cur) { non_decreasing = false; break; }
-        if (nxt > cur) has_progress = true;
-    }
-    if (!non_decreasing || !has_progress) {
-        SNNDL_DEBUG_LOG(0,
-            "[diag-bcsr] core=%u rowptr invalid (non-monotonic or empty) source=%s\n",
-            core_id_, source ? source : "-");
-        bcsr_rowptr_host_.clear();
-        return false;
-    }
-    bcsr_rowptr_ready_ = true;
-    bcsr_rowptr_read_pending_ = false;
     if (count_stats) {
         bcsr_count_row_reads_++;
         bcsr_bytes_idx_ += bytes;
+    }
+    if (window_read_debug_ && output_) {
+        const auto& rp = bcsr_weights_.rowptrHost();
+        output_->verbose(CALL_INFO, 0, 0,
+            "[diag-bcsr] core=%u rowptr ready entries=%zu first=%u second=%u\n",
+            core_id_, rp.size(),
+            rp.empty()?0u:rp[0],
+            rp.size()>1?rp[1]:0u);
     }
     return true;
 }

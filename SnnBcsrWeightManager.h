@@ -19,14 +19,15 @@ public:
                    uint32_t val_bytes);
 
     uint64_t rowptrAddr() const { return rowptr_addr_; }
+    void setRowptrAddr(uint64_t addr) { rowptr_addr_ = addr; }
     uint32_t blockRows() const { return block_rows_; }
     uint32_t blockCols() const { return block_cols_; }
     uint32_t idxBytes() const { return idx_bytes_; }
     uint32_t valBytes() const { return val_bytes_; }
 
     bool isRowptrReady() const { return rowptr_ready_; }
-    bool isRowptrReadPending() const { return rowptr_read_pending_; }
     void setRowptrReady(bool ready) { rowptr_ready_ = ready; }
+    bool isRowptrReadPending() const { return rowptr_read_pending_; }
     void setRowptrReadPending(bool pending) { rowptr_read_pending_ = pending; }
 
     std::vector<uint32_t>& rowptrHost() { return bcsr_rowptr_host_; }
