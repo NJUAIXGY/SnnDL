@@ -36,16 +36,7 @@ bool snndl_rowptr_fallback_disable_flag = false;
 using namespace SST;
 using namespace SST::SnnDL;
 
-namespace {
-inline bool snndlDiagEnabled() {
-    static int cached = -1;
-    if (cached == -1) {
-        const char* env = std::getenv("SNNDL_DIAG_ENABLE");
-        cached = (env && std::atoi(env) != 0) ? 1 : 0;
-    }
-    return cached == 1;
-}
-}
+// 诊断门控改为参数化：由 enable_extended_diagnostics_ 成员控制
 
 bool SnnPESubComponent::BcsrLayout::validate(uint64_t base, Output* out, bool debug, uint32_t core_id, uint32_t node_id) const {
     const bool monotonic = (colidx_offset >= rowptr_offset) && (blockdata_offset >= colidx_offset);
@@ -687,6 +678,7 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     base_addr_ = params.find<uint64_t>("base_addr", 0);
     node_id_ = params.find<uint32_t>("node_id", 0);
     verbose_ = params.find<int>("verbose", 0);
+    enable_extended_diagnostics_ = params.find<int>("enable_extended_diagnostics", 0) != 0;
     if (kSentinelOn && output_) {
         SNNDL_LOG(0, "[[sentinel-core-ctor]] after params2: node_id=%u num_neurons=%u base_addr=%" PRIu64 "\n",
                 node_id_, num_neurons_, (uint64_t)base_addr_);
@@ -752,11 +744,11 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     edge_collector_max_capacity_ = static_cast<size_t>(params.find<uint64_t>("edge_collector_max_capacity", 1000000));
     if (window_read_enable_) {
         reserveWindowContainers_();
-        if (!record_edge_idle_enable_ && !record_edge_scatter_enable_ && window_read_debug_ && output_ && snndlDiagEnabled()) {
+    if (!record_edge_idle_enable_ && !record_edge_scatter_enable_ && window_read_debug_ && output_ && enable_extended_diagnostics_) {
             output_->verbose(CALL_INFO, 0, 0,
                 "[diag-record-edge] core=%d 仅在Gather阶段记录边 (Apply/Idle/Scatter=0)", core_id_);
         }
-    } else if (window_read_debug_ && output_ && snndlDiagEnabled()) {
+    } else if (window_read_debug_ && output_ && enable_extended_diagnostics_) {
         output_->verbose(CALL_INFO, 0, 0,
             "[diag-record-edge] core=%d window_read_enable=0 => 忽略 window_read_debug", core_id_);
     }
@@ -798,7 +790,7 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     bcsr_layout_.blockdata_offset = params.find<uint64_t>("bcsr_blockdata_offset", 0);
     bcsr_layout_.blockids_offset = params.find<uint64_t>("bcsr_blockids_offset", 0);
     bcsr_layout_.per_core_stride = params.find<uint64_t>("per_core_stride", 0);
-    bcsr_layout_.validate(base_addr_, output_, (window_read_debug_ || snndlDiagEnabled()), core_id_, node_id_);
+    bcsr_layout_.validate(base_addr_, output_, (window_read_debug_ || enable_extended_diagnostics_), core_id_, node_id_);
     bcsr_br_ = bcsr_layout_.block_rows;
     bcsr_bc_ = bcsr_layout_.block_cols;
     bcsr_val_bytes_ = bcsr_layout_.val_bytes;
@@ -832,7 +824,7 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     const int record_apply_default = (gas_window_mode_ && apply_acc_enable_) ? 1 : 0;
     record_edge_apply_enable_ = params.find<int>("record_edge_apply_enable", record_apply_default) != 0;
     record_edge_idle_enable_ = params.find<int>("record_edge_idle_enable", 0) != 0;
-    if (record_edge_idle_enable_ && output_ && snndlDiagEnabled()) {
+    if (record_edge_idle_enable_ && output_ && enable_extended_diagnostics_) {
         output_->verbose(CALL_INFO, 0, 0,
             "[diag-gas-config] core=%d 已启用 record_edge_idle（诊断配置，回归默认关闭）\n",
             core_id_);
@@ -857,7 +849,7 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     // 默认启用致密累加器（与头文件参数表一致）
     apply_dense_acc_enable_ = params.find<int>("apply_dense_acc_enable", 1) != 0;
     acc_shadow_verify_enable_ = apply_dense_acc_enable_ && params.find<int>("acc_shadow_verify_enable", 0) != 0;
-    if (acc_shadow_verify_enable_ && !snndlDiagEnabled()) {
+    if (acc_shadow_verify_enable_ && !enable_extended_diagnostics_) {
         acc_shadow_verify_enable_ = false;
     }
     if (acc_shadow_verify_enable_) {

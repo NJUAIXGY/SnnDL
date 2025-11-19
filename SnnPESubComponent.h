@@ -129,6 +129,7 @@ public:
         // === Code-level memory optimizations (optional, default off) ===
         {"use_clock_weight_cache", "Use clock/second-chance policy for weight cache (0/1)", "0"},
         {"apply_dense_acc_enable", "Use dense-array accumulator for GAS Apply (0/1)", "1"},
+        {"enable_extended_diagnostics", "Enable extended diagnostics/logs (replaces SNNDL_DIAG_ENABLE)", "0"},
         {"acc_shadow_verify_enable", "Enable shadow accumulator verification when dense accumulator is active (diagnostic)", "0"},
         // 诊断：禁用权重缓存以强制触发内存读取
         {"disable_weight_cache", "Disable weight cache to force memory reads (diagnostic)", "0"}
@@ -283,6 +284,7 @@ private:
     // Shadow verify: map用于与dense累加器对照（可选）
     std::unordered_map<uint32_t, float> acc_shadow_map_;
     bool acc_shadow_verify_enable_ = false;
+    bool enable_extended_diagnostics_ = false; // 参数化诊断开关（替代环境变量 SNNDL_DIAG_ENABLE）
     bool acc_shadow_mismatch_logged_ = false;
     // Per-window aggregation counters (PE-level flush on stage events)
     uint64_t acc_updates_count_ = 0;
