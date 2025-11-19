@@ -16,6 +16,8 @@ libSnnDL_la_SOURCES = \
 	SnnCoreAPI.h \
 	SnnPESubComponent.cc \
 	SnnPESubComponent.h \
+	SnnBcsrWeightManager.cc \
+	SnnBcsrWeightManager.h \
 	SpikeSource.cc \
 	SpikeSource.h \
 	SnnNIC.cc \
