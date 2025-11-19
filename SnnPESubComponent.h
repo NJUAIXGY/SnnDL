@@ -277,6 +277,36 @@ private:
         void markBeginScatter(uint32_t seq);
         void markEndScatter(uint32_t seq, uint64_t spikes_emitted);
     } stage_event_hub_;
+
+    struct DebugState {
+        static constexpr uint32_t EDGE_LOG_LIMIT = 64;
+        static constexpr uint32_t EDGE_LOG_LIMIT_SMALL = 8;
+        static constexpr uint32_t DELTA_LOG_LIMIT = 128;
+
+        uint32_t edge_log_count = 0;
+        uint32_t scatter_diag_quota = 0;
+
+        void resetForWindow(uint32_t scatter_limit) {
+            edge_log_count = 0;
+            scatter_diag_quota = scatter_limit;
+        }
+
+        void refreshScatterLimit(uint32_t scatter_limit) {
+            scatter_diag_quota = scatter_limit;
+        }
+
+        bool tryLog(uint32_t limit = EDGE_LOG_LIMIT) {
+            if (edge_log_count >= limit) return false;
+            ++edge_log_count;
+            return true;
+        }
+
+        bool consumeScatterQuota() {
+            if (scatter_diag_quota == 0) return false;
+            --scatter_diag_quota;
+            return true;
+        }
+    } debug_state_;
     StatsReporter stats_reporter_;
     // Accumulators
     std::unordered_map<uint32_t, float> acc_delta_;        // post_local -> deltaV
@@ -393,7 +423,7 @@ private:
         }
     }
     inline void accUpdate_(uint32_t post, float dv) {
-        if (window_read_debug_ && std::fabs(dv) > 1e-6f && debug_edge_log_count_ < 128) {
+        if (window_read_debug_ && std::fabs(dv) > 1e-6f && debug_state_.tryLog(DebugState::DELTA_LOG_LIMIT)) {
             output_->verbose(CALL_INFO, 0, 0,
                 "[diag-delta] core=%d post=%u dv=%.6f stage=%d\n",
                 core_id_, post, dv, static_cast<int>(gas_stage_));
@@ -872,7 +902,6 @@ private:
     bool window_read_debug_ = false;    // 控制窗口读相关调试日志
     // 每窗Scatter阶段诊断配额（打印dv/v调试信息的条数，避免日志爆炸）
     uint32_t scatter_diag_limit_param_ = 0;
-    uint32_t scatter_diag_quota_ = 0;
     std::vector<uint8_t> posts_seen_window_;      // 当前窗口触达的 post（Scatter 填充，位图）
     std::vector<uint8_t> posts_seen_prev_window_; // 上一窗口触达的 post（位图，给 BeginApply 使用）
     std::vector<uint32_t> posts_list_window_;     // 当前窗口触达的 post 列表（压缩遍历）
@@ -880,7 +909,6 @@ private:
     std::unordered_set<uint32_t> active_pre_window_;      // 当前窗口触达的 pre（全局列）
     std::unordered_set<uint32_t> active_pre_prev_window_; // 上一窗口触达的 pre
     uint32_t debug_window_log_count_ = 0;
-    uint32_t debug_edge_log_count_ = 0;
     // Debug instrumentation
     uint32_t debug_window_idx_ = 0;
     std::vector<uint64_t> wcache_keys_;

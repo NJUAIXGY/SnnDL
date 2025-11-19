@@ -131,12 +131,11 @@ void SnnPESubComponent::diagEdgeWeight_(const char* tag, uint32_t post_local,
                                         uint32_t pre_global, float weight,
                                         uint32_t count) {
     if (!window_read_debug_ || !output_) return;
-    if (debug_edge_log_count_ >= 64) return;
+    if (!debug_state_.tryLog(DebugState::EDGE_LOG_LIMIT)) return;
     output_->verbose(CALL_INFO, 0, 0,
         "[diag-weight] %s core=%d window=%u post_local=%u pre_global=%u weight=%.6f count=%u\n",
         tag ? tag : "edge", core_id_, curr_stage_seq_, post_local, pre_global,
         (double)weight, count);
-    debug_edge_log_count_++;
 }
 
 namespace {
@@ -204,7 +203,7 @@ void SnnPESubComponent::StageEventHub::markBeginGather(uint32_t) {
     have_begin_apply = false;
     have_begin_scatter = false;
     core->window_spikes_all_ = 0;
-    core->debug_edge_log_count_ = 0;
+    core->debug_state_.resetForWindow(core->scatter_diag_limit_param_);
 }
 
 void SnnPESubComponent::StageEventHub::markBeginApply(uint32_t) {
@@ -2288,12 +2287,11 @@ void SnnPESubComponent::processLocalSpike(SpikeEvent* spike_event) {
         }
     }
 
-    if (window_read_debug_ && debug_edge_log_count_ < 8) {
+    if (window_read_debug_ && debug_state_.tryLog(DebugState::EDGE_LOG_LIMIT_SMALL)) {
         output_->verbose(CALL_INFO, 0, 0,
             "[diag-spike] core=%d stage=%d pre_g=%u post_g=%u dest_l=%u queue=%zu\n",
             core_id_, (int)gas_stage_, spike_event->getSourceNeuron(), spike_event->getDestinationNeuron(),
             target_neuron, incoming_spikes_.size());
-        debug_edge_log_count_++;
     }
     
     uint32_t refr = getRefrac_(target_neuron);
@@ -2375,11 +2373,10 @@ void SnnPESubComponent::processLocalSpike(SpikeEvent* spike_event) {
                 core_id_, pre_global, post_local);
         }
     } else {
-        if (window_read_debug_ && debug_edge_log_count_ < 8) {
+        if (window_read_debug_ && debug_state_.tryLog(DebugState::EDGE_LOG_LIMIT_SMALL)) {
             output_->verbose(CALL_INFO, 0, 0,
                 "[diag-edge-gate] core=%d skip recordEdge: ewf=%d mem=%s ready=%d stage=%d\n",
                 core_id_, enable_weight_fetch_ ? 1 : 0, memory_ ? "set" : "null", memory_ready_ ? 1 : 0, (int)gas_stage_);
-            debug_edge_log_count_++;
         }
     }
     // 记录本窗触达的post（仅用于窗口读发起；不改变语义）
@@ -2684,7 +2681,7 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                     case GasOp::BeginScatter:
                         gas_stage_ = GasStage::Scatter; // apply accumulated deltas deterministically
                         // reset per-window scatter diagnostics quota
-                        scatter_diag_quota_ = scatter_diag_limit_param_;
+                        debug_state_.refreshScatterLimit(scatter_diag_limit_param_);
                         if (window_read_debug_ && output_) {
                             SNNDL_LOG(1, "[diag-stage] BeginScatter window=%" PRIu64 " stage=%d\n",
                                 (uint64_t)op->superstep, static_cast<int>(gas_stage_));
@@ -2738,13 +2735,12 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                                     float v = v_before + dv;
                                     setMem_(post, v);
                                     bool willFire = (v >= v_thresh_ && getRefrac_(post) == 0);
-                                    if (scatter_diag_quota_ && window_read_debug_ && output_) {
+                                    if (window_read_debug_ && output_ && debug_state_.consumeScatterQuota()) {
                                         output_->verbose(CALL_INFO, 0, 0,
                                             "[diag-scatter] core=%u window=%u post=%u v_before=%.6f dv=%.6f v_after=%.6f thr=%.6f refrac=%u willFire=%d\n",
                                             core_id_, curr_stage_seq_, post,
                                             (double)v_before, (double)dv, (double)v, (double)v_thresh_,
                                             (unsigned)getRefrac_(post), willFire ? 1 : 0);
-                                        if (scatter_diag_quota_) scatter_diag_quota_--;
                                     }
                                     checkAndFireSpike(post);
                                     if (willFire) {
@@ -2763,13 +2759,12 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                                     float v = v_before + dv;
                                     setMem_(post, v);
                                     bool willFire = (v >= v_thresh_ && getRefrac_(post) == 0);
-                                    if (scatter_diag_quota_ && window_read_debug_ && output_) {
+                                    if (window_read_debug_ && output_ && debug_state_.consumeScatterQuota()) {
                                         output_->verbose(CALL_INFO, 0, 0,
                                             "[diag-scatter] core=%u window=%u post=%u v_before=%.6f dv=%.6f v_after=%.6f thr=%.6f refrac=%u willFire=%d\n",
                                             core_id_, curr_stage_seq_, post,
                                             (double)v_before, (double)dv, (double)v, (double)v_thresh_,
                                             (unsigned)getRefrac_(post), willFire ? 1 : 0);
-                                        if (scatter_diag_quota_) scatter_diag_quota_--;
                                     }
                                     checkAndFireSpike(post);
                                     if (willFire) {
