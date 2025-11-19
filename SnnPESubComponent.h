@@ -1059,6 +1059,9 @@ private:
     void bcsrPopulateWeightCache_(uint32_t block_row, uint32_t block_col, const std::vector<float>& blk);
     bool loadBcsrRowptrFromFile_();
     void ensureRowptrReadyOrFatal_(const char* reason);
+    size_t expectedRowptrEntries_() const;
+    size_t expectedRowptrBytes_() const;
+    bool installRowptrFromBytes_(const uint8_t* data, size_t bytes, const char* source, bool count_stats);
     bool bcsr_force_file_read_ = false; // 诊断：强制从文件读取BCSR块（绕过内存）
     // 从权重文件读取单个 (post_local, pre_global) 的权重（仅诊断/验证用）
     float readBcsrWeightFromFile_(uint32_t post_local, uint32_t pre_global) const;
