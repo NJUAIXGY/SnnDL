@@ -24,6 +24,7 @@
 #include "SnnNeuronModel.h"
 #include "SnnProfiler.h"  // 轻量级性能分析（条件编译）
 #include "SnnBcsrWeightManager.h"
+#include "GasPhaseController.h"
 
 namespace SST {
 namespace SnnDL {
@@ -277,6 +278,9 @@ private:
         void markBeginScatter(uint32_t seq);
         void markEndScatter(uint32_t seq, uint64_t spikes_emitted);
     } stage_event_hub_;
+
+    // Phase4 Step2: GAS controller (skeleton). Owning pointer to avoid heavy headers here.
+    std::unique_ptr<GasPhaseController> gas_ctrl_;
 
     StatsReporter stats_reporter_;
     // Accumulators
@@ -681,6 +685,8 @@ private:
     void issueReadCommon_(uint64_t req_addr, size_t req_size,
                           bool is_row, uint32_t row, uint32_t col_start, uint32_t count_floats,
                           std::function<void(float)> single_cb, uint32_t single_col);
+
+    // (moved to public section at end)
 
     // 方案1辅助
     inline uint32_t scheme1SliceFromPreGlobal_(uint32_t pre_g) const {
@@ -1132,6 +1138,13 @@ public:
     // 应用门控决策（由父级MultiCorePE调用）
     void applyGatingDecision(uint32_t src_global, const std::vector<uint32_t>& dest_pes,
                              uint64_t current_cycle, uint64_t ttl_cycles);
+    // Phase4 Step2-3: minimal orchestration entry for Apply window (delegated by GasPhaseController)
+    void orchestrateApplyWindowEntry();
+    void orchestrateBeginGatherWindowSetup();
+    void orchestrateBeginApplyIssueFallback(bool strict_active);
+    void orchestrateContinueIssueReads();
+    void orchestrateIssueFromEdgesDirect();
+    void orchestrateMarkBeginApply();
 };
 
 } // namespace SnnDL

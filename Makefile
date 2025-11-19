@@ -176,7 +176,8 @@ am__uninstall_files_from_dir = { \
 am__installdirs = "$(DESTDIR)$(compdir)"
 LTLIBRARIES = $(comp_LTLIBRARIES)
 libSnnDL_la_LIBADD =
-am_libSnnDL_la_OBJECTS = SnnPE.lo SnnPESubComponent.lo SpikeSource.lo \
+am_libSnnDL_la_OBJECTS = SnnPE.lo SnnPESubComponent.lo \
+	GasPhaseController.lo SnnBcsrWeightManager.lo SpikeSource.lo \
 	SnnNIC.lo SnnNetworkAdapter.lo SimpleNetworkWrapper.lo \
 	MultiCorePE.lo OptimizedInternalRing.lo SpikeEventWrapper.lo \
 	SimpleTestEvent.lo WeightLoader.lo GatingPE.lo \
@@ -205,13 +206,14 @@ am__v_at_1 =
 DEFAULT_INCLUDES = -I. -I$(top_builddir)/src
 depcomp = $(SHELL) $(top_srcdir)/config/depcomp
 am__maybe_remake_depfiles = depfiles
-am__depfiles_remade = ./$(DEPDIR)/GatherBufferIF.Plo \
-	./$(DEPDIR)/GatingPE.Plo ./$(DEPDIR)/MPIMultiCorePE.Plo \
-	./$(DEPDIR)/MPITypes.Plo ./$(DEPDIR)/MemKCalBench.Plo \
-	./$(DEPDIR)/MultiCorePE.Plo \
+am__depfiles_remade = ./$(DEPDIR)/GasPhaseController.Plo \
+	./$(DEPDIR)/GatherBufferIF.Plo ./$(DEPDIR)/GatingPE.Plo \
+	./$(DEPDIR)/MPIMultiCorePE.Plo ./$(DEPDIR)/MPITypes.Plo \
+	./$(DEPDIR)/MemKCalBench.Plo ./$(DEPDIR)/MultiCorePE.Plo \
 	./$(DEPDIR)/OptimizedInternalRing.Plo \
 	./$(DEPDIR)/SimpleNetworkWrapper.Plo \
-	./$(DEPDIR)/SimpleTestEvent.Plo ./$(DEPDIR)/SnnNIC.Plo \
+	./$(DEPDIR)/SimpleTestEvent.Plo \
+	./$(DEPDIR)/SnnBcsrWeightManager.Plo ./$(DEPDIR)/SnnNIC.Plo \
 	./$(DEPDIR)/SnnNetworkAdapter.Plo ./$(DEPDIR)/SnnPE.Plo \
 	./$(DEPDIR)/SnnPESubComponent.Plo \
 	./$(DEPDIR)/SpikeEventWrapper.Plo ./$(DEPDIR)/SpikeSource.Plo \
@@ -544,11 +546,12 @@ comp_LTLIBRARIES = libSnnDL.la
 
 # MPI扩展源文件 - 重新启用测试编译
 libSnnDL_la_SOURCES = SnnPE.cc SnnPE.h SnnCoreAPI.h \
-	SnnPESubComponent.cc SnnPESubComponent.h SpikeSource.cc \
-	SpikeSource.h SnnNIC.cc SnnNIC.h SnnNetworkAdapter.cc \
-	SnnNetworkAdapter.h SimpleNetworkWrapper.cc \
-	SimpleNetworkWrapper.h MultiCorePE.cc MultiCorePE.h \
-	OptimizedInternalRing.cc OptimizedInternalRing.h \
+	SnnPESubComponent.cc SnnPESubComponent.h GasPhaseController.cc \
+	GasPhaseController.h SnnBcsrWeightManager.cc \
+	SnnBcsrWeightManager.h SpikeSource.cc SpikeSource.h SnnNIC.cc \
+	SnnNIC.h SnnNetworkAdapter.cc SnnNetworkAdapter.h \
+	SimpleNetworkWrapper.cc SimpleNetworkWrapper.h MultiCorePE.cc \
+	MultiCorePE.h OptimizedInternalRing.cc OptimizedInternalRing.h \
 	SnnInterface.h SnnPEParentInterface.h SpikeEvent.h \
 	SpikeEventWrapper.h SpikeEventWrapper.cc SimpleTestEvent.h \
 	SimpleTestEvent.cc WeightLoader.cc WeightLoader.h GatingPE.cc \
@@ -634,6 +637,7 @@ mostlyclean-compile:
 distclean-compile:
 	-rm -f *.tab.c
 
+include ./$(DEPDIR)/GasPhaseController.Plo # am--include-marker
 include ./$(DEPDIR)/GatherBufferIF.Plo # am--include-marker
 include ./$(DEPDIR)/GatingPE.Plo # am--include-marker
 include ./$(DEPDIR)/MPIMultiCorePE.Plo # am--include-marker
@@ -643,6 +647,7 @@ include ./$(DEPDIR)/MultiCorePE.Plo # am--include-marker
 include ./$(DEPDIR)/OptimizedInternalRing.Plo # am--include-marker
 include ./$(DEPDIR)/SimpleNetworkWrapper.Plo # am--include-marker
 include ./$(DEPDIR)/SimpleTestEvent.Plo # am--include-marker
+include ./$(DEPDIR)/SnnBcsrWeightManager.Plo # am--include-marker
 include ./$(DEPDIR)/SnnNIC.Plo # am--include-marker
 include ./$(DEPDIR)/SnnNetworkAdapter.Plo # am--include-marker
 include ./$(DEPDIR)/SnnPE.Plo # am--include-marker
@@ -815,7 +820,8 @@ clean-am: clean-compLTLIBRARIES clean-generic clean-libtool \
 	mostlyclean-am
 
 distclean: distclean-am
-		-rm -f ./$(DEPDIR)/GatherBufferIF.Plo
+		-rm -f ./$(DEPDIR)/GasPhaseController.Plo
+	-rm -f ./$(DEPDIR)/GatherBufferIF.Plo
 	-rm -f ./$(DEPDIR)/GatingPE.Plo
 	-rm -f ./$(DEPDIR)/MPIMultiCorePE.Plo
 	-rm -f ./$(DEPDIR)/MPITypes.Plo
@@ -824,6 +830,7 @@ distclean: distclean-am
 	-rm -f ./$(DEPDIR)/OptimizedInternalRing.Plo
 	-rm -f ./$(DEPDIR)/SimpleNetworkWrapper.Plo
 	-rm -f ./$(DEPDIR)/SimpleTestEvent.Plo
+	-rm -f ./$(DEPDIR)/SnnBcsrWeightManager.Plo
 	-rm -f ./$(DEPDIR)/SnnNIC.Plo
 	-rm -f ./$(DEPDIR)/SnnNetworkAdapter.Plo
 	-rm -f ./$(DEPDIR)/SnnPE.Plo
@@ -876,7 +883,8 @@ install-ps-am:
 installcheck-am:
 
 maintainer-clean: maintainer-clean-am
-		-rm -f ./$(DEPDIR)/GatherBufferIF.Plo
+		-rm -f ./$(DEPDIR)/GasPhaseController.Plo
+	-rm -f ./$(DEPDIR)/GatherBufferIF.Plo
 	-rm -f ./$(DEPDIR)/GatingPE.Plo
 	-rm -f ./$(DEPDIR)/MPIMultiCorePE.Plo
 	-rm -f ./$(DEPDIR)/MPITypes.Plo
@@ -885,6 +893,7 @@ maintainer-clean: maintainer-clean-am
 	-rm -f ./$(DEPDIR)/OptimizedInternalRing.Plo
 	-rm -f ./$(DEPDIR)/SimpleNetworkWrapper.Plo
 	-rm -f ./$(DEPDIR)/SimpleTestEvent.Plo
+	-rm -f ./$(DEPDIR)/SnnBcsrWeightManager.Plo
 	-rm -f ./$(DEPDIR)/SnnNIC.Plo
 	-rm -f ./$(DEPDIR)/SnnNetworkAdapter.Plo
 	-rm -f ./$(DEPDIR)/SnnPE.Plo

@@ -11,6 +11,7 @@
 #include "GasCustomCmd.h"
 #include "MultiCorePE.h"
 #include "GatherBufferIF.h"
+#include "GasPhaseController.h"
 
 #include <sstream>
 #include <iostream>
@@ -32,6 +33,69 @@ using namespace SST;
 using namespace SST::SnnDL;
 
 // 诊断门控改为参数化：由 enable_extended_diagnostics_ 成员控制
+
+// Public thin wrapper for Phase4 Step2-3. Keeps behavior inside SnnPESubComponent.
+void SnnPESubComponent::orchestrateApplyWindowEntry() {
+    prepareEdgeWindowForApply_();
+}
+
+void SnnPESubComponent::orchestrateBeginGatherWindowSetup() {
+    // Exactly preserve original order of operations for BeginGather setup
+    if (use_bcsr_) {
+        logBcsrWindowStats_("prev");
+        resetBcsrWindowCounters_();
+    }
+    uint64_t now = getCurrentSimTimeNano();
+    appendStageEventRow_("BeginGather", now, 0);
+    if (gas_ctrl_) gas_ctrl_->onBeginGather(static_cast<uint32_t>(curr_stage_seq_));
+    stage_event_hub_.t_begin_gather = now;
+    stage_event_hub_.have_begin_gather = true;
+    stage_event_hub_.have_begin_apply = false;
+    stage_event_hub_.have_begin_scatter = false;
+    window_spikes_all_ = 0;
+    // 新窗开始：复位边集合容量告警
+    edge_collector_capacity_warned_ = false;
+    if (window_read_enable_) {
+        // 位图迁移
+        if (!posts_seen_window_.empty()) {
+            if (posts_seen_prev_window_.size() != posts_seen_window_.size()) {
+                posts_seen_prev_window_.assign(posts_seen_window_.size(), 0);
+            }
+            posts_seen_prev_window_ = posts_seen_window_;
+            std::fill(posts_seen_window_.begin(), posts_seen_window_.end(), 0);
+        } else if (posts_seen_prev_window_.size() != num_neurons_) {
+            posts_seen_prev_window_.assign(num_neurons_, 0);
+        }
+        // 列表迁移
+        posts_list_prev_window_.swap(posts_list_window_);
+        posts_list_window_.clear();
+        // pre 集合迁移
+        active_pre_prev_window_ = std::move(active_pre_window_);
+        active_pre_window_.clear();
+    }
+    // reset per-window counters
+    acc_updates_count_ = 0; acc_posts_touched_count_ = 0;
+    diag_edges_record_hits_ = 0; diag_edges_stage_skips_ = 0; diag_edges_cond_skips_ = 0;
+    diag_spikes_stage_gather_ = diag_spikes_stage_apply_ = diag_spikes_stage_scatter_ = 0;
+    diag_spikes_stage_idle_ = 0;
+    acc_spill_records_count_ = 0; acc_spilled_bytes_sum_ = 0; acc_hwm_bytes_max_ = 0;
+}
+
+void SnnPESubComponent::orchestrateBeginApplyIssueFallback(bool strict_active) {
+    read_orchestrator_.issueFallbackReadsIfNeeded(strict_active);
+}
+
+void SnnPESubComponent::orchestrateContinueIssueReads() {
+    issueEdgeWeightFetches_();
+}
+
+void SnnPESubComponent::orchestrateIssueFromEdgesDirect() {
+    read_orchestrator_.issueFromEdges();
+}
+
+void SnnPESubComponent::orchestrateMarkBeginApply() {
+    stage_event_hub_.markBeginApply(curr_stage_seq_);
+}
 
 bool SnnPESubComponent::BcsrLayout::validate(uint64_t base, Output* out, bool debug, uint32_t core_id, uint32_t node_id) const {
     const bool monotonic = (colidx_offset >= rowptr_offset) && (blockdata_offset >= colidx_offset);
@@ -211,6 +275,7 @@ void SnnPESubComponent::StageEventHub::markBeginGather(uint32_t) {
     }
     uint64_t now = core->getCurrentSimTimeNano();
     core->appendStageEventRow_("BeginGather", now, 0);
+    if (core->gas_ctrl_) core->gas_ctrl_->onBeginGather(static_cast<uint32_t>(core->curr_stage_seq_));
     t_begin_gather = now;
     have_begin_gather = true;
     have_begin_apply = false;
@@ -222,6 +287,7 @@ void SnnPESubComponent::StageEventHub::markBeginApply(uint32_t) {
     if (!core) return;
     uint64_t now = core->getCurrentSimTimeNano();
     core->appendStageEventRow_("BeginApply", now, 0);
+    if (core->gas_ctrl_) core->gas_ctrl_->onBeginApply(static_cast<uint32_t>(core->curr_stage_seq_));
     t_begin_apply = now;
     have_begin_apply = true;
 }
@@ -230,6 +296,7 @@ void SnnPESubComponent::StageEventHub::markBeginScatter(uint32_t) {
     if (!core) return;
     uint64_t now = core->getCurrentSimTimeNano();
     core->appendStageEventRow_("BeginScatter", now, 0);
+    if (core->gas_ctrl_) core->gas_ctrl_->onBeginScatter(static_cast<uint32_t>(core->curr_stage_seq_));
     t_begin_scatter = now;
     have_begin_scatter = true;
     if (core->apply_acc_enable_ && core->gas_window_mode_) {
@@ -245,6 +312,18 @@ void SnnPESubComponent::StageEventHub::markEndScatter(uint32_t seq, uint64_t spi
     if (!core) return;
     uint64_t now = core->getCurrentSimTimeNano();
     core->appendStageEventRow_("EndScatter", now, spikes_emitted);
+    if (core->gas_ctrl_) {
+        core->gas_ctrl_->onEndScatter(seq, spikes_emitted);
+        core->gas_ctrl_->onScatterFinalize(static_cast<uint32_t>(seq),
+                                           spikes_emitted,
+                                           core->window_spikes_all_,
+                                           core->acc_updates_count_,
+                                           core->acc_posts_touched_count_,
+                                           core->acc_hwm_bytes_max_,
+                                           core->acc_spill_records_count_,
+                                           core->acc_spilled_bytes_sum_);
+        core->gas_ctrl_->onWindowFinalize();
+    }
     core->stats_reporter_.reportWindowSpikes(static_cast<uint32_t>(seq), spikes_emitted);
     core->spikes_emitted_window_ = 0;
     core->window_spikes_all_ = 0;
@@ -254,20 +333,31 @@ void SnnPESubComponent::StageEventHub::markEndScatter(uint32_t seq, uint64_t spi
         }
     }
     if (core->stat_gas_superstep_total_cycles_) {
-        if (have_begin_gather) {
-            uint64_t total = (now >= t_begin_gather) ? (now - t_begin_gather) : 0ULL;
+        // Prefer controller mirror if present; fallback to local times to preserve behavior
+        bool Hbg = have_begin_gather, Hba = have_begin_apply, Hbs = have_begin_scatter;
+        uint64_t Tbg = t_begin_gather, Tba = t_begin_apply, Tbs = t_begin_scatter;
+        if (core->gas_ctrl_) {
+            Hbg = core->gas_ctrl_->hasBeginGather();
+            Hba = core->gas_ctrl_->hasBeginApply();
+            Hbs = core->gas_ctrl_->hasBeginScatter();
+            Tbg = core->gas_ctrl_->tBeginGather();
+            Tba = core->gas_ctrl_->tBeginApply();
+            Tbs = core->gas_ctrl_->tBeginScatter();
+        }
+        if (Hbg) {
+            uint64_t total = (now >= Tbg) ? (now - Tbg) : 0ULL;
             core->stat_gas_superstep_total_cycles_->addData(total);
         }
-        if (have_begin_gather && have_begin_apply && core->stat_gas_superstep_gather_cycles_) {
-            uint64_t g = (t_begin_apply >= t_begin_gather) ? (t_begin_apply - t_begin_gather) : 0ULL;
+        if (Hbg && Hba && core->stat_gas_superstep_gather_cycles_) {
+            uint64_t g = (Tba >= Tbg) ? (Tba - Tbg) : 0ULL;
             core->stat_gas_superstep_gather_cycles_->addData(g);
         }
-        if (have_begin_apply && core->stat_gas_superstep_apply_cycles_) {
-            uint64_t a = (t_begin_scatter >= t_begin_apply) ? (t_begin_scatter - t_begin_apply) : 0ULL;
+        if (Hba && core->stat_gas_superstep_apply_cycles_) {
+            uint64_t a = (Tbs >= Tba) ? (Tbs - Tba) : 0ULL;
             core->stat_gas_superstep_apply_cycles_->addData(a);
         }
-        if (have_begin_scatter && core->stat_gas_superstep_scatter_cycles_) {
-            uint64_t s = (now >= t_begin_scatter) ? (now - t_begin_scatter) : 0ULL;
+        if (Hbs && core->stat_gas_superstep_scatter_cycles_) {
+            uint64_t s = (now >= Tbs) ? (now - Tbs) : 0ULL;
             core->stat_gas_superstep_scatter_cycles_->addData(s);
         }
     }
@@ -357,10 +447,16 @@ void SnnPESubComponent::StatsReporter::updatePendingPeak(uint32_t outstanding) c
 }
 
 void SnnPESubComponent::issueEdgeWeightFetches_() {
-    read_orchestrator_.logEdgeFetchStart(
-        edge_collector_.prevSize(), window_reads_issued_this_apply_,
-        outstanding_requests_, window_read_budget_);
-    read_orchestrator_.issueFromEdges();
+    if (gas_ctrl_) {
+        gas_ctrl_->logEdgeFetchStart(
+            static_cast<uint64_t>(edge_collector_.prevSize()), window_reads_issued_this_apply_,
+            outstanding_requests_, window_read_budget_);
+    } else {
+        read_orchestrator_.logEdgeFetchStart(
+            edge_collector_.prevSize(), window_reads_issued_this_apply_,
+            outstanding_requests_, window_read_budget_);
+    }
+    if (gas_ctrl_) gas_ctrl_->issueFromEdges(); else read_orchestrator_.issueFromEdges();
 }
 
 void SnnPESubComponent::ReadOrchestrator::issueFromEdges() {
@@ -435,6 +531,7 @@ void SnnPESubComponent::ReadOrchestrator::issueFromEdges() {
                 } while(0);
                 if (core->readresp_zero_fallback_ && resolved == 0.0f) resolved = core->init_default_weight_;
                 core->accUpdate_(post_local, resolved * static_cast<float>(count));
+                if (core->gas_ctrl_) core->gas_ctrl_->onWeightResolved(post_local, resolved, count);
                 core->diagEdgeWeight_("bcsr-file", post_local, pre_global, resolved, count);
                 // 继续发起下一条边
                 issueFromEdges();
@@ -442,12 +539,14 @@ void SnnPESubComponent::ReadOrchestrator::issueFromEdges() {
                 core->outstanding_requests_++;
                 core->stats_reporter_.updatePendingPeak(core->outstanding_requests_);
                 core->window_reads_issued_this_apply_++;
+                if (core->gas_ctrl_) core->gas_ctrl_->onReadIssued();
                 uint32_t pre_capture = pre_global;
                 core->requestWeightBCSR(pre_global, post_local,
                     [this, post_local, count, pre_capture](float w) {
                         float resolved = w;
                         if (core->readresp_zero_fallback_ && resolved == 0.0f) resolved = core->init_default_weight_;
                         core->accUpdate_(post_local, resolved * static_cast<float>(count));
+                        if (core->gas_ctrl_) core->gas_ctrl_->onWeightResolved(post_local, resolved, count);
                         core->diagEdgeWeight_("bcsr", post_local, pre_capture, resolved, count);
                         if (core->outstanding_requests_ > 0) core->outstanding_requests_--;
                         issueFromEdges();
@@ -469,6 +568,7 @@ void SnnPESubComponent::ReadOrchestrator::issueFromEdges() {
         if (core->weightCacheTryGet_(cache_key, cached)) {
             if (core->readresp_zero_fallback_ && cached == 0.0f) cached = core->init_default_weight_;
             core->accUpdate_(post_local, cached * static_cast<float>(count));
+            if (core->gas_ctrl_) core->gas_ctrl_->onWeightResolved(post_local, cached, count);
             core->diagEdgeWeight_("cache", post_local, pre_global, cached, count);
             core->stats_reporter_.reportCacheAccess(true);
             continue;
@@ -478,6 +578,7 @@ void SnnPESubComponent::ReadOrchestrator::issueFromEdges() {
         core->outstanding_requests_++;
         core->stats_reporter_.updatePendingPeak(core->outstanding_requests_);
         core->window_reads_issued_this_apply_++;
+        if (core->gas_ctrl_) core->gas_ctrl_->onReadIssued();
         uint32_t pre_capture = pre_global;
         core->requestWeight(req_pre, req_post,
             [this, post_local, count, cache_key, pre_capture](float w) {
@@ -485,6 +586,7 @@ void SnnPESubComponent::ReadOrchestrator::issueFromEdges() {
                 if (core->readresp_zero_fallback_ && resolved == 0.0f) resolved = core->init_default_weight_;
                 core->weightCacheStore_(cache_key, resolved);
                 core->accUpdate_(post_local, resolved * static_cast<float>(count));
+                if (core->gas_ctrl_) core->gas_ctrl_->onWeightResolved(post_local, resolved, count);
                 core->diagEdgeWeight_("miss", post_local, pre_capture, resolved, count);
                 if (core->outstanding_requests_ > 0) core->outstanding_requests_--;
                 issueFromEdges();
@@ -512,6 +614,7 @@ void SnnPESubComponent::ReadOrchestrator::issueFromSets(
             core->outstanding_requests_++;
             core->stats_reporter_.updatePendingPeak(core->outstanding_requests_);
             core->window_reads_issued_this_apply_++;
+            if (core->gas_ctrl_) core->gas_ctrl_->onReadIssued();
             issued++;
             core->requestWeight(req_pre, req_post, [this, cache_key](float w){
                 core->weightCacheStore_(cache_key, w);
@@ -577,7 +680,8 @@ void SnnPESubComponent::ReadOrchestrator::issueFromSetsBcsr(
             core->stats_reporter_.reportCacheAccess(false);
             core->outstanding_requests_++;
             core->stats_reporter_.updatePendingPeak(core->outstanding_requests_);
-            core->window_reads_issued_this_apply_++;
+        core->window_reads_issued_this_apply_++;
+        if (core->gas_ctrl_) core->gas_ctrl_->onReadIssued();
             primed++;
             core->requestWeightBCSR(pre_g, post_l, [this](float) {
                 if (core->outstanding_requests_ > 0) core->outstanding_requests_--;
@@ -633,6 +737,25 @@ void SnnPESubComponent::ReadOrchestrator::logEdgeFetchStart(
 
 bool SnnPESubComponent::ReadOrchestrator::canIssueMoreReads_() const {
     if (!core) return false;
+    // Delegate decision to controller when available (mirror-only),
+    // but keep exact original behavior via local counters.
+    if (core->gas_ctrl_) {
+        bool ok = core->gas_ctrl_->canIssueMoreReads(core->window_reads_issued_this_apply_, core->window_read_budget_,
+                                                     core->outstanding_requests_, core->max_outstanding_requests_);
+        if (!ok) {
+            // Emit same diagnostics as before for transparency
+            if (core->window_read_budget_ && core->window_reads_issued_this_apply_ >= core->window_read_budget_) {
+                diag_.log(0, "[diag-edge-loop] core=%d budget hit issued=%u\n", core->core_id_, core->window_reads_issued_this_apply_);
+            }
+            if (core->outstanding_requests_ >= core->max_outstanding_requests_) {
+                diag_.log(0, "[diag-edge-loop] core=%d outstanding=%u limit=%u\n",
+                    core->core_id_, core->outstanding_requests_, core->max_outstanding_requests_);
+            }
+            return false;
+        }
+        return true;
+    }
+    // Fallback to local rule
     if (core->window_read_budget_ && core->window_reads_issued_this_apply_ >= core->window_read_budget_) {
         diag_.log(0, "[diag-edge-loop] core=%d budget hit issued=%u\n", core->core_id_, core->window_reads_issued_this_apply_);
         return false;
@@ -694,6 +817,15 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     enable_weight_fetch_ = params.find<int>("enable_weight_fetch", 0) != 0;
     // 现在再初始化依赖core指针的轻量结构
     stage_event_hub_.init(this);
+    // Phase4 Step2-1: Initialize GasPhaseController skeleton (no behavior change)
+    try {
+        gas_ctrl_.reset(new GasPhaseController());
+        gas_ctrl_->init(this, output_);
+        gas_ctrl_->setDebug(window_read_debug_, enable_extended_diagnostics_);
+        gas_ctrl_->setStageEventsCsv(stage_events_csv_);
+    } catch (...) {
+        gas_ctrl_.reset();
+    }
     stats_reporter_.init(this);
     read_orchestrator_.init(this);
 #if SNNDL_DEBUG_ENABLED
@@ -748,6 +880,7 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     window_read_enable_ = params.find<int>("window_read_enable", 0) != 0;
     window_read_debug_ = params.find<int>("window_read_debug", 0) != 0;
     window_read_budget_ = params.find<uint32_t>("window_read_budget", 1024);
+    if (gas_ctrl_) gas_ctrl_->setWindowReadBudget(window_read_budget_);
     read_force_single_ = params.find<int>("read_force_single", 0) != 0;
     // 边集合容量上限（极端保护）
     edge_collector_max_capacity_ = static_cast<size_t>(params.find<uint64_t>("edge_collector_max_capacity", 1000000));
@@ -2450,6 +2583,7 @@ void SnnPESubComponent::processLocalSpike(SpikeEvent* spike_event) {
             diag_dv_sum_window_ += (double)weight;
             if (weight != 0.0f) diag_dv_updates_nonzero_++;
             accUpdate_(post_local, weight);
+            if (gas_ctrl_) gas_ctrl_->onWeightResolved(post_local, weight, 1);
         }
         recordSynapticAccess_();
         return;
@@ -2632,39 +2766,11 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                             posts_list_prev_window_.size(), active_pre_prev_window_.size(),
                             posts_list_window_.size(), active_pre_window_.size(), incoming_spikes_.size());
                         }
-                        // reset per-window counters
-                        {
-                        stage_event_hub_.markBeginGather(curr_stage_seq_);
-                        // 新窗开始：复位边集合容量告警
-                        edge_collector_capacity_warned_ = false;
-                            if (window_read_enable_) {
-                                // 位图迁移
-                                if (!posts_seen_window_.empty()) {
-                                    if (posts_seen_prev_window_.size() != posts_seen_window_.size()) {
-                                        posts_seen_prev_window_.assign(posts_seen_window_.size(), 0);
-                                    }
-                                    posts_seen_prev_window_ = posts_seen_window_;
-                                    std::fill(posts_seen_window_.begin(), posts_seen_window_.end(), 0);
-                                } else if (posts_seen_prev_window_.size() != num_neurons_) {
-                                    posts_seen_prev_window_.assign(num_neurons_, 0);
-                                }
-                                // 列表迁移
-                                posts_list_prev_window_.swap(posts_list_window_);
-                                posts_list_window_.clear();
-                                // pre 集合迁移
-                                active_pre_prev_window_ = std::move(active_pre_window_);
-                                active_pre_window_.clear();
-                            }
-                        }
-                        acc_updates_count_ = 0; acc_posts_touched_count_ = 0;
-                        diag_edges_record_hits_ = 0; diag_edges_stage_skips_ = 0; diag_edges_cond_skips_ = 0;
-                        diag_spikes_stage_gather_ = diag_spikes_stage_apply_ = diag_spikes_stage_scatter_ = 0;
-                        diag_spikes_stage_idle_ = 0;
-                        acc_spill_records_count_ = 0; acc_spilled_bytes_sum_ = 0; acc_hwm_bytes_max_ = 0;
+                        if (gas_ctrl_) gas_ctrl_->beginGatherWindowSetup(); else orchestrateBeginGatherWindowSetup();
                         break;
                     case GasOp::BeginApply:
                         gas_stage_ = GasStage::Apply; curr_stage_seq_ = op->superstep; // start accepting accum
-                        prepareEdgeWindowForApply_();
+                        if (gas_ctrl_) gas_ctrl_->beginApplyOrchestrate(); else prepareEdgeWindowForApply_();
 #if SNNDL_DEBUG_ENABLED
                         if (window_read_debug_) {
                             SNNDL_DEBUG_LOG(1, "[diag-stage] BeginApply window=%" PRIu64 " stage=%d posts_prev=%zu active_prev=%zu posts_curr=%zu active_curr=%zu\n",
@@ -2674,7 +2780,12 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                         }
 #endif
                 stage_event_hub_.markBeginApply(curr_stage_seq_);
-                read_orchestrator_.issueFallbackReadsIfNeeded(apply_acc_enable_ && gas_window_mode_);
+                if (gas_ctrl_) gas_ctrl_->beginApplyFullSequence(apply_acc_enable_ && gas_window_mode_);
+                else {
+                    orchestrateApplyWindowEntry();
+                    stage_event_hub_.markBeginApply(curr_stage_seq_);
+                    read_orchestrator_.issueFallbackReadsIfNeeded(apply_acc_enable_ && gas_window_mode_);
+                }
 #if SNNDL_DEBUG_ENABLED
                 if (window_read_debug_ && output_) {
                     output_->verbose(CALL_INFO, 1, 0,
@@ -2733,11 +2844,11 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                             uint32_t curp=UINT32_MAX; float sum=0.0f;
                             for (auto &pr : acc_spill_log_) {
                                 if (pr.first != curp) {
-                                    if (curp!=UINT32_MAX) accUpdate_(curp, sum);
+                                    if (curp!=UINT32_MAX) { accUpdate_(curp, sum); if (gas_ctrl_) gas_ctrl_->onWeightResolved(curp, sum, 1); }
                                     curp = pr.first; sum = pr.second;
                                 } else { sum += pr.second; }
                             }
-                            if (curp!=UINT32_MAX) accUpdate_(curp, sum);
+                            if (curp!=UINT32_MAX) { accUpdate_(curp, sum); if (gas_ctrl_) gas_ctrl_->onWeightResolved(curp, sum, 1); }
                             acc_spill_log_.clear();
                         }
                         {
@@ -2934,7 +3045,7 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
             }
             bcsrPrefetchAll_();
             if (apply_acc_enable_ && gas_window_mode_ && gas_stage_ == GasStage::Apply) {
-                issueEdgeWeightFetches_();
+                if (gas_ctrl_) gas_ctrl_->continueIssueReads(); else issueEdgeWeightFetches_();
             }
         };
 
@@ -3125,6 +3236,7 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                 if (apply_acc_enable_ && gas_window_mode_) {
                     uint32_t post_local = pending_req.bcsr_block_row * bcsr_weights_.effectiveBlockRows() + pending_req.bcsr_intra_row;
                     accUpdate_(post_local, w);
+                    if (gas_ctrl_) gas_ctrl_->onWeightResolved(post_local, w, 1);
                 }
                 if (pending_req.has_single_cb && pending_req.single_cb) pending_req.single_cb(w);
             } else {
@@ -3227,6 +3339,7 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                             if (outstanding_requests_ > 0) outstanding_requests_--;
                         });
                         window_reads_issued_this_apply_++;
+                        if (gas_ctrl_) gas_ctrl_->onReadIssued();
                         if (outstanding_requests_ >= max_outstanding_requests_) break;
                     }
                     if (window_reads_issued_this_apply_ >= window_read_budget_ || outstanding_requests_ >= max_outstanding_requests_) break;
@@ -3234,7 +3347,7 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
             }
         }
         if (apply_acc_enable_ && gas_window_mode_) {
-            issueEdgeWeightFetches_();
+            if (gas_ctrl_) gas_ctrl_->continueIssueReads(); else issueEdgeWeightFetches_();
         }
     }
     
