@@ -129,6 +129,7 @@ public:
         // === Code-level memory optimizations (optional, default off) ===
         {"use_clock_weight_cache", "Use clock/second-chance policy for weight cache (0/1)", "0"},
         {"apply_dense_acc_enable", "Use dense-array accumulator for GAS Apply (0/1)", "1"},
+        {"bcsr_rowptr_file_fallback_enable", "Allow loading BCSR rowptrs from weight files if DRAM read fails", "0"},
         {"enable_extended_diagnostics", "Enable extended diagnostics/logs (replaces SNNDL_DIAG_ENABLE)", "0"},
         {"acc_shadow_verify_enable", "Enable shadow accumulator verification when dense accumulator is active (diagnostic)", "0"},
         // 诊断：禁用权重缓存以强制触发内存读取
@@ -284,6 +285,7 @@ private:
     // Shadow verify: map用于与dense累加器对照（可选）
     std::unordered_map<uint32_t, float> acc_shadow_map_;
     bool acc_shadow_verify_enable_ = false;
+    bool bcsr_rowptr_file_fallback_enable_ = false;
     bool enable_extended_diagnostics_ = false; // 参数化诊断开关（替代环境变量 SNNDL_DIAG_ENABLE）
     bool acc_shadow_mismatch_logged_ = false;
     // Per-window aggregation counters (PE-level flush on stage events)
@@ -1014,6 +1016,7 @@ private:
     uint64_t bcsr_bad_weight_count_ = 0;
     std::vector<uint32_t> bcsr_rowptr_host_;// 缓存 rowptr 表（内存镜像）
     bool bcsr_rowptr_ready_ = false;
+    bool bcsr_rowptr_read_pending_ = false;
 
     // --- Verify (BCSR probe) state (diagnostic only; zero-cost when disabled) ---
     bool verify_bcsr_started_ = false;
@@ -1023,10 +1026,6 @@ private:
     uint32_t verify_bcsr_block_col_ = 0;    // chosen block column
     uint32_t verify_bcsr_intra_col_ = 0;    // scan 0..bc-1
     bool verify_bcsr_block_resolved_ = false;
-    uint64_t bcsr_rowptr_retry_cycle_ = 0;
-    uint64_t bcsr_rowptr_retry_interval_cycles_ = 2000;
-    uint32_t bcsr_rowptr_retry_attempts_ = 0;
-    uint32_t bcsr_rowptr_retry_max_ = 4;
     uint32_t bcsr_row_index_cache_cap_ = 64; // 行索引段缓存容量（行数）
     uint32_t bcsr_block_cache_cap_ = 256;    // 数据块缓存容量（块数）
     // 行索引缓存：block_row -> colidx 段
@@ -1063,6 +1062,7 @@ private:
     void bcsrPrefetchRowBlocks_(uint32_t block_row, const std::vector<uint32_t>& cols, uint32_t row_start);
     void bcsrPopulateWeightCache_(uint32_t block_row, uint32_t block_col, const std::vector<float>& blk);
     bool loadBcsrRowptrFromFile_();
+    void ensureRowptrReadyOrFatal_(const char* reason);
     bool bcsr_force_file_read_ = false; // 诊断：强制从文件读取BCSR块（绕过内存）
     // 从权重文件读取单个 (post_local, pre_global) 的权重（仅诊断/验证用）
     float readBcsrWeightFromFile_(uint32_t post_local, uint32_t pre_global) const;

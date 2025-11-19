@@ -17,11 +17,6 @@
 #include <cmath>
 #include <algorithm>
 #include <cstdio>   // TEMP: debug file sink for acc-shadow verification
-// 诊断：允许禁用rowptr文件回落(调试用) —— 放入SST::SnnDL命名空间，避免符号不匹配
-namespace SST { namespace SnnDL {
-bool snndl_rowptr_fallback_disable_flag = false;
-} }
-
 #include <cstring>
 #include <cstdlib>
 #include <cstdint>
@@ -813,6 +808,7 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     // 权重验证参数
     verify_weights_ = params.find<int>("verify_weights", 0) != 0;
     bcsr_force_file_read_ = params.find<int>("bcsr_force_file_read", 0) != 0;
+    bcsr_rowptr_file_fallback_enable_ = params.find<int>("bcsr_rowptr_file_fallback_enable", 0) != 0;
     weight_verify_samples_ = params.find<uint32_t>("weight_verify_samples", 16);
     expected_weight_value_ = params.find<float>("expected_weight_value", 0.0f);
     verify_epsilon_ = params.find<float>("verify_epsilon", 1e-4f);
@@ -982,7 +978,7 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
             output_->verbose(CALL_INFO, 0, 0,
                 "[diag-bcsr] node=%u core=%d warning: weights_template empty while BCSR enabled\n",
                 node_id_, core_id_);
-        } else if (!weights_template_.empty() && !bcsr_rowptr_ready_ && !snndl_rowptr_fallback_disable_flag && loadBcsrRowptrFromFile_()) {
+        } else if (bcsr_rowptr_file_fallback_enable_ && !weights_template_.empty() && !bcsr_rowptr_ready_ && loadBcsrRowptrFromFile_()) {
             bcsr_rowptr_ready_ = true;
             if (window_read_debug_) {
                 output_->verbose(CALL_INFO, 0, 0,
@@ -1440,10 +1436,9 @@ bool SnnPESubComponent::clockTick(Cycle_t current_cycle) {
     */
     
     // BCSR rowptr 预取（延迟到运行期且满足暖机与barrier）
-    if (use_bcsr_ && memory_ && memory_ready_ && !bcsr_rowptr_ready_ &&
+    if (use_bcsr_ && memory_ && memory_ready_ && !bcsr_rowptr_ready_ && !bcsr_rowptr_read_pending_ &&
         total_cycles_ >= memory_warmup_cycles_ &&
-        (loader_barrier_cycles_ == 0 || total_cycles_ >= loader_barrier_cycles_) &&
-        total_cycles_ >= bcsr_rowptr_retry_cycle_) {
+        (loader_barrier_cycles_ == 0 || total_cycles_ >= loader_barrier_cycles_)) {
         uint32_t rows = num_neurons_;
         uint32_t br = (bcsr_br_ > 0) ? bcsr_br_ : 16;
         uint32_t nBlockRows = (rows + br - 1) / br;
@@ -1464,7 +1459,7 @@ bool SnnPESubComponent::clockTick(Cycle_t current_cycle) {
                 core_id_, (unsigned long long)bcsr_rowptr_addr_, bytes);
         }
         memory_->send(read);
-        bcsr_rowptr_retry_cycle_ = total_cycles_ + bcsr_rowptr_retry_interval_cycles_;
+        bcsr_rowptr_read_pending_ = true;
     }
 
 
@@ -2907,6 +2902,24 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
             if (scheme1_pending_prefetch_ > 0) scheme1_pending_prefetch_--;
         }
 
+        auto finalize_rowptr_ready = [&]() {
+            if (window_read_debug_ && output_) {
+                output_->verbose(CALL_INFO, 0, 0,
+                    "[diag-bcsr] core=%u rowptr ready entries=%zu first=%u second=%u\n",
+                    core_id_, bcsr_rowptr_host_.size(),
+                    bcsr_rowptr_host_.empty() ? 0u : bcsr_rowptr_host_[0],
+                    bcsr_rowptr_host_.size() > 1 ? bcsr_rowptr_host_[1] : 0u);
+            }
+            bcsrPrefetchAll_();
+            if (apply_acc_enable_ && gas_window_mode_ && gas_stage_ == GasStage::Apply) {
+                issueEdgeWeightFetches_();
+            }
+        };
+        auto fallback_and_finalize = [&](const char* reason) {
+            ensureRowptrReadyOrFatal_(reason);
+            finalize_rowptr_ready();
+        };
+
         auto* readResp = dynamic_cast<SST::Interfaces::StandardMem::ReadResp*>(req);
         if (readResp && window_read_debug_) {
             const std::vector<uint8_t>& bytes = readResp->data;
@@ -2922,6 +2935,9 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                 core_id_, kind_label, req->getID(), (unsigned long long)pending_req.address,
                 bytes.size());
         }
+        if (pending_req.bcsr_kind == 1) {
+            bcsr_rowptr_read_pending_ = false;
+        }
         if (readResp && !readResp->data.empty()) {
             const std::vector<uint8_t>& bytes = readResp->data;
             size_t float_count = bytes.size() / sizeof(float);
@@ -2932,9 +2948,7 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
             if (pending_req.bcsr_kind == 1) {
                 const size_t expect = pending_req.size;
                 if (bytes.size() != expect) {
-                    output_->verbose(CALL_INFO, 0, 0,
-                        "[diag-bcsr][warn] rowptr read size mismatch: got=%zu expect=%zu addr=0x%llx\n",
-                        bytes.size(), expect, (unsigned long long)pending_req.address);
+                    fallback_and_finalize("rowptr size mismatch");
                     return;
                 }
                 size_t n = bytes.size() / sizeof(uint32_t);
@@ -2950,50 +2964,15 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                 if (bcsr_rowptr_host_.empty() || !rowptr_sane) {
                     if (window_read_debug_ && output_) {
                         output_->verbose(CALL_INFO, 0, 0,
-                            "[diag-bcsr] core=%u rowptr invalid (all-zero) retry in %" PRIu64 " cycles\n",
-                            core_id_, bcsr_rowptr_retry_interval_cycles_);
+                            "[diag-bcsr] core=%u rowptr invalid (all-zero)\n",
+                            core_id_);
                     }
                     bcsr_rowptr_host_.clear();
                     bcsr_rowptr_ready_ = false;
-                    bcsr_rowptr_retry_attempts_++;
-                    bool fallback_loaded = false;
-                    if (bcsr_rowptr_retry_attempts_ >= bcsr_rowptr_retry_max_) {
-                        static bool s_fallback_enable = !snndl_rowptr_fallback_disable_flag; // 由参数一次性设置
-                        if (s_fallback_enable && loadBcsrRowptrFromFile_()) {
-                            if (window_read_debug_ && output_) {
-                                output_->verbose(CALL_INFO, 0, 0,
-                                    "[diag-bcsr] core=%u rowptr loaded from file fallback\n", core_id_);
-                            }
-                            fallback_loaded = true;
-                            bcsr_rowptr_ready_ = true;
-                            bcsr_rowptr_retry_cycle_ = total_cycles_;
-                            bcsr_rowptr_retry_attempts_ = 0;
-                        }
-                    }
-                    if (fallback_loaded) {
-                        if (window_read_debug_ && output_) {
-                            output_->verbose(CALL_INFO, 0, 0,
-                                "[diag-bcsr] core=%u using file-based rowptr snapshot (%zu entries)\n",
-                                core_id_, bcsr_rowptr_host_.size());
-                        }
-                        bcsrPrefetchAll_();
-                        return;
-                    }
-                    bcsr_rowptr_retry_cycle_ = total_cycles_ + bcsr_rowptr_retry_interval_cycles_;
+                    fallback_and_finalize("rowptr contents invalid");
                     return;
                 }
-                bcsr_rowptr_retry_cycle_ = total_cycles_;
-                if (window_read_debug_ && output_) {
-                    output_->verbose(CALL_INFO, 0, 0,
-                        "[diag-bcsr] core=%u rowptr ready entries=%zu first=%u second=%u\n",
-                        core_id_, bcsr_rowptr_host_.size(),
-                        bcsr_rowptr_host_.empty() ? 0u : bcsr_rowptr_host_[0],
-                        bcsr_rowptr_host_.size()>1 ? bcsr_rowptr_host_[1] : 0u);
-                }
-                bcsrPrefetchAll_();
-                if (apply_acc_enable_ && gas_window_mode_ && gas_stage_ == GasStage::Apply) {
-                    issueEdgeWeightFetches_();
-                }
+                finalize_rowptr_ready();
             } else if (pending_req.bcsr_kind == 2) {
                 const size_t expect = pending_req.size;
                 if (bytes.size() != expect) {
@@ -3105,8 +3084,10 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                                         "[diag-bcsr][file] loaded block row=%u idx_in_row=%u gb=%u off=0x%llx bytes=%zu\n",
                                         pending_req.bcsr_block_row, pending_req.bcsr_idx_in_row, global_block_index,
                                         (unsigned long long)file_off, (size_t)block_bytes);
-                                }
-                            }
+                }
+        } else if (pending_req.bcsr_kind == 1) {
+            fallback_and_finalize("rowptr read returned empty payload");
+        }
                         }
                     }
                 }
@@ -4196,7 +4177,7 @@ void SnnPESubComponent::requestWeightBCSR(uint32_t pre_global, uint32_t post_loc
     uint32_t end   = bcsr_rowptr_host_[block_row+1];
     if (end <= start) {
         bool recovered = false;
-        if (loadBcsrRowptrFromFile_()) {
+        if (bcsr_rowptr_file_fallback_enable_ && loadBcsrRowptrFromFile_()) {
             if (block_row + 1 < bcsr_rowptr_host_.size()) {
                 start = bcsr_rowptr_host_[block_row];
                 end = bcsr_rowptr_host_[block_row+1];
@@ -4434,7 +4415,25 @@ bool SnnPESubComponent::loadBcsrRowptrFromFile_() {
             bcsr_rowptr_host_.size()>1?bcsr_rowptr_host_[1]:0u);
     }
     bcsr_rowptr_ready_ = true;
-    bcsr_rowptr_retry_cycle_ = total_cycles_;
-    bcsr_rowptr_retry_attempts_ = 0;
+    bcsr_rowptr_read_pending_ = false;
     return true;
+}
+
+void SnnPESubComponent::ensureRowptrReadyOrFatal_(const char* reason) {
+    const char* msg = reason ? reason : "unknown";
+    if (!bcsr_rowptr_file_fallback_enable_) {
+        output_->fatal(CALL_INFO, -1,
+            "BCSR rowptr load failed for core=%u node=%u (%s). Enable parameter 'bcsr_rowptr_file_fallback_enable=1' or fix rowptr data.\n",
+            core_id_, node_id_, msg);
+    }
+    if (!loadBcsrRowptrFromFile_()) {
+        output_->fatal(CALL_INFO, -1,
+            "BCSR rowptr load failed (%s) and fallback weight file could not be loaded (core=%u node=%u).\n",
+            msg, core_id_, node_id_);
+    }
+    if (window_read_debug_ && output_) {
+        output_->verbose(CALL_INFO, 0, 0,
+            "[diag-bcsr] core=%u rowptr fallback applied (%s)\n",
+            core_id_, msg);
+    }
 }
