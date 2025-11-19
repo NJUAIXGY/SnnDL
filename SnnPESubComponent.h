@@ -1002,13 +1002,6 @@ private:
 
     // ===== BCSR 读路径支持 =====
     bool use_bcsr_ = false;
-    uint32_t bcsr_br_ = 16;                 // block rows
-    uint32_t bcsr_bc_ = 16;                 // block cols
-    uint32_t bcsr_val_bytes_ = 4;           // FP32
-    uint32_t bcsr_idx_bytes_ = 2;           // uint16
-    uint64_t bcsr_colidx_addr_ = 0;         // colidx 基地址
-    uint64_t bcsr_blockdata_addr_ = 0;      // blockdata 基地址
-    uint64_t bcsr_blockids_addr_ = 0;       // blockids 基地址（可选）
     // 读值守护（诊断/健壮性）：过滤非有限或异常大的权重，避免毒化ΔV（默认开启）
     bool bcsr_weight_guard_enable_ = true;
     float bcsr_weight_abs_max_ = 10.0f;
@@ -1023,15 +1016,6 @@ private:
     uint32_t verify_bcsr_block_col_ = 0;    // chosen block column
     uint32_t verify_bcsr_intra_col_ = 0;    // scan 0..bc-1
     bool verify_bcsr_block_resolved_ = false;
-    uint32_t bcsr_row_index_cache_cap_ = 64; // 行索引段缓存容量（行数）
-    uint32_t bcsr_block_cache_cap_ = 256;    // 数据块缓存容量（块数）
-    // 行索引缓存：block_row -> colidx 段
-    std::unordered_map<uint32_t, std::vector<uint32_t>> bcsr_row_index_cache_;
-    std::list<uint32_t> bcsr_row_index_lru_;
-    // 数据块缓存：key=(block_row<<32)|block_col -> 块数据
-    struct BcsrBlockEntry { std::vector<float> data; std::list<uint64_t>::iterator it; };
-    std::unordered_map<uint64_t, BcsrBlockEntry> bcsr_block_cache_;
-    std::list<uint64_t> bcsr_block_lru_;
 
     // BCSR 统计计数（收尾打印）
     uint64_t bcsr_count_row_reads_ = 0;
@@ -1049,12 +1033,12 @@ private:
     // BCSR 辅助
     void requestWeightBCSR(uint32_t pre_global, uint32_t post_local, std::function<void(float)> cb);
     bool bcsrRowIndexGet_(uint32_t block_row, std::vector<uint32_t>& out);
-    void bcsrRowIndexPut_(uint32_t block_row, std::vector<uint32_t>& data);
-    bool bcsrBlockGet_(uint32_t block_row, uint32_t block_col, std::vector<float>& out);
-    void bcsrBlockPut_(uint32_t block_row, uint32_t block_col, std::vector<float>& data);
+    void bcsrRowIndexPut_(uint32_t block_row, std::vector<uint32_t>& cols);
     void bcsrPrefetchAll_();
     void bcsrPrefetchRowBlocks_(uint32_t block_row, const std::vector<uint32_t>& cols, uint32_t row_start);
     void bcsrPopulateWeightCache_(uint32_t block_row, uint32_t block_col, const std::vector<float>& blk);
+    bool bcsrBlockGet_(uint32_t block_row, uint32_t block_col, std::vector<float>& out);
+    void bcsrBlockPut_(uint32_t block_row, uint32_t block_col, std::vector<float>& data);
     bool loadBcsrRowptrFromFile_();
     void ensureRowptrReadyOrFatal_(const char* reason);
     size_t expectedRowptrEntries_() const;
