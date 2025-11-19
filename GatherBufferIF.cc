@@ -8,6 +8,7 @@
 #include <cmath>
 #include <fstream>
 #include <cstdlib>
+#include <mutex>
 
 using namespace SST;
 using namespace SST::Interfaces;
@@ -15,14 +16,15 @@ using namespace SST::SnnDL;
 
 namespace {
 inline bool snndlGlobalDebugEnabled() {
-    static int cached = -1;
-    if (cached == -1) {
+    static std::once_flag flag;
+    static int cached = 0;
+    std::call_once(flag, [](){
         const char* env = std::getenv("SNNDL_DEBUG");
         if (!env || std::atoi(env) == 0) {
             env = std::getenv("SNNDL_DIAG_ENABLE");
         }
         cached = (env && std::atoi(env) != 0) ? 1 : 0;
-    }
+    });
     return cached == 1;
 }
 }
