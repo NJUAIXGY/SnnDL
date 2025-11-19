@@ -70,6 +70,16 @@ bool SnnPESubComponent::BcsrLayout::validate(uint64_t base, Output* out, bool de
 #define SNNDL_LOG(lvl, ...) SNNDL_LOGPTR(output_, (lvl), __VA_ARGS__)
 #endif
 
+#ifdef SNNDL_ENABLE_DEBUG_LOG
+#define SNNDL_DEBUG_ENABLED 1
+#define SNNDL_DEBUG_LOG(lvl, ...) SNNDL_LOG(lvl, __VA_ARGS__)
+#define SNNDL_DEBUG_BLOCK(stmt) do { stmt; } while(0)
+#else
+#define SNNDL_DEBUG_ENABLED 0
+#define SNNDL_DEBUG_LOG(lvl, ...) do {} while(0)
+#define SNNDL_DEBUG_BLOCK(stmt) do {} while(0)
+#endif
+
 constexpr uint32_t BCSR_SENTINEL_ID = 0xFFFFFFFFu;
 
 // === 静态共享路由缓存定义 ===
@@ -127,16 +137,19 @@ void SnnPESubComponent::prepareEdgeWindowForApply_() {
     issueEdgeWeightFetches_();
 }
 
+#ifdef SNNDL_ENABLE_DEBUG_LOG
 void SnnPESubComponent::diagEdgeWeight_(const char* tag, uint32_t post_local,
                                         uint32_t pre_global, float weight,
                                         uint32_t count) {
     if (!window_read_debug_ || !output_) return;
-    if (!debug_state_.tryLog(DebugState::EDGE_LOG_LIMIT)) return;
     output_->verbose(CALL_INFO, 0, 0,
         "[diag-weight] %s core=%d window=%u post_local=%u pre_global=%u weight=%.6f count=%u\n",
         tag ? tag : "edge", core_id_, curr_stage_seq_, post_local, pre_global,
         (double)weight, count);
 }
+#else
+void SnnPESubComponent::diagEdgeWeight_(const char*, uint32_t, uint32_t, float, uint32_t) {}
+#endif
 
 namespace {
 bool extractUnsigned(const std::string& text, const char* key, uint64_t& value) {
@@ -203,7 +216,6 @@ void SnnPESubComponent::StageEventHub::markBeginGather(uint32_t) {
     have_begin_apply = false;
     have_begin_scatter = false;
     core->window_spikes_all_ = 0;
-    core->debug_state_.resetForWindow(core->scatter_diag_limit_param_);
 }
 
 void SnnPESubComponent::StageEventHub::markBeginApply(uint32_t) {
@@ -682,9 +694,11 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     stage_event_hub_.init(this);
     stats_reporter_.init(this);
     read_orchestrator_.init(this);
+#if SNNDL_DEBUG_ENABLED
     if (window_read_debug_) {
-        SNNDL_LOG(1, "[diag-init] core=%d enable_weight_fetch=%d\n", core_id_, enable_weight_fetch_ ? 1 : 0);
+        SNNDL_DEBUG_LOG(1, "[diag-init] core=%d enable_weight_fetch=%d\n", core_id_, enable_weight_fetch_ ? 1 : 0);
     }
+#endif
     write_weights_on_init_ = params.find<int>("write_weights_on_init", 1) != 0;
     memory_warmup_cycles_ = params.find<uint64_t>("memory_warmup_cycles", 1000);
     init_default_weight_ = params.find<float>("init_default_weight", 0.5f);
@@ -731,7 +745,6 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     disable_weight_cache_ = params.find<int>("disable_weight_cache", 0) != 0;
     window_read_enable_ = params.find<int>("window_read_enable", 0) != 0;
     window_read_debug_ = params.find<int>("window_read_debug", 0) != 0;
-    scatter_diag_limit_param_ = params.find<uint32_t>("scatter_diag_limit", 0);
     window_read_budget_ = params.find<uint32_t>("window_read_budget", 1024);
     read_force_single_ = params.find<int>("read_force_single", 0) != 0;
     // 边集合容量上限（极端保护）
@@ -761,7 +774,7 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     } else if (index_mode_str == "csr_post_row") {
         // CSR 模式已弃用：统一禁用
         use_post_row_pre_col_ = true;
-        SNNDL_LOG(1, "[CSR] 索引模式已禁用，改用密集/BCSR读取\n");
+        SNNDL_DEBUG_LOG(1, "[CSR] 索引模式已禁用，改用密集/BCSR读取\n");
     }
     if (weights_cols_ == 0) weights_cols_ = num_neurons_; // 默认沿用旧行宽
     // 预计算dense权重区域上界（按行*列*4B）
@@ -2287,12 +2300,14 @@ void SnnPESubComponent::processLocalSpike(SpikeEvent* spike_event) {
         }
     }
 
-    if (window_read_debug_ && debug_state_.tryLog(DebugState::EDGE_LOG_LIMIT_SMALL)) {
+#ifdef SNNDL_ENABLE_DEBUG_LOG
+    if (window_read_debug_) {
         output_->verbose(CALL_INFO, 0, 0,
             "[diag-spike] core=%d stage=%d pre_g=%u post_g=%u dest_l=%u queue=%zu\n",
             core_id_, (int)gas_stage_, spike_event->getSourceNeuron(), spike_event->getDestinationNeuron(),
             target_neuron, incoming_spikes_.size());
     }
+#endif
     
     uint32_t refr = getRefrac_(target_neuron);
     if (refr > 0) {
@@ -2368,16 +2383,22 @@ void SnnPESubComponent::processLocalSpike(SpikeEvent* spike_event) {
             } else if (window_read_enable_) {
                 stats_reporter_.reportCacheAccess(false);
             }
-        } else if (window_read_debug_) {
-            SNNDL_LOG(0, "[diag-edge-resolve] core=%d skipped pre=%u post=%u (resolve失败)\n",
-                core_id_, pre_global, post_local);
+        } else {
+#if SNNDL_DEBUG_ENABLED
+            if (window_read_debug_) {
+                SNNDL_DEBUG_LOG(0, "[diag-edge-resolve] core=%d skipped pre=%u post=%u (resolve失败)\n",
+                    core_id_, pre_global, post_local);
+            }
+#endif
         }
     } else {
-        if (window_read_debug_ && debug_state_.tryLog(DebugState::EDGE_LOG_LIMIT_SMALL)) {
+#ifdef SNNDL_ENABLE_DEBUG_LOG
+        if (window_read_debug_) {
             output_->verbose(CALL_INFO, 0, 0,
                 "[diag-edge-gate] core=%d skip recordEdge: ewf=%d mem=%s ready=%d stage=%d\n",
                 core_id_, enable_weight_fetch_ ? 1 : 0, memory_ ? "set" : "null", memory_ready_ ? 1 : 0, (int)gas_stage_);
         }
+#endif
     }
     // 记录本窗触达的post（仅用于窗口读发起；不改变语义）
     // window_read_enable_ 情况下，posts_seen_window_ 已在 deliverSpike 时打点，
@@ -2593,7 +2614,7 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                                 curr_stage_seq_, edge_collector_.currSize(), edge_collector_.prevSize());
                         }
                         if (window_read_debug_) {
-                        SNNDL_LOG(1, "[diag-stage] BeginGather window=%" PRIu64 " stage=%d posts_prev=%zu active_prev=%zu posts_curr=%zu active_curr=%zu qsize=%zu\n",
+                        SNNDL_DEBUG_LOG(1, "[diag-stage] BeginGather window=%" PRIu64 " stage=%d posts_prev=%zu active_prev=%zu posts_curr=%zu active_curr=%zu qsize=%zu\n",
                             (uint64_t)op->superstep, static_cast<int>(gas_stage_),
                             posts_list_prev_window_.size(), active_pre_prev_window_.size(),
                             posts_list_window_.size(), active_pre_window_.size(), incoming_spikes_.size());
@@ -2631,34 +2652,17 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                     case GasOp::BeginApply:
                         gas_stage_ = GasStage::Apply; curr_stage_seq_ = op->superstep; // start accepting accum
                         prepareEdgeWindowForApply_();
-                        // 强制探针（仅诊断；PE0/core0；每窗一次），用于对比内存与文件权重
-                        // 强制探针（无条件基于 PE0/core0；use_bcsr_ 才执行）
-                        if (use_bcsr_ && node_id_ == 0 && core_id_ == 0) {
-                            if (verify_forced_seq_ != curr_stage_seq_) {
-                                verify_forced_seq_ = curr_stage_seq_;
-                                uint32_t post_local = 0;
-                                for (uint32_t pre = 0; pre < 8; ++pre) {
-                                    requestWeightBCSR(pre, post_local, [this, pre, post_local](float w){
-                                        float fv = readBcsrWeightFromFile_(post_local, pre);
-                SNNDL_LOG(0, "[VERIFY][probe-bcsr-forced] node=%u core=%u post=%u pre=%u mem=%.6f file=%.6f\n",
-                                                   node_id_, core_id_, post_local, pre, w, fv);
-                                        if (output_) {
-                                            output_->verbose(CALL_INFO, 1, 0,
-                                                "[VERIFY][probe-bcsr-forced] post=%u pre=%u value=%.6f file=%.6f\n",
-                                                post_local, pre, w, fv);
-                                        }
-                                    });
-                                }
-                            }
-                        }
+#if SNNDL_DEBUG_ENABLED
                         if (window_read_debug_) {
-                        SNNDL_LOG(1, "[diag-stage] BeginApply window=%" PRIu64 " stage=%d posts_prev=%zu active_prev=%zu posts_curr=%zu active_curr=%zu\n",
-                    (uint64_t)op->superstep, static_cast<int>(gas_stage_),
-                    posts_list_prev_window_.size(), active_pre_prev_window_.size(),
-                    posts_list_window_.size(), active_pre_window_.size());
-                    }
+                            SNNDL_DEBUG_LOG(1, "[diag-stage] BeginApply window=%" PRIu64 " stage=%d posts_prev=%zu active_prev=%zu posts_curr=%zu active_curr=%zu\n",
+                                (uint64_t)op->superstep, static_cast<int>(gas_stage_),
+                                posts_list_prev_window_.size(), active_pre_prev_window_.size(),
+                                posts_list_window_.size(), active_pre_window_.size());
+                        }
+#endif
                 stage_event_hub_.markBeginApply(curr_stage_seq_);
                 read_orchestrator_.issueFallbackReadsIfNeeded(apply_acc_enable_ && gas_window_mode_);
+#if SNNDL_DEBUG_ENABLED
                 if (window_read_debug_ && output_) {
                     output_->verbose(CALL_INFO, 1, 0,
                         "[diag-edges-summary] core=%u window=%u recorded=%" PRIu64 " stage_skip=%" PRIu64 " cond_skip=%" PRIu64 " edges_prev=%zu\n",
@@ -2669,6 +2673,7 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                         core_id_, curr_stage_seq_, diag_spikes_stage_gather_, diag_spikes_stage_apply_,
                         diag_spikes_stage_scatter_, diag_spikes_stage_idle_);
                 }
+#endif
                 diag_spikes_stage_gather_ = 0;
                 break;
                     case GasOp::EndApply:
@@ -2680,16 +2685,16 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                         break;
                     case GasOp::BeginScatter:
                         gas_stage_ = GasStage::Scatter; // apply accumulated deltas deterministically
-                        // reset per-window scatter diagnostics quota
-                        debug_state_.refreshScatterLimit(scatter_diag_limit_param_);
+#if SNNDL_DEBUG_ENABLED
                         if (window_read_debug_ && output_) {
-                            SNNDL_LOG(1, "[diag-stage] BeginScatter window=%" PRIu64 " stage=%d\n",
+                            SNNDL_DEBUG_LOG(1, "[diag-stage] BeginScatter window=%" PRIu64 " stage=%d\n",
                                 (uint64_t)op->superstep, static_cast<int>(gas_stage_));
                             output_->verbose(CALL_INFO, 1, 0,
                                 "[diag-spike-stage] core=%u window=%u (apply) gather=%" PRIu64 " apply=%" PRIu64 " scatter=%" PRIu64 " idle=%" PRIu64 "\n",
                                 core_id_, curr_stage_seq_, diag_spikes_stage_gather_, diag_spikes_stage_apply_,
                                 diag_spikes_stage_scatter_, diag_spikes_stage_idle_);
                         }
+#endif
                         diag_spikes_stage_apply_ = 0;
                         stage_event_hub_.markBeginScatter(curr_stage_seq_);
                         // 记录窗口发放基线：用于 EndScatter 兜底对齐口径（O(1) 开销）
@@ -2697,6 +2702,7 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                         // Scheme-C (debug aid): print per-window delta summary just before applying
                         // Helps verify that Apply phase indeed accumulated into this window.
                         // We intentionally use a low verbosity so it shows up when users enable logs.
+#if SNNDL_DEBUG_ENABLED
                         if (window_read_debug_ && output_) {
                             // Use updates/posts as主要口径，避免因 acc_delta_ 已在溢写合并前为空而误判
                             output_->verbose(CALL_INFO, 1, 0,
@@ -2707,6 +2713,7 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                                 "[GAS][Delta][sum] core=%u seq=%u dv_sum=%.6f nonzero_updates=%" PRIu64 "\n",
                                 core_id_, curr_stage_seq_, diag_dv_sum_window_, diag_dv_updates_nonzero_);
                         }
+#endif
                         if (!acc_spill_log_.empty()) {
                             // Merge spill into map: sort by post and reduce
                             std::sort(acc_spill_log_.begin(), acc_spill_log_.end(), [](auto&a, auto&b){return a.first<b.first;});
@@ -2735,13 +2742,15 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                                     float v = v_before + dv;
                                     setMem_(post, v);
                                     bool willFire = (v >= v_thresh_ && getRefrac_(post) == 0);
-                                    if (window_read_debug_ && output_ && debug_state_.consumeScatterQuota()) {
+#if SNNDL_DEBUG_ENABLED
+                                    if (window_read_debug_ && output_) {
                                         output_->verbose(CALL_INFO, 0, 0,
                                             "[diag-scatter] core=%u window=%u post=%u v_before=%.6f dv=%.6f v_after=%.6f thr=%.6f refrac=%u willFire=%d\n",
                                             core_id_, curr_stage_seq_, post,
                                             (double)v_before, (double)dv, (double)v, (double)v_thresh_,
                                             (unsigned)getRefrac_(post), willFire ? 1 : 0);
                                     }
+#endif
                                     checkAndFireSpike(post);
                                     if (willFire) {
                                         spikes_emitted++;
@@ -2759,13 +2768,15 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                                     float v = v_before + dv;
                                     setMem_(post, v);
                                     bool willFire = (v >= v_thresh_ && getRefrac_(post) == 0);
-                                    if (window_read_debug_ && output_ && debug_state_.consumeScatterQuota()) {
+#if SNNDL_DEBUG_ENABLED
+                                    if (window_read_debug_ && output_) {
                                         output_->verbose(CALL_INFO, 0, 0,
                                             "[diag-scatter] core=%u window=%u post=%u v_before=%.6f dv=%.6f v_after=%.6f thr=%.6f refrac=%u willFire=%d\n",
                                             core_id_, curr_stage_seq_, post,
                                             (double)v_before, (double)dv, (double)v, (double)v_thresh_,
                                             (unsigned)getRefrac_(post), willFire ? 1 : 0);
                                     }
+#endif
                                     checkAndFireSpike(post);
                                     if (willFire) {
                                         spikes_emitted++;
@@ -2798,12 +2809,14 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                                 if (delta > 0) to_emit = delta;
                             }
                             // 诊断：当两种口径均非零但不一致时，提示一次（不改变行为）
+#if SNNDL_DEBUG_ENABLED
                             if (window_read_debug_ && window_spikes_all_ > 0 && spikes_emitted_window_ > 0 &&
                                 window_spikes_all_ != spikes_emitted_window_) {
                                 output_->verbose(CALL_INFO, 0, 0,
                                     "[diag-window] ⚠️ inconsistent spikes: all=%" PRIu64 " vs emitted=%" PRIu64 " (seq=%u)\n",
                                     window_spikes_all_, spikes_emitted_window_, curr_stage_seq_);
                             }
+#endif
                             if (window_read_debug_ && output_) {
                                 output_->verbose(CALL_INFO, 1, 0,
                                     "[diag-spike-stage] core=%u window=%u (scatter) gather=%" PRIu64 " apply=%" PRIu64 " scatter=%" PRIu64 " idle=%" PRIu64 "\n",

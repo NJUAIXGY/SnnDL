@@ -79,7 +79,6 @@ public:
         {"verify_log_each_sample", "Log each weight sample for verification", "0"},
         {"verify_against_file", "Verify weights by comparing memory reads against weight file (0/1)", "0"},
         {"verify_file_template", "Template for per-PE weight files used for verification (e.g., .../classification_weights_pe_{pe}.bin)", ""},
-        {"scatter_diag_limit", "Per-window diagnostic logs for Scatter apply (number of dv>0 entries to print)", "0"},
         {"quiet_finish_logs", "Suppress finish() console summaries (0/1)", "0"},
         {"loader_done_key", "SharedArray key toggled by WeightLoader upon completion", ""},
         // Profiling（可选）
@@ -278,35 +277,6 @@ private:
         void markEndScatter(uint32_t seq, uint64_t spikes_emitted);
     } stage_event_hub_;
 
-    struct DebugState {
-        static constexpr uint32_t EDGE_LOG_LIMIT = 64;
-        static constexpr uint32_t EDGE_LOG_LIMIT_SMALL = 8;
-        static constexpr uint32_t DELTA_LOG_LIMIT = 128;
-
-        uint32_t edge_log_count = 0;
-        uint32_t scatter_diag_quota = 0;
-
-        void resetForWindow(uint32_t scatter_limit) {
-            edge_log_count = 0;
-            scatter_diag_quota = scatter_limit;
-        }
-
-        void refreshScatterLimit(uint32_t scatter_limit) {
-            scatter_diag_quota = scatter_limit;
-        }
-
-        bool tryLog(uint32_t limit = EDGE_LOG_LIMIT) {
-            if (edge_log_count >= limit) return false;
-            ++edge_log_count;
-            return true;
-        }
-
-        bool consumeScatterQuota() {
-            if (scatter_diag_quota == 0) return false;
-            --scatter_diag_quota;
-            return true;
-        }
-    } debug_state_;
     StatsReporter stats_reporter_;
     // Accumulators
     std::unordered_map<uint32_t, float> acc_delta_;        // post_local -> deltaV
@@ -423,11 +393,13 @@ private:
         }
     }
     inline void accUpdate_(uint32_t post, float dv) {
-        if (window_read_debug_ && std::fabs(dv) > 1e-6f && debug_state_.tryLog(DebugState::DELTA_LOG_LIMIT)) {
+#ifdef SNNDL_ENABLE_DEBUG_LOG
+        if (window_read_debug_ && std::fabs(dv) > 1e-6f) {
             output_->verbose(CALL_INFO, 0, 0,
                 "[diag-delta] core=%d post=%u dv=%.6f stage=%d\n",
                 core_id_, post, dv, static_cast<int>(gas_stage_));
         }
+#endif
         // Estimate growth: map entry ~ 16B（粗估）；spill record ~ 8B
         if (acc_spill_enable_ && acc_bytes_estimate_ >= acc_hwm_bytes_) {
             acc_spill_log_.emplace_back(post, dv);
@@ -901,7 +873,6 @@ private:
     uint32_t window_read_budget_ = 1024;
     bool window_read_debug_ = false;    // 控制窗口读相关调试日志
     // 每窗Scatter阶段诊断配额（打印dv/v调试信息的条数，避免日志爆炸）
-    uint32_t scatter_diag_limit_param_ = 0;
     std::vector<uint8_t> posts_seen_window_;      // 当前窗口触达的 post（Scatter 填充，位图）
     std::vector<uint8_t> posts_seen_prev_window_; // 上一窗口触达的 post（位图，给 BeginApply 使用）
     std::vector<uint32_t> posts_list_window_;     // 当前窗口触达的 post 列表（压缩遍历）
@@ -1076,9 +1047,6 @@ private:
     uint64_t bcsr_bytes_val_ = 0;
     bool bcsr_prefetch_all_ = true;
     bool bcsr_prefetch_issued_ = false;
-
-    // 强制探针（仅诊断，PE0/core0用，避免刷屏每窗仅一次）
-    uint32_t verify_forced_seq_ = UINT32_MAX;
 
     // BCSR 辅助
     void requestWeightBCSR(uint32_t pre_global, uint32_t post_local, std::function<void(float)> cb);
