@@ -12,7 +12,6 @@
 #include "MultiCorePE.h"
 #include "GatherBufferIF.h"
 
-#include <fstream>
 #include <sstream>
 #include <iostream>
 #include <cmath>
@@ -29,12 +28,10 @@ bool snndl_rowptr_fallback_disable_flag = false;
 #include <unordered_map>
 #include <unordered_set>
 #include <list>
-#include <sstream>
 #include <limits>
 #include <iomanip>
 #include <cctype>
 #include <iterator>
-#include <cmath>
 
 using namespace SST;
 using namespace SST::SnnDL;
@@ -78,7 +75,6 @@ bool SnnPESubComponent::BcsrLayout::validate(uint64_t base, Output* out, bool de
     return monotonic && aligned64;
 }
 
-#include "GasCustomCmd.h"
 
 // Lightweight logging helpers (file-local). Use consistent style across SnnDL.
 #ifndef SNNDL_LOGPTR
@@ -657,15 +653,12 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
       memory_(nullptr),
       gather_buffer_if_(nullptr),
       memory_link_(nullptr) {
-    // 构造期最早哨兵（避免依赖 output_ 未就绪）——默认静默，除非显式启用 SNNDL_SENTINEL_ENABLE
+    // 构造期最早哨兵（默认静默，除非显式启用 SNNDL_SENTINEL_ENABLE）。
+    // 避免直接使用 stdout，统一走 SST Output。
     static const bool kSentinelOn = [](){
         const char* env = std::getenv("SNNDL_SENTINEL_ENABLE");
         return env && std::atoi(env) != 0;
     }();
-    if (kSentinelOn) {
-        fprintf(stdout, "[[sentinel-core-ctor]] core_ctor enter\n");
-        fflush(stdout);
-    }
     // 提前构建一个最低等级的输出对象，避免后续早期初始化路径使用 output_ 时发生空指针
     // 真实 verbose 等级稍后在解析完参数后再生效（此处仅用于早期诊断与防护）
     if (!output_) {
@@ -679,8 +672,9 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     
     // 读取配置参数
     core_id_ = params.find<int>("core_id", 0);
-    if (kSentinelOn) {
-        fprintf(stdout, "[[sentinel-core-ctor]] after params: core_id=%d\n", core_id_);
+    if (kSentinelOn && output_) {
+        SNNDL_LOG(0, "[[sentinel-core-ctor]] core_ctor enter\n");
+        SNNDL_LOG(0, "[[sentinel-core-ctor]] after params: core_id=%d\n", core_id_);
     }
     total_cores_ = params.find<int>("total_cores", 8);
     global_neuron_base_ = params.find<uint64_t>("global_neuron_base", 0);
@@ -693,8 +687,8 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     base_addr_ = params.find<uint64_t>("base_addr", 0);
     node_id_ = params.find<uint32_t>("node_id", 0);
     verbose_ = params.find<int>("verbose", 0);
-    if (kSentinelOn) {
-        fprintf(stdout, "[[sentinel-core-ctor]] after params2: node_id=%u num_neurons=%u base_addr=%" PRIu64 "\n",
+    if (kSentinelOn && output_) {
+        SNNDL_LOG(0, "[[sentinel-core-ctor]] after params2: node_id=%u num_neurons=%u base_addr=%" PRIu64 "\n",
                 node_id_, num_neurons_, (uint64_t)base_addr_);
     }
     enable_weight_fetch_ = params.find<int>("enable_weight_fetch", 0) != 0;
@@ -860,7 +854,8 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
 #endif
     // 代码级内存优化开关（可选）
     use_clock_weight_cache_ = params.find<int>("use_clock_weight_cache", 0) != 0;
-    apply_dense_acc_enable_ = params.find<int>("apply_dense_acc_enable", 0) != 0;
+    // 默认启用致密累加器（与头文件参数表一致）
+    apply_dense_acc_enable_ = params.find<int>("apply_dense_acc_enable", 1) != 0;
     acc_shadow_verify_enable_ = apply_dense_acc_enable_ && params.find<int>("acc_shadow_verify_enable", 0) != 0;
     if (acc_shadow_verify_enable_ && !snndlDiagEnabled()) {
         acc_shadow_verify_enable_ = false;
@@ -2661,7 +2656,7 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                                 for (uint32_t pre = 0; pre < 8; ++pre) {
                                     requestWeightBCSR(pre, post_local, [this, pre, post_local](float w){
                                         float fv = readBcsrWeightFromFile_(post_local, pre);
-                                        std::printf("[VERIFY][probe-bcsr-forced] node=%u core=%u post=%u pre=%u mem=%.6f file=%.6f\n",
+                SNNDL_LOG(0, "[VERIFY][probe-bcsr-forced] node=%u core=%u post=%u pre=%u mem=%.6f file=%.6f\n",
                                                    node_id_, core_id_, post_local, pre, w, fv);
                                         if (output_) {
                                             output_->verbose(CALL_INFO, 1, 0,

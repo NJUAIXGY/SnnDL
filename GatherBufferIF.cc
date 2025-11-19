@@ -157,12 +157,13 @@ void GatherBufferIF::init(unsigned int phase) {
     backend_->init(phase);
     // 记录所有 phase 的初始化情况（仅在显式启用时打印）
     const char* sent_env = std::getenv("SNNDL_SENTINEL_ENABLE");
-        if (sent_env && std::atoi(sent_env) != 0) {
-            printf("[[sentinel-gbi-init]] phase=%u window_auto=%d manual=%d clock=%s win_cyc_g=%" PRIu64 " win_cyc_a=%" PRIu64 " win_cyc_s=%" PRIu64 " auto_bytes=%" PRIu64 " auto_reads=%" PRIu64 " defer=%d\n",
-               phase, window_auto_ ? 1 : 0, manual_window_drive_ ? 1 : 0, clock_freq_.c_str(),
-               win_cyc_gather_, win_cyc_apply_, win_cyc_scatter_,
-               gather_auto_end_bytes_, gather_auto_end_reads_, defer_issue_until_apply_ ? 1 : 0);
-        }
+    if (sent_env && std::atoi(sent_env) != 0) {
+        out_.verbose(CALL_INFO, 0, 0,
+            "[[sentinel-gbi-init]] phase=%u window_auto=%d manual=%d clock=%s win_cyc_g=%" PRIu64 " win_cyc_a=%" PRIu64 " win_cyc_s=%" PRIu64 " auto_bytes=%" PRIu64 " auto_reads=%" PRIu64 " defer=%d\n",
+            phase, window_auto_ ? 1 : 0, manual_window_drive_ ? 1 : 0, clock_freq_.c_str(),
+            win_cyc_gather_, win_cyc_apply_, win_cyc_scatter_,
+            gather_auto_end_bytes_, gather_auto_end_reads_, defer_issue_until_apply_ ? 1 : 0);
+    }
     if (phase == 0 && window_auto_) {
         if (out_.getVerboseLevel() >= 2) {
             out_.verbose(CALL_INFO, 0, 0,
