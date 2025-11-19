@@ -7,10 +7,25 @@
 #include <cstring>
 #include <cmath>
 #include <fstream>
+#include <cstdlib>
 
 using namespace SST;
 using namespace SST::Interfaces;
 using namespace SST::SnnDL;
+
+namespace {
+inline bool snndlGlobalDebugEnabled() {
+    static int cached = -1;
+    if (cached == -1) {
+        const char* env = std::getenv("SNNDL_DEBUG");
+        if (!env || std::atoi(env) == 0) {
+            env = std::getenv("SNNDL_DIAG_ENABLE");
+        }
+        cached = (env && std::atoi(env) != 0) ? 1 : 0;
+    }
+    return cached == 1;
+}
+}
 
 GatherBufferIF::GatherBufferIF(ComponentId_t id, Params& params, TimeConverter* time, HandlerBase* handler)
     : StandardMem(id, params, time, handler), time_(time), upstream_handler_(handler)
@@ -98,6 +113,8 @@ GatherBufferIF::GatherBufferIF(ComponentId_t id, Params& params, TimeConverter* 
     stat_ctrl_probes_  = registerStatistic<uint64_t>("gas_ctrl_probes");
     stat_ctrl_adopts_  = registerStatistic<uint64_t>("gas_ctrl_adopts");
     stat_ctrl_reverts_ = registerStatistic<uint64_t>("gas_ctrl_reverts");
+    inflight_down_.reserve(128);
+    queued_non_gather_reads_.reserve(32);
     last_stage_change_ns_ = getCurrentSimTimeNano();
     // Adaptive k params
     k_adapt_enable_   = params.find<int>("k_adapt_enable", 0) != 0;
@@ -187,7 +204,7 @@ void GatherBufferIF::setMemoryMappedAddressRegion(Addr start, Addr size) {
 }
 
 void GatherBufferIF::manualWindowTick() {
-    // Deprecated no-op: manual window driving removed. Keep symbol for binary compatibility.
+    // Deprecated no-op for legacy compatibility.
     return;
 }
 
@@ -198,11 +215,10 @@ void GatherBufferIF::send(Request* req) {
         if (data) {
             // In auto mode, ignore external GasOp control requests (manual drive deprecated)
             if (window_auto_) {
-                static bool warned_auto_custom = false;
-                if (!warned_auto_custom) {
-                    warned_auto_custom = true;
+                if (!warned_auto_custom_req_ && diagEnabled_()) {
+                    warned_auto_custom_req_ = true;
                     out_.verbose(CALL_INFO, 0, 0,
-                        "[diag-gbi] CustomReq 被忽略：window_auto=1 manual_drive=0 (仅记录一次)");
+                        "[diag-gbi] CustomReq ignored: window_auto=1 manual_drive=0 (logged once)");
                 }
                 delete req; return;
             }
@@ -282,6 +298,11 @@ void GatherBufferIF::send(Request* req) {
                 "[diag-gbi] send() Read: stage=%d tgt_buf=%d gap_merge=%d defer=%d -> path=%s\n",
                 (int)stage_, tgt, (int)gap_merge_enable_, (int)defer_issue_until_apply_,
                 take_staging_path ? "STAGING" : "IMMEDIATE");
+            if (defer_issue_until_apply_ && take_staging_path && !warned_defer_issue_path_ && diagEnabled_()) {
+                warned_defer_issue_path_ = true;
+                out_.verbose(CALL_INFO, 0, 0,
+                    "[diag-gbi] defer_issue_until_apply=1: upstream Read IDs will be remapped via staged granules (logged once)");
+            }
             if (take_staging_path) {
                 // Stage later for gap/Lmax (and optional row-window) merging
                 sb_[tgt].staging_reads.push_back(rd);
@@ -1213,6 +1234,9 @@ void GatherBufferIF::flushStageCycles_(Stage stage, bool window_boundary) {
         if (stage_cycles_export_enable_ && !stage_cycles_csv_.empty()) {
             if (!stage_cycles_stream_.is_open()) {
                 stage_cycles_stream_.open(stage_cycles_csv_, std::ios::out | std::ios::app);
+                if (stage_cycles_stream_.good() && stage_cycles_stream_.tellp() > 0) {
+                    stage_cycles_header_written_ = true;
+                }
                 if (stage_cycles_stream_.good() && !stage_cycles_header_written_) {
                     stage_cycles_stream_ << "window_id,gather_cycles,apply_cycles,scatter_cycles\n";
                     stage_cycles_header_written_ = true;
@@ -1249,11 +1273,17 @@ std::vector<uint64_t> GatherBufferIF::parseCsvU64_(const std::string& s) {
     return v;
 }
 
+bool GatherBufferIF::diagEnabled_(int level) const {
+    if (out_.getVerboseLevel() >= level) return true;
+    return snndlGlobalDebugEnabled();
+}
+
 void GatherBufferIF::exportGranuleRow_(uint64_t start_ns, uint32_t bytes) {
     if (export_granules_csv_.empty()) return;
     if (!granule_stream_.is_open()) {
         granule_stream_.open(export_granules_csv_, std::ios::out | std::ios::app);
         if (!granule_stream_.good()) return;
+        if (granule_stream_.tellp() > 0) export_header_written_ = true;
         if (!export_header_written_) {
             granule_stream_ << "step,req_tile,owner_tile,burst_bytes,start_ns\n";
             export_header_written_ = true;
@@ -1272,6 +1302,7 @@ void GatherBufferIF::exportWindowMetricsRow_(uint64_t window_id, uint64_t payloa
     if (!window_stream_.is_open()) {
         window_stream_.open(export_window_metrics_csv_, std::ios::out | std::ios::app);
         if (!window_stream_.good()) return;
+        if (window_stream_.tellp() > 0) window_metrics_header_written_ = true;
         if (!window_metrics_header_written_) {
             window_stream_ << "window_id,payload_bytes,bursts,inflight_peak,buffer_max_bytes\n";
             window_metrics_header_written_ = true;

@@ -17,6 +17,7 @@
 #include <iostream>
 #include <cmath>
 #include <algorithm>
+#include <cstdio>   // TEMP: debug file sink for acc-shadow verification
 // 诊断：允许禁用rowptr文件回落(调试用) —— 放入SST::SnnDL命名空间，避免符号不匹配
 namespace SST { namespace SnnDL {
 bool snndl_rowptr_fallback_disable_flag = false;
@@ -33,6 +34,7 @@ bool snndl_rowptr_fallback_disable_flag = false;
 #include <iomanip>
 #include <cctype>
 #include <iterator>
+#include <cmath>
 
 using namespace SST;
 using namespace SST::SnnDL;
@@ -46,6 +48,34 @@ inline bool snndlDiagEnabled() {
     }
     return cached == 1;
 }
+}
+
+bool SnnPESubComponent::BcsrLayout::validate(uint64_t base, Output* out, bool debug, uint32_t core_id, uint32_t node_id) const {
+    const bool monotonic = (colidx_offset >= rowptr_offset) && (blockdata_offset >= colidx_offset);
+    const bool aligned64 = ((rowptr_offset | colidx_offset | blockdata_offset | blockids_offset) & 0x3FULL) == 0;
+    const uint64_t stride = per_core_stride;
+    const uint64_t max_off = maxOffset();
+    const bool stride_ok = (stride == 0) ? true : (max_off < stride);
+    if (debug && out) {
+        out->verbose(CALL_INFO, 0, 0,
+            "[diag-bcsr-base] node=%u core=%u base=0x%lx rp=0x%lx ci=0x%lx bd=0x%lx ids=0x%lx stride=%" PRIu64 " stride_ok=%d align64=%d mono=%d\n",
+            node_id, core_id,
+            (unsigned long)base,
+            (unsigned long)(base + rowptr_offset),
+            (unsigned long)(base + colidx_offset),
+            (unsigned long)(base + blockdata_offset),
+            (unsigned long)(blockids_offset ? base + blockids_offset : 0),
+            stride, stride_ok ? 1 : 0,
+            aligned64 ? 1 : 0,
+            monotonic ? 1 : 0);
+        if (!aligned64 || !monotonic || !stride_ok) {
+            out->verbose(CALL_INFO, 0, 0,
+                "[diag-bcsr-base] offsets suspect (aligned64=%d monotonic=%d stride_ok=%d max_off=0x%llx stride=0x%llx)\n",
+                aligned64 ? 1 : 0, monotonic ? 1 : 0, stride_ok ? 1 : 0,
+                (unsigned long long)max_off, (unsigned long long)stride);
+        }
+    }
+    return monotonic && aligned64;
 }
 
 #include "GasCustomCmd.h"
@@ -763,57 +793,26 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     log_weight_details_ = params.find<int>("log_weight_details", 0) != 0;
     loader_barrier_cycles_ = params.find<uint64_t>("loader_barrier_cycles", 0);
     // BCSR 参数
-    bcsr_br_ = params.find<uint32_t>("bcsr_block_rows", 16);
-    bcsr_bc_ = params.find<uint32_t>("bcsr_block_cols", 16);
-    bcsr_val_bytes_ = params.find<uint32_t>("bcsr_val_bytes", 4);
-    bcsr_idx_bytes_ = params.find<uint32_t>("bcsr_idx_bytes", 2);
-    // 权重守护参数（默认启用，阈值10.0）
-    bcsr_weight_guard_enable_ = params.find<int>("bcsr_weight_guard_enable", 1) != 0;
-    {
-        double wmax = params.find<double>("bcsr_weight_abs_max", 10.0);
-        if (std::isfinite(wmax) && wmax > 0.0) bcsr_weight_abs_max_ = static_cast<float>(wmax);
-    }
-    bcsr_rowptr_retry_interval_cycles_ = params.find<uint64_t>("bcsr_rowptr_retry_interval_cycles", 2000);
-    // 允许在运行时禁用rowptr文件回落（仅影响本进程静态开关）
-    { 
-        int fe = params.find<int>("bcsr_rowptr_file_fallback_enable", 1); 
-        if (fe == 0) { SST::SnnDL::snndl_rowptr_fallback_disable_flag = true; } 
-    }
-
-    // 允许通过参数调整/禁用rowptr文件回落，避免IO/竞态引发的不稳定
-    bcsr_rowptr_retry_max_ = params.find<uint32_t>("bcsr_rowptr_retry_max", bcsr_rowptr_retry_max_);
-    bool bcsr_rowptr_file_fallback_enable = params.find<int>("bcsr_rowptr_file_fallback_enable", 1) != 0;
-    uint64_t rp_off = params.find<uint64_t>("bcsr_rowptr_offset", 0);
-    uint64_t ci_off = params.find<uint64_t>("bcsr_colidx_offset", 0);
-    uint64_t bd_off = params.find<uint64_t>("bcsr_blockdata_offset", 0);
-    uint64_t id_off = params.find<uint64_t>("bcsr_blockids_offset", 0);
-    bcsr_rowptr_addr_ = base_addr_ + rp_off;
-    bcsr_colidx_addr_ = base_addr_ + ci_off;
-    bcsr_blockdata_addr_ = base_addr_ + bd_off;
-    bcsr_blockids_addr_ = (id_off > 0) ? (base_addr_ + id_off) : 0;
-    bool offsets_monotonic = (ci_off >= rp_off) && (bd_off >= ci_off);
-    bool offsets_aligned = ((rp_off | ci_off | bd_off | id_off) & 0x3FUL) == 0;
-    if (!base_addr_log_once_) {
-        base_addr_log_once_ = true;
-        if (window_read_debug_ && output_) {
-            output_->verbose(CALL_INFO, 0, 0,
-                "[diag-bcsr-base] node=%u core=%u base=0x%lx rp=0x%lx ci=0x%lx bd=0x%lx ids=0x%lx rp_off=%lu ci_off=%lu bd_off=%lu id_off=%lu align64=%d mono=%d\n",
-                node_id_, core_id_,
-                (unsigned long)base_addr_,
-                (unsigned long)bcsr_rowptr_addr_,
-                (unsigned long)bcsr_colidx_addr_,
-                (unsigned long)bcsr_blockdata_addr_,
-                (unsigned long)bcsr_blockids_addr_,
-                (unsigned long)rp_off, (unsigned long)ci_off, (unsigned long)bd_off, (unsigned long)id_off,
-                offsets_aligned ? 1 : 0,
-                offsets_monotonic ? 1 : 0);
-            if (!offsets_aligned || !offsets_monotonic) {
-                output_->verbose(CALL_INFO, 0, 0,
-                    "[diag-bcsr-base] ⚠️ node=%u core=%u BCSR offset异常：aligned=%d monotonic=%d\n",
-                    node_id_, core_id_, offsets_aligned ? 1 : 0, offsets_monotonic ? 1 : 0);
-            }
-        }
-    }
+    bcsr_layout_.rows = num_neurons_;
+    bcsr_layout_.cols = params.find<uint32_t>("weights_cols", num_neurons_);
+    bcsr_layout_.block_rows = params.find<uint32_t>("bcsr_block_rows", 16);
+    bcsr_layout_.block_cols = params.find<uint32_t>("bcsr_block_cols", 16);
+    bcsr_layout_.idx_bytes = params.find<uint32_t>("bcsr_idx_bytes", 2);
+    bcsr_layout_.val_bytes = params.find<uint32_t>("bcsr_val_bytes", 4);
+    bcsr_layout_.rowptr_offset = params.find<uint64_t>("bcsr_rowptr_offset", 0);
+    bcsr_layout_.colidx_offset = params.find<uint64_t>("bcsr_colidx_offset", 0);
+    bcsr_layout_.blockdata_offset = params.find<uint64_t>("bcsr_blockdata_offset", 0);
+    bcsr_layout_.blockids_offset = params.find<uint64_t>("bcsr_blockids_offset", 0);
+    bcsr_layout_.per_core_stride = params.find<uint64_t>("per_core_stride", 0);
+    bcsr_layout_.validate(base_addr_, output_, (window_read_debug_ || snndlDiagEnabled()), core_id_, node_id_);
+    bcsr_br_ = bcsr_layout_.block_rows;
+    bcsr_bc_ = bcsr_layout_.block_cols;
+    bcsr_val_bytes_ = bcsr_layout_.val_bytes;
+    bcsr_idx_bytes_ = bcsr_layout_.idx_bytes;
+    bcsr_rowptr_addr_ = base_addr_ + bcsr_layout_.rowptr_offset;
+    bcsr_colidx_addr_ = base_addr_ + bcsr_layout_.colidx_offset;
+    bcsr_blockdata_addr_ = base_addr_ + bcsr_layout_.blockdata_offset;
+    bcsr_blockids_addr_ = bcsr_layout_.blockids_offset ? base_addr_ + bcsr_layout_.blockids_offset : 0;
     bcsr_row_index_cache_cap_ = params.find<uint32_t>("bcsr_row_index_cache_cap", 64);
     bcsr_block_cache_cap_ = params.find<uint32_t>("bcsr_block_cache_cap", 256);
     if (aosoa_block_rows_ == 0) aosoa_block_rows_ = (bcsr_br_ > 0) ? bcsr_br_ : 16;
@@ -862,6 +861,23 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     // 代码级内存优化开关（可选）
     use_clock_weight_cache_ = params.find<int>("use_clock_weight_cache", 0) != 0;
     apply_dense_acc_enable_ = params.find<int>("apply_dense_acc_enable", 0) != 0;
+    acc_shadow_verify_enable_ = apply_dense_acc_enable_ && params.find<int>("acc_shadow_verify_enable", 0) != 0;
+    if (acc_shadow_verify_enable_ && !snndlDiagEnabled()) {
+        acc_shadow_verify_enable_ = false;
+    }
+    if (acc_shadow_verify_enable_) {
+        // TEMP(debug): write a one-shot breadcrumb so we can confirm shadow verification is actually enabled at runtime.
+        // This will be removed after verification of runs (10us/100us).
+        FILE* fp = std::fopen("/tmp/acc_shadow.log", "a");
+        if (fp) {
+            std::fprintf(fp, "[acc-shadow-enabled] node=%u core=%u seq=%u time_ns=%" PRIu64 "\n",
+                        node_id_, core_id_, curr_stage_seq_, (uint64_t)getCurrentSimTimeNano());
+            std::fclose(fp);
+        }
+        // 强制落盘到 stdout，便于调试捕获（调试用，跑完撤销）
+        fprintf(stdout, "[acc-shadow-enable] core=%d acc_dense=1 shadow=1\n", core_id_);
+        fflush(stdout);
+    }
     if (use_clock_weight_cache_ && max_cache_entries_ > 0) {
         wcache_cap_ = max_cache_entries_;
         wcache_keys_.resize(wcache_cap_);
@@ -2783,6 +2799,9 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                             }
                             // cache this window's spikes for EndScatter CSV emit
                             spikes_emitted_window_ = spikes_emitted;
+                            if (apply_dense_acc_enable_) {
+                                verifyDenseAccumulator_(curr_stage_seq_);
+                            }
                             if (spikes_emitted>0 && parent_) {
                                 if (auto* pe = parent_pe_cached_) {
                                     pe->accumulateApplyScatterStats(0, 0, spikes_emitted, 0, 0, 0);
@@ -3380,6 +3399,48 @@ void SnnPESubComponent::scheme1PrefetchSlice_(uint32_t slice_idx) {
         }
     }
     s1_is_issuing_prefetch_ = false;
+}
+
+void SnnPESubComponent::verifyDenseAccumulator_(uint32_t seq) {
+    if (!acc_shadow_verify_enable_) return;
+    constexpr double kEps = 1e-5;
+    // TEMP(debug): append a per-window breadcrumb indicating verify path executed and basics of touched size.
+    {
+        FILE* fp = std::fopen("/tmp/acc_shadow.log", "a");
+        if (fp) {
+            std::fprintf(fp, "[acc-shadow-verify] node=%u core=%u seq=%u touched=%zu time_ns=%" PRIu64 "\n",
+                        node_id_, core_id_, seq, acc_touched_list_.size(), (uint64_t)getCurrentSimTimeNano());
+            std::fclose(fp);
+        }
+    }
+    auto log_once = [&](const char* reason, uint32_t post, double dense, double reference) {
+        if (acc_shadow_mismatch_logged_ || !output_) return;
+        output_->verbose(CALL_INFO, 0, 0,
+            "[acc-shadow] core=%u seq=%u %s post=%u dense=%.6f ref=%.6f diff=%.6g\n",
+            core_id_, seq, reason ? reason : "-", post,
+            dense, reference, dense - reference);
+        acc_shadow_mismatch_logged_ = true;
+    };
+
+    for (auto post : acc_touched_list_) {
+        double dense = (post < acc_dense_.size()) ? (double)acc_dense_[post] : 0.0;
+        double reference = 0.0;
+        auto it = acc_shadow_map_.find(post);
+        if (it != acc_shadow_map_.end()) {
+            reference = (double)it->second;
+            acc_shadow_map_.erase(it);
+        }
+        if (std::fabs(dense - reference) > kEps) {
+            log_once("mismatch", post, dense, reference);
+        }
+    }
+    if (!acc_shadow_map_.empty()) {
+        auto kv = *acc_shadow_map_.begin();
+        log_once("unused", kv.first, 0.0, kv.second);
+        acc_shadow_map_.clear();
+    }
+    acc_shadow_map_.clear();
+    acc_shadow_mismatch_logged_ = false;
 }
 
 // === Helpers implementations ===

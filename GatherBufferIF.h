@@ -128,6 +128,7 @@ public:
     void setup() override;
     void finish() override;
 
+    // Deprecated no-op for legacy manual window drive APIs.
     void manualWindowTick();
 
 private:
@@ -364,6 +365,10 @@ private:
     Statistic<uint64_t>* stat_ctrl_adopts_ = nullptr;
     Statistic<uint64_t>* stat_ctrl_reverts_ = nullptr;
     
+    bool warned_auto_custom_req_ = false;
+    bool warned_defer_issue_path_ = false;
+
+    bool diagEnabled_(int level = 1) const;
 };
 
 }} // namespace

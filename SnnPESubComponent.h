@@ -128,7 +128,8 @@ public:
         {"weight_decay", "L2 weight decay coefficient (requires cached weight)", "0.0"},
         // === Code-level memory optimizations (optional, default off) ===
         {"use_clock_weight_cache", "Use clock/second-chance policy for weight cache (0/1)", "0"},
-        {"apply_dense_acc_enable", "Use dense-array accumulator for GAS Apply (0/1)", "0"},
+        {"apply_dense_acc_enable", "Use dense-array accumulator for GAS Apply (0/1)", "1"},
+        {"acc_shadow_verify_enable", "Enable shadow accumulator verification when dense accumulator is active (diagnostic)", "0"},
         // 诊断：禁用权重缓存以强制触发内存读取
         {"disable_weight_cache", "Disable weight cache to force memory reads (diagnostic)", "0"}
         ,
@@ -279,6 +280,10 @@ private:
     std::unordered_map<uint32_t, float> acc_delta_;        // post_local -> deltaV
     uint64_t acc_bytes_estimate_ = 0;         // approximate memory footprint
     std::vector<std::pair<uint32_t,float>> acc_spill_log_; // fallback when HWM reached
+    // Shadow verify: map用于与dense累加器对照（可选）
+    std::unordered_map<uint32_t, float> acc_shadow_map_;
+    bool acc_shadow_verify_enable_ = false;
+    bool acc_shadow_mismatch_logged_ = false;
     // Per-window aggregation counters (PE-level flush on stage events)
     uint64_t acc_updates_count_ = 0;
     uint64_t acc_posts_touched_count_ = 0;
@@ -377,6 +382,8 @@ private:
                 }
             }
             acc_touched_list_.clear();
+            acc_shadow_map_.clear();
+            acc_shadow_mismatch_logged_ = false;
         } else {
             acc_delta_.clear();
         }
@@ -401,6 +408,9 @@ private:
         if (apply_dense_acc_enable_) {
             if (post < acc_dense_.size()) {
                 acc_dense_[post] += dv;
+                if (acc_shadow_verify_enable_) {
+                    acc_shadow_map_[post] += dv;
+                }
                 if (!acc_touched_bitmap_.empty() && acc_touched_bitmap_[post] == 0) {
                     acc_touched_bitmap_[post] = 1;
                     acc_touched_list_.push_back(post);
@@ -677,6 +687,7 @@ private:
     void scheme1Reset_();
     bool scheme1Tick_(); // 返回 true 表示本周期已由方案1路径完全处理
     void scheme1PrefetchSlice_(uint32_t slice_idx);
+    void verifyDenseAccumulator_(uint32_t seq);
 
     // Debug/diagnostic switches (params)
     bool read_force_single_ = false; // 当为真时，强制按单元素读取（req_size=4B），用于定位对齐/切片问题
@@ -964,6 +975,26 @@ private:
 
     // Dense 权重区域上界（用于区域分组）；BCSR 通过 bcsr_kind 判别
     uint64_t weight_region_end_ = 0; // [base_addr_, weight_region_end_) 视为权重区（dense）
+
+    // BCSR 布局描述（集中校验与寻址）
+    struct BcsrLayout {
+        uint32_t rows = 0;
+        uint32_t cols = 0;
+        uint32_t block_rows = 0;
+        uint32_t block_cols = 0;
+        uint32_t idx_bytes = 0;
+        uint32_t val_bytes = 0;
+        uint64_t rowptr_offset = 0;
+        uint64_t colidx_offset = 0;
+        uint64_t blockdata_offset = 0;
+        uint64_t blockids_offset = 0;
+        uint64_t per_core_stride = 0;
+        bool validate(uint64_t base, Output* out, bool debug, uint32_t core_id, uint32_t node_id) const;
+        uint64_t maxOffset() const {
+            return std::max(std::max(rowptr_offset, colidx_offset),
+                            std::max(blockdata_offset, blockids_offset));
+        }
+    } bcsr_layout_;
 
     // ===== BCSR 读路径支持 =====
     bool use_bcsr_ = false;
