@@ -9,9 +9,9 @@
 #include "SnnPESubComponent.h"
 #include <fstream>
 #include "GasCustomCmd.h"
+#include "GasPhaseController.h"
 #include "MultiCorePE.h"
 #include "GatherBufferIF.h"
-#include "GasPhaseController.h"
 
 #include <sstream>
 #include <iostream>
@@ -33,69 +33,6 @@ using namespace SST;
 using namespace SST::SnnDL;
 
 // 诊断门控改为参数化：由 enable_extended_diagnostics_ 成员控制
-
-// Public thin wrapper for Phase4 Step2-3. Keeps behavior inside SnnPESubComponent.
-void SnnPESubComponent::orchestrateApplyWindowEntry() {
-    prepareEdgeWindowForApply_();
-}
-
-void SnnPESubComponent::orchestrateBeginGatherWindowSetup() {
-    // Exactly preserve original order of operations for BeginGather setup
-    if (use_bcsr_) {
-        logBcsrWindowStats_("prev");
-        resetBcsrWindowCounters_();
-    }
-    uint64_t now = getCurrentSimTimeNano();
-    appendStageEventRow_("BeginGather", now, 0);
-    if (gas_ctrl_) gas_ctrl_->onBeginGather(static_cast<uint32_t>(curr_stage_seq_));
-    stage_event_hub_.t_begin_gather = now;
-    stage_event_hub_.have_begin_gather = true;
-    stage_event_hub_.have_begin_apply = false;
-    stage_event_hub_.have_begin_scatter = false;
-    window_spikes_all_ = 0;
-    // 新窗开始：复位边集合容量告警
-    edge_collector_capacity_warned_ = false;
-    if (window_read_enable_) {
-        // 位图迁移
-        if (!posts_seen_window_.empty()) {
-            if (posts_seen_prev_window_.size() != posts_seen_window_.size()) {
-                posts_seen_prev_window_.assign(posts_seen_window_.size(), 0);
-            }
-            posts_seen_prev_window_ = posts_seen_window_;
-            std::fill(posts_seen_window_.begin(), posts_seen_window_.end(), 0);
-        } else if (posts_seen_prev_window_.size() != num_neurons_) {
-            posts_seen_prev_window_.assign(num_neurons_, 0);
-        }
-        // 列表迁移
-        posts_list_prev_window_.swap(posts_list_window_);
-        posts_list_window_.clear();
-        // pre 集合迁移
-        active_pre_prev_window_ = std::move(active_pre_window_);
-        active_pre_window_.clear();
-    }
-    // reset per-window counters
-    acc_updates_count_ = 0; acc_posts_touched_count_ = 0;
-    diag_edges_record_hits_ = 0; diag_edges_stage_skips_ = 0; diag_edges_cond_skips_ = 0;
-    diag_spikes_stage_gather_ = diag_spikes_stage_apply_ = diag_spikes_stage_scatter_ = 0;
-    diag_spikes_stage_idle_ = 0;
-    acc_spill_records_count_ = 0; acc_spilled_bytes_sum_ = 0; acc_hwm_bytes_max_ = 0;
-}
-
-void SnnPESubComponent::orchestrateBeginApplyIssueFallback(bool strict_active) {
-    read_orchestrator_.issueFallbackReadsIfNeeded(strict_active);
-}
-
-void SnnPESubComponent::orchestrateContinueIssueReads() {
-    issueEdgeWeightFetches_();
-}
-
-void SnnPESubComponent::orchestrateIssueFromEdgesDirect() {
-    read_orchestrator_.issueFromEdges();
-}
-
-void SnnPESubComponent::orchestrateMarkBeginApply() {
-    stage_event_hub_.markBeginApply(curr_stage_seq_);
-}
 
 bool SnnPESubComponent::BcsrLayout::validate(uint64_t base, Output* out, bool debug, uint32_t core_id, uint32_t node_id) const {
     const bool monotonic = (colidx_offset >= rowptr_offset) && (blockdata_offset >= colidx_offset);
@@ -198,7 +135,7 @@ void SnnPESubComponent::prepareEdgeWindowForApply_() {
     if (!(apply_acc_enable_ && gas_window_mode_)) return;
     edge_collector_.flipForApply(window_read_debug_, output_, core_id_, curr_stage_seq_);
     window_reads_issued_this_apply_ = 0;
-    issueEdgeWeightFetches_();
+    orchestrateIssueFromEdgesDirect();
 }
 
 #ifdef SNNDL_ENABLE_DEBUG_LOG
@@ -267,15 +204,15 @@ void SnnPESubComponent::resetBcsrWindowCounters_() {
     bcsr_req_block_miss_ = 0;
 }
 
-void SnnPESubComponent::StageEventHub::markBeginGather(uint32_t) {
+void SnnPESubComponent::StageEventHub::markBeginGather(uint32_t seq) {
     if (!core) return;
+    if (core->gas_ctrl_) core->gas_ctrl_->onBeginGather(seq);
     if (core->use_bcsr_) {
         core->logBcsrWindowStats_("prev");
         core->resetBcsrWindowCounters_();
     }
     uint64_t now = core->getCurrentSimTimeNano();
     core->appendStageEventRow_("BeginGather", now, 0);
-    if (core->gas_ctrl_) core->gas_ctrl_->onBeginGather(static_cast<uint32_t>(core->curr_stage_seq_));
     t_begin_gather = now;
     have_begin_gather = true;
     have_begin_apply = false;
@@ -283,20 +220,20 @@ void SnnPESubComponent::StageEventHub::markBeginGather(uint32_t) {
     core->window_spikes_all_ = 0;
 }
 
-void SnnPESubComponent::StageEventHub::markBeginApply(uint32_t) {
+void SnnPESubComponent::StageEventHub::markBeginApply(uint32_t seq) {
     if (!core) return;
+    if (core->gas_ctrl_) core->gas_ctrl_->onBeginApply(seq);
     uint64_t now = core->getCurrentSimTimeNano();
     core->appendStageEventRow_("BeginApply", now, 0);
-    if (core->gas_ctrl_) core->gas_ctrl_->onBeginApply(static_cast<uint32_t>(core->curr_stage_seq_));
     t_begin_apply = now;
     have_begin_apply = true;
 }
 
-void SnnPESubComponent::StageEventHub::markBeginScatter(uint32_t) {
+void SnnPESubComponent::StageEventHub::markBeginScatter(uint32_t seq) {
     if (!core) return;
+    if (core->gas_ctrl_) core->gas_ctrl_->onBeginScatter(seq);
     uint64_t now = core->getCurrentSimTimeNano();
     core->appendStageEventRow_("BeginScatter", now, 0);
-    if (core->gas_ctrl_) core->gas_ctrl_->onBeginScatter(static_cast<uint32_t>(core->curr_stage_seq_));
     t_begin_scatter = now;
     have_begin_scatter = true;
     if (core->apply_acc_enable_ && core->gas_window_mode_) {
@@ -310,20 +247,9 @@ void SnnPESubComponent::StageEventHub::markBeginScatter(uint32_t) {
 
 void SnnPESubComponent::StageEventHub::markEndScatter(uint32_t seq, uint64_t spikes_emitted) {
     if (!core) return;
+    if (core->gas_ctrl_) core->gas_ctrl_->onEndScatter(seq, spikes_emitted);
     uint64_t now = core->getCurrentSimTimeNano();
     core->appendStageEventRow_("EndScatter", now, spikes_emitted);
-    if (core->gas_ctrl_) {
-        core->gas_ctrl_->onEndScatter(seq, spikes_emitted);
-        core->gas_ctrl_->onScatterFinalize(static_cast<uint32_t>(seq),
-                                           spikes_emitted,
-                                           core->window_spikes_all_,
-                                           core->acc_updates_count_,
-                                           core->acc_posts_touched_count_,
-                                           core->acc_hwm_bytes_max_,
-                                           core->acc_spill_records_count_,
-                                           core->acc_spilled_bytes_sum_);
-        core->gas_ctrl_->onWindowFinalize();
-    }
     core->stats_reporter_.reportWindowSpikes(static_cast<uint32_t>(seq), spikes_emitted);
     core->spikes_emitted_window_ = 0;
     core->window_spikes_all_ = 0;
@@ -333,31 +259,20 @@ void SnnPESubComponent::StageEventHub::markEndScatter(uint32_t seq, uint64_t spi
         }
     }
     if (core->stat_gas_superstep_total_cycles_) {
-        // Prefer controller mirror if present; fallback to local times to preserve behavior
-        bool Hbg = have_begin_gather, Hba = have_begin_apply, Hbs = have_begin_scatter;
-        uint64_t Tbg = t_begin_gather, Tba = t_begin_apply, Tbs = t_begin_scatter;
-        if (core->gas_ctrl_) {
-            Hbg = core->gas_ctrl_->hasBeginGather();
-            Hba = core->gas_ctrl_->hasBeginApply();
-            Hbs = core->gas_ctrl_->hasBeginScatter();
-            Tbg = core->gas_ctrl_->tBeginGather();
-            Tba = core->gas_ctrl_->tBeginApply();
-            Tbs = core->gas_ctrl_->tBeginScatter();
-        }
-        if (Hbg) {
-            uint64_t total = (now >= Tbg) ? (now - Tbg) : 0ULL;
+        if (have_begin_gather) {
+            uint64_t total = (now >= t_begin_gather) ? (now - t_begin_gather) : 0ULL;
             core->stat_gas_superstep_total_cycles_->addData(total);
         }
-        if (Hbg && Hba && core->stat_gas_superstep_gather_cycles_) {
-            uint64_t g = (Tba >= Tbg) ? (Tba - Tbg) : 0ULL;
+        if (have_begin_gather && have_begin_apply && core->stat_gas_superstep_gather_cycles_) {
+            uint64_t g = (t_begin_apply >= t_begin_gather) ? (t_begin_apply - t_begin_gather) : 0ULL;
             core->stat_gas_superstep_gather_cycles_->addData(g);
         }
-        if (Hba && core->stat_gas_superstep_apply_cycles_) {
-            uint64_t a = (Tbs >= Tba) ? (Tbs - Tba) : 0ULL;
+        if (have_begin_apply && core->stat_gas_superstep_apply_cycles_) {
+            uint64_t a = (t_begin_scatter >= t_begin_apply) ? (t_begin_scatter - t_begin_apply) : 0ULL;
             core->stat_gas_superstep_apply_cycles_->addData(a);
         }
-        if (Hbs && core->stat_gas_superstep_scatter_cycles_) {
-            uint64_t s = (now >= Tbs) ? (now - Tbs) : 0ULL;
+        if (have_begin_scatter && core->stat_gas_superstep_scatter_cycles_) {
+            uint64_t s = (now >= t_begin_scatter) ? (now - t_begin_scatter) : 0ULL;
             core->stat_gas_superstep_scatter_cycles_->addData(s);
         }
     }
@@ -447,16 +362,10 @@ void SnnPESubComponent::StatsReporter::updatePendingPeak(uint32_t outstanding) c
 }
 
 void SnnPESubComponent::issueEdgeWeightFetches_() {
-    if (gas_ctrl_) {
-        gas_ctrl_->logEdgeFetchStart(
-            static_cast<uint64_t>(edge_collector_.prevSize()), window_reads_issued_this_apply_,
-            outstanding_requests_, window_read_budget_);
-    } else {
-        read_orchestrator_.logEdgeFetchStart(
-            edge_collector_.prevSize(), window_reads_issued_this_apply_,
-            outstanding_requests_, window_read_budget_);
-    }
-    if (gas_ctrl_) gas_ctrl_->issueFromEdges(); else read_orchestrator_.issueFromEdges();
+    read_orchestrator_.logEdgeFetchStart(
+        edge_collector_.prevSize(), window_reads_issued_this_apply_,
+        outstanding_requests_, window_read_budget_);
+    read_orchestrator_.issueFromEdges();
 }
 
 void SnnPESubComponent::ReadOrchestrator::issueFromEdges() {
@@ -488,9 +397,8 @@ void SnnPESubComponent::ReadOrchestrator::issueFromEdges() {
         if (core->use_bcsr_) {
             if (core->bcsr_force_file_read_) {
                 // 诊断路径：直接从权重文件读取块，避免内存可见性/一致性导致的错误
-                uint32_t br = core->bcsr_weights_.effectiveBlockRows();
-                br = (br > 0 ? br : 1);
-                uint32_t bc = core->bcsr_weights_.effectiveBlockCols();
+                uint32_t br = (core->bcsr_br_>0? core->bcsr_br_:1);
+                uint32_t bc = (core->bcsr_bc_>0? core->bcsr_bc_:16);
                 uint32_t block_row = post_local / br;
                 uint32_t intra_row = post_local % br;
                 uint32_t blk_col = (bc? (pre_global / bc) : 0);
@@ -531,7 +439,6 @@ void SnnPESubComponent::ReadOrchestrator::issueFromEdges() {
                 } while(0);
                 if (core->readresp_zero_fallback_ && resolved == 0.0f) resolved = core->init_default_weight_;
                 core->accUpdate_(post_local, resolved * static_cast<float>(count));
-                if (core->gas_ctrl_) core->gas_ctrl_->onWeightResolved(post_local, resolved, count);
                 core->diagEdgeWeight_("bcsr-file", post_local, pre_global, resolved, count);
                 // 继续发起下一条边
                 issueFromEdges();
@@ -539,14 +446,12 @@ void SnnPESubComponent::ReadOrchestrator::issueFromEdges() {
                 core->outstanding_requests_++;
                 core->stats_reporter_.updatePendingPeak(core->outstanding_requests_);
                 core->window_reads_issued_this_apply_++;
-                if (core->gas_ctrl_) core->gas_ctrl_->onReadIssued();
                 uint32_t pre_capture = pre_global;
                 core->requestWeightBCSR(pre_global, post_local,
                     [this, post_local, count, pre_capture](float w) {
                         float resolved = w;
                         if (core->readresp_zero_fallback_ && resolved == 0.0f) resolved = core->init_default_weight_;
                         core->accUpdate_(post_local, resolved * static_cast<float>(count));
-                        if (core->gas_ctrl_) core->gas_ctrl_->onWeightResolved(post_local, resolved, count);
                         core->diagEdgeWeight_("bcsr", post_local, pre_capture, resolved, count);
                         if (core->outstanding_requests_ > 0) core->outstanding_requests_--;
                         issueFromEdges();
@@ -568,7 +473,6 @@ void SnnPESubComponent::ReadOrchestrator::issueFromEdges() {
         if (core->weightCacheTryGet_(cache_key, cached)) {
             if (core->readresp_zero_fallback_ && cached == 0.0f) cached = core->init_default_weight_;
             core->accUpdate_(post_local, cached * static_cast<float>(count));
-            if (core->gas_ctrl_) core->gas_ctrl_->onWeightResolved(post_local, cached, count);
             core->diagEdgeWeight_("cache", post_local, pre_global, cached, count);
             core->stats_reporter_.reportCacheAccess(true);
             continue;
@@ -578,7 +482,6 @@ void SnnPESubComponent::ReadOrchestrator::issueFromEdges() {
         core->outstanding_requests_++;
         core->stats_reporter_.updatePendingPeak(core->outstanding_requests_);
         core->window_reads_issued_this_apply_++;
-        if (core->gas_ctrl_) core->gas_ctrl_->onReadIssued();
         uint32_t pre_capture = pre_global;
         core->requestWeight(req_pre, req_post,
             [this, post_local, count, cache_key, pre_capture](float w) {
@@ -586,7 +489,6 @@ void SnnPESubComponent::ReadOrchestrator::issueFromEdges() {
                 if (core->readresp_zero_fallback_ && resolved == 0.0f) resolved = core->init_default_weight_;
                 core->weightCacheStore_(cache_key, resolved);
                 core->accUpdate_(post_local, resolved * static_cast<float>(count));
-                if (core->gas_ctrl_) core->gas_ctrl_->onWeightResolved(post_local, resolved, count);
                 core->diagEdgeWeight_("miss", post_local, pre_capture, resolved, count);
                 if (core->outstanding_requests_ > 0) core->outstanding_requests_--;
                 issueFromEdges();
@@ -614,7 +516,6 @@ void SnnPESubComponent::ReadOrchestrator::issueFromSets(
             core->outstanding_requests_++;
             core->stats_reporter_.updatePendingPeak(core->outstanding_requests_);
             core->window_reads_issued_this_apply_++;
-            if (core->gas_ctrl_) core->gas_ctrl_->onReadIssued();
             issued++;
             core->requestWeight(req_pre, req_post, [this, cache_key](float w){
                 core->weightCacheStore_(cache_key, w);
@@ -680,8 +581,7 @@ void SnnPESubComponent::ReadOrchestrator::issueFromSetsBcsr(
             core->stats_reporter_.reportCacheAccess(false);
             core->outstanding_requests_++;
             core->stats_reporter_.updatePendingPeak(core->outstanding_requests_);
-        core->window_reads_issued_this_apply_++;
-        if (core->gas_ctrl_) core->gas_ctrl_->onReadIssued();
+            core->window_reads_issued_this_apply_++;
             primed++;
             core->requestWeightBCSR(pre_g, post_l, [this](float) {
                 if (core->outstanding_requests_ > 0) core->outstanding_requests_--;
@@ -737,25 +637,6 @@ void SnnPESubComponent::ReadOrchestrator::logEdgeFetchStart(
 
 bool SnnPESubComponent::ReadOrchestrator::canIssueMoreReads_() const {
     if (!core) return false;
-    // Delegate decision to controller when available (mirror-only),
-    // but keep exact original behavior via local counters.
-    if (core->gas_ctrl_) {
-        bool ok = core->gas_ctrl_->canIssueMoreReads(core->window_reads_issued_this_apply_, core->window_read_budget_,
-                                                     core->outstanding_requests_, core->max_outstanding_requests_);
-        if (!ok) {
-            // Emit same diagnostics as before for transparency
-            if (core->window_read_budget_ && core->window_reads_issued_this_apply_ >= core->window_read_budget_) {
-                diag_.log(0, "[diag-edge-loop] core=%d budget hit issued=%u\n", core->core_id_, core->window_reads_issued_this_apply_);
-            }
-            if (core->outstanding_requests_ >= core->max_outstanding_requests_) {
-                diag_.log(0, "[diag-edge-loop] core=%d outstanding=%u limit=%u\n",
-                    core->core_id_, core->outstanding_requests_, core->max_outstanding_requests_);
-            }
-            return false;
-        }
-        return true;
-    }
-    // Fallback to local rule
     if (core->window_read_budget_ && core->window_reads_issued_this_apply_ >= core->window_read_budget_) {
         diag_.log(0, "[diag-edge-loop] core=%d budget hit issued=%u\n", core->core_id_, core->window_reads_issued_this_apply_);
         return false;
@@ -817,17 +698,12 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     enable_weight_fetch_ = params.find<int>("enable_weight_fetch", 0) != 0;
     // 现在再初始化依赖core指针的轻量结构
     stage_event_hub_.init(this);
-    // Phase4 Step2-1: Initialize GasPhaseController skeleton (no behavior change)
-    try {
-        gas_ctrl_.reset(new GasPhaseController());
-        gas_ctrl_->init(this, output_);
-        gas_ctrl_->setDebug(window_read_debug_, enable_extended_diagnostics_);
-        gas_ctrl_->setStageEventsCsv(stage_events_csv_);
-    } catch (...) {
-        gas_ctrl_.reset();
-    }
     stats_reporter_.init(this);
     read_orchestrator_.init(this);
+    gas_ctrl_ = std::make_unique<GasPhaseController>();
+    if (gas_ctrl_) {
+        gas_ctrl_->init(this, output_);
+    }
 #if SNNDL_DEBUG_ENABLED
     if (window_read_debug_) {
         SNNDL_DEBUG_LOG(1, "[diag-init] core=%d enable_weight_fetch=%d\n", core_id_, enable_weight_fetch_ ? 1 : 0);
@@ -879,8 +755,8 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     disable_weight_cache_ = params.find<int>("disable_weight_cache", 0) != 0;
     window_read_enable_ = params.find<int>("window_read_enable", 0) != 0;
     window_read_debug_ = params.find<int>("window_read_debug", 0) != 0;
+    if (gas_ctrl_) gas_ctrl_->setDebug(window_read_debug_, enable_extended_diagnostics_);
     window_read_budget_ = params.find<uint32_t>("window_read_budget", 1024);
-    if (gas_ctrl_) gas_ctrl_->setWindowReadBudget(window_read_budget_);
     read_force_single_ = params.find<int>("read_force_single", 0) != 0;
     // 边集合容量上限（极端保护）
     edge_collector_max_capacity_ = static_cast<size_t>(params.find<uint64_t>("edge_collector_max_capacity", 1000000));
@@ -933,28 +809,24 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     bcsr_layout_.blockids_offset = params.find<uint64_t>("bcsr_blockids_offset", 0);
     bcsr_layout_.per_core_stride = params.find<uint64_t>("per_core_stride", 0);
     bcsr_layout_.validate(base_addr_, output_, (window_read_debug_ || enable_extended_diagnostics_), core_id_, node_id_);
+    bcsr_br_ = bcsr_layout_.block_rows;
+    bcsr_bc_ = bcsr_layout_.block_cols;
+    bcsr_val_bytes_ = bcsr_layout_.val_bytes;
+    bcsr_idx_bytes_ = bcsr_layout_.idx_bytes;
     uint64_t bcsr_rowptr_addr = base_addr_ + bcsr_layout_.rowptr_offset;
-    uint64_t bcsr_colidx_addr = base_addr_ + bcsr_layout_.colidx_offset;
-    uint64_t bcsr_blockdata_addr = base_addr_ + bcsr_layout_.blockdata_offset;
-    uint64_t bcsr_blockids_addr = bcsr_layout_.blockids_offset ? base_addr_ + bcsr_layout_.blockids_offset : 0;
-    bcsr_weights_.configure(bcsr_rowptr_addr,
-                            bcsr_colidx_addr,
-                            bcsr_blockdata_addr,
-                            bcsr_blockids_addr,
-                            bcsr_layout_.block_rows,
-                            bcsr_layout_.block_cols,
-                            bcsr_layout_.idx_bytes,
-                            bcsr_layout_.val_bytes);
-    const uint32_t row_index_cache_cap = params.find<uint32_t>("bcsr_row_index_cache_cap", 64);
-    const uint32_t block_cache_cap = params.find<uint32_t>("bcsr_block_cache_cap", 256);
-    bcsr_weights_.setRowIndexCacheCapacity(row_index_cache_cap);
-    bcsr_weights_.setBlockCacheCapacity(block_cache_cap);
-    if (aosoa_block_rows_ == 0) aosoa_block_rows_ = bcsr_weights_.effectiveBlockRows();
+    bcsr_colidx_addr_ = base_addr_ + bcsr_layout_.colidx_offset;
+    bcsr_blockdata_addr_ = base_addr_ + bcsr_layout_.blockdata_offset;
+    bcsr_blockids_addr_ = bcsr_layout_.blockids_offset ? base_addr_ + bcsr_layout_.blockids_offset : 0;
+    bcsr_weights_.configure(bcsr_rowptr_addr, bcsr_br_, bcsr_bc_, bcsr_idx_bytes_, bcsr_val_bytes_);
+    bcsr_row_index_cache_cap_ = params.find<uint32_t>("bcsr_row_index_cache_cap", 64);
+    bcsr_block_cache_cap_ = params.find<uint32_t>("bcsr_block_cache_cap", 256);
+    if (aosoa_block_rows_ == 0) aosoa_block_rows_ = (bcsr_br_ > 0) ? bcsr_br_ : 16;
     // GAS Apply/Scatter Phase‑1
     apply_acc_enable_ = params.find<int>("apply_acc_enable", 0) != 0;
     acc_hwm_bytes_ = params.find<uint64_t>("acc_high_watermark_bytes", 16*1024*1024);
     acc_spill_enable_ = params.find<int>("acc_spill_enable", 1) != 0;
     stage_events_csv_ = params.find<std::string>("stage_events_csv", "");
+    if (gas_ctrl_) gas_ctrl_->setStageEventsCsv(stage_events_csv_);
     if (aosoa_block_rows_ == 0) aosoa_block_rows_ = 16;
     // CSR 参数已移除
     bcsr_prefetch_all_ = params.find<int>("bcsr_prefetch_all", 0) != 0;
@@ -1122,9 +994,9 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
             node_id_, core_id_,
             (unsigned long long)base_addr_,
             (unsigned long long)bcsr_weights_.rowptrAddr(),
-            (unsigned long long)bcsr_weights_.colidxAddr(),
-            (unsigned long long)bcsr_weights_.blockdataAddr(),
-            (unsigned long long)bcsr_weights_.blockidsAddr());
+            (unsigned long long)bcsr_colidx_addr_,
+            (unsigned long long)bcsr_blockdata_addr_,
+            (unsigned long long)bcsr_blockids_addr_);
     }
     if (use_bcsr_) {
         if (weights_template_.empty() && window_read_debug_) {
@@ -1594,7 +1466,7 @@ bool SnnPESubComponent::clockTick(Cycle_t current_cycle) {
         total_cycles_ >= memory_warmup_cycles_ &&
         (loader_barrier_cycles_ == 0 || total_cycles_ >= loader_barrier_cycles_)) {
         uint32_t rows = num_neurons_;
-        uint32_t br = bcsr_weights_.effectiveBlockRows();
+        uint32_t br = (bcsr_br_ > 0) ? bcsr_br_ : 16;
         uint32_t nBlockRows = (rows + br - 1) / br;
         size_t bytes = static_cast<size_t>(nBlockRows + 1) * sizeof(uint32_t);
         auto* read = new SST::Interfaces::StandardMem::Read(bcsr_weights_.rowptrAddr(), bytes);
@@ -1734,8 +1606,8 @@ bool SnnPESubComponent::clockTick(Cycle_t current_cycle) {
     if (verify_weights_ && use_bcsr_ && memory_ && memory_ready_ && bcsr_weights_.isRowptrReady() &&
         total_cycles_ >= memory_warmup_cycles_ && (loader_barrier_cycles_ == 0 || total_cycles_ >= loader_barrier_cycles_)) {
         if (!verify_bcsr_done_ && !verify_bcsr_inflight_) {
-            uint32_t br = bcsr_weights_.effectiveBlockRows();
-            uint32_t bc = bcsr_weights_.effectiveBlockCols();
+            uint32_t br = (bcsr_br_>0? bcsr_br_:16);
+            uint32_t bc = (bcsr_bc_>0? bcsr_bc_:16);
             uint32_t nBlockRows = (num_neurons_ + br - 1) / br;
             if (!verify_bcsr_started_) {
                 const auto& rp = bcsr_weights_.rowptrHost();
@@ -1796,15 +1668,15 @@ bool SnnPESubComponent::clockTick(Cycle_t current_cycle) {
                 uint32_t post_local = verify_bcsr_post_local_;
                 verify_bcsr_inflight_ = true;
                 uint32_t block_row = verify_bcsr_post_local_ / br;
-                uint32_t bc_eff = bcsr_weights_.effectiveBlockCols();
-                uint32_t blk_col = (bc_eff ? (pre_global / bc_eff) : 0);
-                size_t block_bytes = bcsr_weights_.blockBytes();
+                uint32_t bc_eff = (bcsr_bc_>0? bcsr_bc_:16);
+                uint32_t blk_col = (bc_eff? (pre_global / bc_eff) : 0);
+                size_t block_bytes = (size_t)(bcsr_br_>0?bcsr_br_:1) * (size_t)bc_eff * (size_t)bcsr_val_bytes_;
                 uint32_t start = 0;
                 uint64_t block_addr = 0;
                 const auto& rp = bcsr_weights_.rowptrHost();
                 if (block_row + 1 < rp.size()) {
                     start = rp[block_row];
-                    block_addr = bcsr_weights_.blockDataAddr(start + verify_bcsr_block_col_);
+                    block_addr = bcsr_blockdata_addr_ + (uint64_t)(start + verify_bcsr_block_col_) * block_bytes;
                 }
                 if (output_) {
                     output_->verbose(CALL_INFO, 0, 0,
@@ -1858,7 +1730,7 @@ bool SnnPESubComponent::clockTick(Cycle_t current_cycle) {
                     if (std::fabs(w) > verify_epsilon_) {
                         verify_bcsr_done_ = true;
                     } else {
-                        uint32_t bc = bcsr_weights_.effectiveBlockCols();
+                        uint32_t bc = (bcsr_bc_>0? bcsr_bc_:16);
                         if (verify_bcsr_intra_col_ + 1 < bc) {
                             // 立即尝试下一列
                             verify_bcsr_intra_col_++;
@@ -1917,6 +1789,86 @@ void SnnPESubComponent::forceEndGather() {
     if (window_read_debug_ && output_) {
         output_->verbose(CALL_INFO, 0, 0, "[diag-gas] 核心%d 手动触发 EndGather\n", core_id_);
     }
+}
+
+void SnnPESubComponent::orchestrateBeginGatherWindowSetup() {
+    stage_event_hub_.markBeginGather(curr_stage_seq_);
+}
+
+void SnnPESubComponent::orchestratePrepareApplyWindow() {
+    prepareEdgeWindowForApply_();
+}
+
+void SnnPESubComponent::orchestrateApplyWindowEntry() {
+    stage_event_hub_.markBeginApply(curr_stage_seq_);
+}
+
+void SnnPESubComponent::orchestrateBeginApplyIssueFallback(bool strict_active) {
+    read_orchestrator_.issueFallbackReadsIfNeeded(strict_active);
+}
+
+void SnnPESubComponent::orchestrateContinueIssueReads() {
+    read_orchestrator_.issueFromEdges();
+}
+
+void SnnPESubComponent::orchestrateIssueFromEdgesDirect() {
+    issueEdgeWeightFetches_();
+}
+
+void SnnPESubComponent::orchestrateBeginScatterSequence() {
+    diag_spikes_stage_apply_ = 0;
+    stage_event_hub_.markBeginScatter(curr_stage_seq_);
+    spikes_generated_base_ = count_spikes_generated_;
+    if (!acc_spill_log_.empty()) {
+        std::sort(acc_spill_log_.begin(), acc_spill_log_.end(), [](auto&a, auto&b){return a.first<b.first;});
+        uint32_t curp=UINT32_MAX; float sum=0.0f;
+        for (auto &pr : acc_spill_log_) {
+            if (pr.first != curp) { if (curp!=UINT32_MAX) accUpdate_(curp, sum); curp = pr.first; sum = pr.second; }
+            else { sum += pr.second; }
+        }
+        if (curp!=UINT32_MAX) accUpdate_(curp, sum);
+        acc_spill_log_.clear();
+    }
+    uint64_t spikes_emitted=0;
+    if (apply_dense_acc_enable_) {
+        if (!acc_touched_list_.empty()) std::sort(acc_touched_list_.begin(), acc_touched_list_.end());
+        for (auto post : acc_touched_list_) {
+            if (post >= acc_dense_.size()) continue;
+            float dv = acc_dense_[post]; if (dv == 0.0f) continue;
+            float v_before = getMem_(post);
+            float v = v_before + dv; setMem_(post, v);
+            bool willFire = (v >= v_thresh_ && getRefrac_(post) == 0);
+            checkAndFireSpike(post);
+            if (willFire) { spikes_emitted++; if (stat_gas_scatter_spikes_emitted_total_) stat_gas_scatter_spikes_emitted_total_->addData(1); }
+        }
+        accReset_();
+    } else if (!acc_delta_.empty()) {
+        std::vector<uint32_t> posts; posts.reserve(acc_delta_.size());
+        for (auto &kv : acc_delta_) posts.push_back(kv.first);
+        std::sort(posts.begin(), posts.end());
+        for (auto post : posts) {
+            float dv = acc_delta_[post];
+            float v_before = getMem_(post);
+            float v = v_before + dv; setMem_(post, v);
+            bool willFire = (v >= v_thresh_ && getRefrac_(post) == 0);
+            checkAndFireSpike(post);
+            if (willFire) { spikes_emitted++; if (stat_gas_scatter_spikes_emitted_total_) stat_gas_scatter_spikes_emitted_total_->addData(1); }
+        }
+        accReset_();
+    }
+    spikes_emitted_window_ = spikes_emitted;
+    if (apply_dense_acc_enable_) verifyDenseAccumulator_(curr_stage_seq_);
+    if (spikes_emitted>0 && parent_) { if (auto* pe = parent_pe_cached_) pe->accumulateApplyScatterStats(0,0,spikes_emitted,0,0,0); }
+}
+
+void SnnPESubComponent::orchestrateEndScatterSequence() {
+    uint64_t to_emit = window_spikes_all_ ? window_spikes_all_ : spikes_emitted_window_;
+    if (to_emit == 0) {
+        uint64_t delta = 0;
+        if (count_spikes_generated_ >= spikes_generated_base_) delta = count_spikes_generated_ - spikes_generated_base_;
+        if (delta > 0) to_emit = delta;
+    }
+    stage_event_hub_.markEndScatter(curr_stage_seq_, to_emit);
 }
 void SnnPESubComponent::deliverSpike(SpikeEvent* spike) {
     if (!spike) return;
@@ -2583,7 +2535,6 @@ void SnnPESubComponent::processLocalSpike(SpikeEvent* spike_event) {
             diag_dv_sum_window_ += (double)weight;
             if (weight != 0.0f) diag_dv_updates_nonzero_++;
             accUpdate_(post_local, weight);
-            if (gas_ctrl_) gas_ctrl_->onWeightResolved(post_local, weight, 1);
         }
         recordSynapticAccess_();
         return;
@@ -2688,9 +2639,8 @@ void SnnPESubComponent::requestWeight(uint32_t pre_neuron, uint32_t post_neuron,
 
 float SnnPESubComponent::readBcsrWeightFromFile_(uint32_t post_local, uint32_t pre_global) const {
     // 基于 meta.json 与二进制文件，解析对应块并取出 (intra_row, intra_col) 的值
-    uint32_t br = bcsr_weights_.effectiveBlockRows();
-    if (br == 0) br = 1;
-    uint32_t bc = bcsr_weights_.effectiveBlockCols();
+    uint32_t br = (bcsr_br_>0? bcsr_br_:1);
+    uint32_t bc = (bcsr_bc_>0? bcsr_bc_:16);
     uint32_t block_row = (br? (post_local / br) : 0);
     uint32_t intra_row = (br? (post_local % br) : 0);
     uint32_t blk_col = (bc? (pre_global / bc) : 0);
@@ -2766,11 +2716,40 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                             posts_list_prev_window_.size(), active_pre_prev_window_.size(),
                             posts_list_window_.size(), active_pre_window_.size(), incoming_spikes_.size());
                         }
-                        if (gas_ctrl_) gas_ctrl_->beginGatherWindowSetup(); else orchestrateBeginGatherWindowSetup();
+                        // reset per-window counters
+                        {
+                        orchestrateBeginGatherWindowSetup();
+                        // 新窗开始：复位边集合容量告警
+                        edge_collector_capacity_warned_ = false;
+                            if (window_read_enable_) {
+                                // 位图迁移
+                                if (!posts_seen_window_.empty()) {
+                                    if (posts_seen_prev_window_.size() != posts_seen_window_.size()) {
+                                        posts_seen_prev_window_.assign(posts_seen_window_.size(), 0);
+                                    }
+                                    posts_seen_prev_window_ = posts_seen_window_;
+                                    std::fill(posts_seen_window_.begin(), posts_seen_window_.end(), 0);
+                                } else if (posts_seen_prev_window_.size() != num_neurons_) {
+                                    posts_seen_prev_window_.assign(num_neurons_, 0);
+                                }
+                                // 列表迁移
+                                posts_list_prev_window_.swap(posts_list_window_);
+                                posts_list_window_.clear();
+                                // pre 集合迁移
+                                active_pre_prev_window_ = std::move(active_pre_window_);
+                                active_pre_window_.clear();
+                            }
+                        }
+                        acc_updates_count_ = 0; acc_posts_touched_count_ = 0;
+                        diag_edges_record_hits_ = 0; diag_edges_stage_skips_ = 0; diag_edges_cond_skips_ = 0;
+                        diag_spikes_stage_gather_ = diag_spikes_stage_apply_ = diag_spikes_stage_scatter_ = 0;
+                        diag_spikes_stage_idle_ = 0;
+                        acc_spill_records_count_ = 0; acc_spilled_bytes_sum_ = 0; acc_hwm_bytes_max_ = 0;
                         break;
                     case GasOp::BeginApply:
                         gas_stage_ = GasStage::Apply; curr_stage_seq_ = op->superstep; // start accepting accum
-                        if (gas_ctrl_) gas_ctrl_->beginApplyOrchestrate(); else prepareEdgeWindowForApply_();
+                        if (gas_ctrl_) { gas_ctrl_->beginApplyFullSequence(apply_acc_enable_ && gas_window_mode_); }
+                        else { orchestratePrepareApplyWindow(); orchestrateApplyWindowEntry(); orchestrateBeginApplyIssueFallback(apply_acc_enable_ && gas_window_mode_); }
 #if SNNDL_DEBUG_ENABLED
                         if (window_read_debug_) {
                             SNNDL_DEBUG_LOG(1, "[diag-stage] BeginApply window=%" PRIu64 " stage=%d posts_prev=%zu active_prev=%zu posts_curr=%zu active_curr=%zu\n",
@@ -2780,12 +2759,7 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                         }
 #endif
                 stage_event_hub_.markBeginApply(curr_stage_seq_);
-                if (gas_ctrl_) gas_ctrl_->beginApplyFullSequence(apply_acc_enable_ && gas_window_mode_);
-                else {
-                    orchestrateApplyWindowEntry();
-                    stage_event_hub_.markBeginApply(curr_stage_seq_);
-                    read_orchestrator_.issueFallbackReadsIfNeeded(apply_acc_enable_ && gas_window_mode_);
-                }
+                read_orchestrator_.issueFallbackReadsIfNeeded(apply_acc_enable_ && gas_window_mode_);
 #if SNNDL_DEBUG_ENABLED
                 if (window_read_debug_ && output_) {
                     output_->verbose(CALL_INFO, 1, 0,
@@ -2819,8 +2793,8 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                                 diag_spikes_stage_scatter_, diag_spikes_stage_idle_);
                         }
 #endif
-                        diag_spikes_stage_apply_ = 0;
-                        stage_event_hub_.markBeginScatter(curr_stage_seq_);
+                        if (gas_ctrl_) { gas_ctrl_->beginScatterSequence(); }
+                        else { orchestrateBeginScatterSequence(); }
                         // 记录窗口发放基线：用于 EndScatter 兜底对齐口径（O(1) 开销）
                         spikes_generated_base_ = count_spikes_generated_;
                         // Scheme-C (debug aid): print per-window delta summary just before applying
@@ -2844,11 +2818,11 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                             uint32_t curp=UINT32_MAX; float sum=0.0f;
                             for (auto &pr : acc_spill_log_) {
                                 if (pr.first != curp) {
-                                    if (curp!=UINT32_MAX) { accUpdate_(curp, sum); if (gas_ctrl_) gas_ctrl_->onWeightResolved(curp, sum, 1); }
+                                    if (curp!=UINT32_MAX) accUpdate_(curp, sum);
                                     curp = pr.first; sum = pr.second;
                                 } else { sum += pr.second; }
                             }
-                            if (curp!=UINT32_MAX) { accUpdate_(curp, sum); if (gas_ctrl_) gas_ctrl_->onWeightResolved(curp, sum, 1); }
+                            if (curp!=UINT32_MAX) accUpdate_(curp, sum);
                             acc_spill_log_.clear();
                         }
                         {
@@ -2947,8 +2921,8 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                                     core_id_, curr_stage_seq_, diag_spikes_stage_gather_, diag_spikes_stage_apply_,
                                     diag_spikes_stage_scatter_, diag_spikes_stage_idle_);
                             }
-                            diag_spikes_stage_scatter_ = 0;
-                            stage_event_hub_.markEndScatter(curr_stage_seq_, to_emit);
+                            if (gas_ctrl_) { gas_ctrl_->endScatterSequence(); }
+                            else { orchestrateEndScatterSequence(); }
                         }
                         break;
                     default: break;
@@ -3045,7 +3019,7 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
             }
             bcsrPrefetchAll_();
             if (apply_acc_enable_ && gas_window_mode_ && gas_stage_ == GasStage::Apply) {
-                if (gas_ctrl_) gas_ctrl_->continueIssueReads(); else issueEdgeWeightFetches_();
+                issueEdgeWeightFetches_();
             }
         };
 
@@ -3088,10 +3062,9 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                     if (pending_req.has_single_cb && pending_req.single_cb) pending_req.single_cb(0.0f);
                     return;
                 }
-                uint32_t idx_bytes = bcsr_weights_.effectiveIdxBytes();
-                size_t n = (idx_bytes ? bytes.size() / idx_bytes : 0);
+                size_t n = bytes.size() / bcsr_idx_bytes_;
                 std::vector<uint32_t> cols(n);
-                if (idx_bytes == 2) {
+                if (bcsr_idx_bytes_ == 2) {
                     for (size_t i=0;i<n;i++) cols[i] = ((const uint16_t*)bytes.data())[i];
                 } else {
                     for (size_t i=0;i<n;i++) cols[i] = ((const uint32_t*)bytes.data())[i];
@@ -3113,14 +3086,13 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                         // 块数据按 rowptr 顺序线性排列；blockids 段为 Reachability 用途，不能作为寻址 ID。
                         uint32_t global_block_index = start + idx_in_row;
                         std::vector<float> blk;
-                        const uint32_t bc_eff = bcsr_weights_.effectiveBlockCols();
                         if (bcsrBlockGet_(pending_req.bcsr_block_row, pending_req.bcsr_target_block_col, blk)) {
-                            uint32_t off = pending_req.bcsr_intra_row * bc_eff + pending_req.bcsr_intra_col;
+                            uint32_t off = pending_req.bcsr_intra_row * bcsr_bc_ + pending_req.bcsr_intra_col;
                             float w = (off<blk.size()? blk[off] : 0.0f);
                             if (pending_req.has_single_cb && pending_req.single_cb) pending_req.single_cb(w);
                         } else {
-                            size_t block_bytes = bcsr_weights_.blockBytes();
-                            uint64_t addr = bcsr_weights_.blockDataAddr(global_block_index);
+                            size_t block_bytes = (size_t)bcsr_br_ * (size_t)bcsr_bc_ * bcsr_val_bytes_;
+                            uint64_t addr = bcsr_blockdata_addr_ + (uint64_t)global_block_index * block_bytes;
                             auto* rd = new SST::Interfaces::StandardMem::Read(addr, block_bytes);
                             auto id = rd->getID();
                             PendingMemoryRequest pm;
@@ -3138,12 +3110,11 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                     }
                 }
             } else if (pending_req.bcsr_kind == 3) {
-                size_t n = static_cast<size_t>(bcsr_weights_.effectiveBlockRows()) *
-                           static_cast<size_t>(bcsr_weights_.effectiveBlockCols());
+                size_t n = (size_t)bcsr_br_ * (size_t)bcsr_bc_;
                 std::vector<float> blk(n); // 默认0填充；若响应为空/不足，避免未定义行为
-                const size_t expect_bytes = n * static_cast<size_t>(bcsr_weights_.effectiveValBytes());
+                const size_t expect_bytes = n * (size_t)bcsr_val_bytes_;
                 bool used_mem_block = false;
-                if (bcsr_weights_.effectiveValBytes() == 4 && bytes.size() >= expect_bytes) {
+                if (bcsr_val_bytes_ == 4 && bytes.size() >= expect_bytes) {
                     std::memcpy(blk.data(), bytes.data(), expect_bytes);
                     used_mem_block = true;
                 } else {
@@ -3174,10 +3145,9 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                         p = path.find("{core}");
                         if (p != std::string::npos) path.replace(p, 6, std::to_string(core_id_));
                     }
-                    size_t block_bytes = bcsr_weights_.blockBytes();
-                    uint64_t blockdata_off = (bcsr_weights_.blockdataAddr() > base_addr_) ?
-                        (bcsr_weights_.blockdataAddr() - base_addr_) : 0;
-                    uint64_t file_off = blockdata_off + (uint64_t)global_block_index * (uint64_t)block_bytes;
+                    size_t block_bytes = (size_t)bcsr_br_ * (size_t)bcsr_bc_ * bcsr_val_bytes_;
+                    // 以文件起始为基准的blockdata偏移 = (bcsr_blockdata_addr_ - base_addr_) + global_block_index * block_bytes
+                    uint64_t file_off = (uint64_t)(bcsr_blockdata_addr_ - base_addr_) + (uint64_t)global_block_index * (uint64_t)block_bytes;
                     std::ifstream fin(path, std::ios::binary);
                     if (fin.good()) {
                         fin.seekg(0, std::ios::end);
@@ -3186,7 +3156,7 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                             fin.seekg((std::streamoff)file_off, std::ios::beg);
                             std::vector<uint8_t> tmp(block_bytes);
                             fin.read(reinterpret_cast<char*>(tmp.data()), (std::streamsize)block_bytes);
-                            if (fin.gcount() == (std::streamsize)block_bytes && bcsr_weights_.effectiveValBytes() == 4) {
+                            if (fin.gcount() == (std::streamsize)block_bytes && bcsr_val_bytes_ == 4) {
                                 std::memcpy(blk.data(), tmp.data(), block_bytes);
                                 used_mem_block = true; // 实际来源为文件，但后续处理一致
                                 if (window_read_debug_ && output_) {
@@ -3205,8 +3175,7 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                 bcsrBlockPut_(pending_req.bcsr_block_row, pending_req.bcsr_target_block_col, blk);
                 bcsr_count_block_reads_++;
                 bcsr_bytes_val_ += bytes.size();
-                const uint32_t bc_hit = bcsr_weights_.effectiveBlockCols();
-                uint32_t off = pending_req.bcsr_intra_row * bc_hit + pending_req.bcsr_intra_col;
+                uint32_t off = pending_req.bcsr_intra_row * bcsr_bc_ + pending_req.bcsr_intra_col;
                 float w = (off < blk.size() ? blk[off] : 0.0f);
                 if (bcsr_weight_guard_enable_) {
                     if (!std::isfinite(w) || std::fabs(w) > bcsr_weight_abs_max_) {
@@ -3225,18 +3194,17 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                 }
                 bcsr_req_block_hit_++;
                 if (window_read_debug_ && output_) {
-                    uint32_t post_local = pending_req.bcsr_block_row * bcsr_weights_.effectiveBlockRows() + pending_req.bcsr_intra_row;
+                    uint32_t post_local = pending_req.bcsr_block_row * bcsr_br_ + pending_req.bcsr_intra_row;
                     uint32_t post_global = global_neuron_base_ + post_local;
-                    uint32_t pre_global_effective = pending_req.bcsr_target_block_col * bc_hit + pending_req.bcsr_intra_col;
+                    uint32_t pre_global_effective = pending_req.bcsr_target_block_col * bcsr_bc_ + pending_req.bcsr_intra_col;
                     output_->verbose(CALL_INFO, 1, 0,
                         "[diag-bcsr-weight] core=%u post_local=%u post_global=%u pre_global=%u weight=%.6f source=%s\n",
                         core_id_, post_local, post_global, pre_global_effective, w, used_mem_block ? "OK" : "FallbackFile");
                 }
                 // 窗口累加：严格GAS下在Apply读到目标权重后，直接将该pair的ΔV累加到当前窗口的acc，Scatter阶段统一应用
                 if (apply_acc_enable_ && gas_window_mode_) {
-                    uint32_t post_local = pending_req.bcsr_block_row * bcsr_weights_.effectiveBlockRows() + pending_req.bcsr_intra_row;
+                    uint32_t post_local = pending_req.bcsr_block_row * bcsr_br_ + pending_req.bcsr_intra_row;
                     accUpdate_(post_local, w);
-                    if (gas_ctrl_) gas_ctrl_->onWeightResolved(post_local, w, 1);
                 }
                 if (pending_req.has_single_cb && pending_req.single_cb) pending_req.single_cb(w);
             } else {
@@ -3339,7 +3307,6 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                             if (outstanding_requests_ > 0) outstanding_requests_--;
                         });
                         window_reads_issued_this_apply_++;
-                        if (gas_ctrl_) gas_ctrl_->onReadIssued();
                         if (outstanding_requests_ >= max_outstanding_requests_) break;
                     }
                     if (window_reads_issued_this_apply_ >= window_read_budget_ || outstanding_requests_ >= max_outstanding_requests_) break;
@@ -3347,7 +3314,7 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
             }
         }
         if (apply_acc_enable_ && gas_window_mode_) {
-            if (gas_ctrl_) gas_ctrl_->continueIssueReads(); else issueEdgeWeightFetches_();
+            issueEdgeWeightFetches_();
         }
     }
     
@@ -3972,14 +3939,14 @@ bool SnnPESubComponent::buildWeightDrivenRoutesFromBcsr() {
 bool SnnPESubComponent::appendRoutesFromBcsrFile(const std::string& path, uint32_t pe_index, int core_index, uint32_t rows_hint) {
     uint32_t rows = rows_hint;
     uint32_t cols = weights_cols_;
-    uint32_t br = bcsr_weights_.effectiveBlockRows();
-    uint32_t bc = bcsr_weights_.effectiveBlockCols();
-    uint32_t idx_bytes = bcsr_weights_.effectiveIdxBytes();
-    uint32_t val_bytes = bcsr_weights_.effectiveValBytes();
+    uint32_t br = bcsr_br_ ? bcsr_br_ : 16;
+    uint32_t bc = bcsr_bc_ ? bcsr_bc_ : 16;
+    uint32_t idx_bytes = bcsr_idx_bytes_ ? bcsr_idx_bytes_ : 2;
+    uint32_t val_bytes = bcsr_val_bytes_ ? bcsr_val_bytes_ : 4;
     uint64_t rowptr_off = (bcsr_weights_.rowptrAddr() > base_addr_) ? (bcsr_weights_.rowptrAddr() - base_addr_) : 0;
-    uint64_t colidx_off = (bcsr_weights_.colidxAddr() > base_addr_) ? (bcsr_weights_.colidxAddr() - base_addr_) : 0;
-    uint64_t blockdata_off = (bcsr_weights_.blockdataAddr() > base_addr_) ? (bcsr_weights_.blockdataAddr() - base_addr_) : 0;
-    uint64_t blockids_off = (bcsr_weights_.blockidsAddr() > base_addr_) ? (bcsr_weights_.blockidsAddr() - base_addr_) : 0;
+    uint64_t colidx_off = (bcsr_colidx_addr_ > base_addr_) ? (bcsr_colidx_addr_ - base_addr_) : 0;
+    uint64_t blockdata_off = (bcsr_blockdata_addr_ > base_addr_) ? (bcsr_blockdata_addr_ - base_addr_) : 0;
+    uint64_t blockids_off = (bcsr_blockids_addr_ > base_addr_) ? (bcsr_blockids_addr_ - base_addr_) : 0;
     uint32_t total_blocks = 0;
     uint32_t meta_cols = cols;
     const uint64_t pe_base_global = static_cast<uint64_t>(pe_index) * static_cast<uint64_t>(num_neurons_);
@@ -4207,31 +4174,47 @@ void SnnPESubComponent::applyGatingDecision(uint32_t src_global, const std::vect
 }
 // === BCSR 辅助实现 ===
 bool SnnPESubComponent::bcsrRowIndexGet_(uint32_t block_row, std::vector<uint32_t>& out) {
-    if (!use_bcsr_) return false;
-    if (!bcsr_weights_.rowIndexGet(block_row, out)) return false;
+    auto it = bcsr_row_index_cache_.find(block_row);
+    if (it == bcsr_row_index_cache_.end()) return false;
+    out = it->second;
     bcsr_count_row_index_hits_++;
     return true;
 }
 
-void SnnPESubComponent::bcsrRowIndexPut_(uint32_t block_row, std::vector<uint32_t>& cols) {
-    if (!use_bcsr_) return;
-    bcsr_weights_.rowIndexPut(block_row, std::move(cols));
+void SnnPESubComponent::bcsrRowIndexPut_(uint32_t block_row, std::vector<uint32_t>& data) {
+    if (bcsr_row_index_cache_.size() >= bcsr_row_index_cache_cap_) {
+        // 简单淘汰：移除最早插入项
+        auto it = bcsr_row_index_cache_.begin();
+        bcsr_row_index_cache_.erase(it);
+    }
+    bcsr_row_index_cache_[block_row] = data;
 }
 
 bool SnnPESubComponent::bcsrBlockGet_(uint32_t block_row, uint32_t block_col, std::vector<float>& out) {
-    if (!use_bcsr_) return false;
-    if (!bcsr_weights_.blockGet(block_row, block_col, out)) return false;
+    uint64_t key = ((uint64_t)block_row << 32) | block_col;
+    auto it = bcsr_block_cache_.find(key);
+    if (it == bcsr_block_cache_.end()) return false;
+    out = it->second.data;
     bcsr_count_block_hits_++;
     return true;
 }
 
 void SnnPESubComponent::bcsrBlockPut_(uint32_t block_row, uint32_t block_col, std::vector<float>& data) {
-    if (!use_bcsr_) return;
-    if (!data.empty()) {
-        bcsrPopulateWeightCache_(block_row, block_col, data);
+    uint64_t key = ((uint64_t)block_row << 32) | block_col;
+    auto it = bcsr_block_cache_.find(key);
+    if (it != bcsr_block_cache_.end()) {
+        it->second.data = data;
+    } else {
+        if (bcsr_block_cache_.size() >= bcsr_block_cache_cap_) {
+            // 简单淘汰：移除表头任意元素
+            auto it2 = bcsr_block_cache_.begin();
+            bcsr_block_cache_.erase(it2);
+        }
+        BcsrBlockEntry e; e.data = data; bcsr_block_cache_[key] = std::move(e);
     }
-    bcsr_weights_.blockPut(block_row, block_col, std::move(data));
+    bcsrPopulateWeightCache_(block_row, block_col, bcsr_block_cache_[key].data);
 }
+
 
 // CSR 读路径已移除
 
@@ -4256,22 +4239,24 @@ void SnnPESubComponent::requestWeightBCSR(uint32_t pre_global, uint32_t post_loc
         return;
     }
     uint32_t rows = num_neurons_;
-    uint32_t br = bcsr_weights_.effectiveBlockRows();
-    uint32_t bc = bcsr_weights_.effectiveBlockCols();
-    uint32_t block_row = (br ? (post_local / br) : 0);
-    uint32_t intra_row = (br ? (post_local % br) : 0);
-    uint32_t block_col = (bc ? (pre_global / bc) : 0);
-    uint32_t intra_col = (bc ? (pre_global % bc) : 0);
-    uint32_t start = 0, end = 0;
-    if (!bcsr_weights_.rowBounds(block_row, start, end)) {
+    uint32_t br = (bcsr_br_>0? bcsr_br_:16);
+    uint32_t bc = (bcsr_bc_>0? bcsr_bc_:16);
+    uint32_t block_row = post_local / br;
+    uint32_t intra_row = post_local % br;
+    uint32_t block_col = pre_global / bc;
+    uint32_t intra_col = pre_global % bc;
+    const auto& rowptr_host = bcsr_weights_.rowptrHost();
+    if (block_row+1 >= rowptr_host.size()) {
         if (window_read_debug_ && output_) {
             output_->verbose(CALL_INFO, 0, 0,
                 "[diag-bcsr] core=%u block_row=%u rowptr_size=%zu out-of-range\n",
-                core_id_, block_row, bcsr_weights_.rowptrHost().size());
+                core_id_, block_row, rowptr_host.size());
         }
         if (cb) cb(0.0f);
         return;
     }
+    uint32_t start = rowptr_host[block_row];
+    uint32_t end   = rowptr_host[block_row+1];
     if (end <= start) {
         if (window_read_debug_ && output_) {
             output_->verbose(CALL_INFO, 0, 0,
@@ -4285,8 +4270,8 @@ void SnnPESubComponent::requestWeightBCSR(uint32_t pre_global, uint32_t post_loc
     std::vector<uint32_t> cols;
     if (!bcsrRowIndexGet_(block_row, cols)) {
         // 发起读取 colidx 段
-        size_t bytes = bcsr_weights_.colIndexBytes(end - start);
-        uint64_t addr = bcsr_weights_.colIndexAddr(start);
+        size_t bytes = (size_t)(end - start) * bcsr_idx_bytes_;
+        uint64_t addr = bcsr_colidx_addr_ + (uint64_t)start * bcsr_idx_bytes_;
         if (window_read_debug_ && output_) {
             output_->verbose(CALL_INFO, 0, 0,
                 "[diag-bcsr] core=%u issue colidx row=%u start=%u end=%u bytes=%zu addr=0x%llx\n",
@@ -4343,9 +4328,9 @@ void SnnPESubComponent::requestWeightBCSR(uint32_t pre_global, uint32_t post_loc
         return;
     }
     // 读取块数据
-    size_t block_bytes = bcsr_weights_.blockBytes();
+    size_t block_bytes = (size_t)br * (size_t)bc * bcsr_val_bytes_;
     uint32_t global_block_index = start + idx_in_row;
-    uint64_t addr = bcsr_weights_.blockDataAddr(global_block_index);
+    uint64_t addr = bcsr_blockdata_addr_ + (uint64_t)global_block_index * block_bytes;
     auto* rd = new SST::Interfaces::StandardMem::Read(addr, block_bytes);
     auto id = rd->getID();
     PendingMemoryRequest pm; pm.request_id = id; pm.address = addr; pm.size = block_bytes; pm.issue_cycle = total_cycles_;
@@ -4366,7 +4351,7 @@ void SnnPESubComponent::bcsrPrefetchAll_() {
     if (!bcsr_weights_.isRowptrReady()) return;
 
     uint32_t rows = num_neurons_;
-    uint32_t br = bcsr_weights_.effectiveBlockRows();
+    uint32_t br = (bcsr_br_>0? bcsr_br_:16);
     uint32_t nBlockRows = (rows + br - 1) / br;
     for (uint32_t block_row = 0; block_row < nBlockRows; ++block_row) {
         const auto& rp = bcsr_weights_.rowptrHost();
@@ -4379,8 +4364,8 @@ void SnnPESubComponent::bcsrPrefetchAll_() {
             bcsrPrefetchRowBlocks_(block_row, cached_cols, start);
             continue;
         }
-        size_t bytes = bcsr_weights_.colIndexBytes(end - start);
-        uint64_t addr = bcsr_weights_.colIndexAddr(start);
+        size_t bytes = (size_t)(end - start) * bcsr_idx_bytes_;
+        uint64_t addr = bcsr_colidx_addr_ + (uint64_t)start * bcsr_idx_bytes_;
         auto* rd = new SST::Interfaces::StandardMem::Read(addr, bytes);
         auto id = rd->getID();
         PendingMemoryRequest pm;
@@ -4404,14 +4389,15 @@ void SnnPESubComponent::bcsrPrefetchAll_() {
 void SnnPESubComponent::bcsrPrefetchRowBlocks_(uint32_t block_row, const std::vector<uint32_t>& cols, uint32_t row_start) {
     if (!use_bcsr_) return;
     if (!memory_) return;
-    uint32_t br = bcsr_weights_.effectiveBlockRows();
-    uint32_t bc = bcsr_weights_.effectiveBlockCols();
-    size_t block_bytes = bcsr_weights_.blockBytes();
+    uint32_t br = (bcsr_br_>0? bcsr_br_:16);
+    uint32_t bc = (bcsr_bc_>0? bcsr_bc_:16);
+    size_t block_bytes = (size_t)br * (size_t)bc * bcsr_val_bytes_;
     for (size_t i = 0; i < cols.size(); ++i) {
         uint32_t block_col = cols[i];
-        if (bcsr_weights_.hasBlock(block_row, block_col)) continue;
+        uint64_t key = ((uint64_t)block_row << 32) | block_col;
+        if (bcsr_block_cache_.find(key) != bcsr_block_cache_.end()) continue;
         uint32_t global_block_index = row_start + static_cast<uint32_t>(i);
-        uint64_t addr = bcsr_weights_.blockDataAddr(global_block_index);
+        uint64_t addr = bcsr_blockdata_addr_ + (uint64_t)global_block_index * block_bytes;
         auto* rd = new SST::Interfaces::StandardMem::Read(addr, block_bytes);
         auto id = rd->getID();
         PendingMemoryRequest pm;
@@ -4437,8 +4423,8 @@ void SnnPESubComponent::bcsrPrefetchRowBlocks_(uint32_t block_row, const std::ve
 void SnnPESubComponent::bcsrPopulateWeightCache_(uint32_t block_row, uint32_t block_col, const std::vector<float>& blk) {
     if (!use_bcsr_) return;
     if (blk.empty()) return;
-    uint32_t br = bcsr_weights_.effectiveBlockRows();
-    uint32_t bc = bcsr_weights_.effectiveBlockCols();
+    uint32_t br = (bcsr_br_>0? bcsr_br_:16);
+    uint32_t bc = (bcsr_bc_>0? bcsr_bc_:16);
     uint32_t row_base = block_row * br;
     uint32_t col_base = block_col * bc;
     for (uint32_t rr = 0; rr < br; ++rr) {

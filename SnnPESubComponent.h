@@ -32,6 +32,7 @@ namespace SnnDL {
 class MultiCorePE; // forward declaration for parent cast
 class GatherBufferIF;
 struct GasOpData;
+class GasPhaseController;
 
 class SnnPESubComponent : public SnnCoreAPI {
 public:
@@ -201,6 +202,15 @@ public:
     inline void driveOneCycle() { (void)clockTick((Cycle_t)0); }
     // 手动触发：结束当前Gather窗口（仅 manual_window_drive 下有效）
     void forceEndGather() override;
+    // GAS 控制镜像（cp4'：仅控制平面，数据路径保持原实现）
+    void orchestrateBeginGatherWindowSetup();
+    void orchestratePrepareApplyWindow();
+    void orchestrateApplyWindowEntry();
+    void orchestrateBeginApplyIssueFallback(bool strict_active);
+    void orchestrateContinueIssueReads();
+    void orchestrateIssueFromEdgesDirect();
+    void orchestrateBeginScatterSequence();
+    void orchestrateEndScatterSequence();
 
 private:
     // === Minimal supervised-learning state (Phase 1: recording only) ===
@@ -1035,6 +1045,9 @@ private:
     uint64_t bcsr_bytes_val_ = 0;
     bool bcsr_prefetch_all_ = true;
     bool bcsr_prefetch_issued_ = false;
+
+    // GAS 阶段控制：mirror-only controller（cp4'）
+    std::unique_ptr<GasPhaseController> gas_ctrl_;
 
     // BCSR 辅助
     void requestWeightBCSR(uint32_t pre_global, uint32_t post_local, std::function<void(float)> cb);
