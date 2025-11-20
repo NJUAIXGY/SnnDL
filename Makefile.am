@@ -16,6 +16,8 @@ libSnnDL_la_SOURCES = \
 	SnnCoreAPI.h \
 	SnnPESubComponent.cc \
 	SnnPESubComponent.h \
+	GasPhaseController.cc \
+	GasPhaseController.h \
 	SnnBcsrWeightManager.cc \
 	SnnBcsrWeightManager.h \
 	SpikeSource.cc \

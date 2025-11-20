@@ -9,6 +9,7 @@
 #include "SnnPESubComponent.h"
 #include <fstream>
 #include "GasCustomCmd.h"
+#include "GasPhaseController.h"
 #include "MultiCorePE.h"
 #include "GatherBufferIF.h"
 
@@ -134,7 +135,7 @@ void SnnPESubComponent::prepareEdgeWindowForApply_() {
     if (!(apply_acc_enable_ && gas_window_mode_)) return;
     edge_collector_.flipForApply(window_read_debug_, output_, core_id_, curr_stage_seq_);
     window_reads_issued_this_apply_ = 0;
-    issueEdgeWeightFetches_();
+    orchestrateIssueFromEdgesDirect();
 }
 
 #ifdef SNNDL_ENABLE_DEBUG_LOG
@@ -203,8 +204,9 @@ void SnnPESubComponent::resetBcsrWindowCounters_() {
     bcsr_req_block_miss_ = 0;
 }
 
-void SnnPESubComponent::StageEventHub::markBeginGather(uint32_t) {
+void SnnPESubComponent::StageEventHub::markBeginGather(uint32_t seq) {
     if (!core) return;
+    if (core->gas_ctrl_) core->gas_ctrl_->onBeginGather(seq);
     if (core->use_bcsr_) {
         core->logBcsrWindowStats_("prev");
         core->resetBcsrWindowCounters_();
@@ -218,16 +220,18 @@ void SnnPESubComponent::StageEventHub::markBeginGather(uint32_t) {
     core->window_spikes_all_ = 0;
 }
 
-void SnnPESubComponent::StageEventHub::markBeginApply(uint32_t) {
+void SnnPESubComponent::StageEventHub::markBeginApply(uint32_t seq) {
     if (!core) return;
+    if (core->gas_ctrl_) core->gas_ctrl_->onBeginApply(seq);
     uint64_t now = core->getCurrentSimTimeNano();
     core->appendStageEventRow_("BeginApply", now, 0);
     t_begin_apply = now;
     have_begin_apply = true;
 }
 
-void SnnPESubComponent::StageEventHub::markBeginScatter(uint32_t) {
+void SnnPESubComponent::StageEventHub::markBeginScatter(uint32_t seq) {
     if (!core) return;
+    if (core->gas_ctrl_) core->gas_ctrl_->onBeginScatter(seq);
     uint64_t now = core->getCurrentSimTimeNano();
     core->appendStageEventRow_("BeginScatter", now, 0);
     t_begin_scatter = now;
@@ -243,6 +247,7 @@ void SnnPESubComponent::StageEventHub::markBeginScatter(uint32_t) {
 
 void SnnPESubComponent::StageEventHub::markEndScatter(uint32_t seq, uint64_t spikes_emitted) {
     if (!core) return;
+    if (core->gas_ctrl_) core->gas_ctrl_->onEndScatter(seq, spikes_emitted);
     uint64_t now = core->getCurrentSimTimeNano();
     core->appendStageEventRow_("EndScatter", now, spikes_emitted);
     core->stats_reporter_.reportWindowSpikes(static_cast<uint32_t>(seq), spikes_emitted);
@@ -695,6 +700,10 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     stage_event_hub_.init(this);
     stats_reporter_.init(this);
     read_orchestrator_.init(this);
+    gas_ctrl_ = std::make_unique<GasPhaseController>();
+    if (gas_ctrl_) {
+        gas_ctrl_->init(this, output_);
+    }
 #if SNNDL_DEBUG_ENABLED
     if (window_read_debug_) {
         SNNDL_DEBUG_LOG(1, "[diag-init] core=%d enable_weight_fetch=%d\n", core_id_, enable_weight_fetch_ ? 1 : 0);
@@ -746,6 +755,7 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     disable_weight_cache_ = params.find<int>("disable_weight_cache", 0) != 0;
     window_read_enable_ = params.find<int>("window_read_enable", 0) != 0;
     window_read_debug_ = params.find<int>("window_read_debug", 0) != 0;
+    if (gas_ctrl_) gas_ctrl_->setDebug(window_read_debug_, enable_extended_diagnostics_);
     window_read_budget_ = params.find<uint32_t>("window_read_budget", 1024);
     read_force_single_ = params.find<int>("read_force_single", 0) != 0;
     // 边集合容量上限（极端保护）
@@ -816,6 +826,7 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     acc_hwm_bytes_ = params.find<uint64_t>("acc_high_watermark_bytes", 16*1024*1024);
     acc_spill_enable_ = params.find<int>("acc_spill_enable", 1) != 0;
     stage_events_csv_ = params.find<std::string>("stage_events_csv", "");
+    if (gas_ctrl_) gas_ctrl_->setStageEventsCsv(stage_events_csv_);
     if (aosoa_block_rows_ == 0) aosoa_block_rows_ = 16;
     // CSR 参数已移除
     bcsr_prefetch_all_ = params.find<int>("bcsr_prefetch_all", 0) != 0;
@@ -1779,6 +1790,86 @@ void SnnPESubComponent::forceEndGather() {
         output_->verbose(CALL_INFO, 0, 0, "[diag-gas] 核心%d 手动触发 EndGather\n", core_id_);
     }
 }
+
+void SnnPESubComponent::orchestrateBeginGatherWindowSetup() {
+    stage_event_hub_.markBeginGather(curr_stage_seq_);
+}
+
+void SnnPESubComponent::orchestratePrepareApplyWindow() {
+    prepareEdgeWindowForApply_();
+}
+
+void SnnPESubComponent::orchestrateApplyWindowEntry() {
+    stage_event_hub_.markBeginApply(curr_stage_seq_);
+}
+
+void SnnPESubComponent::orchestrateBeginApplyIssueFallback(bool strict_active) {
+    read_orchestrator_.issueFallbackReadsIfNeeded(strict_active);
+}
+
+void SnnPESubComponent::orchestrateContinueIssueReads() {
+    read_orchestrator_.issueFromEdges();
+}
+
+void SnnPESubComponent::orchestrateIssueFromEdgesDirect() {
+    issueEdgeWeightFetches_();
+}
+
+void SnnPESubComponent::orchestrateBeginScatterSequence() {
+    diag_spikes_stage_apply_ = 0;
+    stage_event_hub_.markBeginScatter(curr_stage_seq_);
+    spikes_generated_base_ = count_spikes_generated_;
+    if (!acc_spill_log_.empty()) {
+        std::sort(acc_spill_log_.begin(), acc_spill_log_.end(), [](auto&a, auto&b){return a.first<b.first;});
+        uint32_t curp=UINT32_MAX; float sum=0.0f;
+        for (auto &pr : acc_spill_log_) {
+            if (pr.first != curp) { if (curp!=UINT32_MAX) accUpdate_(curp, sum); curp = pr.first; sum = pr.second; }
+            else { sum += pr.second; }
+        }
+        if (curp!=UINT32_MAX) accUpdate_(curp, sum);
+        acc_spill_log_.clear();
+    }
+    uint64_t spikes_emitted=0;
+    if (apply_dense_acc_enable_) {
+        if (!acc_touched_list_.empty()) std::sort(acc_touched_list_.begin(), acc_touched_list_.end());
+        for (auto post : acc_touched_list_) {
+            if (post >= acc_dense_.size()) continue;
+            float dv = acc_dense_[post]; if (dv == 0.0f) continue;
+            float v_before = getMem_(post);
+            float v = v_before + dv; setMem_(post, v);
+            bool willFire = (v >= v_thresh_ && getRefrac_(post) == 0);
+            checkAndFireSpike(post);
+            if (willFire) { spikes_emitted++; if (stat_gas_scatter_spikes_emitted_total_) stat_gas_scatter_spikes_emitted_total_->addData(1); }
+        }
+        accReset_();
+    } else if (!acc_delta_.empty()) {
+        std::vector<uint32_t> posts; posts.reserve(acc_delta_.size());
+        for (auto &kv : acc_delta_) posts.push_back(kv.first);
+        std::sort(posts.begin(), posts.end());
+        for (auto post : posts) {
+            float dv = acc_delta_[post];
+            float v_before = getMem_(post);
+            float v = v_before + dv; setMem_(post, v);
+            bool willFire = (v >= v_thresh_ && getRefrac_(post) == 0);
+            checkAndFireSpike(post);
+            if (willFire) { spikes_emitted++; if (stat_gas_scatter_spikes_emitted_total_) stat_gas_scatter_spikes_emitted_total_->addData(1); }
+        }
+        accReset_();
+    }
+    spikes_emitted_window_ = spikes_emitted;
+    if (apply_dense_acc_enable_) verifyDenseAccumulator_(curr_stage_seq_);
+    if (spikes_emitted>0 && parent_) { if (auto* pe = parent_pe_cached_) pe->accumulateApplyScatterStats(0,0,spikes_emitted,0,0,0); }
+}
+
+void SnnPESubComponent::orchestrateEndScatterSequence() {
+    uint64_t to_emit = window_spikes_all_ ? window_spikes_all_ : spikes_emitted_window_;
+    if (to_emit == 0) {
+        uint64_t delta = 0;
+        if (count_spikes_generated_ >= spikes_generated_base_) delta = count_spikes_generated_ - spikes_generated_base_;
+        if (delta > 0) to_emit = delta;
+    }
+    stage_event_hub_.markEndScatter(curr_stage_seq_, to_emit);
+}
 void SnnPESubComponent::deliverSpike(SpikeEvent* spike) {
     if (!spike) return;
 
@@ -2627,7 +2718,7 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                         }
                         // reset per-window counters
                         {
-                        stage_event_hub_.markBeginGather(curr_stage_seq_);
+                        orchestrateBeginGatherWindowSetup();
                         // 新窗开始：复位边集合容量告警
                         edge_collector_capacity_warned_ = false;
                             if (window_read_enable_) {
@@ -2657,7 +2748,8 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                         break;
                     case GasOp::BeginApply:
                         gas_stage_ = GasStage::Apply; curr_stage_seq_ = op->superstep; // start accepting accum
-                        prepareEdgeWindowForApply_();
+                        if (gas_ctrl_) { gas_ctrl_->beginApplyFullSequence(apply_acc_enable_ && gas_window_mode_); }
+                        else { orchestratePrepareApplyWindow(); orchestrateApplyWindowEntry(); orchestrateBeginApplyIssueFallback(apply_acc_enable_ && gas_window_mode_); }
 #if SNNDL_DEBUG_ENABLED
                         if (window_read_debug_) {
                             SNNDL_DEBUG_LOG(1, "[diag-stage] BeginApply window=%" PRIu64 " stage=%d posts_prev=%zu active_prev=%zu posts_curr=%zu active_curr=%zu\n",
@@ -2701,8 +2793,8 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                                 diag_spikes_stage_scatter_, diag_spikes_stage_idle_);
                         }
 #endif
-                        diag_spikes_stage_apply_ = 0;
-                        stage_event_hub_.markBeginScatter(curr_stage_seq_);
+                        if (gas_ctrl_) { gas_ctrl_->beginScatterSequence(); }
+                        else { orchestrateBeginScatterSequence(); }
                         // 记录窗口发放基线：用于 EndScatter 兜底对齐口径（O(1) 开销）
                         spikes_generated_base_ = count_spikes_generated_;
                         // Scheme-C (debug aid): print per-window delta summary just before applying
@@ -2829,8 +2921,8 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                                     core_id_, curr_stage_seq_, diag_spikes_stage_gather_, diag_spikes_stage_apply_,
                                     diag_spikes_stage_scatter_, diag_spikes_stage_idle_);
                             }
-                            diag_spikes_stage_scatter_ = 0;
-                            stage_event_hub_.markEndScatter(curr_stage_seq_, to_emit);
+                            if (gas_ctrl_) { gas_ctrl_->endScatterSequence(); }
+                            else { orchestrateEndScatterSequence(); }
                         }
                         break;
                     default: break;
