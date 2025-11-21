@@ -38,16 +38,7 @@ using namespace SST::SnnDL;
 
 // ===== MultiCorePE 主组件实现 =====
 
-namespace {
-inline bool sentinelsEnabled() {
-    static int cached = -1;
-    if (cached == -1) {
-        const char* env = std::getenv("SNNDL_SENTINEL_ENABLE");
-        cached = (env && std::atoi(env) != 0) ? 1 : 0;
-    }
-    return cached == 1;
-}
-} // namespace
+// P2: 环境变量前端化 – 不再使用TU级别的 getenv 缓存；改用构造期解析的成员 sentinel_enabled_
 
 MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
     // 初始化输出对象
@@ -68,6 +59,27 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
     global_neuron_base_ = params.find<uint64_t>("global_neuron_base", 0);
     sim_stop_ns_ = params.find<uint64_t>("sim_stop_ns", 0);
     verbose_ = verbose_level;
+    // P2: 解析 sentinel 与步级诊断参数（未设置则回退环境变量）
+    {
+        int sent_p = params.find<int>("sentinel_enable", -1);
+        if (sent_p >= 0) sentinel_enabled_ = (sent_p != 0);
+        else {
+            const char* env = std::getenv("SNNDL_SENTINEL_ENABLE");
+            sentinel_enabled_ = (env && std::atoi(env) != 0);
+        }
+        long cap_p = params.find<long>("step_diag_cap", LONG_MIN);
+        if (cap_p != LONG_MIN) step_diag_cap_cfg_ = cap_p;
+        else {
+            const char* env = std::getenv("STEP_ACTIVATION_DIAG_CAP");
+            step_diag_cap_cfg_ = env ? std::strtol(env, nullptr, 10) : -1;
+        }
+        int de_p = params.find<int>("step_diag_enable", INT_MIN);
+        if (de_p != INT_MIN) step_diag_enable_cfg_ = de_p;
+        else {
+            const char* env = std::getenv("STEP_ACTIVATION_DIAG_ENABLE");
+            step_diag_enable_cfg_ = env ? std::atoi(env) : 0;
+        }
+    }
     weights_file_ = params.find<std::string>("weights_file", "");
     enable_numa_ = params.find<bool>("enable_numa", true);
     
@@ -150,7 +162,7 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
     }
 
     if (step_activation_enable_ && step_activation_use_bcsr_routes_) {
-    bool sentinel_on = sentinelsEnabled();
+    bool sentinel_on = sentinel_enabled_;
     if (sentinel_on && output_) output_->output("[[sentinel-pe-ctor]] node=%d building step BCSR reachability\n", node_id_);
         if (!loadBcsrReachability_()) {
             output_->verbose(CALL_INFO, 1, 0,
@@ -228,7 +240,7 @@ MultiCorePE::~MultiCorePE() {
 }
 
 void MultiCorePE::init(unsigned int phase) {
-    if (sentinelsEnabled() && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=%u enter\n", node_id_, phase); }
+    if (sentinel_enabled_ && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=%u enter\n", node_id_, phase); }
     if (phase == 0) {
         if (primary_keepalive_ || sim_stop_ns_ > 0) {
             registerAsPrimaryComponent();
@@ -240,7 +252,7 @@ void MultiCorePE::init(unsigned int phase) {
         std::string clock_freq = "1GHz";  // 默认时钟频率
         // 不需要单独的clock_handler_变量
         registerClock(clock_freq, new Clock::Handler2<MultiCorePE,&MultiCorePE::clockTick>(this));
-        if (sentinelsEnabled() && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=0 clock-registered\n", node_id_); }
+        if (sentinel_enabled_ && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=0 clock-registered\n", node_id_); }
         
         
         // 初始化统计收集
@@ -250,60 +262,60 @@ void MultiCorePE::init(unsigned int phase) {
             new Event::Handler2<MultiCorePE,&MultiCorePE::handleExternalSpikeEvent>(this));
         external_spike_output_link_ = configureLink("external_spike_output");
         mem_link_ = configureLink("mem_link");
-        if (sentinelsEnabled() && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=0 links-configured\n", node_id_); }
+        if (sentinel_enabled_ && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=0 links-configured\n", node_id_); }
         
         
         // 初始化方向链路（用于端口代理机制）
         initializeDirectionLinks();
-        if (sentinelsEnabled() && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=0 dir-links\n", node_id_); }
+        if (sentinel_enabled_ && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=0 dir-links\n", node_id_); }
         
         // 初始化处理单元
         initializeProcessingUnits();
-        if (sentinelsEnabled() && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=0 units-initialized\n", node_id_); }
+        if (sentinel_enabled_ && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=0 units-initialized\n", node_id_); }
         
         // 初始化内部互连
         initializeInternalRing();
-        if (sentinelsEnabled() && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=0 ring-initialized\n", node_id_); }
+        if (sentinel_enabled_ && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=0 ring-initialized\n", node_id_); }
         
         // 初始化多核控制器
         controller_ = new MultiCoreController(this, output_);
-        if (sentinelsEnabled() && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=0 controller-created\n", node_id_); }
+        if (sentinel_enabled_ && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=0 controller-created\n", node_id_); }
         
 
         // 将当前phase转发给所有子核心
         for (auto* core : cores_) {
             if (core) core->init(phase);
         }
-        if (sentinelsEnabled() && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=0 cores-init-done\n", node_id_); }
+        if (sentinel_enabled_ && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=0 cores-init-done\n", node_id_); }
         
         // 关键修复：转发init到网络接口
         if (external_nic_) {
             external_nic_->init(phase);
         }
-        if (sentinelsEnabled() && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=0 nic-init-done\n", node_id_); }
+        if (sentinel_enabled_ && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=0 nic-init-done\n", node_id_); }
         // 标记Step注入就绪（保证NIC已完成init）
         step_injection_ready_ = true;
     }
     else if (phase == 1) {
-        if (sentinelsEnabled() && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=1 enter\n", node_id_); }
+        if (sentinel_enabled_ && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=1 enter\n", node_id_); }
         // 阶段1：加载权重和配置子组件
         loadAndDistributeWeights();
-        if (sentinelsEnabled() && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=1 weights-loaded\n", node_id_); }
+        if (sentinel_enabled_ && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=1 weights-loaded\n", node_id_); }
 
         // 将当前phase转发给所有子核心
         for (auto* core : cores_) {
             if (core) core->init(phase);
         }
-        if (sentinelsEnabled() && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=1 cores-init-done\n", node_id_); }
+        if (sentinel_enabled_ && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=1 cores-init-done\n", node_id_); }
         
         // 转发init到网络接口
         if (external_nic_) {
             external_nic_->init(phase);
         }
-        if (sentinelsEnabled() && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=1 nic-init-done\n", node_id_); }
+        if (sentinel_enabled_ && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=1 nic-init-done\n", node_id_); }
     }
     else {
-        if (sentinelsEnabled() && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=%u forward-only\n", node_id_, phase); }
+        if (sentinel_enabled_ && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=%u forward-only\n", node_id_, phase); }
         // 其余phase同样转发
         for (auto* core : cores_) {
             if (core) core->init(phase);
@@ -313,12 +325,12 @@ void MultiCorePE::init(unsigned int phase) {
         if (external_nic_) {
             external_nic_->init(phase);
         }
-        if (sentinelsEnabled() && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=%u done\n", node_id_, phase); }
+        if (sentinel_enabled_ && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=%u done\n", node_id_, phase); }
     }
 }
 
 void MultiCorePE::setup() {
-    if (sentinelsEnabled() && output_) { output_->output("[[sentinel-pe-setup]] node=%d enter\n", node_id_); }
+    if (sentinel_enabled_ && output_) { output_->output("[[sentinel-pe-setup]] node=%d enter\n", node_id_); }
     
     // 验证所有组件初始化完成
     if (cores_.size() != static_cast<size_t>(num_cores_)) {
@@ -335,13 +347,13 @@ void MultiCorePE::setup() {
     for (auto* core : cores_) {
         if (core) core->setup();
     }
-    if (sentinelsEnabled() && output_) { output_->output("[[sentinel-pe-setup]] node=%d cores-setup\n", node_id_); }
+    if (sentinel_enabled_ && output_) { output_->output("[[sentinel-pe-setup]] node=%d cores-setup\n", node_id_); }
     
     // 调用网络接口的setup
     if (external_nic_) {
         external_nic_->setup();
     }
-    if (sentinelsEnabled() && output_) { output_->output("[[sentinel-pe-setup]] node=%d nic-setup\n", node_id_); }
+    if (sentinel_enabled_ && output_) { output_->output("[[sentinel-pe-setup]] node=%d nic-setup\n", node_id_); }
     
     if (!controller_) {
         output_->fatal(CALL_INFO, -1, "❌ 错误: 多核控制器未初始化\n");
@@ -471,8 +483,7 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
     // 详细调试信息（仅在高详细度时输出）
     static bool first_tick_logged = false;
     if (!first_tick_logged) {
-        const char* sent_env = std::getenv("SNNDL_SENTINEL_ENABLE");
-        if (sent_env && std::atoi(sent_env) != 0) {
+        if (sentinel_enabled_) {
             PE_LOG(1, "[[sentinel-pe-clock]] node=%d first_tick cyc=%" PRIu64 "\n", node_id_, (uint64_t)current_cycle_);
         }
     PE_LOG(2, "[diag-PE] clockTick start node=%d\n", node_id_);
@@ -1713,12 +1724,7 @@ void MultiCorePE::injectStepActivations(uint32_t seq, uint64_t sim_time_ns) {
     const uint64_t max_global = (total_nodes_ > 0 && neurons_per_pe > 0)
         ? static_cast<uint64_t>(total_nodes_) * neurons_per_pe
         : 0ULL;
-    static long diag_cap_cache = LONG_MIN;
-    if (diag_cap_cache == LONG_MIN) {
-        const char* env = std::getenv("STEP_ACTIVATION_DIAG_CAP");
-        diag_cap_cache = env ? std::strtol(env, nullptr, 10) : -1;
-    }
-    const uint64_t diag_cap = (diag_cap_cache > 0) ? static_cast<uint64_t>(diag_cap_cache) : 0ULL;
+    const uint64_t diag_cap = (step_diag_cap_cfg_ > 0) ? static_cast<uint64_t>(step_diag_cap_cfg_) : 0ULL;
     std::mt19937_64 rng(step_activation_seed_ ^ (static_cast<uint64_t>(seq) + (static_cast<uint64_t>(node_id_) << 32)));
     std::uniform_int_distribution<uint64_t> post_dist(0, local_total - 1);
     std::bernoulli_distribution pick(fraction);
@@ -1733,12 +1739,7 @@ void MultiCorePE::injectStepActivations(uint32_t seq, uint64_t sim_time_ns) {
 
     // 诊断：仅在 node_id_=0 且 seq 较小时，对路由表做一次全局采样，避免日志爆炸
     static bool route_diag_done = false;
-    static int diag_enable_cache = INT_MIN;
-    if (diag_enable_cache == INT_MIN) {
-        const char* env = std::getenv("STEP_ACTIVATION_DIAG_ENABLE");
-        diag_enable_cache = env ? std::atoi(env) : 0;
-    }
-    const bool step_diag_enabled = (diag_enable_cache != 0);
+    const bool step_diag_enabled = (step_diag_enable_cfg_ != 0);
 
     if (step_diag_enabled && !route_diag_done && node_id_ == 0 && seq <= 1 && step_activation_use_bcsr_routes_) {
         uint64_t with_routes = 0;

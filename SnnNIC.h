@@ -69,7 +69,8 @@ public:
         {"enable_inter_rank_batching", "[已禁用] 启用跨Rank代理聚合(0/1)", "0"},
         {"inter_rank_batch_window", "[已禁用] 跨Rank批量窗口(ns)", "0"},
         {"nodes_per_rank", "[已禁用] 每个rank的节点数(用于简化映射)", "0"},
-        {"export_spike_csv", "可选：写出每条脉冲消息的网络轨迹CSV", ""}
+        {"export_spike_csv", "可选：写出每条脉冲消息的网络轨迹CSV", ""},
+        {"sentinel_enable", "启用 sentinel 调试输出(0/1，未设置则回退 SNNDL_SENTINEL_ENABLE)", "-1"}
     )
 
     // 端口文档
@@ -305,6 +306,7 @@ private:
     // 定时刷新（时间窗）
     bool flushClockTick(SST::Cycle_t currentCycle);
 
+    bool sentinel_enabled_ = false;  // 参数化的 sentinel 门控
     // 网络初始化与就绪状态
     bool network_ready_ = false;               ///< 在setup完成后标记为就绪，避免过早发送
     bool link_ready_ = false;                  ///< 首次收到发送回调后标记为就绪，确保端口握手完成

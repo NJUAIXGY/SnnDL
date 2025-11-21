@@ -14,26 +14,34 @@ using namespace SST;
 using namespace SST::Interfaces;
 using namespace SST::SnnDL;
 
-namespace {
-inline bool snndlGlobalDebugEnabled() {
-    static std::once_flag flag;
-    static int cached = 0;
-    std::call_once(flag, [](){
-        const char* env = std::getenv("SNNDL_DEBUG");
-        if (!env || std::atoi(env) == 0) {
-            env = std::getenv("SNNDL_DIAG_ENABLE");
-        }
-        cached = (env && std::atoi(env) != 0) ? 1 : 0;
-    });
-    return cached == 1;
-}
-}
+// P2: 移除TU级别的 getenv 依赖；改为构造期解析的成员 debug/diag 标志
 
 GatherBufferIF::GatherBufferIF(ComponentId_t id, Params& params, TimeConverter* time, HandlerBase* handler)
     : StandardMem(id, params, time, handler), time_(time), upstream_handler_(handler)
 {
     setDefaultTimeBase(*time);
     int verbose = params.find<int>("verbose", 0);
+    // P2: 解析 diag/debug/sentinel（参数优先；未设置回退环境变量）
+    {
+        int de = params.find<int>("diag_enable", -1);
+        if (de >= 0) diag_enable_ = (de != 0);
+        else {
+            const char* env = std::getenv("SNNDL_DIAG_ENABLE");
+            diag_enable_ = (env && std::atoi(env) != 0);
+        }
+        int dbg = params.find<int>("snndl_debug", -1);
+        if (dbg >= 0) debug_enable_ = (dbg != 0);
+        else {
+            const char* env = std::getenv("SNNDL_DEBUG");
+            debug_enable_ = (env && std::atoi(env) != 0);
+        }
+        int sen = params.find<int>("sentinel_enable", -1);
+        if (sen >= 0) sentinel_enable_ = (sen != 0);
+        else {
+            const char* env = std::getenv("SNNDL_SENTINEL_ENABLE");
+            sentinel_enable_ = (env && std::atoi(env) != 0);
+        }
+    }
     out_.init("GatherBufferIF[@p:@l]: ", verbose, 0, Output::STDOUT);
 
     merge_ = parseMerge(params.find<std::string>("merge_policy", "auto"));
@@ -158,8 +166,7 @@ GatherBufferIF::~GatherBufferIF() {
 void GatherBufferIF::init(unsigned int phase) {
     backend_->init(phase);
     // 记录所有 phase 的初始化情况（仅在显式启用时打印）
-    const char* sent_env = std::getenv("SNNDL_SENTINEL_ENABLE");
-    if (sent_env && std::atoi(sent_env) != 0) {
+    if (sentinel_enable_) {
         out_.verbose(CALL_INFO, 0, 0,
             "[[sentinel-gbi-init]] phase=%u window_auto=%d manual=%d clock=%s win_cyc_g=%" PRIu64 " win_cyc_a=%" PRIu64 " win_cyc_s=%" PRIu64 " auto_bytes=%" PRIu64 " auto_reads=%" PRIu64 " defer=%d\n",
             phase, window_auto_ ? 1 : 0, manual_window_drive_ ? 1 : 0, clock_freq_.c_str(),
@@ -1282,7 +1289,7 @@ std::vector<uint64_t> GatherBufferIF::parseCsvU64_(const std::string& s) {
 
 bool GatherBufferIF::diagEnabled_(int level) const {
     if (out_.getVerboseLevel() >= level) return true;
-    return snndlGlobalDebugEnabled();
+    return diag_enable_ || debug_enable_;
 }
 
 void GatherBufferIF::exportGranuleRow_(uint64_t start_ns, uint32_t bytes) {

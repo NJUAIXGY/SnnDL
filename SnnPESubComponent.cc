@@ -655,9 +655,11 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
       memory_(nullptr),
       gather_buffer_if_(nullptr),
       memory_link_(nullptr) {
-    // 构造期最早哨兵（默认静默，除非显式启用 SNNDL_SENTINEL_ENABLE）。
+    // 构造期最早哨兵（P2：参数优先，未设置回退到环境变量，以保持兼容）。
     // 避免直接使用 stdout，统一走 SST Output。
-    static const bool kSentinelOn = [](){
+    const bool kSentinelOn = [&params](){
+        int sent_p = params.find<int>("sentinel_enable", -1);
+        if (sent_p >= 0) return sent_p != 0;
         const char* env = std::getenv("SNNDL_SENTINEL_ENABLE");
         return env && std::atoi(env) != 0;
     }();
