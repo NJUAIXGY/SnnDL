@@ -879,20 +879,7 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     // 不再受 enable_extended_diagnostics_ 影响（日志仍受编译期/verbose 门控）
     acc_shadow_verify_enable_ = apply_dense_acc_enable_ && params.find<int>("acc_shadow_verify_enable", 0) != 0;
     if (acc_shadow_verify_enable_) {
-#ifdef SNNDL_ENABLE_DEBUG_LOG
-        // TEMP(debug): write a one-shot breadcrumb so we can confirm shadow verification is actually enabled at runtime.
-        // This will be removed after verification of runs (10us/100us).
-        FILE* fp = std::fopen("/tmp/acc_shadow.log", "a");
-        if (fp) {
-            std::fprintf(fp, "[acc-shadow-enabled] node=%u core=%u seq=%u time_ns=%" PRIu64 "\n",
-                        node_id_, core_id_, curr_stage_seq_, (uint64_t)getCurrentSimTimeNano());
-            std::fclose(fp);
-        }
-        // 强制落盘到 stdout，便于调试捕获（调试用，跑完撤销）
-        fprintf(stdout, "[acc-shadow-enable] core=%d acc_dense=1 shadow=1\n", core_id_);
-        fflush(stdout);
-#endif
-
+        // Removed temporary file/stdout breadcrumbs to avoid I/O side effects
     }
     if (use_clock_weight_cache_ && max_cache_entries_ > 0) {
         wcache_cap_ = max_cache_entries_;
@@ -3464,11 +3451,11 @@ void SnnPESubComponent::verifyDenseAccumulator_(uint32_t seq) {
     // TEMP(debug): append a per-window breadcrumb indicating verify path executed and basics of touched size.
     {
 #ifdef SNNDL_ENABLE_DEBUG_LOG
-        FILE* fp = std::fopen("/tmp/acc_shadow.log", "a");
+        // removed acc-shadow breadcrumb
         if (fp) {
-            std::fprintf(fp, "[acc-shadow-verify] node=%u core=%u seq=%u touched=%zu time_ns=%" PRIu64 "\n",
+            // removed acc-shadow breadcrumb node=%u core=%u seq=%u touched=%zu time_ns=%" PRIu64 "\n",
                         node_id_, core_id_, seq, acc_touched_list_.size(), (uint64_t)getCurrentSimTimeNano());
-            std::fclose(fp);
+            
         }
 #endif
     }

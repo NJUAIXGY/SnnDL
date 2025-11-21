@@ -506,15 +506,13 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
         SpikeEvent* spike = external_spike_queue_.front();
         external_spike_queue_.pop();
         
-        // Debug output removed to reduce log noise
-        
-        int target_unit = determineTargetUnit(spike->getDestinationNeuron());
-        if (target_unit >= 0 && target_unit < num_cores_) {
-            // 目标在本节点，直接投递给对应的处理单元
-            // Debug output removed
-            fflush(stdout);
-            deliverSpikeToCore(target_unit, spike);
-        } else {
+            // Debug output removed to reduce log noise
+            int target_unit = determineTargetUnit(spike->getDestinationNeuron());
+            if (target_unit >= 0 && target_unit < num_cores_) {
+                // 目标在本节点，直接投递给对应的处理单元
+                // Debug output removed
+                deliverSpikeToCore(target_unit, spike);
+            } else {
             // 目标不在本节点，需要转发到其他节点
             if (external_nic_) {
                 PE_LOG(3, "🔄 中继转发脉冲: 神经元%d -> 目标节点%d\n", 
