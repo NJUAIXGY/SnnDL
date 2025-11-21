@@ -427,6 +427,7 @@ void GatherBufferIF::onDownstreamResp_(Request* r) {
                 if (stat_unique_bytes_) stat_unique_bytes_->addData(git->second.size);
                 // Diagnostic: dump per-sub first-float values into CSV
                 // Use SRAM block (blk) as the source of truth so we still produce samples even if rr->data is empty.
+                #ifdef SNNDL_ENABLE_DEBUG_LOG
                 if (!probe_csv_path_.empty()) {
                     FILE* fp = fopen(probe_csv_path_.c_str(), probe_csv_header_written_? "a" : "w");
                     if (fp) {
@@ -442,6 +443,7 @@ void GatherBufferIF::onDownstreamResp_(Request* r) {
                         fclose(fp);
                     }
                 }
+                #endif
                 // --- Adaptive k: segment timing and payload ---
                 if (k_adapt_enable_ || ctrl_enable_) {
                     uint64_t end_ns = getCurrentSimTimeNano();
@@ -892,6 +894,7 @@ void GatherBufferIF::emitApplyResponsesBuf_(int buf) {
                     (unsigned long)g.base, (unsigned)s.offset,
                     (unsigned long)abs_addr, (unsigned)s.size, f0);
             }
+            #ifdef SNNDL_ENABLE_DEBUG_LOG
             if (!probe_csv_path_.empty()) {
                 // write one line per sub-read with addr,size,first-float (read from SRAM block)
                 FILE* fp = fopen(probe_csv_path_.c_str(), probe_csv_header_written_? "a" : "w");
@@ -904,6 +907,7 @@ void GatherBufferIF::emitApplyResponsesBuf_(int buf) {
                     fclose(fp);
                 }
             }
+            #endif
             if (upstream_handler_) (*upstream_handler_)(resp);
             // 注意：上游StandardMem::Read的所有权由上游组件管理。
             // 这里不再delete上游请求指针，仅从追踪表移除，避免重复释放导致的崩溃。

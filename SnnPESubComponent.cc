@@ -878,6 +878,7 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
         acc_shadow_verify_enable_ = false;
     }
     if (acc_shadow_verify_enable_) {
+#ifdef SNNDL_ENABLE_DEBUG_LOG
         // TEMP(debug): write a one-shot breadcrumb so we can confirm shadow verification is actually enabled at runtime.
         // This will be removed after verification of runs (10us/100us).
         FILE* fp = std::fopen("/tmp/acc_shadow.log", "a");
@@ -889,6 +890,8 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
         // 强制落盘到 stdout，便于调试捕获（调试用，跑完撤销）
         fprintf(stdout, "[acc-shadow-enable] core=%d acc_dense=1 shadow=1\n", core_id_);
         fflush(stdout);
+#endif
+
     }
     if (use_clock_weight_cache_ && max_cache_entries_ > 0) {
         wcache_cap_ = max_cache_entries_;
@@ -3459,12 +3462,14 @@ void SnnPESubComponent::verifyDenseAccumulator_(uint32_t seq) {
     constexpr double kEps = 1e-5;
     // TEMP(debug): append a per-window breadcrumb indicating verify path executed and basics of touched size.
     {
+#ifdef SNNDL_ENABLE_DEBUG_LOG
         FILE* fp = std::fopen("/tmp/acc_shadow.log", "a");
         if (fp) {
             std::fprintf(fp, "[acc-shadow-verify] node=%u core=%u seq=%u touched=%zu time_ns=%" PRIu64 "\n",
                         node_id_, core_id_, seq, acc_touched_list_.size(), (uint64_t)getCurrentSimTimeNano());
             std::fclose(fp);
         }
+#endif
     }
     auto log_once = [&](const char* reason, uint32_t post, double dense, double reference) {
         if (acc_shadow_mismatch_logged_ || !output_) return;

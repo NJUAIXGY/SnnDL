@@ -436,8 +436,7 @@ void MultiCorePE::finish() {
             agg_spikes += unit_states_[i].spikes_processed;
             agg_fired  += unit_states_[i].neurons_fired;
         }
-        printf("NODE%d: 脉冲=%lu, 激发=%lu\n", node_id_, agg_spikes, agg_fired);
-        fflush(stdout);
+        PE_LOG(1, "NODE%d: 脉冲=%lu, 激发=%lu\n", node_id_, agg_spikes, agg_fired);
     }
     
     // 转发finish到所有子核心（确保子组件的收尾统计/摘要被打印与收集）
@@ -474,9 +473,7 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
     if (!first_tick_logged) {
         const char* sent_env = std::getenv("SNNDL_SENTINEL_ENABLE");
         if (sent_env && std::atoi(sent_env) != 0) {
-            printf("[[sentinel-pe-clock]] node=%d first_tick cyc=%" PRIu64 "\n",
-                   node_id_, (uint64_t)current_cycle_);
-            fflush(stdout);
+            PE_LOG(1, "[[sentinel-pe-clock]] node=%d first_tick cyc=%" PRIu64 "\n", node_id_, (uint64_t)current_cycle_);
         }
     PE_LOG(2, "[diag-PE] clockTick start node=%d\n", node_id_);
         first_tick_logged = true;
@@ -1785,9 +1782,7 @@ void MultiCorePE::injectStepActivations(uint32_t seq, uint64_t sim_time_ns) {
             static uint64_t route_sampled = 0;
             if (step_diag_enabled && use_routes && routes && !routes->empty() &&
                 node_id_ == 0 && seq <= 1 && route_sampled < 16) {
-                printf("[[step-diag-pre]] node=%d seq=%u pre_global=%u routes=%zu\n",
-                       node_id_, seq, pre_global, routes->size());
-                fflush(stdout);
+                PE_LOG(1, "[[step-diag-pre]] node=%d seq=%u pre_global=%u routes=%zu\n", node_id_, seq, pre_global, routes->size());
                 ++route_sampled;
             }
             for (uint32_t fan = 0; fan < step_activation_fanout_; ++fan) {
@@ -1866,16 +1861,15 @@ void MultiCorePE::injectStepActivations(uint32_t seq, uint64_t sim_time_ns) {
     }
 
     if (step_diag_enabled && node_id_ == 0 && seq <= 1) {
-        printf("[[step-diag-stats]] node=%d seq=%u sources=%llu attempts=%llu spikes=%llu hits=%llu miss=%llu cap=%" PRIu64 " cap_hit=%d\n",
+        PE_LOG(1, "[[step-diag-stats]] node=%d seq=%u sources=%llu attempts=%llu spikes=%llu hits=%llu miss=%llu cap=%" PRIu64 " cap_hit=%d\n",
                node_id_, seq,
-               static_cast<unsigned long long>(sources_selected),
-               static_cast<unsigned long long>(spike_attempts),
-               static_cast<unsigned long long>(spikes_injected),
-               static_cast<unsigned long long>(route_hits),
-               static_cast<unsigned long long>(route_misses),
+               (unsigned long long)sources_selected,
+               (unsigned long long)spike_attempts,
+               (unsigned long long)spikes_injected,
+               (unsigned long long)route_hits,
+               (unsigned long long)route_misses,
                diag_cap,
                diag_cap_hit ? 1 : 0);
-        fflush(stdout);
     }
 }
 
