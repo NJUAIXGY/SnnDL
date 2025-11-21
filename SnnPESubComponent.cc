@@ -88,7 +88,6 @@ std::mutex SnnPESubComponent::s_route_cache_mtx_;
 std::unordered_map<std::string, std::weak_ptr<const SnnPESubComponent::RouteMap>> SnnPESubComponent::s_route_cache_;
 std::mutex SnnPESubComponent::s_stage_csv_mutex_;
 std::unordered_set<std::string> SnnPESubComponent::s_stage_csv_files_;
-static std::unordered_set<std::string> s_stage_written_once_; // key: path:seq:event
 
 void SnnPESubComponent::appendStageEventRow_(const char* event_name, uint64_t now_ns, uint64_t spikes_emitted) {
     // 仅由 core0 代表本 PE 写入阶段事件，且每 (seq,event) 仅写一次
@@ -817,7 +816,12 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     bcsr_colidx_addr_ = base_addr_ + bcsr_layout_.colidx_offset;
     bcsr_blockdata_addr_ = base_addr_ + bcsr_layout_.blockdata_offset;
     bcsr_blockids_addr_ = bcsr_layout_.blockids_offset ? base_addr_ + bcsr_layout_.blockids_offset : 0;
-    bcsr_weights_.configure(bcsr_rowptr_addr, bcsr_br_, bcsr_bc_, bcsr_idx_bytes_, bcsr_val_bytes_);
+    bcsr_weights_.configure(
+        bcsr_rowptr_addr,
+        bcsr_colidx_addr_,
+        bcsr_blockdata_addr_,
+        bcsr_blockids_addr_,
+        bcsr_br_, bcsr_bc_, bcsr_idx_bytes_, bcsr_val_bytes_);
     bcsr_row_index_cache_cap_ = params.find<uint32_t>("bcsr_row_index_cache_cap", 64);
     bcsr_block_cache_cap_ = params.find<uint32_t>("bcsr_block_cache_cap", 256);
     if (aosoa_block_rows_ == 0) aosoa_block_rows_ = (bcsr_br_ > 0) ? bcsr_br_ : 16;
