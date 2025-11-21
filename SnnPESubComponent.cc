@@ -874,10 +874,9 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     use_clock_weight_cache_ = params.find<int>("use_clock_weight_cache", 0) != 0;
     // 默认启用致密累加器（与头文件参数表一致）
     apply_dense_acc_enable_ = params.find<int>("apply_dense_acc_enable", 1) != 0;
+    // P3: 验证逻辑去 debug 依赖：是否启用影子验证仅由参数决定，
+    // 不再受 enable_extended_diagnostics_ 影响（日志仍受编译期/verbose 门控）
     acc_shadow_verify_enable_ = apply_dense_acc_enable_ && params.find<int>("acc_shadow_verify_enable", 0) != 0;
-    if (acc_shadow_verify_enable_ && !enable_extended_diagnostics_) {
-        acc_shadow_verify_enable_ = false;
-    }
     if (acc_shadow_verify_enable_) {
 #ifdef SNNDL_ENABLE_DEBUG_LOG
         // TEMP(debug): write a one-shot breadcrumb so we can confirm shadow verification is actually enabled at runtime.
