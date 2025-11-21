@@ -406,8 +406,7 @@ void SnnPE::handleSpikeEvent(Event* ev) {
         
         // 检查目标神经元ID有效性
         if (target_local_id >= num_neurons) {
-            printf("RECV_LINK: 错误 - 目标神经元ID %u 超出范围 (最大: %u)\n", 
-                   target_local_id, num_neurons - 1);
+            PE_LOG(1, "RECV_LINK: 错误 - 目标神经元ID %u 超出范围 (最大: %u)\n", target_local_id, num_neurons - 1);
             delete ev;
             return;
         }
@@ -544,7 +543,7 @@ void SnnPE::handleSpikeEvent(Event* ev) {
 
 void SnnPE::handleInterfaceSpike(SpikeEvent* spike_event) {
     if (!spike_event) {
-        printf("RECV_SPIKE: 核心%u接收到空的脉冲事件\n", node_id);
+        PE_LOG(1, "RECV_SPIKE: 核心%u接收到空的脉冲事件\n", node_id);
         return;
     }
     
@@ -561,14 +560,14 @@ void SnnPE::handleInterfaceSpike(SpikeEvent* spike_event) {
     
     // 检查是否为本节点的脉冲
     if (dest_node != node_id) {
-        printf("RECV_SPIKE: 错误 - 核心%u接收到发给核心%u的脉冲\n", node_id, dest_node);
+        PE_LOG(1, "RECV_SPIKE: 错误 - 核心%u接收到发给核心%u的脉冲\n", node_id, dest_node);
         delete spike_event;
         return;
     }
     
     // 检查目标神经元索引
     if (dest_neuron >= num_neurons) {
-        printf("RECV_SPIKE: 错误 - 目标神经元索引%u超出范围[0, %u)\n", dest_neuron, num_neurons);
+        PE_LOG(1, "RECV_SPIKE: 错误 - 目标神经元索引%u超出范围[0, %u)\n", dest_neuron, num_neurons);
         delete spike_event;
         return;
     }
@@ -598,7 +597,7 @@ void SnnPE::handleInterfaceSpike(SpikeEvent* spike_event) {
             
             checkAndFireSpike(dest_neuron);
         } else {
-            printf("RECV_SPIKE: 核心%u神经元%u在不应期，忽略脉冲\n", node_id, dest_neuron);
+            PE_LOG(4, "RECV_SPIKE: 核心%u神经元%u在不应期，忽略脉冲\n", node_id, dest_neuron);
         }
     }
     

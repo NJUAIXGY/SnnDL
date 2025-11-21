@@ -116,6 +116,9 @@ public:
         {"step_activation_event_weight", "步级注入事件权重（非严格模式备用）", "0.0"},
         {"step_reset_mem_each_step", "步末复位膜电位", "0"},
         {"step_activation_use_bcsr_routes", "随机激活是否使用BCSR路由表", "0"},
+        {"sentinel_enable", "启用 sentinel 调试输出(0/1)", "0"},
+        {"step_diag_cap", "步级诊断采样上限（>0 启用）", "0"},
+        {"step_diag_enable", "启用步级诊断(0/1)", "0"},
         {"step_activation_bcsr_template", "BCSR权重文件模板({core})", ""},
         {"step_activation_bcsr_rows_per_core", "BCSR每核行数", "0"},
         {"step_activation_bcsr_br", "BCSR块行大小", "16"},
@@ -304,6 +307,14 @@ public:
     friend class MultiCoreController;
 
 private:
+    // 诊断打印节流（成员化，替代函数静态）
+    bool first_tick_logged_ = false;
+    bool route_diag_done_ = false;
+    // P2: 参数化门控（优先参数，其次回退环境变量）
+    bool sentinel_enabled_ = false;
+    long step_diag_cap_cfg_ = -1;
+    int  step_diag_enable_cfg_ = 0;
+
     // ===== 配置参数 =====
     
     int num_cores_;

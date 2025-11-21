@@ -14,26 +14,20 @@ using namespace SST;
 using namespace SST::Interfaces;
 using namespace SST::SnnDL;
 
-namespace {
-inline bool snndlGlobalDebugEnabled() {
-    static std::once_flag flag;
-    static int cached = 0;
-    std::call_once(flag, [](){
-        const char* env = std::getenv("SNNDL_DEBUG");
-        if (!env || std::atoi(env) == 0) {
-            env = std::getenv("SNNDL_DIAG_ENABLE");
-        }
-        cached = (env && std::atoi(env) != 0) ? 1 : 0;
-    });
-    return cached == 1;
-}
-}
+// P2: 移除TU级别的 getenv 依赖；改为构造期解析的成员 debug/diag 标志
 
 GatherBufferIF::GatherBufferIF(ComponentId_t id, Params& params, TimeConverter* time, HandlerBase* handler)
     : StandardMem(id, params, time, handler), time_(time), upstream_handler_(handler)
 {
     setDefaultTimeBase(*time);
     int verbose = params.find<int>("verbose", 0);
+    // P2: 解析 diag/debug/sentinel（参数优先；未设置回退环境变量）
+    {
+        // P2 Step3：移除 getenv 回退，仅参数驱动（默认禁用）
+        diag_enable_ = (params.find<int>("diag_enable", 0) != 0);
+        debug_enable_ = (params.find<int>("snndl_debug", 0) != 0);
+        sentinel_enable_ = (params.find<int>("sentinel_enable", 0) != 0);
+    }
     out_.init("GatherBufferIF[@p:@l]: ", verbose, 0, Output::STDOUT);
 
     merge_ = parseMerge(params.find<std::string>("merge_policy", "auto"));
@@ -158,8 +152,7 @@ GatherBufferIF::~GatherBufferIF() {
 void GatherBufferIF::init(unsigned int phase) {
     backend_->init(phase);
     // 记录所有 phase 的初始化情况（仅在显式启用时打印）
-    const char* sent_env = std::getenv("SNNDL_SENTINEL_ENABLE");
-    if (sent_env && std::atoi(sent_env) != 0) {
+    if (sentinel_enable_) {
         out_.verbose(CALL_INFO, 0, 0,
             "[[sentinel-gbi-init]] phase=%u window_auto=%d manual=%d clock=%s win_cyc_g=%" PRIu64 " win_cyc_a=%" PRIu64 " win_cyc_s=%" PRIu64 " auto_bytes=%" PRIu64 " auto_reads=%" PRIu64 " defer=%d\n",
             phase, window_auto_ ? 1 : 0, manual_window_drive_ ? 1 : 0, clock_freq_.c_str(),
@@ -427,6 +420,7 @@ void GatherBufferIF::onDownstreamResp_(Request* r) {
                 if (stat_unique_bytes_) stat_unique_bytes_->addData(git->second.size);
                 // Diagnostic: dump per-sub first-float values into CSV
                 // Use SRAM block (blk) as the source of truth so we still produce samples even if rr->data is empty.
+                #ifdef SNNDL_ENABLE_DEBUG_LOG
                 if (!probe_csv_path_.empty()) {
                     FILE* fp = fopen(probe_csv_path_.c_str(), probe_csv_header_written_? "a" : "w");
                     if (fp) {
@@ -442,6 +436,7 @@ void GatherBufferIF::onDownstreamResp_(Request* r) {
                         fclose(fp);
                     }
                 }
+                #endif
                 // --- Adaptive k: segment timing and payload ---
                 if (k_adapt_enable_ || ctrl_enable_) {
                     uint64_t end_ns = getCurrentSimTimeNano();
@@ -892,6 +887,7 @@ void GatherBufferIF::emitApplyResponsesBuf_(int buf) {
                     (unsigned long)g.base, (unsigned)s.offset,
                     (unsigned long)abs_addr, (unsigned)s.size, f0);
             }
+            #ifdef SNNDL_ENABLE_DEBUG_LOG
             if (!probe_csv_path_.empty()) {
                 // write one line per sub-read with addr,size,first-float (read from SRAM block)
                 FILE* fp = fopen(probe_csv_path_.c_str(), probe_csv_header_written_? "a" : "w");
@@ -904,6 +900,7 @@ void GatherBufferIF::emitApplyResponsesBuf_(int buf) {
                     fclose(fp);
                 }
             }
+            #endif
             if (upstream_handler_) (*upstream_handler_)(resp);
             // 注意：上游StandardMem::Read的所有权由上游组件管理。
             // 这里不再delete上游请求指针，仅从追踪表移除，避免重复释放导致的崩溃。
@@ -1278,7 +1275,7 @@ std::vector<uint64_t> GatherBufferIF::parseCsvU64_(const std::string& s) {
 
 bool GatherBufferIF::diagEnabled_(int level) const {
     if (out_.getVerboseLevel() >= level) return true;
-    return snndlGlobalDebugEnabled();
+    return diag_enable_ || debug_enable_;
 }
 
 void GatherBufferIF::exportGranuleRow_(uint64_t start_ns, uint32_t bytes) {

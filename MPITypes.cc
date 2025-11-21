@@ -9,6 +9,7 @@
 #include "MPITypes.h"
 #include "SpikeEvent.h"
 #include <iostream>
+#include <sst/core/output.h>
 #include <sst/core/params.h>
 
 namespace SST {
@@ -24,11 +25,12 @@ bool MPITypes::initializeMPIConfig(SST::Params& params) {
     config_.comm_pattern = params.find<std::string>("mpi_comm_strategy", "eager");
     config_.buffer_size = params.find<size_t>("mpi_buffer_size", 65536);
     
+    #ifdef SNNDL_ENABLE_DEBUG_LOG
     if (config_.enabled) {
-        std::cout << "MPITypes: 配置已启用 - rank=" << config_.rank 
-                  << ", size=" << config_.size 
-                  << ", pattern=" << config_.comm_pattern << std::endl;
+        SST::Output out("MPITypes[@p:@l]: ", 1, 0, SST::Output::STDOUT);
+        out.verbose(CALL_INFO, 1, 0, "配置已启用 - rank=%d size=%d pattern=%s\n", config_.rank, config_.size, config_.comm_pattern.c_str());
     }
+    #endif
     
     return true;
 }
@@ -63,7 +65,9 @@ bool SSTMPICommHelper::initialize(const MPITypes::MPIConfig& config) {
     }
     
     initialized_ = true;
-    std::cout << "SSTMPICommHelper: 初始化成功 - rank=" << config_.rank << std::endl;
+    #ifdef SNNDL_ENABLE_DEBUG_LOG
+    { SST::Output out("MPITypes[@p:@l]: ", 1, 0, SST::Output::STDOUT); out.verbose(CALL_INFO, 1, 0, "SSTMPICommHelper: 初始化成功 - rank=%d\n", config_.rank); }
+    #endif
     return true;
 }
 
@@ -144,14 +148,19 @@ void SSTMPIPerformanceMonitor::recordBarrierCall(double time) {
 }
 
 void SSTMPIPerformanceMonitor::printStats() {
-    std::cout << "=== MPI性能统计 ===" << std::endl;
-    std::cout << "发送消息数: " << stats_.messages_sent << std::endl;
-    std::cout << "接收消息数: " << stats_.messages_received << std::endl;
-    std::cout << "发送字节数: " << stats_.bytes_sent << std::endl;
-    std::cout << "接收字节数: " << stats_.bytes_received << std::endl;
-    std::cout << "通信总时间: " << stats_.total_comm_time << "s" << std::endl;
-    std::cout << "屏障调用次数: " << stats_.barrier_calls << std::endl;
-    std::cout << "屏障总时间: " << stats_.total_barrier_time << "s" << std::endl;
+    #ifdef SNNDL_ENABLE_DEBUG_LOG
+    {
+        SST::Output out("MPITypes[@p:@l]: ", 1, 0, SST::Output::STDOUT);
+        out.verbose(CALL_INFO, 1, 0, "=== MPI性能统计 ===\n");
+        out.verbose(CALL_INFO, 1, 0, "发送消息数: %" PRIu64 "\n", stats_.messages_sent);
+        out.verbose(CALL_INFO, 1, 0, "接收消息数: %" PRIu64 "\n", stats_.messages_received);
+        out.verbose(CALL_INFO, 1, 0, "发送字节数: %" PRIu64 "\n", stats_.bytes_sent);
+        out.verbose(CALL_INFO, 1, 0, "接收字节数: %" PRIu64 "\n", stats_.bytes_received);
+        out.verbose(CALL_INFO, 1, 0, "通信总时间: %.6fs\n", stats_.total_comm_time);
+        out.verbose(CALL_INFO, 1, 0, "屏障调用次数: %" PRIu64 "\n", stats_.barrier_calls);
+        out.verbose(CALL_INFO, 1, 0, "屏障总时间: %.6fs\n", stats_.total_barrier_time);
+    }
+    #endif
 }
 
 } // namespace SnnDL

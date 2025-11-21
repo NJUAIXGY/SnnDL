@@ -88,7 +88,6 @@ std::mutex SnnPESubComponent::s_route_cache_mtx_;
 std::unordered_map<std::string, std::weak_ptr<const SnnPESubComponent::RouteMap>> SnnPESubComponent::s_route_cache_;
 std::mutex SnnPESubComponent::s_stage_csv_mutex_;
 std::unordered_set<std::string> SnnPESubComponent::s_stage_csv_files_;
-static std::unordered_set<std::string> s_stage_written_once_; // key: path:seq:event
 
 void SnnPESubComponent::appendStageEventRow_(const char* event_name, uint64_t now_ns, uint64_t spikes_emitted) {
     // 仅由 core0 代表本 PE 写入阶段事件，且每 (seq,event) 仅写一次
@@ -656,11 +655,12 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
       memory_(nullptr),
       gather_buffer_if_(nullptr),
       memory_link_(nullptr) {
-    // 构造期最早哨兵（默认静默，除非显式启用 SNNDL_SENTINEL_ENABLE）。
+    // 构造期最早哨兵（P2：参数优先，未设置回退到环境变量，以保持兼容）。
     // 避免直接使用 stdout，统一走 SST Output。
-    static const bool kSentinelOn = [](){
-        const char* env = std::getenv("SNNDL_SENTINEL_ENABLE");
-        return env && std::atoi(env) != 0;
+    const bool kSentinelOn = [&params](){
+        // P2 Step3：仅参数驱动，默认0=禁用
+        int sent_p = params.find<int>("sentinel_enable", 0);
+        return sent_p != 0;
     }();
     // 提前构建一个最低等级的输出对象，避免后续早期初始化路径使用 output_ 时发生空指针
     // 真实 verbose 等级稍后在解析完参数后再生效（此处仅用于早期诊断与防护）
@@ -817,7 +817,13 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     bcsr_colidx_addr_ = base_addr_ + bcsr_layout_.colidx_offset;
     bcsr_blockdata_addr_ = base_addr_ + bcsr_layout_.blockdata_offset;
     bcsr_blockids_addr_ = bcsr_layout_.blockids_offset ? base_addr_ + bcsr_layout_.blockids_offset : 0;
-    bcsr_weights_.configure(bcsr_rowptr_addr, bcsr_br_, bcsr_bc_, bcsr_idx_bytes_, bcsr_val_bytes_);
+    bcsr_weights_.configure(
+        bcsr_rowptr_addr,
+        bcsr_colidx_addr_,
+        bcsr_blockdata_addr_,
+        bcsr_blockids_addr_,
+        bcsr_br_, bcsr_bc_, bcsr_idx_bytes_, bcsr_val_bytes_);
+    // Revert: 默认值恢复为 64/256，避免影响发放路径；如需禁用由脚本显式传入 0
     bcsr_row_index_cache_cap_ = params.find<uint32_t>("bcsr_row_index_cache_cap", 64);
     bcsr_block_cache_cap_ = params.find<uint32_t>("bcsr_block_cache_cap", 256);
     if (aosoa_block_rows_ == 0) aosoa_block_rows_ = (bcsr_br_ > 0) ? bcsr_br_ : 16;
@@ -869,22 +875,11 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     use_clock_weight_cache_ = params.find<int>("use_clock_weight_cache", 0) != 0;
     // 默认启用致密累加器（与头文件参数表一致）
     apply_dense_acc_enable_ = params.find<int>("apply_dense_acc_enable", 1) != 0;
+    // P3: 验证逻辑去 debug 依赖：是否启用影子验证仅由参数决定，
+    // 不再受 enable_extended_diagnostics_ 影响（日志仍受编译期/verbose 门控）
     acc_shadow_verify_enable_ = apply_dense_acc_enable_ && params.find<int>("acc_shadow_verify_enable", 0) != 0;
-    if (acc_shadow_verify_enable_ && !enable_extended_diagnostics_) {
-        acc_shadow_verify_enable_ = false;
-    }
     if (acc_shadow_verify_enable_) {
-        // TEMP(debug): write a one-shot breadcrumb so we can confirm shadow verification is actually enabled at runtime.
-        // This will be removed after verification of runs (10us/100us).
-        FILE* fp = std::fopen("/tmp/acc_shadow.log", "a");
-        if (fp) {
-            std::fprintf(fp, "[acc-shadow-enabled] node=%u core=%u seq=%u time_ns=%" PRIu64 "\n",
-                        node_id_, core_id_, curr_stage_seq_, (uint64_t)getCurrentSimTimeNano());
-            std::fclose(fp);
-        }
-        // 强制落盘到 stdout，便于调试捕获（调试用，跑完撤销）
-        fprintf(stdout, "[acc-shadow-enable] core=%d acc_dense=1 shadow=1\n", core_id_);
-        fflush(stdout);
+        // Removed temporary file/stdout breadcrumbs to avoid I/O side effects
     }
     if (use_clock_weight_cache_ && max_cache_entries_ > 0) {
         wcache_cap_ = max_cache_entries_;
@@ -3455,12 +3450,14 @@ void SnnPESubComponent::verifyDenseAccumulator_(uint32_t seq) {
     constexpr double kEps = 1e-5;
     // TEMP(debug): append a per-window breadcrumb indicating verify path executed and basics of touched size.
     {
-        FILE* fp = std::fopen("/tmp/acc_shadow.log", "a");
+#ifdef SNNDL_ENABLE_DEBUG_LOG
+        // removed acc-shadow breadcrumb
         if (fp) {
-            std::fprintf(fp, "[acc-shadow-verify] node=%u core=%u seq=%u touched=%zu time_ns=%" PRIu64 "\n",
+            // removed acc-shadow breadcrumb node=%u core=%u seq=%u touched=%zu time_ns=%" PRIu64 "\n",
                         node_id_, core_id_, seq, acc_touched_list_.size(), (uint64_t)getCurrentSimTimeNano());
-            std::fclose(fp);
+            
         }
+#endif
     }
     auto log_once = [&](const char* reason, uint32_t post, double dense, double reference) {
         if (acc_shadow_mismatch_logged_ || !output_) return;

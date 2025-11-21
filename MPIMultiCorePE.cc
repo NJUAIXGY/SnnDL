@@ -9,6 +9,17 @@
 #include "MPIMultiCorePE.h"
 #include <iostream>
 #include <sstream>
+#include <sst/core/output.h>
+
+// Lightweight logging macro for MPI (debug only); avoids direct std::cout
+#ifdef SNNDL_ENABLE_DEBUG_LOG
+#define MPI_LOG(lvl, ...) do { \
+    SST::Output __out__("MPIMultiCorePE[@p:@l]: ", mpi_verbose_, 0, SST::Output::STDOUT); \
+    __out__.verbose(CALL_INFO, (lvl), 0, __VA_ARGS__); \
+} while(0)
+#else
+#define MPI_LOG(lvl, ...) do {} while(0)
+#endif
 
 using namespace SST;
 using namespace SST::SnnDL;
@@ -54,25 +65,14 @@ MPIMultiCorePE::MPIMultiCorePE(ComponentId_t id, Params& params)
         mpi_size_ = mpi_config_.size;
         mpi_available_ = true;
         
-        if (mpi_verbose_ > 0) {
-            std::cout << "MPIMultiCorePE: MPI enabled - rank=" << mpi_rank_ 
-                      << ", size=" << mpi_size_ << std::endl;
-        }
+        MPI_LOG(1, "MPI enabled - rank=%d size=%d\n", mpi_rank_, mpi_size_);
     } else {
-        if (mpi_verbose_ > 0) {
-            std::cout << "MPIMultiCorePE: MPI disabled, running in single-node mode" << std::endl;
-        }
+        MPI_LOG(1, "MPI disabled, running in single-node mode\n");
     }
     
     // 输出组件信息
-    if (mpi_verbose_ > 1) {
-        std::cout << "MPIMultiCorePE constructed with:" << std::endl;
-        std::cout << "  enable_mpi: " << mpi_enabled_ << std::endl;
-        std::cout << "  mpi_data_parallel: " << mpi_data_parallel_ << std::endl;
-        std::cout << "  mpi_model_parallel: " << mpi_model_parallel_ << std::endl;
-        std::cout << "  mpi_comm_strategy: " << mpi_comm_strategy_ << std::endl;
-        std::cout << "  mpi_buffer_size: " << mpi_buffer_size_ << std::endl;
-    }
+    MPI_LOG(2, "constructed: enable_mpi=%d data_parallel=%d model_parallel=%d strategy=%s buf=%zu\n",
+            mpi_enabled_?1:0, mpi_data_parallel_?1:0, mpi_model_parallel_?1:0, mpi_comm_strategy_.c_str(), (size_t)mpi_buffer_size_);
 }
 
 MPIMultiCorePE::~MPIMultiCorePE() {
@@ -176,13 +176,11 @@ bool MPIMultiCorePE::initializeSSTMPI() {
     // 创建MPI通信助手
     sst_mpi_comm_helper_ = std::make_unique<SSTMPICommHelper>(this);
     if (!sst_mpi_comm_helper_->initialize(mpi_config_)) {
-        std::cerr << "Failed to initialize SST MPI communication helper" << std::endl;
+        MPI_LOG(0, "Failed to initialize SST MPI communication helper\n");
         return false;
     }
     
-    if (mpi_verbose_ > 0) {
-        std::cout << "SST MPI initialized successfully for rank " << mpi_rank_ << std::endl;
-    }
+    MPI_LOG(1, "SST MPI initialized successfully for rank %d\n", mpi_rank_);
     
     return true;
 }
@@ -192,8 +190,8 @@ void MPIMultiCorePE::finalizeSSTMPI() {
         sst_mpi_comm_helper_.reset();
     }
     
-    if (mpi_verbose_ > 0 && mpi_enabled_) {
-        std::cout << "SST MPI finalized for rank " << mpi_rank_ << std::endl;
+    if (mpi_enabled_) {
+        MPI_LOG(1, "SST MPI finalized for rank %d\n", mpi_rank_);
         SSTMPIPerformanceMonitor::printStats();
     }
 }
@@ -212,9 +210,7 @@ void MPIMultiCorePE::initializeMPIStatistics() {
     stat_mpi_sync_time_ = registerStatistic<double>("mpi_sync_time");
     stat_mpi_load_imbalance_ = registerStatistic<double>("mpi_load_imbalance");
     
-    if (mpi_verbose_ > 1) {
-        std::cout << "MPI statistics initialized for rank " << mpi_rank_ << std::endl;
-    }
+    MPI_LOG(2, "MPI statistics initialized for rank %d\n", mpi_rank_);
 }
 
 // ===== MPICommManager 子组件实现 =====

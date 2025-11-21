@@ -65,7 +65,10 @@ public:
         {"emit_stage_events_lenient", "Lenient emission: allow EndApply/Scatter even if inflight>0 at window boundary (0/1)", "0"},
         {"stage_cycles_csv", "Optional CSV path to log per-window stage cycle counts", ""},
         {"probe_gas_csv", "(diagnostic) CSV path to dump probe-gas samples; empty to disable", ""},
-        {"port", "shared port name for downstream standardInterface when loaded anonymously"}
+        {"port", "shared port name for downstream standardInterface when loaded anonymously"},
+        {"diag_enable", "启用诊断打印(0/1)", "0"},
+        {"snndl_debug", "调试增强开关(0/1)", "0"},
+        {"sentinel_enable", "启用 sentinel 调试输出(0/1)", "0"}
         ,
         // --- Adaptive control (Phase-1) ---
         {"ctrl_enable", "Enable window-level adaptive control (0/1)", "0"},
@@ -132,6 +135,11 @@ public:
     void manualWindowTick();
 
 private:
+    // P2: 参数化门控（仅参数，不再回退env）
+    bool diag_enable_ = false;
+    bool debug_enable_ = false;
+    bool sentinel_enable_ = false;
+
     // Internal types
     enum class Stage { Idle=0, Gather=1, Apply=2, Scatter=3 };
     enum class Merge { None=0, Cacheline=1, Row=2, Auto=3 };
