@@ -468,13 +468,12 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
     }
     
     // 详细调试信息（仅在高详细度时输出）
-    static bool first_tick_logged = false;
-    if (!first_tick_logged) {
+    if (!first_tick_logged_) {
         if (sentinel_enabled_) {
             PE_LOG(1, "[[sentinel-pe-clock]] node=%d first_tick cyc=%" PRIu64 "\n", node_id_, (uint64_t)current_cycle_);
         }
     PE_LOG(2, "[diag-PE] clockTick start node=%d\n", node_id_);
-        first_tick_logged = true;
+        first_tick_logged_ = true;
     }
     
     // 0a. 若存在延迟的Step注入且已就绪，优先补发
@@ -1723,10 +1722,9 @@ void MultiCorePE::injectStepActivations(uint32_t seq, uint64_t sim_time_ns) {
     bool diag_cap_hit = false;
 
     // 诊断：仅在 node_id_=0 且 seq 较小时，对路由表做一次全局采样，避免日志爆炸
-    static bool route_diag_done = false;
     const bool step_diag_enabled = (step_diag_enable_cfg_ != 0);
 
-    if (step_diag_enabled && !route_diag_done && node_id_ == 0 && seq <= 1 && step_activation_use_bcsr_routes_) {
+    if (step_diag_enabled && !route_diag_done_ && node_id_ == 0 && seq <= 1 && step_activation_use_bcsr_routes_) {
         uint64_t with_routes = 0;
         uint64_t max_routes = 0;
         uint64_t local_edges = 0;
@@ -1751,7 +1749,7 @@ void MultiCorePE::injectStepActivations(uint32_t seq, uint64_t sim_time_ns) {
                 node_id_, with_routes, step_activation_routes_.size(), max_routes, max_global,
                 local_edges, local_ratio, remote_edges, remote_ratio);
         }
-        route_diag_done = true;
+        route_diag_done_ = true;
     }
 
     for (int core = 0; core < num_cores_; ++core) {

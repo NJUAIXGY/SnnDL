@@ -307,6 +307,9 @@ public:
     friend class MultiCoreController;
 
 private:
+    // 诊断打印节流（成员化，替代函数静态）
+    bool first_tick_logged_ = false;
+    bool route_diag_done_ = false;
     // P2: 参数化门控（优先参数，其次回退环境变量）
     bool sentinel_enabled_ = false;
     long step_diag_cap_cfg_ = -1;
