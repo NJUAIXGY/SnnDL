@@ -24,11 +24,13 @@ bool MPITypes::initializeMPIConfig(SST::Params& params) {
     config_.comm_pattern = params.find<std::string>("mpi_comm_strategy", "eager");
     config_.buffer_size = params.find<size_t>("mpi_buffer_size", 65536);
     
+    #ifdef SNNDL_ENABLE_DEBUG_LOG
     if (config_.enabled) {
         std::cout << "MPITypes: 配置已启用 - rank=" << config_.rank 
                   << ", size=" << config_.size 
                   << ", pattern=" << config_.comm_pattern << std::endl;
     }
+    #endif
     
     return true;
 }
@@ -63,7 +65,9 @@ bool SSTMPICommHelper::initialize(const MPITypes::MPIConfig& config) {
     }
     
     initialized_ = true;
+    #ifdef SNNDL_ENABLE_DEBUG_LOG
     std::cout << "SSTMPICommHelper: 初始化成功 - rank=" << config_.rank << std::endl;
+    #endif
     return true;
 }
 
@@ -144,6 +148,7 @@ void SSTMPIPerformanceMonitor::recordBarrierCall(double time) {
 }
 
 void SSTMPIPerformanceMonitor::printStats() {
+    #ifdef SNNDL_ENABLE_DEBUG_LOG
     std::cout << "=== MPI性能统计 ===" << std::endl;
     std::cout << "发送消息数: " << stats_.messages_sent << std::endl;
     std::cout << "接收消息数: " << stats_.messages_received << std::endl;
@@ -152,6 +157,7 @@ void SSTMPIPerformanceMonitor::printStats() {
     std::cout << "通信总时间: " << stats_.total_comm_time << "s" << std::endl;
     std::cout << "屏障调用次数: " << stats_.barrier_calls << std::endl;
     std::cout << "屏障总时间: " << stats_.total_barrier_time << "s" << std::endl;
+    #endif
 }
 
 } // namespace SnnDL

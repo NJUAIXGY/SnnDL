@@ -144,8 +144,7 @@ SnnNIC::SnnNIC(ComponentId_t id, Params& params)
     do {
         const char* _sent = std::getenv("SNNDL_SENTINEL_ENABLE");
         if (_sent && std::atoi(_sent) != 0) {
-            fprintf(stdout, "[[sentinel-nic-ctor]] enter\n");
-            fflush(stdout);
+            NIC_LOG(0, "[[sentinel-nic-ctor]] enter\n");
         }
     } while(0);
     // 获取参数
