@@ -70,7 +70,7 @@ public:
         {"inter_rank_batch_window", "[已禁用] 跨Rank批量窗口(ns)", "0"},
         {"nodes_per_rank", "[已禁用] 每个rank的节点数(用于简化映射)", "0"},
         {"export_spike_csv", "可选：写出每条脉冲消息的网络轨迹CSV", ""},
-        {"sentinel_enable", "启用 sentinel 调试输出(0/1，未设置则回退 SNNDL_SENTINEL_ENABLE)", "-1"}
+        {"sentinel_enable", "启用 sentinel 调试输出(0/1)", "0"}
     )
 
     // 端口文档

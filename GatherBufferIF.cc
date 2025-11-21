@@ -23,24 +23,10 @@ GatherBufferIF::GatherBufferIF(ComponentId_t id, Params& params, TimeConverter* 
     int verbose = params.find<int>("verbose", 0);
     // P2: 解析 diag/debug/sentinel（参数优先；未设置回退环境变量）
     {
-        int de = params.find<int>("diag_enable", -1);
-        if (de >= 0) diag_enable_ = (de != 0);
-        else {
-            const char* env = std::getenv("SNNDL_DIAG_ENABLE");
-            diag_enable_ = (env && std::atoi(env) != 0);
-        }
-        int dbg = params.find<int>("snndl_debug", -1);
-        if (dbg >= 0) debug_enable_ = (dbg != 0);
-        else {
-            const char* env = std::getenv("SNNDL_DEBUG");
-            debug_enable_ = (env && std::atoi(env) != 0);
-        }
-        int sen = params.find<int>("sentinel_enable", -1);
-        if (sen >= 0) sentinel_enable_ = (sen != 0);
-        else {
-            const char* env = std::getenv("SNNDL_SENTINEL_ENABLE");
-            sentinel_enable_ = (env && std::atoi(env) != 0);
-        }
+        // P2 Step3：移除 getenv 回退，仅参数驱动（默认禁用）
+        diag_enable_ = (params.find<int>("diag_enable", 0) != 0);
+        debug_enable_ = (params.find<int>("snndl_debug", 0) != 0);
+        sentinel_enable_ = (params.find<int>("sentinel_enable", 0) != 0);
     }
     out_.init("GatherBufferIF[@p:@l]: ", verbose, 0, Output::STDOUT);
 

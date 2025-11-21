@@ -61,24 +61,11 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
     verbose_ = verbose_level;
     // P2: 解析 sentinel 与步级诊断参数（未设置则回退环境变量）
     {
-        int sent_p = params.find<int>("sentinel_enable", -1);
-        if (sent_p >= 0) sentinel_enabled_ = (sent_p != 0);
-        else {
-            const char* env = std::getenv("SNNDL_SENTINEL_ENABLE");
-            sentinel_enabled_ = (env && std::atoi(env) != 0);
-        }
-        long cap_p = params.find<long>("step_diag_cap", LONG_MIN);
-        if (cap_p != LONG_MIN) step_diag_cap_cfg_ = cap_p;
-        else {
-            const char* env = std::getenv("STEP_ACTIVATION_DIAG_CAP");
-            step_diag_cap_cfg_ = env ? std::strtol(env, nullptr, 10) : -1;
-        }
-        int de_p = params.find<int>("step_diag_enable", INT_MIN);
-        if (de_p != INT_MIN) step_diag_enable_cfg_ = de_p;
-        else {
-            const char* env = std::getenv("STEP_ACTIVATION_DIAG_ENABLE");
-            step_diag_enable_cfg_ = env ? std::atoi(env) : 0;
-        }
+        // P2 Step3: 移除运行期 getenv 回退；仅由参数驱动（默认禁用）
+        int sent_p = params.find<int>("sentinel_enable", 0);
+        sentinel_enabled_ = (sent_p != 0);
+        step_diag_cap_cfg_ = params.find<long>("step_diag_cap", 0);
+        step_diag_enable_cfg_ = params.find<int>("step_diag_enable", 0);
     }
     weights_file_ = params.find<std::string>("weights_file", "");
     enable_numa_ = params.find<bool>("enable_numa", true);

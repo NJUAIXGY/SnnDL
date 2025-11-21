@@ -142,12 +142,9 @@ SnnNIC::SnnNIC(ComponentId_t id, Params& params)
 {
     // P2: 环境变量前端化 – 优先参数，其次回退到环境变量，保持兼容
     {
-        int sent_param = params.find<int>("sentinel_enable", -1);
-        if (sent_param >= 0) sentinel_enabled_ = (sent_param != 0);
-        else {
-            const char* _sent = std::getenv("SNNDL_SENTINEL_ENABLE");
-            sentinel_enabled_ = (_sent && std::atoi(_sent) != 0);
-        }
+        // P2 Step3: 移除运行期 getenv 回退；仅由参数驱动（默认0=禁用）
+        int sent_param = params.find<int>("sentinel_enable", 0);
+        sentinel_enabled_ = (sent_param != 0);
         if (sentinel_enabled_) {
             NIC_LOG(0, "[[sentinel-nic-ctor]] enter\n");
         }

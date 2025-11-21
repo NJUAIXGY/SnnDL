@@ -658,10 +658,9 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     // 构造期最早哨兵（P2：参数优先，未设置回退到环境变量，以保持兼容）。
     // 避免直接使用 stdout，统一走 SST Output。
     const bool kSentinelOn = [&params](){
-        int sent_p = params.find<int>("sentinel_enable", -1);
-        if (sent_p >= 0) return sent_p != 0;
-        const char* env = std::getenv("SNNDL_SENTINEL_ENABLE");
-        return env && std::atoi(env) != 0;
+        // P2 Step3：仅参数驱动，默认0=禁用
+        int sent_p = params.find<int>("sentinel_enable", 0);
+        return sent_p != 0;
     }();
     // 提前构建一个最低等级的输出对象，避免后续早期初始化路径使用 output_ 时发生空指针
     // 真实 verbose 等级稍后在解析完参数后再生效（此处仅用于早期诊断与防护）
