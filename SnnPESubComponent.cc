@@ -823,9 +823,9 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
         bcsr_blockdata_addr_,
         bcsr_blockids_addr_,
         bcsr_br_, bcsr_bc_, bcsr_idx_bytes_, bcsr_val_bytes_);
-    // P3-B: 默认禁用行/块缓存，保持 CP2 稳定基线；如需启用由脚本显式传入
-    bcsr_row_index_cache_cap_ = params.find<uint32_t>("bcsr_row_index_cache_cap", 0);
-    bcsr_block_cache_cap_ = params.find<uint32_t>("bcsr_block_cache_cap", 0);
+    // Revert: 默认值恢复为 64/256，避免影响发放路径；如需禁用由脚本显式传入 0
+    bcsr_row_index_cache_cap_ = params.find<uint32_t>("bcsr_row_index_cache_cap", 64);
+    bcsr_block_cache_cap_ = params.find<uint32_t>("bcsr_block_cache_cap", 256);
     if (aosoa_block_rows_ == 0) aosoa_block_rows_ = (bcsr_br_ > 0) ? bcsr_br_ : 16;
     // GAS Apply/Scatter Phase‑1
     apply_acc_enable_ = params.find<int>("apply_acc_enable", 0) != 0;
