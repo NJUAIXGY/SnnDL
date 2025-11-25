@@ -445,10 +445,10 @@ PINTOOL_PATH = /home/xgy/.local/bin:/home/xgy/remote/sst_install/bin:/tmp/.tmpns
 PINTOOL_RUNTIME = 
 PIN_CPPFLAGS = -g   -Wall   -Werror   -Wno-unknown-pragmas   -D__PIN__=1 -DPIN_CRT=1   -fno-stack-protector   -fno-exceptions   -funwind-tables   -fasynchronous-unwind-tables   -fomit-frame-pointer   -fno-strict-aliasing   -fno-rtti   -faligned-new   -fpic   -DTARGET_IA32E   -DHOST_IA32E   -DTARGET_LINUX   -DPIN_VERSION_MINOR=
 PIN_CPPFLAGS_COMPILER = -fno-exceptions          -fabi-version=2
-RAMULATOR2_CPPFLAGS = 
-RAMULATOR2_LDFLAGS = 
-RAMULATOR2_LIB = 
-RAMULATOR2_LIBDIR = 
+RAMULATOR2_CPPFLAGS = -I/home/xgy/remote/externals/ramulator2/src/ -I/home/xgy/remote/externals/ramulator2/ext/spdlog/include/       -I/home/xgy/remote/externals/ramulator2/ext/yaml-cpp/include/ -DRAMULATOR2 -DHAVE_RAMULATOR2
+RAMULATOR2_LDFLAGS = -L/home/xgy/remote/externals/ramulator2
+RAMULATOR2_LIB = -lramulator
+RAMULATOR2_LIBDIR = /home/xgy/remote/externals/ramulator2
 RAMULATOR_CPPFLAGS = 
 RAMULATOR_LDFLAGS = 
 RAMULATOR_LIB = 
@@ -458,9 +458,9 @@ SED = /usr/bin/sed
 SET_MAKE = 
 SHELL = /bin/bash
 SHM_LIB =  
-SSTELEMENTS_GIT_BRANCH = HEAD
-SSTELEMENTS_GIT_COMMITCOUNT = 15377
-SSTELEMENTS_GIT_HEADSHA = b86eb21b52465e4c69eb90edaf7a423896f3838e
+SSTELEMENTS_GIT_BRANCH = snndl_re
+SSTELEMENTS_GIT_COMMITCOUNT = 15402
+SSTELEMENTS_GIT_HEADSHA = 96170b7a47718074dabe194ba71cd3494e38a024
 SST_ACTIVE_ELEMENT_LIBRARIES =  ariel cacheTracer cassini cramSim ember firefly gensa golem hermes iris kingsley mask-mpi memHierarchy mercury merlin messier miranda mmu osseous prospero rdmaNic samba shogun simpleElementExample simpleSimulation SnnDL thornhill vanadis vaultsim zodiac
 SST_CONFIG_TOOL = /home/xgy/remote/sst_install/bin/sst-config
 SST_DIST_ELEMENT_LIBRARIES =  ariel balar cacheTracer cassini cramSim ember firefly gensa golem hermes iris kingsley mask-mpi memHierarchy mercury merlin messier miranda mmu osseous prospero rdmaNic samba shogun simpleElementExample simpleSimulation SnnDL thornhill vanadis vaultsim zodiac

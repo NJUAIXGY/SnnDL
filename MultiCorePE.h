@@ -130,7 +130,8 @@ public:
         {"step_activation_bcsr_blockdata_offset", "BCSR blockdata段偏移", "0"},
         {"step_activation_bcsr_blockids_offset", "BCSR blockids段偏移", "0"},
         {"step_activation_bcsr_stride_bytes", "BCSR per-core stride字节数", "0"},
-        {"step_activation_bcsr_weight_epsilon", "判定非零连边的权重阈值", "0.0"}
+        {"step_activation_bcsr_weight_epsilon", "判定非零连边的权重阈值", "0.0"},
+        {"step_activation_log_enable", "启用步级激活BCSR路由构建日志(0/1)", "0"}
     )
 
     // 子组件槽位文档
@@ -517,6 +518,7 @@ private:
     uint64_t step_activation_bcsr_blockdata_offset_ = 0;
     uint64_t step_activation_bcsr_blockids_offset_ = 0;
     double step_activation_bcsr_weight_epsilon_ = 0.0;
+    bool step_activation_log_enable_ = false;
     std::vector<std::vector<uint32_t>> step_activation_routes_;
     uint32_t last_step_injection_seq_ = std::numeric_limits<uint32_t>::max();
     uint32_t last_step_reset_seq_ = std::numeric_limits<uint32_t>::max();

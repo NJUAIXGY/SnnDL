@@ -566,14 +566,13 @@ void SnnNIC::setup()
         network->setup();
     }
     network_ready_ = true;
-    if (output) {
-        output->verbose(CALL_INFO, 0, 0,
-            "[nic-config] node=%u mode=%s link_bw=%s in_buf=%s out_buf=%s vn=%u\n",
-            node_id,
-            use_direct_link ? "direct" : "SimpleNetwork",
-            link_bw.c_str(), input_buf_size.c_str(), output_buf_size.c_str(),
-            effective_num_vns_);
-    }
+    // 仅在显式提高verbose等级或调试时打印NIC配置
+    NIC_LOG(2,
+        "[nic-config] node=%u mode=%s link_bw=%s in_buf=%s out_buf=%s vn=%u\n",
+        node_id,
+        use_direct_link ? "direct" : "SimpleNetwork",
+        link_bw.c_str(), input_buf_size.c_str(), output_buf_size.c_str(),
+        effective_num_vns_);
     if (output && sentinel_enabled_) {
         output->output("[[sentinel-nic-setup]] node=%u done\n", node_id);
     }

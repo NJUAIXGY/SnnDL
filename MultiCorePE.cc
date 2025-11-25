@@ -129,6 +129,7 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
     step_activation_bcsr_blockdata_offset_ = params.find<uint64_t>("step_activation_bcsr_blockdata_offset", 0);
     step_activation_bcsr_blockids_offset_ = params.find<uint64_t>("step_activation_bcsr_blockids_offset", 0);
     step_activation_bcsr_weight_epsilon_ = params.find<double>("step_activation_bcsr_weight_epsilon", 0.0);
+    step_activation_log_enable_ = params.find<bool>("step_activation_log_enable", false);
     // 仅本节点构建路由，降低IO与规避跨PE元数据不一致风险（可由脚本覆盖）
     step_activation_build_local_only_ = params.find<bool>("step_activation_build_local_only", true);
     
@@ -2106,8 +2107,8 @@ bool MultiCorePE::buildRoutesFromBcsrFile_(const std::string& path, uint32_t cor
             }
         }
     }
-    // 诊断：一次性打印装载概览
-    if (output_ && output_->getVerboseLevel() >= 1) {
+    // 诊断：一次性打印装载概览（仅在显式启用日志时）
+    if (output_ && step_activation_log_enable_ && output_->getVerboseLevel() >= 1) {
         uint64_t edges = 0;
         for (auto &v : step_activation_routes_) edges += (uint64_t)v.size();
         output_->verbose(CALL_INFO, 1, 0,
@@ -2118,7 +2119,7 @@ bool MultiCorePE::buildRoutesFromBcsrFile_(const std::string& path, uint32_t cor
 }
 
 bool MultiCorePE::loadBcsrReachability_() {
-    if (output_) {
+    if (output_ && step_activation_log_enable_) {
         output_->verbose(CALL_INFO, 0, 0,
             "[step-activation] node=%d loadBcsrReachability enable=%d use_bcsr=%d template=%s build_local_only=%d rows_per_core=%u br=%u bc=%u\n",
             node_id_, (int)step_activation_enable_, (int)step_activation_use_bcsr_routes_,
@@ -2126,7 +2127,9 @@ bool MultiCorePE::loadBcsrReachability_() {
             step_activation_bcsr_rows_per_core_, step_activation_bcsr_br_, step_activation_bcsr_bc_);
     }
     if (step_activation_bcsr_template_.empty()) {
-        output_->verbose(CALL_INFO, 0, 0, "⚠️ 未提供 step_activation_bcsr_template，无法加载BCSR索引\n");
+        if (output_ && step_activation_log_enable_) {
+            output_->verbose(CALL_INFO, 0, 0, "⚠️ 未提供 step_activation_bcsr_template，无法加载BCSR索引\n");
+        }
         return false;
         }
         const uint64_t total_pre = static_cast<uint64_t>(global_neuron_base_) + static_cast<uint64_t>(total_neurons_);
@@ -2151,7 +2154,7 @@ bool MultiCorePE::loadBcsrReachability_() {
         for (const auto& vec : step_activation_routes_) {
             if (!vec.empty()) ++with_routes;
         }
-        if (!step_activation_route_ack_logged_) {
+        if (step_activation_log_enable_ && !step_activation_route_ack_logged_) {
             output_->verbose(CALL_INFO, 1, 0,
                 "[step-activation] BCSR reachability loaded: pre_with_routes=%zu total_pre=%zu\n",
                 with_routes, step_activation_routes_.size());
@@ -2159,19 +2162,19 @@ bool MultiCorePE::loadBcsrReachability_() {
             computeRouteRatios_();
             step_activation_route_ack_logged_ = true;
         }
-        if (output_) {
+        if (output_ && step_activation_log_enable_) {
             output_->verbose(CALL_INFO, 0, 0,
                 "[step-activation] node=%d loadBcsrReachability success route_vectors=%zu\n",
                 node_id_, step_activation_routes_.size());
         }
     } else {
-        if (!step_activation_route_warned_) {
+        if (step_activation_log_enable_ && !step_activation_route_warned_) {
             output_->verbose(CALL_INFO, 0, 0,
                 "⚠️ step_activation BCSR route build failed, routes cleared; using fallback sampling\n");
             step_activation_route_warned_ = true;
         }
         step_activation_routes_.clear();
-        if (output_) {
+        if (output_ && step_activation_log_enable_) {
             output_->verbose(CALL_INFO, 0, 0,
                 "[step-activation] node=%d loadBcsrReachability FAILED\n",
                 node_id_);
@@ -2196,7 +2199,7 @@ void MultiCorePE::computeRouteRatios_() const {
     }
     double local_ratio = (total_edges ? (double)local_edges / (double)total_edges : 0.0);
     double remote_ratio = (total_edges ? (double)remote_edges / (double)total_edges : 0.0);
-    if (output_) {
+    if (output_ && step_activation_log_enable_) {
         output_->verbose(CALL_INFO, 1, 0,
             "[step-activation] route_ratio: node=%d local_edges=%" PRIu64 " remote_edges=%" PRIu64 " total=%" PRIu64 " local_ratio=%.4f remote_ratio=%.4f\n",
             node_id_, local_edges, remote_edges, total_edges, local_ratio, remote_ratio);

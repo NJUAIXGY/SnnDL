@@ -145,7 +145,11 @@ private:
     enum class Merge { None=0, Cacheline=1, Row=2, Auto=3 };
     enum class Sort { Addr=0, Row=1, BankRow=2 };
 
-    struct SubReq { Request::id_t up_id; uint64_t offset; uint32_t size; SST::Interfaces::StandardMem::Read* up_read; };
+    struct SubReq {
+        Request::id_t up_id;  // upstream Read ID
+        uint64_t      offset; // offset within granule base
+        uint32_t      size;   // bytes to return
+    };
     struct Granule {
         uint64_t base; uint32_t size; std::vector<SubReq> subs;
         bool issued=false; bool ready=false; uint64_t down_id=0;

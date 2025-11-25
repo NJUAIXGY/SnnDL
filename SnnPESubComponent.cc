@@ -755,6 +755,7 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     disable_weight_cache_ = params.find<int>("disable_weight_cache", 0) != 0;
     window_read_enable_ = params.find<int>("window_read_enable", 0) != 0;
     window_read_debug_ = params.find<int>("window_read_debug", 0) != 0;
+    route_summary_enable_ = params.find<int>("route_summary_enable", 0) != 0;
     if (gas_ctrl_) gas_ctrl_->setDebug(window_read_debug_, enable_extended_diagnostics_);
     window_read_budget_ = params.find<uint32_t>("window_read_budget", 1024);
     read_force_single_ = params.find<int>("read_force_single", 0) != 0;
@@ -1250,7 +1251,7 @@ void SnnPESubComponent::init(unsigned int phase) {
                             if (pe_of_post == node_id_) ++local_edges; else ++remote_edges;
                         }
                     }
-                    if (!route_summary_logged_) {
+                    if (route_summary_enable_ && !route_summary_logged_) {
                         route_summary_logged_ = true;
                         double local_ratio = (total_entries > 0) ? (double)local_edges / (double)total_entries : 0.0;
                         double remote_ratio = (total_entries > 0) ? (double)remote_edges / (double)total_entries : 0.0;
@@ -1271,7 +1272,7 @@ void SnnPESubComponent::init(unsigned int phase) {
             }
         }
 
-        if (window_read_debug_ || output_->getVerboseLevel() >= 1) {
+        if ((window_read_debug_ || route_summary_enable_) && output_) {
             logRoutingSummary_("setup", routing_weight_driven_ ? "active" : "fallback_fixed");
         }
 

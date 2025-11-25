@@ -74,6 +74,7 @@ public:
         {"aosoa_block_rows", "AoSoA block row width; defaults to bcsr_block_rows when unset", "0"},
         {"verify_routing_weights", "Log and verify routing fanout against weight threshold (0/1)", "0"},
         {"enable_detailed_map_log", "Enable detailed logging of neuron mapping", "0"},
+        {"route_summary_enable", "Enable one-shot route summary logging per core (0/1)", "0"},
         {"verify_weights", "Enable weight verification", "0"},
         {"weight_verify_samples", "Number of weight samples to verify", "16"},
         {"expected_weight_value", "Expected weight value for verification", "0.0"},
@@ -740,6 +741,7 @@ private:
     uint32_t max_cache_entries_;
     bool use_event_weight_fallback_;
     bool base_addr_log_once_ = false;
+    bool route_summary_enable_ = false;
     bool route_summary_logged_ = false;
     bool event_weight_fallback_warned_;
     bool merge_read_cacheline_;

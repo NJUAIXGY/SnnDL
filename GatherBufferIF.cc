@@ -237,11 +237,19 @@ void GatherBufferIF::send(Request* req) {
                             uint64_t base = (merge_==Merge::Cacheline || (merge_==Merge::Auto && !use_row)) ? alignDown(r->pAddr, gsz)
                                                : (use_row ? alignDown(r->pAddr, row_bytes_guess_) : r->pAddr);
                             uint32_t sz = (merge_==Merge::None) ? r->size : (use_row ? row_bytes_guess_ : gsz);
-                            uint64_t key = (base << 32) ^ (uint64_t)sz;
-                            auto& g = sb_[gather_buf_index_].granules[key];
-                            if (g.subs.empty()) { g.base = base; g.size = sz; g.window_id = current_gather_id_; sb_[gather_buf_index_].required_set.insert(key); if (stat_coalesce_granule_size_) stat_coalesce_granule_size_->addData((uint64_t)sz); }
-                            uint64_t off = (r->pAddr >= base) ? (r->pAddr - base) : 0;
-                            g.subs.push_back({r->getID(), off, (uint32_t)r->size, r});
+                    uint64_t key = (base << 32) ^ (uint64_t)sz;
+                    auto& g = sb_[gather_buf_index_].granules[key];
+                    if (g.subs.empty()) {
+                        g.base = base;
+                        g.size = sz;
+                        g.window_id = current_gather_id_;
+                        sb_[gather_buf_index_].required_set.insert(key);
+                        if (stat_coalesce_granule_size_) {
+                            stat_coalesce_granule_size_->addData((uint64_t)sz);
+                        }
+                    }
+                    uint64_t off = (r->pAddr >= base) ? (r->pAddr - base) : 0;
+                    g.subs.push_back({r->getID(), off, (uint32_t)r->size});
                             if (!g.issued) { issueGranuleBuf_(gather_buf_index_, key, g); }
                             if (stat_up_reads_) stat_up_reads_->addData(1);
                         }
@@ -311,9 +319,17 @@ void GatherBufferIF::send(Request* req) {
                 uint32_t sz = (merge_==Merge::None) ? rd->size : (use_row ? row_bytes_guess_ : gsz);
                 uint64_t key = (base << 32) ^ (uint64_t)sz; // compact key
                 auto& g = sb_[tgt].granules[key];
-                if (g.subs.empty()) { g.base = base; g.size = sz; g.window_id = current_gather_id_; sb_[tgt].required_set.insert(key); if (stat_coalesce_granule_size_) stat_coalesce_granule_size_->addData((uint64_t)sz); }
+                if (g.subs.empty()) {
+                    g.base = base;
+                    g.size = sz;
+                    g.window_id = current_gather_id_;
+                    sb_[tgt].required_set.insert(key);
+                    if (stat_coalesce_granule_size_) {
+                        stat_coalesce_granule_size_->addData((uint64_t)sz);
+                    }
+                }
                 uint64_t off = (rd->pAddr >= base) ? (rd->pAddr - base) : 0;
-                g.subs.push_back({rd->getID(), off, (uint32_t)rd->size, rd});
+                g.subs.push_back({rd->getID(), off, (uint32_t)rd->size});
                 if (!defer_issue_until_apply_) {
                     if (!g.issued) { issueGranuleBuf_(tgt, key, g); }
                 }
@@ -701,7 +717,12 @@ void GatherBufferIF::buildGranulesWithGapMergeBuf_(int buf) {
         }
     }
     // Group by (bank,rowIndex)
-    struct ReadItem { uint64_t addr; uint32_t size; uint64_t arr_ns; StandardMem::Read* rd; };
+    struct ReadItem {
+        uint64_t addr;
+        uint32_t size;
+        uint64_t arr_ns;
+        StandardMem::Read* rd;
+    };
     std::unordered_map<uint64_t, std::vector<ReadItem>> groups;
 
     // 优化3：预分配groups容器（假设平均每组4个读请求）
@@ -740,15 +761,19 @@ void GatherBufferIF::buildGranulesWithGapMergeBuf_(int buf) {
             uint64_t gkey = (base << 32) ^ (uint64_t)sz;
             auto &g = S.granules[gkey];
             if (g.subs.empty()) {
-                g.base = base; g.size = sz; g.window_id = current_gather_id_;
+                g.base = base;
+                g.size = sz;
+                g.window_id = current_gather_id_;
                 S.required_set.insert(gkey);
-                if (stat_coalesce_granule_size_) stat_coalesce_granule_size_->addData((uint64_t)sz);
+                if (stat_coalesce_granule_size_) {
+                    stat_coalesce_granule_size_->addData((uint64_t)sz);
+                }
                 // 优化3：预分配subs空间（已知即将添加segSubs.size()个元素）
                 g.subs.reserve(segSubs.size());
             }
             for (auto &it : segSubs) {
                 uint64_t off = (it.addr >= base) ? (it.addr - base) : 0;
-                g.subs.push_back({it.rd->getID(), off, it.size, it.rd});
+                g.subs.push_back({it.rd->getID(), off, it.size});
             }
             // P1-2: export granule row if enabled
             if (!export_granules_csv_.empty()) {
@@ -866,7 +891,13 @@ void GatherBufferIF::emitApplyResponsesBuf_(int buf) {
 
         // 发回所有 sub-reads
         for (auto& s : g.subs) {
-            auto* resp = new StandardMem::ReadResp(s.up_read, std::vector<uint8_t>(s.size));
+            // 使用 up_id 构造响应，避免依赖上游 Read* 指针的生命周期
+            auto* resp = new StandardMem::ReadResp(
+                s.up_id,
+                g.base + s.offset,                  // 物理地址可选，这里使用granule内的绝对地址
+                (uint64_t)s.size,
+                std::vector<uint8_t>(s.size)
+            );
             // Fill payload
             if (s.offset + s.size <= blk.size()) {
                 std::memcpy(resp->data.data(), blk.data() + s.offset, s.size);
@@ -1088,9 +1119,17 @@ bool GatherBufferIF::clockTick(Cycle_t) {
                     uint32_t sz = (merge_==Merge::None) ? r->size : (merge_==Merge::Row ? row_bytes_guess_ : gsz);
                     uint64_t key = (base << 32) ^ (uint64_t)sz;
                     auto& g = sb_[gather_buf_index_].granules[key];
-                    if (g.subs.empty()) { g.base = base; g.size = sz; g.window_id = current_gather_id_; sb_[gather_buf_index_].required_set.insert(key); if (stat_coalesce_granule_size_) stat_coalesce_granule_size_->addData((uint64_t)sz); }
+                    if (g.subs.empty()) {
+                        g.base = base;
+                        g.size = sz;
+                        g.window_id = current_gather_id_;
+                        sb_[gather_buf_index_].required_set.insert(key);
+                        if (stat_coalesce_granule_size_) {
+                            stat_coalesce_granule_size_->addData((uint64_t)sz);
+                        }
+                    }
                     uint64_t off = (r->pAddr >= base) ? (r->pAddr - base) : 0;
-                    g.subs.push_back({r->getID(), off, (uint32_t)r->size, r});
+                    g.subs.push_back({r->getID(), off, (uint32_t)r->size});
                     if (!g.issued) { issueGranuleBuf_(gather_buf_index_, key, g); }
                     if (stat_up_reads_) stat_up_reads_->addData(1);
                 }
