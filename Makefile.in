@@ -176,13 +176,29 @@ am__uninstall_files_from_dir = { \
 am__installdirs = "$(DESTDIR)$(compdir)"
 LTLIBRARIES = $(comp_LTLIBRARIES)
 libSnnDL_la_LIBADD =
-am_libSnnDL_la_OBJECTS = SnnPE.lo SnnPESubComponent.lo \
-	GasPhaseController.lo SnnBcsrWeightManager.lo SpikeSource.lo \
-	SnnNIC.lo SnnNetworkAdapter.lo SimpleNetworkWrapper.lo \
-	MultiCorePE.lo OptimizedInternalRing.lo SpikeEventWrapper.lo \
-	SimpleTestEvent.lo WeightLoader.lo GatingPE.lo \
-	GatherBufferIF.lo MemKCalBench.lo MPITypes.lo \
-	MPIMultiCorePE.lo
+am__dirstamp = $(am__leading_dot)dirstamp
+am_libSnnDL_la_OBJECTS = events/SimpleTestEvent.lo \
+	events/SpikeEventWrapper.lo components/GatherBufferIF.lo \
+	components/GatingPE.lo components/MemKCalBench.lo \
+	components/MultiCorePE.lo components/SnnNIC.lo \
+	components/SnnPE.lo components/SpikeSource.lo \
+	components/WeightLoader.lo components/mpi/MPIMultiCorePE.lo \
+	components/mpi/MPITypes.lo control/SnnPESubComponent.lo \
+	control/SnnPESubComponent_bcsr.lo \
+	control/SnnPESubComponent_mem.lo \
+	control/SnnPESubComponent_routing.lo \
+	control/SnnPESubComponent_scheme1.lo \
+	control/SnnPESubComponent_spike.lo \
+	control/SnnPEApplyScatter.lo control/SnnPEOrchestrators.lo \
+	control/StageEventHub.lo compute/SnnComputeCore.lo \
+	compute/SnnCoreEngine.lo compute/SnnLearningCore.lo \
+	compute/SnnWeightDiagnostics.lo services/AccumulatorOps.lo \
+	services/GasEdgeCollector.lo services/GasPhaseController.lo \
+	services/OptimizedInternalRing.lo services/SimpleNetworkWrapper.lo \
+	services/SnnBcsrWeightManager.lo services/SnnNetworkAdapter.lo \
+	services/SnnRouteProvider.lo services/WeightAccessor.lo \
+	services/WeightCacheOps.lo services/StandardMemBackend.lo \
+	services/SpikeCommSubsystem.lo
 libSnnDL_la_OBJECTS = $(am_libSnnDL_la_OBJECTS)
 AM_V_lt = $(am__v_lt_@AM_V@)
 am__v_lt_ = $(am__v_lt_@AM_DEFAULT_V@)
@@ -206,18 +222,41 @@ am__v_at_1 =
 DEFAULT_INCLUDES = -I.@am__isrc@ -I$(top_builddir)/src
 depcomp = $(SHELL) $(top_srcdir)/config/depcomp
 am__maybe_remake_depfiles = depfiles
-am__depfiles_remade = ./$(DEPDIR)/GasPhaseController.Plo \
-	./$(DEPDIR)/GatherBufferIF.Plo ./$(DEPDIR)/GatingPE.Plo \
-	./$(DEPDIR)/MPIMultiCorePE.Plo ./$(DEPDIR)/MPITypes.Plo \
-	./$(DEPDIR)/MemKCalBench.Plo ./$(DEPDIR)/MultiCorePE.Plo \
-	./$(DEPDIR)/OptimizedInternalRing.Plo \
-	./$(DEPDIR)/SimpleNetworkWrapper.Plo \
-	./$(DEPDIR)/SimpleTestEvent.Plo \
-	./$(DEPDIR)/SnnBcsrWeightManager.Plo ./$(DEPDIR)/SnnNIC.Plo \
-	./$(DEPDIR)/SnnNetworkAdapter.Plo ./$(DEPDIR)/SnnPE.Plo \
-	./$(DEPDIR)/SnnPESubComponent.Plo \
-	./$(DEPDIR)/SpikeEventWrapper.Plo ./$(DEPDIR)/SpikeSource.Plo \
-	./$(DEPDIR)/WeightLoader.Plo
+am__depfiles_remade = components/$(DEPDIR)/GatherBufferIF.Plo \
+	components/$(DEPDIR)/GatingPE.Plo \
+	components/$(DEPDIR)/MemKCalBench.Plo \
+	components/$(DEPDIR)/MultiCorePE.Plo \
+	components/$(DEPDIR)/SnnNIC.Plo components/$(DEPDIR)/SnnPE.Plo \
+	components/$(DEPDIR)/SpikeSource.Plo \
+	components/$(DEPDIR)/WeightLoader.Plo \
+	components/mpi/$(DEPDIR)/MPIMultiCorePE.Plo \
+	components/mpi/$(DEPDIR)/MPITypes.Plo \
+	compute/$(DEPDIR)/SnnComputeCore.Plo \
+	compute/$(DEPDIR)/SnnCoreEngine.Plo \
+	compute/$(DEPDIR)/SnnLearningCore.Plo \
+	compute/$(DEPDIR)/SnnWeightDiagnostics.Plo \
+	control/$(DEPDIR)/SnnPEApplyScatter.Plo \
+	control/$(DEPDIR)/SnnPEOrchestrators.Plo \
+	control/$(DEPDIR)/SnnPESubComponent.Plo \
+	control/$(DEPDIR)/SnnPESubComponent_bcsr.Plo \
+	control/$(DEPDIR)/SnnPESubComponent_mem.Plo \
+	control/$(DEPDIR)/SnnPESubComponent_routing.Plo \
+	control/$(DEPDIR)/SnnPESubComponent_scheme1.Plo \
+	control/$(DEPDIR)/SnnPESubComponent_spike.Plo \
+	control/$(DEPDIR)/StageEventHub.Plo \
+	events/$(DEPDIR)/SimpleTestEvent.Plo \
+	events/$(DEPDIR)/SpikeEventWrapper.Plo \
+	services/$(DEPDIR)/AccumulatorOps.Plo \
+	services/$(DEPDIR)/GasEdgeCollector.Plo \
+	services/$(DEPDIR)/GasPhaseController.Plo \
+	services/$(DEPDIR)/OptimizedInternalRing.Plo \
+	services/$(DEPDIR)/ReadOrchestrator.Plo \
+	services/$(DEPDIR)/SimpleNetworkWrapper.Plo \
+	services/$(DEPDIR)/SnnBcsrWeightManager.Plo \
+	services/$(DEPDIR)/SnnNetworkAdapter.Plo \
+	services/$(DEPDIR)/SnnRouteProvider.Plo \
+	services/$(DEPDIR)/WeightAccessor.Plo \
+	services/$(DEPDIR)/WeightCacheOps.Plo
 am__mv = mv -f
 CXXCOMPILE = $(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) \
 	$(AM_CPPFLAGS) $(CPPFLAGS) $(AM_CXXFLAGS) $(CXXFLAGS)
@@ -286,7 +325,10 @@ DISTFILES = $(DIST_COMMON) $(DIST_SOURCES) $(TEXINFOS) $(EXTRA_DIST)
 ACLOCAL = @ACLOCAL@
 AMTAR = @AMTAR@
 AM_CFLAGS = @AM_CFLAGS@
-AM_CPPFLAGS = @AM_CPPFLAGS@ -I$(top_srcdir)/src \
+AM_CPPFLAGS = @AM_CPPFLAGS@ -I$(top_srcdir)/src -I$(srcdir) \
+	-I$(srcdir)/api -I$(srcdir)/events -I$(srcdir)/components \
+	-I$(srcdir)/components/mpi -I$(srcdir)/control \
+	-I$(srcdir)/compute -I$(srcdir)/services \
 	-I/home/xgy/remote/sst_install/include
 AM_CXXFLAGS = @AM_CXXFLAGS@
 AM_DEFAULT_VERBOSITY = @AM_DEFAULT_VERBOSITY@
@@ -539,25 +581,92 @@ top_srcdir = @top_srcdir@
 # endif
 compdir = $(pkglibdir)
 comp_LTLIBRARIES = libSnnDL.la
+libSnnDL_la_SOURCES = \
+	api/SnnCoreAPI.h \
+	api/SnnInterface.h \
+	api/SnnPEParentInterface.h \
+	api/ISpikeTransport.h \
+	api/SnnWeightReader.h \
+	events/GatingDecisionEvent.h \
+	events/SimpleTestEvent.cc \
+	events/SimpleTestEvent.h \
+	events/SpikeEvent.h \
+	events/SpikeEventWrapper.cc \
+	events/SpikeEventWrapper.h \
+	events/SpikePacket.h \
+	components/GatherBufferIF.cc \
+	components/GatherBufferIF.h \
+	components/GatingPE.cc \
+	components/GatingPE.h \
+	components/MemKCalBench.cc \
+	components/MemKCalBench.h \
+	components/MultiCorePE.cc \
+	components/MultiCorePE.h \
+	components/SnnNIC.cc \
+	components/SnnNIC.h \
+	components/SnnPE.cc \
+	components/SnnPE.h \
+	components/SpikeSource.cc \
+	components/SpikeSource.h \
+	components/WeightLoader.cc \
+	components/WeightLoader.h \
+	components/mpi/MPIMultiCorePE.cc \
+	components/mpi/MPIMultiCorePE.h \
+	components/mpi/MPITypes.cc \
+	components/mpi/MPITypes.h \
+	control/SnnPESubComponent.cc \
+	control/SnnPESubComponent.h \
+	control/SnnPESubComponent_bcsr.cc \
+	control/SnnPESubComponent_mem.cc \
+	control/SnnPESubComponent_routing.cc \
+	control/SnnPESubComponent_scheme1.cc \
+	control/SnnPESubComponent_spike.cc \
+	control/SnnPEApplyScatter.cc \
+	control/SnnPEOrchestrators.cc \
+	control/StageEventHub.cc \
+	control/StageEventHub.h \
+	compute/SnnComputeCore.cc \
+	compute/SnnComputeCore.h \
+	compute/SnnCoreEngine.cc \
+	compute/SnnCoreEngine.h \
+	compute/SnnLearningCore.cc \
+	compute/SnnLearningCore.h \
+	compute/SnnNeuronModel.h \
+	compute/SnnWeightDiagnostics.cc \
+	compute/SnnWeightDiagnostics.h \
+	compute/SynapseManager.h \
+	services/AccumulatorOps.cc \
+	services/AccumulatorOps.h \
+	services/GasCustomCmd.h \
+	services/GasEdgeCollector.cc \
+	services/GasEdgeCollector.h \
+	services/GasPhaseController.cc \
+	services/GasPhaseController.h \
+	services/OptimizedInternalRing.cc \
+	services/OptimizedInternalRing.h \
+	services/SimpleNetworkWrapper.cc \
+	services/SimpleNetworkWrapper.h \
+	services/SnnBcsrWeightManager.cc \
+	services/SnnBcsrWeightManager.h \
+	services/SnnNetworkAdapter.cc \
+	services/SnnNetworkAdapter.h \
+	services/SnnProfiler.h \
+	services/SnnRouteProvider.cc \
+	services/SnnRouteProvider.h \
+	services/WeightAccessor.cc \
+	services/WeightAccessor.h \
+	services/WeightCacheOps.cc \
+	services/WeightCacheOps.h \
+	services/WeightMemorySubsystem.h \
+	services/SpikeCommSubsystem.cc \
+	services/SpikeCommSubsystem.h \
+	services/StandardMemBackend.cc \
+	services/StandardMemBackend.h
 
-# GAS scratchpad StandardMem front-end
 
-# Micro-benchmark component for k calibration
-
-# MPI扩展源文件 - 重新启用测试编译
-libSnnDL_la_SOURCES = SnnPE.cc SnnPE.h SnnCoreAPI.h \
-	SnnPESubComponent.cc SnnPESubComponent.h GasPhaseController.cc \
-	GasPhaseController.h SnnBcsrWeightManager.cc \
-	SnnBcsrWeightManager.h SpikeSource.cc SpikeSource.h SnnNIC.cc \
-	SnnNIC.h SnnNetworkAdapter.cc SnnNetworkAdapter.h \
-	SimpleNetworkWrapper.cc SimpleNetworkWrapper.h MultiCorePE.cc \
-	MultiCorePE.h OptimizedInternalRing.cc OptimizedInternalRing.h \
-	SnnInterface.h SnnPEParentInterface.h SpikeEvent.h \
-	SpikeEventWrapper.h SpikeEventWrapper.cc SimpleTestEvent.h \
-	SimpleTestEvent.cc WeightLoader.cc WeightLoader.h GatingPE.cc \
-	GatingPE.h GatingDecisionEvent.h GatherBufferIF.cc \
-	GatherBufferIF.h GasCustomCmd.h MemKCalBench.cc MemKCalBench.h \
-	MPITypes.h MPITypes.cc MPIMultiCorePE.h MPIMultiCorePE.cc
+#
+# Note: sources above already include GatherBufferIF / MemKCalBench / MPI files.
+#
 libSnnDL_la_LDFLAGS = -module -avoid-version
 all: all-am
 
@@ -627,34 +736,172 @@ clean-compLTLIBRARIES:
 	  echo rm -f $${locs}; \
 	  rm -f $${locs}; \
 	}
+events/$(am__dirstamp):
+	@$(MKDIR_P) events
+	@: > events/$(am__dirstamp)
+events/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) events/$(DEPDIR)
+	@: > events/$(DEPDIR)/$(am__dirstamp)
+events/SimpleTestEvent.lo: events/$(am__dirstamp) \
+	events/$(DEPDIR)/$(am__dirstamp)
+events/SpikeEventWrapper.lo: events/$(am__dirstamp) \
+	events/$(DEPDIR)/$(am__dirstamp)
+components/$(am__dirstamp):
+	@$(MKDIR_P) components
+	@: > components/$(am__dirstamp)
+components/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) components/$(DEPDIR)
+	@: > components/$(DEPDIR)/$(am__dirstamp)
+components/GatherBufferIF.lo: components/$(am__dirstamp) \
+	components/$(DEPDIR)/$(am__dirstamp)
+components/GatingPE.lo: components/$(am__dirstamp) \
+	components/$(DEPDIR)/$(am__dirstamp)
+components/MemKCalBench.lo: components/$(am__dirstamp) \
+	components/$(DEPDIR)/$(am__dirstamp)
+components/MultiCorePE.lo: components/$(am__dirstamp) \
+	components/$(DEPDIR)/$(am__dirstamp)
+components/SnnNIC.lo: components/$(am__dirstamp) \
+	components/$(DEPDIR)/$(am__dirstamp)
+components/SnnPE.lo: components/$(am__dirstamp) \
+	components/$(DEPDIR)/$(am__dirstamp)
+components/SpikeSource.lo: components/$(am__dirstamp) \
+	components/$(DEPDIR)/$(am__dirstamp)
+components/WeightLoader.lo: components/$(am__dirstamp) \
+	components/$(DEPDIR)/$(am__dirstamp)
+components/mpi/$(am__dirstamp):
+	@$(MKDIR_P) components/mpi
+	@: > components/mpi/$(am__dirstamp)
+components/mpi/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) components/mpi/$(DEPDIR)
+	@: > components/mpi/$(DEPDIR)/$(am__dirstamp)
+components/mpi/MPIMultiCorePE.lo: components/mpi/$(am__dirstamp) \
+	components/mpi/$(DEPDIR)/$(am__dirstamp)
+components/mpi/MPITypes.lo: components/mpi/$(am__dirstamp) \
+	components/mpi/$(DEPDIR)/$(am__dirstamp)
+control/$(am__dirstamp):
+	@$(MKDIR_P) control
+	@: > control/$(am__dirstamp)
+control/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) control/$(DEPDIR)
+	@: > control/$(DEPDIR)/$(am__dirstamp)
+control/SnnPESubComponent.lo: control/$(am__dirstamp) \
+	control/$(DEPDIR)/$(am__dirstamp)
+control/SnnPESubComponent_bcsr.lo: control/$(am__dirstamp) \
+	control/$(DEPDIR)/$(am__dirstamp)
+control/SnnPESubComponent_mem.lo: control/$(am__dirstamp) \
+	control/$(DEPDIR)/$(am__dirstamp)
+control/SnnPESubComponent_routing.lo: control/$(am__dirstamp) \
+	control/$(DEPDIR)/$(am__dirstamp)
+control/SnnPESubComponent_scheme1.lo: control/$(am__dirstamp) \
+	control/$(DEPDIR)/$(am__dirstamp)
+control/SnnPESubComponent_spike.lo: control/$(am__dirstamp) \
+	control/$(DEPDIR)/$(am__dirstamp)
+control/SnnPEApplyScatter.lo: control/$(am__dirstamp) \
+	control/$(DEPDIR)/$(am__dirstamp)
+control/SnnPEOrchestrators.lo: control/$(am__dirstamp) \
+	control/$(DEPDIR)/$(am__dirstamp)
+control/StageEventHub.lo: control/$(am__dirstamp) \
+	control/$(DEPDIR)/$(am__dirstamp)
+compute/$(am__dirstamp):
+	@$(MKDIR_P) compute
+	@: > compute/$(am__dirstamp)
+compute/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) compute/$(DEPDIR)
+	@: > compute/$(DEPDIR)/$(am__dirstamp)
+compute/SnnComputeCore.lo: compute/$(am__dirstamp) \
+	compute/$(DEPDIR)/$(am__dirstamp)
+compute/SnnCoreEngine.lo: compute/$(am__dirstamp) \
+	compute/$(DEPDIR)/$(am__dirstamp)
+compute/SnnLearningCore.lo: compute/$(am__dirstamp) \
+	compute/$(DEPDIR)/$(am__dirstamp)
+compute/SnnWeightDiagnostics.lo: compute/$(am__dirstamp) \
+	compute/$(DEPDIR)/$(am__dirstamp)
+services/$(am__dirstamp):
+	@$(MKDIR_P) services
+	@: > services/$(am__dirstamp)
+services/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) services/$(DEPDIR)
+	@: > services/$(DEPDIR)/$(am__dirstamp)
+services/AccumulatorOps.lo: services/$(am__dirstamp) \
+	services/$(DEPDIR)/$(am__dirstamp)
+services/GasEdgeCollector.lo: services/$(am__dirstamp) \
+	services/$(DEPDIR)/$(am__dirstamp)
+services/GasPhaseController.lo: services/$(am__dirstamp) \
+	services/$(DEPDIR)/$(am__dirstamp)
+services/OptimizedInternalRing.lo: services/$(am__dirstamp) \
+	services/$(DEPDIR)/$(am__dirstamp)
+services/ReadOrchestrator.lo: services/$(am__dirstamp) \
+	services/$(DEPDIR)/$(am__dirstamp)
+services/SimpleNetworkWrapper.lo: services/$(am__dirstamp) \
+	services/$(DEPDIR)/$(am__dirstamp)
+services/SnnBcsrWeightManager.lo: services/$(am__dirstamp) \
+	services/$(DEPDIR)/$(am__dirstamp)
+services/SnnNetworkAdapter.lo: services/$(am__dirstamp) \
+	services/$(DEPDIR)/$(am__dirstamp)
+services/SnnRouteProvider.lo: services/$(am__dirstamp) \
+	services/$(DEPDIR)/$(am__dirstamp)
+services/WeightAccessor.lo: services/$(am__dirstamp) \
+	services/$(DEPDIR)/$(am__dirstamp)
+services/WeightCacheOps.lo: services/$(am__dirstamp) \
+	services/$(DEPDIR)/$(am__dirstamp)
 
 libSnnDL.la: $(libSnnDL_la_OBJECTS) $(libSnnDL_la_DEPENDENCIES) $(EXTRA_libSnnDL_la_DEPENDENCIES) 
 	$(AM_V_CXXLD)$(libSnnDL_la_LINK) -rpath $(compdir) $(libSnnDL_la_OBJECTS) $(libSnnDL_la_LIBADD) $(LIBS)
 
 mostlyclean-compile:
 	-rm -f *.$(OBJEXT)
+	-rm -f components/*.$(OBJEXT)
+	-rm -f components/*.lo
+	-rm -f components/mpi/*.$(OBJEXT)
+	-rm -f components/mpi/*.lo
+	-rm -f compute/*.$(OBJEXT)
+	-rm -f compute/*.lo
+	-rm -f control/*.$(OBJEXT)
+	-rm -f control/*.lo
+	-rm -f events/*.$(OBJEXT)
+	-rm -f events/*.lo
+	-rm -f services/*.$(OBJEXT)
+	-rm -f services/*.lo
 
 distclean-compile:
 	-rm -f *.tab.c
 
-@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/GasPhaseController.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/GatherBufferIF.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/GatingPE.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/MPIMultiCorePE.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/MPITypes.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/MemKCalBench.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/MultiCorePE.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/OptimizedInternalRing.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/SimpleNetworkWrapper.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/SimpleTestEvent.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/SnnBcsrWeightManager.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/SnnNIC.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/SnnNetworkAdapter.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/SnnPE.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/SnnPESubComponent.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/SpikeEventWrapper.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/SpikeSource.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/WeightLoader.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@components/$(DEPDIR)/GatherBufferIF.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@components/$(DEPDIR)/GatingPE.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@components/$(DEPDIR)/MemKCalBench.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@components/$(DEPDIR)/MultiCorePE.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@components/$(DEPDIR)/SnnNIC.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@components/$(DEPDIR)/SnnPE.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@components/$(DEPDIR)/SpikeSource.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@components/$(DEPDIR)/WeightLoader.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@components/mpi/$(DEPDIR)/MPIMultiCorePE.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@components/mpi/$(DEPDIR)/MPITypes.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@compute/$(DEPDIR)/SnnComputeCore.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@compute/$(DEPDIR)/SnnCoreEngine.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@compute/$(DEPDIR)/SnnLearningCore.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@compute/$(DEPDIR)/SnnWeightDiagnostics.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@control/$(DEPDIR)/SnnPEApplyScatter.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@control/$(DEPDIR)/SnnPEOrchestrators.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@control/$(DEPDIR)/SnnPESubComponent.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@control/$(DEPDIR)/SnnPESubComponent_bcsr.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@control/$(DEPDIR)/SnnPESubComponent_mem.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@control/$(DEPDIR)/SnnPESubComponent_routing.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@control/$(DEPDIR)/SnnPESubComponent_scheme1.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@control/$(DEPDIR)/SnnPESubComponent_spike.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@control/$(DEPDIR)/StageEventHub.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@events/$(DEPDIR)/SimpleTestEvent.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@events/$(DEPDIR)/SpikeEventWrapper.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@services/$(DEPDIR)/AccumulatorOps.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@services/$(DEPDIR)/GasEdgeCollector.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@services/$(DEPDIR)/GasPhaseController.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@services/$(DEPDIR)/OptimizedInternalRing.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@services/$(DEPDIR)/ReadOrchestrator.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@services/$(DEPDIR)/SimpleNetworkWrapper.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@services/$(DEPDIR)/SnnBcsrWeightManager.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@services/$(DEPDIR)/SnnNetworkAdapter.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@services/$(DEPDIR)/SnnRouteProvider.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@services/$(DEPDIR)/WeightAccessor.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@services/$(DEPDIR)/WeightCacheOps.Plo@am__quote@ # am--include-marker
 
 $(am__depfiles_remade):
 	@$(MKDIR_P) $(@D)
@@ -691,6 +938,12 @@ mostlyclean-libtool:
 
 clean-libtool:
 	-rm -rf .libs _libs
+	-rm -rf components/.libs components/_libs
+	-rm -rf components/mpi/.libs components/mpi/_libs
+	-rm -rf compute/.libs compute/_libs
+	-rm -rf control/.libs control/_libs
+	-rm -rf events/.libs events/_libs
+	-rm -rf services/.libs services/_libs
 snippets-local: 
 
 ID: $(am__tagged_files)
@@ -810,6 +1063,18 @@ clean-generic:
 distclean-generic:
 	-test -z "$(CONFIG_CLEAN_FILES)" || rm -f $(CONFIG_CLEAN_FILES)
 	-test . = "$(srcdir)" || test -z "$(CONFIG_CLEAN_VPATH_FILES)" || rm -f $(CONFIG_CLEAN_VPATH_FILES)
+	-rm -f components/$(DEPDIR)/$(am__dirstamp)
+	-rm -f components/$(am__dirstamp)
+	-rm -f components/mpi/$(DEPDIR)/$(am__dirstamp)
+	-rm -f components/mpi/$(am__dirstamp)
+	-rm -f compute/$(DEPDIR)/$(am__dirstamp)
+	-rm -f compute/$(am__dirstamp)
+	-rm -f control/$(DEPDIR)/$(am__dirstamp)
+	-rm -f control/$(am__dirstamp)
+	-rm -f events/$(DEPDIR)/$(am__dirstamp)
+	-rm -f events/$(am__dirstamp)
+	-rm -f services/$(DEPDIR)/$(am__dirstamp)
+	-rm -f services/$(am__dirstamp)
 
 maintainer-clean-generic:
 	@echo "This command is intended for maintainers to use"
@@ -820,24 +1085,42 @@ clean-am: clean-compLTLIBRARIES clean-generic clean-libtool \
 	mostlyclean-am
 
 distclean: distclean-am
-		-rm -f ./$(DEPDIR)/GasPhaseController.Plo
-	-rm -f ./$(DEPDIR)/GatherBufferIF.Plo
-	-rm -f ./$(DEPDIR)/GatingPE.Plo
-	-rm -f ./$(DEPDIR)/MPIMultiCorePE.Plo
-	-rm -f ./$(DEPDIR)/MPITypes.Plo
-	-rm -f ./$(DEPDIR)/MemKCalBench.Plo
-	-rm -f ./$(DEPDIR)/MultiCorePE.Plo
-	-rm -f ./$(DEPDIR)/OptimizedInternalRing.Plo
-	-rm -f ./$(DEPDIR)/SimpleNetworkWrapper.Plo
-	-rm -f ./$(DEPDIR)/SimpleTestEvent.Plo
-	-rm -f ./$(DEPDIR)/SnnBcsrWeightManager.Plo
-	-rm -f ./$(DEPDIR)/SnnNIC.Plo
-	-rm -f ./$(DEPDIR)/SnnNetworkAdapter.Plo
-	-rm -f ./$(DEPDIR)/SnnPE.Plo
-	-rm -f ./$(DEPDIR)/SnnPESubComponent.Plo
-	-rm -f ./$(DEPDIR)/SpikeEventWrapper.Plo
-	-rm -f ./$(DEPDIR)/SpikeSource.Plo
-	-rm -f ./$(DEPDIR)/WeightLoader.Plo
+		-rm -f components/$(DEPDIR)/GatherBufferIF.Plo
+	-rm -f components/$(DEPDIR)/GatingPE.Plo
+	-rm -f components/$(DEPDIR)/MemKCalBench.Plo
+	-rm -f components/$(DEPDIR)/MultiCorePE.Plo
+	-rm -f components/$(DEPDIR)/SnnNIC.Plo
+	-rm -f components/$(DEPDIR)/SnnPE.Plo
+	-rm -f components/$(DEPDIR)/SpikeSource.Plo
+	-rm -f components/$(DEPDIR)/WeightLoader.Plo
+	-rm -f components/mpi/$(DEPDIR)/MPIMultiCorePE.Plo
+	-rm -f components/mpi/$(DEPDIR)/MPITypes.Plo
+	-rm -f compute/$(DEPDIR)/SnnComputeCore.Plo
+	-rm -f compute/$(DEPDIR)/SnnCoreEngine.Plo
+	-rm -f compute/$(DEPDIR)/SnnLearningCore.Plo
+	-rm -f compute/$(DEPDIR)/SnnWeightDiagnostics.Plo
+	-rm -f control/$(DEPDIR)/SnnPEApplyScatter.Plo
+	-rm -f control/$(DEPDIR)/SnnPEOrchestrators.Plo
+	-rm -f control/$(DEPDIR)/SnnPESubComponent.Plo
+	-rm -f control/$(DEPDIR)/SnnPESubComponent_bcsr.Plo
+	-rm -f control/$(DEPDIR)/SnnPESubComponent_mem.Plo
+	-rm -f control/$(DEPDIR)/SnnPESubComponent_routing.Plo
+	-rm -f control/$(DEPDIR)/SnnPESubComponent_scheme1.Plo
+	-rm -f control/$(DEPDIR)/SnnPESubComponent_spike.Plo
+	-rm -f control/$(DEPDIR)/StageEventHub.Plo
+	-rm -f events/$(DEPDIR)/SimpleTestEvent.Plo
+	-rm -f events/$(DEPDIR)/SpikeEventWrapper.Plo
+	-rm -f services/$(DEPDIR)/AccumulatorOps.Plo
+	-rm -f services/$(DEPDIR)/GasEdgeCollector.Plo
+	-rm -f services/$(DEPDIR)/GasPhaseController.Plo
+	-rm -f services/$(DEPDIR)/OptimizedInternalRing.Plo
+	-rm -f services/$(DEPDIR)/ReadOrchestrator.Plo
+	-rm -f services/$(DEPDIR)/SimpleNetworkWrapper.Plo
+	-rm -f services/$(DEPDIR)/SnnBcsrWeightManager.Plo
+	-rm -f services/$(DEPDIR)/SnnNetworkAdapter.Plo
+	-rm -f services/$(DEPDIR)/SnnRouteProvider.Plo
+	-rm -f services/$(DEPDIR)/WeightAccessor.Plo
+	-rm -f services/$(DEPDIR)/WeightCacheOps.Plo
 	-rm -f Makefile
 distclean-am: clean-am distclean-compile distclean-generic \
 	distclean-tags
@@ -883,24 +1166,42 @@ install-ps-am:
 installcheck-am:
 
 maintainer-clean: maintainer-clean-am
-		-rm -f ./$(DEPDIR)/GasPhaseController.Plo
-	-rm -f ./$(DEPDIR)/GatherBufferIF.Plo
-	-rm -f ./$(DEPDIR)/GatingPE.Plo
-	-rm -f ./$(DEPDIR)/MPIMultiCorePE.Plo
-	-rm -f ./$(DEPDIR)/MPITypes.Plo
-	-rm -f ./$(DEPDIR)/MemKCalBench.Plo
-	-rm -f ./$(DEPDIR)/MultiCorePE.Plo
-	-rm -f ./$(DEPDIR)/OptimizedInternalRing.Plo
-	-rm -f ./$(DEPDIR)/SimpleNetworkWrapper.Plo
-	-rm -f ./$(DEPDIR)/SimpleTestEvent.Plo
-	-rm -f ./$(DEPDIR)/SnnBcsrWeightManager.Plo
-	-rm -f ./$(DEPDIR)/SnnNIC.Plo
-	-rm -f ./$(DEPDIR)/SnnNetworkAdapter.Plo
-	-rm -f ./$(DEPDIR)/SnnPE.Plo
-	-rm -f ./$(DEPDIR)/SnnPESubComponent.Plo
-	-rm -f ./$(DEPDIR)/SpikeEventWrapper.Plo
-	-rm -f ./$(DEPDIR)/SpikeSource.Plo
-	-rm -f ./$(DEPDIR)/WeightLoader.Plo
+		-rm -f components/$(DEPDIR)/GatherBufferIF.Plo
+	-rm -f components/$(DEPDIR)/GatingPE.Plo
+	-rm -f components/$(DEPDIR)/MemKCalBench.Plo
+	-rm -f components/$(DEPDIR)/MultiCorePE.Plo
+	-rm -f components/$(DEPDIR)/SnnNIC.Plo
+	-rm -f components/$(DEPDIR)/SnnPE.Plo
+	-rm -f components/$(DEPDIR)/SpikeSource.Plo
+	-rm -f components/$(DEPDIR)/WeightLoader.Plo
+	-rm -f components/mpi/$(DEPDIR)/MPIMultiCorePE.Plo
+	-rm -f components/mpi/$(DEPDIR)/MPITypes.Plo
+	-rm -f compute/$(DEPDIR)/SnnComputeCore.Plo
+	-rm -f compute/$(DEPDIR)/SnnCoreEngine.Plo
+	-rm -f compute/$(DEPDIR)/SnnLearningCore.Plo
+	-rm -f compute/$(DEPDIR)/SnnWeightDiagnostics.Plo
+	-rm -f control/$(DEPDIR)/SnnPEApplyScatter.Plo
+	-rm -f control/$(DEPDIR)/SnnPEOrchestrators.Plo
+	-rm -f control/$(DEPDIR)/SnnPESubComponent.Plo
+	-rm -f control/$(DEPDIR)/SnnPESubComponent_bcsr.Plo
+	-rm -f control/$(DEPDIR)/SnnPESubComponent_mem.Plo
+	-rm -f control/$(DEPDIR)/SnnPESubComponent_routing.Plo
+	-rm -f control/$(DEPDIR)/SnnPESubComponent_scheme1.Plo
+	-rm -f control/$(DEPDIR)/SnnPESubComponent_spike.Plo
+	-rm -f control/$(DEPDIR)/StageEventHub.Plo
+	-rm -f events/$(DEPDIR)/SimpleTestEvent.Plo
+	-rm -f events/$(DEPDIR)/SpikeEventWrapper.Plo
+	-rm -f services/$(DEPDIR)/AccumulatorOps.Plo
+	-rm -f services/$(DEPDIR)/GasEdgeCollector.Plo
+	-rm -f services/$(DEPDIR)/GasPhaseController.Plo
+	-rm -f services/$(DEPDIR)/OptimizedInternalRing.Plo
+	-rm -f services/$(DEPDIR)/ReadOrchestrator.Plo
+	-rm -f services/$(DEPDIR)/SimpleNetworkWrapper.Plo
+	-rm -f services/$(DEPDIR)/SnnBcsrWeightManager.Plo
+	-rm -f services/$(DEPDIR)/SnnNetworkAdapter.Plo
+	-rm -f services/$(DEPDIR)/SnnRouteProvider.Plo
+	-rm -f services/$(DEPDIR)/WeightAccessor.Plo
+	-rm -f services/$(DEPDIR)/WeightCacheOps.Plo
 	-rm -f Makefile
 maintainer-clean-am: distclean-am maintainer-clean-generic
 

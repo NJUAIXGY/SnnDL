@@ -1,0 +1,542 @@
+#include "SnnComputeCore.h"
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <fstream>
+#include <sstream>
+
+namespace SST { namespace SnnDL {
+
+std::unique_ptr<ISnnComputeCore> createComputeCoreByName(const std::string& name) {
+    if (name.empty() || name == "default" || name == "snn") {
+        return std::make_unique<DefaultSnnComputeCore>();
+    }
+    return nullptr;
+}
+
+ComputeCoreCapabilities DefaultSnnComputeCore::getCapabilities() const {
+    ComputeCoreCapabilities caps;
+    caps.needs_weight_cache = true;
+    caps.supports_gating = true;
+    caps.requires_window_scatter = false;
+    caps.supports_learning = (learning_core_ != nullptr);
+    caps.uses_synaptic_events = false;
+    return caps;
+}
+
+void DefaultSnnComputeCore::configure(const ComputeCoreContext& ctx, const SST::Params& params) {
+    ctx_ = ctx;
+    output_ = ctx.log;
+    weight_reader_ = ctx.weight_reader;
+    core_engine_ = SnnCoreEngine();
+
+    // 基础参数
+    num_neurons_ = ctx.num_neurons;
+    global_neuron_base_ = ctx.global_neuron_base;
+    neurons_per_pe_cfg_ = ctx.neurons_per_pe_cfg ? ctx.neurons_per_pe_cfg : (ctx.num_neurons *  ctx.num_neurons ? 1 : 0); // fallback
+    v_thresh_ = params.find<float>("v_thresh", 1.0f);
+    v_reset_ = params.find<float>("v_reset", 0.0f);
+    v_rest_ = params.find<float>("v_rest", 0.0f);
+    tau_mem_ = params.find<float>("tau_mem", 20.0f);
+    t_ref_ = params.find<uint32_t>("t_ref", 2);
+    dt_ms_ = 1.0f;
+
+    // 可选神经模型（与 SnnPE 行为保持一致）
+    {
+        std::string model_name = params.find<std::string>("neuron_model", "LIF");
+        NeuronModelType model_type = parseNeuronModel(model_name);
+        neuron_model_ = createNeuronModel(model_type);
+        if (neuron_model_) {
+            ModelConfig mcfg = buildModelConfigFromParams(params);
+            dt_ms_ = mcfg.dt_ms;
+            neuron_model_->init(num_neurons_, mcfg, params);
+            if (output_) {
+                output_->verbose(CALL_INFO, 1, 0,
+                    "[core-model] core=%u model=%s dt=%.3fms\n",
+                    ctx_.core_id, model_name.c_str(), (double)dt_ms_);
+            }
+        }
+    }
+
+    use_soa_state_ = params.find<int>("use_soa_neuron_state", 0) != 0;
+    use_aosoa_state_ = params.find<int>("use_aosoa_neuron_state", 0) != 0;
+    // 兼容旧默认：未显式传入时（或传0）先暂存为0，待解析 BCSR 后再回填
+    aosoa_block_rows_ = params.find<uint32_t>("aosoa_block_rows", 0);
+    if (use_aosoa_state_) use_soa_state_ = true;
+
+    apply_acc_enable_ = params.find<int>("apply_acc_enable", 0) != 0;
+    gas_window_mode_ = params.find<int>("gas_window_mode", 0) != 0;
+    window_read_debug_ = params.find<int>("window_read_debug", 0) != 0;
+    window_read_budget_ = params.find<uint32_t>("window_read_budget", 1024);
+    max_outstanding_requests_ = params.find<uint32_t>("max_outstanding_requests", 16);
+    line_size_bytes_ = params.find<uint32_t>("line_size_bytes", 64);
+    weights_cols_ = params.find<uint32_t>("weights_cols", 0);
+    if (weights_cols_ == 0) weights_cols_ = num_neurons_;
+    use_post_row_pre_col_ = params.find<std::string>("index_mode", "pre_row_post_col") == "post_row_pre_col";
+
+    init_default_weight_ = params.find<float>("init_default_weight", 0.5f);
+    readresp_zero_fallback_ = params.find<int>("readresp_zero_fallback", 0) != 0;
+    memory_warmup_cycles_ = params.find<uint64_t>("memory_warmup_cycles", 1000);
+    loader_barrier_cycles_ = params.find<uint64_t>("loader_barrier_cycles", 0);
+
+    // 验证参数
+    verify_weights_ = params.find<int>("verify_weights", 0) != 0;
+    verify_against_file_ = params.find<int>("verify_against_file", 0) != 0;
+    verify_cluster_enable_ = params.find<int>("verify_cluster_enable", 0) != 0;
+    verify_log_each_sample_ = params.find<int>("verify_log_each_sample", 0) != 0;
+    expected_weight_value_ = params.find<float>("expected_weight_value", 0.0f);
+    verify_epsilon_ = params.find<float>("verify_epsilon", 1e-4f);
+    weight_verify_samples_ = params.find<uint32_t>("weight_verify_samples", 16);
+    verify_file_template_ = params.find<std::string>("verify_file_template", "");
+
+    // BCSR
+    use_bcsr_ = params.find<std::string>("index_mode", "pre_row_post_col") == "bcsr_post_row";
+    bcsr_br_ = params.find<uint32_t>("bcsr_block_rows", 16);
+    bcsr_bc_ = params.find<uint32_t>("bcsr_block_cols", 16);
+    bcsr_val_bytes_ = params.find<uint32_t>("bcsr_val_bytes", 4);
+    bcsr_idx_bytes_ = params.find<uint32_t>("bcsr_idx_bytes", 2);
+    bcsr_force_file_read_ = params.find<int>("bcsr_force_file_read", 0) != 0;
+    bcsr_row_index_cache_cap_ = params.find<uint32_t>("bcsr_row_index_cache_cap", 64);
+    bcsr_block_cache_cap_ = params.find<uint32_t>("bcsr_block_cache_cap", 256);
+    bcsr_prefetch_all_ = params.find<int>("bcsr_prefetch_all", 0) != 0;
+
+	    if (aosoa_block_rows_ == 0) {
+	        // 若启用 BCSR，则默认跟随其 block_rows；否则回退 16（与旧 SnnPESubComponent 行为一致）
+	        aosoa_block_rows_ = (use_bcsr_ && bcsr_br_ > 0) ? bcsr_br_ : 16;
+	    }
+
+	    // 学习核心初始化（独立 LearningCore，便于后续替换算法）
+	    if (!learning_core_) {
+	        learning_core_ = std::make_unique<DefaultLearningCore>();
+	    }
+	    if (learning_core_) {
+	        learning_core_->configure(ctx_.core_id, ctx_.node_id,
+	                                  num_neurons_, global_neuron_base_,
+	                                  weights_cols_, use_post_row_pre_col_,
+	                                  v_thresh_, output_, params,
+	                                  ctx.writeback_fn);
+	    }
+
+	    // 初始化状态
+	    initCoreEngineState_();
+	    initVerifyFile_();
+    prepareBcsrCaches_();
+}
+
+void DefaultSnnComputeCore::initCoreEngineState_() {
+    SnnCoreConfig cfg;
+    cfg.num_neurons = num_neurons_;
+    cfg.v_thresh = v_thresh_;
+    cfg.v_reset = v_reset_;
+    cfg.v_rest = v_rest_;
+    cfg.tau_mem = tau_mem_;
+    cfg.t_ref = t_ref_;
+    cfg.use_soa_state = use_soa_state_;
+    cfg.use_aosoa_state = use_aosoa_state_;
+    cfg.aosoa_block_rows = aosoa_block_rows_;
+    core_engine_.configure(cfg);
+
+    if (use_soa_state_) {
+        soa_v_mem_.assign(num_neurons_, v_rest_);
+        soa_refrac_.assign(num_neurons_, 0);
+        soa_last_spike_.assign(num_neurons_, 0);
+        neuron_states_.clear();
+        core_engine_.bindState(nullptr, &soa_v_mem_, &soa_refrac_, &soa_last_spike_);
+    } else {
+        neuron_states_.assign(num_neurons_, SnnCoreNeuronState(v_rest_));
+        soa_v_mem_.clear();
+        soa_refrac_.clear();
+        soa_last_spike_.clear();
+        core_engine_.bindState(&neuron_states_, nullptr, nullptr, nullptr);
+    }
+    fired_this_window_.assign(num_neurons_, 0);
+}
+
+void DefaultSnnComputeCore::initVerifyFile_() {
+    verify_file_loaded_ = false;
+    verify_file_buf_.clear();
+    if (!(verify_against_file_ && !verify_file_template_.empty())) return;
+    std::string path = verify_file_template_;
+    {
+        size_t pos = path.find("{pe:02d}");
+        if (pos != std::string::npos) {
+            char buf[16]; std::snprintf(buf, sizeof(buf), "%02u", ctx_.node_id);
+            path.replace(pos, 8, buf);
+        } else {
+            pos = path.find("{pe}");
+            if (pos != std::string::npos) path.replace(pos, 4, std::to_string(ctx_.node_id));
+        }
+    }
+    std::ifstream fin(path, std::ios::binary);
+    if (!fin.good()) return;
+    fin.seekg(0, std::ios::end);
+    std::streamsize bytes = fin.tellg();
+    fin.seekg(0, std::ios::beg);
+    if (bytes > 0 && (bytes % sizeof(float) == 0)) {
+        size_t count = static_cast<size_t>(bytes / sizeof(float));
+        verify_file_buf_.resize(count);
+        fin.read(reinterpret_cast<char*>(verify_file_buf_.data()), bytes);
+        verify_file_loaded_ = true;
+    }
+}
+
+void DefaultSnnComputeCore::prepareBcsrCaches_() {
+    bcsr_row_index_cache_.clear();
+    bcsr_row_index_lru_.clear();
+    bcsr_block_cache_.clear();
+    bcsr_block_lru_.clear();
+}
+
+void DefaultSnnComputeCore::onInit(unsigned int) {}
+void DefaultSnnComputeCore::onSetup() {}
+void DefaultSnnComputeCore::onFinish() {}
+
+void DefaultSnnComputeCore::onClockTick(uint64_t now_cycle) {
+    total_cycles_++;
+    if (hasWork()) active_cycles_++;
+    performWeightVerificationTick_(now_cycle);
+    performBcsrProbeTick_(now_cycle);
+    if (learning_core_) learning_core_->onClockTick(now_cycle);
+}
+
+void DefaultSnnComputeCore::endCycle(uint64_t now_cycle) {
+    // 推进动力学
+    updateNeuronStates();
+    // 按当前窗口/阶段门控判定发放，复用 fire() 以保持旧语义
+    for (uint32_t i = 0; i < num_neurons_; ++i) {
+        float v_before = 0.0f, v_after = 0.0f;
+        fire(i, now_cycle, neuron_model_.get(), v_before, v_after);
+    }
+}
+
+void DefaultSnnComputeCore::endCycleCandidates(uint64_t now_cycle,
+                                               const std::vector<uint32_t>& candidates) {
+    // 与 endCycle() 保持一致的“先推进动力学，再判定发放”顺序。
+    // candidates 允许控制层在 window/scatter 场景下仅检查触达的 post 集合。
+    updateNeuronStates();
+
+    if (candidates.empty()) return;
+
+    std::vector<uint32_t> uniq = candidates;
+    std::sort(uniq.begin(), uniq.end());
+    uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
+
+    for (uint32_t idx : uniq) {
+        if (idx >= num_neurons_) continue;
+        float v_before = 0.0f, v_after = 0.0f;
+        fire(idx, now_cycle, neuron_model_.get(), v_before, v_after);
+    }
+}
+
+void DefaultSnnComputeCore::drainOutputs(std::vector<FireEvent>& out, bool clear) {
+    out.insert(out.end(), fired_events_window_.begin(), fired_events_window_.end());
+    if (clear) fired_events_window_.clear();
+}
+
+bool DefaultSnnComputeCore::shouldAcceptSynapticInput(uint32_t post_local, uint64_t now_cycle) const {
+    (void)now_cycle;
+    if (post_local >= num_neurons_) return false;
+    // 与 onSynapticEvent() 的门控口径保持一致：不应期期间丢弃突触输入。
+    return core_engine_.getRefrac(post_local) == 0;
+}
+
+void DefaultSnnComputeCore::applySynapticDelta(uint32_t post_local, float dv) {
+    synaptic_accesses_count_++;
+    core_engine_.addMem(post_local, dv);
+}
+
+void DefaultSnnComputeCore::onSynapticEvent(const SynapticEvent& ev) {
+    if (ev.post_local >= num_neurons_) return;
+    // 保持旧 SnnPESubComponent 语义：目标神经元处于不应期时，忽略本次突触输入。
+    // 注意：Scatter 阶段的窗口累加使用 applySynapticDelta()，不受此门控影响。
+    if (core_engine_.getRefrac(ev.post_local) > 0) return;
+    if (neuron_model_ && neuron_model_->useAccumulator()) {
+        // 累加到模型内部 I_syn，膜电位在 tickIdx 中更新
+        synaptic_accesses_count_++;
+        neuron_model_->accumulateISyn(ev.post_local, ev.weight);
+        // accumulator 模式下不做在线梯度（保持旧行为：apply_acc_enable_ 路径不会进入此处）
+        return;
+    }
+    // 默认实现：直接累加到膜电位
+    applySynapticDelta(ev.post_local, ev.weight);
+
+    if (learning_core_ && learning_core_->enabled()) {
+        LearningSynapticEvent lev;
+        lev.pre_global = ev.pre_global;
+        lev.post_local = ev.post_local;
+        lev.v_after = core_engine_.getMem(ev.post_local);
+        learning_core_->onSynapticEvent(lev);
+    }
+}
+
+void DefaultSnnComputeCore::updateNeuronStates() {
+    cycles_update_neuron_count_ += num_neurons_;
+    if (neuron_model_) {
+        if (use_soa_state_) {
+            for (uint32_t i = 0; i < num_neurons_; ++i) {
+                neuron_model_->tickIdx(i, soa_v_mem_[i], soa_refrac_[i]);
+            }
+        } else {
+            for (uint32_t i = 0; i < num_neurons_; ++i) {
+                neuron_model_->tickIdx(i, neuron_states_[i].v_mem, neuron_states_[i].refractory_timer);
+            }
+        }
+        return;
+    }
+    core_engine_.updateNeuronStates();
+}
+
+void DefaultSnnComputeCore::clearFiredWindow() {
+    if (fired_this_window_.empty()) return;
+    std::fill(fired_this_window_.begin(), fired_this_window_.end(), 0);
+}
+
+void DefaultSnnComputeCore::getFiredEvents(std::vector<FireEvent>& out, bool clear) {
+    out.insert(out.end(), fired_events_window_.begin(), fired_events_window_.end());
+    if (clear) fired_events_window_.clear();
+}
+
+bool DefaultSnnComputeCore::wasFiredThisWindow(uint32_t idx) const {
+    if (idx >= fired_this_window_.size()) return false;
+    return fired_this_window_[idx] != 0;
+}
+
+void DefaultSnnComputeCore::markFiredThisWindow(uint32_t idx) {
+    if (idx >= fired_this_window_.size()) return;
+    fired_this_window_[idx] = 1;
+}
+
+void DefaultSnnComputeCore::onLearningEvent(const LearningEvent& ev) {
+    (void)ev; // 默认实现留空；学习核心可在此处理误差信号
+}
+
+bool DefaultSnnComputeCore::fire(uint32_t idx, uint64_t now_cycles, INeuronModel* model,
+                                 float& v_before, float& v_after) {
+    if (apply_acc_enable_ && gas_window_mode_) {
+        if (gas_stage_ != GasStage::Scatter) return false;
+        if (idx < fired_this_window_.size() && fired_this_window_[idx]) return false;
+    }
+    INeuronModel* use_model = model ? model : neuron_model_.get();
+    bool fired = core_engine_.fire(idx, now_cycles, use_model, v_before, v_after);
+    if (fired && apply_acc_enable_ && gas_window_mode_ && idx < fired_this_window_.size()) {
+        fired_this_window_[idx] = 1;
+    }
+    if (fired) {
+        neurons_fired_count_++;
+        spikes_generated_count_++;
+        fired_events_window_.push_back(FireEvent{idx, v_before, v_after});
+        if (learning_core_ && learning_core_->enabled()) {
+            learning_core_->onNeuronFired(idx, now_cycles, v_before);
+        }
+    }
+    return fired;
+}
+
+bool DefaultSnnComputeCore::readNeuronState(uint32_t idx, NeuronStateSnapshot& out) const {
+    if (idx >= num_neurons_) return false;
+    out.v_mem = core_engine_.getMem(idx);
+    out.refractory = core_engine_.getRefrac(idx);
+    out.last_spike = core_engine_.getLastSpike(idx);
+    return true;
+}
+
+void DefaultSnnComputeCore::writeNeuronState(uint32_t idx, const NeuronStateSnapshot& st) {
+    if (idx >= num_neurons_) return;
+    core_engine_.setMem(idx, st.v_mem);
+    core_engine_.setRefrac(idx, st.refractory);
+    core_engine_.setLastSpike(idx, st.last_spike);
+}
+
+bool DefaultSnnComputeCore::requestWeight(uint32_t pre, uint32_t post,
+                       const std::function<void(float)>& cb) {
+    if (!weight_reader_) return false;
+    weight_reader_->requestDense(pre, post, [this, cb](float w){
+        if (cb) cb(w);
+    });
+    return true;
+}
+
+bool DefaultSnnComputeCore::requestWeightBCSR(uint32_t pre, uint32_t post,
+                           const std::function<void(float)>& cb) {
+    if (!weight_reader_) return false;
+    weight_reader_->requestBCSR(pre, post, [this, cb](float w){
+        if (cb) cb(w);
+    });
+    return true;
+}
+
+bool DefaultSnnComputeCore::weightCacheTryGet(uint64_t key, float& out) const {
+    if (!weight_reader_) return false;
+    bool hit = weight_reader_->tryCache(key, out);
+    if (hit) {
+        const_cast<DefaultSnnComputeCore*>(this)->weight_cache_hits_++;
+    } else {
+        const_cast<DefaultSnnComputeCore*>(this)->weight_cache_misses_++;
+    }
+    return hit;
+}
+
+void DefaultSnnComputeCore::weightCacheStore(uint64_t key, float v) {
+    if (!weight_reader_) return;
+    weight_reader_->putCache(key, v);
+}
+
+bool DefaultSnnComputeCore::resolveWeightKey(uint32_t, uint32_t,
+                          uint32_t& req_pre, uint32_t& req_post,
+                          uint64_t& cache_key) const {
+    // 默认实现交由上层 WeightAccessor；此处返回 false 表示沿用旧路径
+    req_pre = req_post = 0;
+    cache_key = 0;
+    return false;
+}
+
+void DefaultSnnComputeCore::onStageBeginGather(uint32_t seq) {
+    gas_stage_ = GasStage::Gather;
+    curr_stage_seq_ = seq;
+    std::fill(fired_this_window_.begin(), fired_this_window_.end(), 0);
+    window_spikes_all_ = 0;
+    fire_gate_active_ = apply_acc_enable_ && gas_window_mode_;
+}
+
+void DefaultSnnComputeCore::onStageBeginApply(uint32_t seq) {
+    gas_stage_ = GasStage::Apply;
+    curr_stage_seq_ = seq;
+}
+
+void DefaultSnnComputeCore::onStageEndApply(uint32_t) {
+    // stats already collected elsewhere; placeholder
+}
+
+void DefaultSnnComputeCore::onStageBeginScatter(uint32_t seq) {
+    gas_stage_ = GasStage::Scatter;
+    curr_stage_seq_ = seq;
+    fire_gate_active_ = apply_acc_enable_ && gas_window_mode_;
+    if (fired_this_window_.size() != num_neurons_) {
+        fired_this_window_.assign(num_neurons_, 0);
+    } else {
+        std::fill(fired_this_window_.begin(), fired_this_window_.end(), 0);
+    }
+    fired_events_window_.clear();
+    spikes_generated_base_ = 0; // caller可按需设置
+}
+
+void DefaultSnnComputeCore::onStageEndScatter(uint32_t, uint64_t) {
+    gas_stage_ = GasStage::Idle;
+    fire_gate_active_ = false;
+    fired_events_window_.clear();
+}
+
+void DefaultSnnComputeCore::onSpikeDelivered(SpikeEvent* spike) {
+    // 控制层已维护 window-read 集合；默认核心无需处理 spike 到达事件
+    (void)spike;
+}
+
+bool DefaultSnnComputeCore::hasWork() const {
+    if (use_soa_state_) {
+        return std::any_of(soa_v_mem_.begin(), soa_v_mem_.end(), [](float v){ return v > 0.1f; });
+    }
+    return std::any_of(neuron_states_.begin(), neuron_states_.end(),
+                      [](const SnnCoreNeuronState& state) { return state.v_mem > 0.1f; });
+}
+
+double DefaultSnnComputeCore::getUtilization() const {
+    if (total_cycles_ == 0) return 0.0;
+    return static_cast<double>(active_cycles_) / static_cast<double>(total_cycles_);
+}
+
+void DefaultSnnComputeCore::getStatistics(std::map<std::string, uint64_t>& out) const {
+    out["core_spikes_generated"] = spikes_generated_count_;
+    out["core_neurons_fired"] = neurons_fired_count_;
+    out["core_cycles_update_neuron"] = cycles_update_neuron_count_;
+    out["core_synaptic_accesses"] = synaptic_accesses_count_;
+    out["core_total_cycles"] = total_cycles_;
+    out["core_active_cycles"] = active_cycles_;
+    out["core_weight_cache_hits"] = weight_cache_hits_;
+    out["core_weight_cache_misses"] = weight_cache_misses_;
+    out["core_pending_reqs_peak"] = pending_reqs_peak_;
+    // 权重验证诊断（可选）：仅用于收尾/统计显示，不改变行为
+    out["core_verify_enabled"] = verify_weights_ ? 1ULL : 0ULL;
+    out["core_verify_completed"] = static_cast<uint64_t>(verify_completed_);
+    out["core_verify_mismatch_count"] = verify_mismatch_count_;
+    if (learning_core_) {
+        learning_core_->getStatistics(out);
+    }
+}
+
+void DefaultSnnComputeCore::resetMembraneState(float v_rest_value) {
+    core_engine_.resetMembrane(v_rest_value);
+    if (!fired_this_window_.empty()) {
+        std::fill(fired_this_window_.begin(), fired_this_window_.end(), 0);
+    }
+}
+
+void DefaultSnnComputeCore::performWeightVerificationTick_(uint64_t now_cycle) {
+    if (!(verify_weights_ && now_cycle >= memory_warmup_cycles_ &&
+          (loader_barrier_cycles_ == 0 || now_cycle >= loader_barrier_cycles_))) {
+        return;
+    }
+    if (!verify_started_) {
+        verify_started_ = true;
+        if (output_) output_->verbose(CALL_INFO, 3, 0, "🎯 核心%d权重验证启动: cycle=%" PRIu64 "\n", ctx_.core_id, now_cycle);
+    }
+    if (verify_completed_ >= weight_verify_samples_) return;
+    if (verify_requested_ - verify_completed_ >= max_outstanding_requests_) return;
+
+    uint32_t sample_idx = verify_requested_;
+    uint32_t row;
+    uint32_t col;
+    if (verify_cluster_enable_) {
+        uint32_t fpl = std::max<uint32_t>(1, line_size_bytes_ / (uint32_t)sizeof(float));
+        row = 0;
+        col = (sample_idx % fpl);
+    } else {
+        row = (sample_idx * 13) % num_neurons_;
+        col = use_post_row_pre_col_ ? ((sample_idx * 7) % std::max<uint32_t>(1, weights_cols_))
+                                     : ((sample_idx * 7) % num_neurons_);
+    }
+    uint32_t arg0 = use_post_row_pre_col_ ? col : row;
+    uint32_t arg1 = use_post_row_pre_col_ ? row : col;
+    if (!weight_reader_) return;
+    weight_reader_->requestDense(arg0, arg1, [this, row, col](float w){
+        verify_completed_++;
+        verify_sum_ += static_cast<double>(w);
+        bool mismatch = false;
+        if (verify_against_file_ && verify_file_loaded_) {
+            uint64_t idx = static_cast<uint64_t>(row) * static_cast<uint64_t>(weights_cols_) + static_cast<uint64_t>(col);
+            float expected = 0.0f;
+            if (idx < verify_file_buf_.size()) expected = verify_file_buf_[idx];
+            mismatch = (std::fabs(w - expected) > verify_epsilon_);
+        } else {
+            mismatch = (std::fabs(w - expected_weight_value_) > verify_epsilon_);
+        }
+        if (mismatch) verify_mismatch_count_++;
+    });
+    verify_requested_++;
+}
+
+void DefaultSnnComputeCore::performBcsrProbeTick_(uint64_t now_cycle) {
+    if (!(verify_weights_ && use_bcsr_ && bcsr_weights_.isRowptrReady() &&
+          now_cycle >= memory_warmup_cycles_ && (loader_barrier_cycles_ == 0 || now_cycle >= loader_barrier_cycles_))) {
+        return;
+    }
+    // 诊断路径保留，简化版本：只探针第一个 block 的一个元素
+    if (verify_bcsr_done_ || verify_bcsr_inflight_) return;
+    verify_bcsr_inflight_ = true;
+    uint32_t br = (bcsr_br_>0? bcsr_br_:16);
+    uint32_t bc = (bcsr_bc_>0? bcsr_bc_:16);
+    uint32_t post_local = verify_bcsr_post_local_;
+    uint32_t pre_global = verify_bcsr_block_resolved_ ? (verify_bcsr_block_col_ * bc + verify_bcsr_intra_col_) : verify_bcsr_intra_col_;
+    if (!weight_reader_) { verify_bcsr_inflight_ = false; return; }
+    weight_reader_->requestBCSR(pre_global, post_local, [this, post_local, pre_global](float w){
+        verify_completed_++;
+        verify_sum_ += static_cast<double>(w);
+        if (std::fabs(w) > verify_epsilon_) {
+            verify_bcsr_done_ = true;
+        } else {
+            verify_bcsr_intra_col_++;
+        }
+        verify_bcsr_inflight_ = false;
+    });
+}
+
+} } // namespace SST::SnnDL

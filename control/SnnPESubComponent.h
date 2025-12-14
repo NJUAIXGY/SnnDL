@@ -1,0 +1,836 @@
+#ifndef _H_SST_SNN_PE_SUBCOMPONENT
+#define _H_SST_SNN_PE_SUBCOMPONENT
+
+#include <sst/core/subcomponent.h>
+#include <sst/core/interfaces/stdMem.h>
+#include <sst/core/link.h>
+#include <sst/core/output.h>
+#include <sst/core/shared/sharedArray.h>
+#include <queue>
+#include <deque>
+#include <map>
+#include <list>
+#include <unordered_map>
+#include <unordered_set>
+#include <memory>
+#include <mutex>
+#include <functional>
+#include <utility>
+#include <string>
+#include <vector>
+#include "SpikeEvent.h"
+#include "SnnPEParentInterface.h"
+#include "SnnCoreAPI.h"
+#include "SnnProfiler.h"  // 轻量级性能分析（条件编译）
+#include "SnnBcsrWeightManager.h"
+#include "ISnnComputeCore.h"
+#include "AccumulatorOps.h"
+#include "WeightCacheOps.h"
+#include "StageEventHub.h"
+#include "SnnRouteProvider.h"
+#include "WeightAccessor.h"
+#include "WeightMemorySubsystem.h"
+#include "StandardMemBackend.h"
+#include "ISpikeTransport.h"
+#include "SpikeCommSubsystem.h"
+
+namespace SST {
+namespace SnnDL {
+
+// 通用 BCSR 无效 ID 标记（用于路由/稀疏解析）
+constexpr uint32_t BCSR_SENTINEL_ID = 0xFFFFFFFFu;
+
+class MultiCorePE; // forward declaration for parent cast
+class GatherBufferIF;
+struct GasOpData;
+class GasPhaseController;
+
+class SnnPESubComponent : public SnnCoreAPI {
+public:
+    SST_ELI_REGISTER_SUBCOMPONENT(
+        SnnPESubComponent,
+        "SnnDL",
+        "SnnPESubComponent",
+        SST_ELI_ELEMENT_VERSION(1, 0, 0),
+        "SNN Processing Element SubComponent",
+        SST::SnnDL::SnnPESubComponent
+    )
+
+    SST_ELI_DOCUMENT_PARAMS(
+        {"core_id", "ID of the core", ""},
+        {"compute_core_impl", "Compute core implementation name (default/snn)", "default"},
+        {"total_cores", "Total number of cores in the PE", "8"},
+        {"global_neuron_base", "Global base ID for neurons in this core", "0"},
+        {"num_neurons", "Number of neurons in this core", "64"},
+        {"v_thresh", "Neuron threshold voltage", "1.0"},
+        {"v_reset", "Neuron reset voltage", "0.0"},
+        {"v_rest", "Neuron resting voltage", "0.0"},
+        {"tau_mem", "Membrane time constant", "20.0"},
+        {"t_ref", "Refractory period in clock cycles", "2"},
+        {"base_addr", "Base address for weight fetching", "0"},
+        {"node_id", "Node ID of the parent PE", "0"},
+        {"verbose", "Verbosity level", "0"},
+        {"enable_weight_fetch", "Enable fetching weights from memory", "0"},
+        {"write_weights_on_init", "Write default weights to memory on init", "1"},
+        {"memory_warmup_cycles", "Cycles to wait before starting memory operations", "1000"},
+        {"init_default_weight", "Default weight value to initialize memory with", "0.5"},
+        {"max_outstanding_requests", "Maximum number of outstanding memory requests", "16"},
+        {"max_cache_entries", "Maximum number of entries in the weight cache", "65536"},
+        {"use_event_weight_fallback", "Use weight from spike event if memory fetch fails", "0"},
+        {"merge_read_cacheline", "Merge memory reads to cache line size", "1"},
+        {"merge_read_row", "Merge memory reads to a full row", "0"},
+        {"line_size_bytes", "Cache line size in bytes", "64"},
+        {"weights_cols", "Number of columns in weight matrix when using global read (post_row_pre_col)", "0"},
+        {"index_mode", "Indexing mode: pre_row_post_col (default) or post_row_pre_col", "pre_row_post_col"},
+        {"use_soa_neuron_state", "Use Structure-of-Arrays layout for neuron state (0=AoS,1=SoA)", "0"},
+        {"use_aosoa_neuron_state", "Use block-wise AoSoA iteration on top of SoA (0/1)", "0"},
+        {"aosoa_block_rows", "AoSoA block row width; defaults to bcsr_block_rows when unset", "0"},
+        {"verify_routing_weights", "Log and verify routing fanout against weight threshold (0/1)", "0"},
+        {"enable_detailed_map_log", "Enable detailed logging of neuron mapping", "0"},
+        {"route_summary_enable", "Enable one-shot route summary logging per core (0/1)", "0"},
+        {"verify_weights", "Enable weight verification", "0"},
+        {"weight_verify_samples", "Number of weight samples to verify", "16"},
+        {"expected_weight_value", "Expected weight value for verification", "0.0"},
+        {"verify_epsilon", "Epsilon for floating point comparison", "1e-4"},
+        {"verify_log_each_sample", "Log each weight sample for verification", "0"},
+        {"verify_against_file", "Verify weights by comparing memory reads against weight file (0/1)", "0"},
+        {"verify_file_template", "Template for per-PE weight files used for verification (e.g., .../classification_weights_pe_{pe}.bin)", ""},
+        {"quiet_finish_logs", "Suppress finish() console summaries (0/1)", "0"},
+        {"loader_done_key", "SharedArray key toggled by WeightLoader upon completion", ""},
+        // Profiling（可选）
+        {"enable_profiler", "Enable lightweight profiling for hot functions (0/1)", "0"},
+        {"profiler_csv_prefix", "CSV export prefix for profiler (e.g., outputs_large/<run>/profile_core)", ""},
+        // 路由模式（默认fixed：沿用内置层间映射；weight_driven：按权重文件驱动扇出）
+        {"routing_mode", "Routing mode: fixed (default) or weight_driven", "fixed"},
+        {"weights_template", "Template for per-PE weight files, e.g. .../classification_weights_pe_{pe}.bin", ""},
+        {"total_nodes", "Total number of PEs/nodes in the system", "16"},
+        {"routing_epsilon", "Threshold to treat a weight as non-zero when building routes", "1e-8"},
+        {"routing_topk", "Global top-K destinations per source (0=unlimited)", "0"},
+        {"routing_topk_per_pe", "Top-K destinations per destination-PE per source (0=unlimited)", "0"},
+        // 路由过滤：层间/同PE
+        {"route_exclude_self_pe", "Exclude routes targeting the same PE as source (0/1)", "0"},
+        {"route_layers_mask", "Allowed layer transitions, e.g. I>H1,H1>H2,H2>O", ""},
+        {"route_filter_warn", "Print prominent warning when route filters are enabled (0/1)", "1"},
+        {"readresp_zero_fallback", "When DRAM returns 0 for weight, fallback to init_default_weight (0/1)", "0"},
+        // === GAS Apply/Scatter (Phase-1, default off) ===
+        {"apply_acc_enable", "Enable Apply-side accumulation and Scatter-side fire (0/1)", "0"},
+        {"acc_high_watermark_bytes", "Accumulator high-watermark in bytes before spilling", "16777216"},
+        {"acc_spill_enable", "Enable spilling to per-window delta-log when HWM reached (0/1)", "1"},
+        {"stage_events_csv", "Optional path to write stage events (seq, begin/end, apply/scatter)", ""},
+        // === Online Gating (event-driven, default off) ===
+        {"gating_mode", "Gating mode: off|event (default off)", "off"},
+        {"gating_ttl_cycles", "TTL window (cycles) for gating decision validity", "1000"},
+        {"gating_scope", "Scope of event gating: inputs|all", "inputs"},
+        // 映射框架集成（默认关闭）
+        {"mapping_mode", "Mapping-driven routes: off (default) or edges_csv", "off"},
+        {"mapping_edges_file", "CSV file of edges: src_global,dst_global,weight(optional)", ""},
+        {"mapping_csv_has_header", "Edges CSV has header line (0/1)", "1"},
+        {"mapping_csv_separator", "Edges CSV separator (default ',')", ","},
+        {"mapping_assume_block_ids", "Assume global_id=pe*rows+row for PE inference (0/1)", "1"},
+        // === Supervised Learning (minimal, default off) ===
+        {"learning_enabled", "Enable supervised learning features (0/1)", "0"},
+        {"learn_window_cycles", "Learning window size in clock cycles", "1000"},
+        {"record_membrane", "Record membrane potentials (lightweight; 0/1)", "0"},
+        {"record_spike_times", "Record spike times for learning (0/1)", "1"},
+        {"surrogate_type", "Surrogate gradient type: superspike|sigmoid|piecewise", "superspike"},
+        {"surrogate_beta", "Surrogate gradient beta (steepness)", "5.0"},
+        {"error_file", "Per-core error file template (supports {node},{core})", ""},
+        {"grad_accum_limit", "Cap on gradient entries before pruning (0=unlimited)", "0"},
+        // === Writeback (Phase 3, default off) ===
+        {"apply_writeback", "Apply gradient updates to DRAM weights (0/1)", "0"},
+        {"apply_every_n_windows", "Apply updates every N learning windows", "1"},
+        {"learning_rate", "Learning rate for SGD updates", "0.001"},
+        {"weight_decay", "L2 weight decay coefficient (requires cached weight)", "0.0"},
+        // === Code-level memory optimizations (optional, default off) ===
+        {"use_clock_weight_cache", "Use clock/second-chance policy for weight cache (0/1)", "0"},
+        {"apply_dense_acc_enable", "Use dense-array accumulator for GAS Apply (0/1)", "1"},
+        {"bcsr_rowptr_file_fallback_enable", "Allow loading BCSR rowptrs from weight files if DRAM read fails", "0"},
+        {"enable_extended_diagnostics", "Enable extended diagnostics/logs (replaces SNNDL_DIAG_ENABLE)", "0"},
+        {"acc_shadow_verify_enable", "Enable shadow accumulator verification when dense accumulator is active (diagnostic)", "0"},
+        // 诊断：禁用权重缓存以强制触发内存读取
+        {"disable_weight_cache", "Disable weight cache to force memory reads (diagnostic)", "0"}
+        ,
+        // 严格GAS：在 BeginApply/Scatter 阶段按窗发起权重读取以填充缓存（不改变ΔV语义，由Scatter统一应用）
+        {"window_read_enable", "Issue window-scoped weight reads at BeginApply/Scatter (0/1)", "0"},
+        {"window_read_budget", "Max number of (pre,post) single-col reads per window", "1024"},
+        // 安全保护：限制单窗边集合容量，防止极端随机发放导致内存增长
+        {"edge_collector_max_capacity", "Max edges per window before overflow protection", "1000000"}
+    )
+
+    SST_ELI_DOCUMENT_STATISTICS(
+        {"spikes_received", "Number of spikes received by this core", "spikes", 1},
+        {"spikes_generated", "Number of spikes generated by this core", "spikes", 1},
+        {"neurons_fired", "Number of times neurons in this core fired", "events", 1},
+        {"memory_requests", "Number of memory requests sent", "requests", 1},
+        {"weight_cache_hits", "Number of weight cache hits", "hits", 1},
+        {"weight_cache_misses", "Number of weight cache misses", "misses", 1},
+        {"merged_reads_rows", "Number of memory reads merged to a full row", "requests", 1},
+        {"merged_reads_cls", "Number of memory reads merged to a cache line", "requests", 1},
+        {"weights_verify_count", "Number of weights verified", "count", 1},
+        {"weights_mismatch_count", "Number of weights that failed verification", "count", 1},
+        {"weights_verify_sum", "Sum of verified weights for averaging", "value", 1},
+        {"routes_entries", "Total number of route entries built for weight-driven routing", "count", 1},
+        {"fanout_per_spike", "Fanout size per emitted spike in weight-driven routing", "count", 1},
+        {"cache_evictions", "Number of cache evictions in weight cache (LRU)", "count", 1},
+        {"pending_reqs_peak", "Peak number of outstanding memory read requests", "count", 1},
+        {"cycles_update_neuron", "Approximate cycles spent updating neuron states (layout-dependent)", "cycles", 1},
+        {"synaptic_accesses", "Number of synaptic weight applications during spike processing", "count", 1},
+        {"scheme1_bytes_read", "Total bytes read issued by Scheme-1 baseline prefetcher", "bytes", 1},
+        // Batch-A detailed memory access stats (can be configured as Histogram in Python)
+        {"mem_read_latency_cycles", "End-to-end memory read latency in cycles", "cycles", 1},
+        {"mem_read_latency_cycles_weights", "Read latency (cycles) for weight-region accesses", "cycles", 1},
+        {"mem_read_latency_cycles_state", "Read latency (cycles) for non-weight (state/other) accesses", "cycles", 1},
+        {"mem_req_size_bytes", "Request size in bytes at issue time", "bytes", 1},
+        {"mem_outstanding_at_issue", "Outstanding inflight requests at issue time", "count", 1},
+        // GAS (windowed gather/apply/scatter): upstream totals accumulated at PE层（由 GatherBufferIF 通过 CustomResp 通知）
+        {"gas_unique_reads_total", "Unique coalesced read transactions issued by GAS", "reads", 1},
+        {"gas_unique_bytes_total", "Total bytes covered by unique coalesced reads (GAS)", "bytes", 1},
+        // Apply/Scatter端到端统计（Phase-1）
+        {"gas_apply_acc_updates_total", "Apply阶段的delta累加次数（有效子读）", "count", 1},
+        {"gas_acc_posts_touched_total", "Apply阶段触达的post计数（去重）", "posts", 1},
+        {"gas_scatter_spikes_emitted_total", "Scatter阶段发放的spike个数", "spikes", 1},
+        {"gas_acc_high_watermark_bytes_total", "累加器峰值占用（bytes）", "bytes", 1},
+        {"gas_acc_spill_records_total", "溢写到增量日志的记录条数", "records", 1},
+        {"gas_acc_spilled_bytes_total", "溢写到增量日志的有效字节数（payload）", "bytes", 1}
+        ,
+        {"weight_read_requests", "Number of weight read requests issued by core", "requests", 1},
+        {"gas_edge_overflow", "Number of times per-window edge collector hit capacity and stopped recording", "events", 1}
+    )
+
+    SnnPESubComponent(SST::ComponentId_t id, SST::Params& params);
+    ~SnnPESubComponent();
+
+    virtual void setParentInterface(SnnPEParentInterface* parent);
+    virtual void init(unsigned int phase) override;
+    virtual void setup() override;
+    virtual void finish() override;
+
+    virtual void deliverSpike(SpikeEvent* spike) override;
+    virtual bool hasWork() const override;
+    virtual double getUtilization() const override;
+    virtual void getStatistics(std::map<std::string, uint64_t>& stats) const override;
+    void setMemoryLink(SST::Link* link);
+    void resetMembraneState(float v_rest) override;
+    // 回退驱动：当上层无法自动触发clockTick时，由父组件每拍调用一次
+    inline void driveOneCycle() { (void)clockTick((Cycle_t)0); }
+    // 手动触发：结束当前Gather窗口（仅 manual_window_drive 下有效）
+    void forceEndGather() override;
+    // GAS 控制镜像（cp4'：仅控制平面，数据路径保持原实现）
+    void orchestrateBeginGatherWindowSetup();
+    void orchestratePrepareApplyWindow();
+    void orchestrateApplyWindowEntry();
+    void orchestrateBeginApplyIssueFallback(bool strict_active);
+    void orchestrateContinueIssueReads();
+    void orchestrateIssueFromEdgesDirect();
+    void orchestrateBeginScatterSequence();
+    void orchestrateEndScatterSequence();
+
+private:
+    // Helper modules extracted to standalone files; keep private access via friends.
+    friend struct StageEventHub;
+    friend struct WeightAccessor;
+
+    // 学习/梯度/误差相关状态已下沉到 compute core（SnnComputeCore）
+
+    // Compute core（动力学/发放/学习），默认内置；保持兼容旧路径
+    std::unique_ptr<ISnnComputeCore> compute_core_;
+    ComputeCoreCapabilities compute_core_caps_{};
+    // 权重读取适配器：将控制层的 requestWeight/cache 接口包装给 compute core
+    std::unique_ptr<IWeightReader> weight_reader_adapter_;
+    // 直接引用 WeightMemorySubsystem 以便管理窗口预算/并发计数（控制层不再持有本地计数）。
+    WeightMemorySubsystem* weight_mem_subsystem_ = nullptr;
+    // 通信子系统：封装 Spike 事件构造与传输
+    std::unique_ptr<ParentSpikeTransport> spike_transport_;
+    SpikeCommSubsystem spike_comm_;
+    bool spike_comm_ready_ = false;
+    inline void applySynapticDelta_(uint32_t idx, float dv) {
+        if (compute_core_) compute_core_->applySynapticDelta(idx, dv);
+    }
+    inline void resetMembraneState_(float v_rest_value) {
+        if (compute_core_) compute_core_->resetMembraneState(v_rest_value);
+    }
+    inline void onStageBeginGatherCore_(uint32_t seq) {
+        if (compute_core_) compute_core_->onStageBeginGather(seq);
+    }
+    inline void onStageBeginApplyCore_(uint32_t seq) {
+        if (compute_core_) compute_core_->onStageBeginApply(seq);
+    }
+    inline void onStageEndApplyCore_(uint32_t seq) {
+        if (compute_core_) compute_core_->onStageEndApply(seq);
+    }
+    inline void onStageBeginScatterCore_(uint32_t seq) {
+        if (compute_core_) compute_core_->onStageBeginScatter(seq);
+    }
+    inline void onStageEndScatterCore_(uint32_t seq, uint64_t spikes_emitted) {
+        if (compute_core_) compute_core_->onStageEndScatter(seq, spikes_emitted);
+    }
+    inline void clearFiredWindowCore_() {
+        if (compute_core_) compute_core_->clearFiredWindow();
+    }
+    inline void onSpikeDeliveredCore_(SpikeEvent* spike) {
+        if (compute_core_) compute_core_->onSpikeDelivered(spike);
+    }
+    inline void onSynapticEventCore_(const SynapticEvent& ev) {
+        if (compute_core_) compute_core_->onSynapticEvent(ev);
+    }
+
+    // === GAS Apply/Scatter Phase‑1 ===
+    bool apply_acc_enable_ = false;           // gate for end-to-end semantics
+    bool readresp_zero_fallback_ = false;     // test-only: map zero read to default weight
+    // Accumulator configuration is passed to AccumulatorOps; control layer keeps no container state.
+    uint64_t acc_hwm_bytes_cfg_ = 16 * 1024 * 1024; // default 16MiB
+    bool acc_spill_enable_cfg_ = true;
+    bool acc_dense_enable_cfg_ = false;
+    bool acc_shadow_verify_enable_cfg_ = false;
+    std::string stage_events_csv_;
+    enum class GasStage { Idle=0, Gather=1, Apply=2, Scatter=3 };
+    GasStage gas_stage_ = GasStage::Idle;
+    uint32_t curr_stage_seq_ = 0;             // gather/apply/scatter sequence id
+    // GAS superstep timing (ns ~= cycles@1GHz)
+    struct StatsReporter {
+        SnnPESubComponent* core = nullptr;
+        void init(SnnPESubComponent* owner) { core = owner; }
+        void reportMemoryIssue(size_t bytes, bool count_weight_read) const;
+        void reportApplyScatter(uint64_t acc_updates, uint64_t posts_touched,
+                                uint64_t spikes_emitted, uint64_t hwm_bytes,
+                                uint64_t spill_records, uint64_t spilled_bytes) const;
+        void reportWindowSpikes(uint32_t seq, uint64_t spikes_emitted) const;
+        void reportCacheAccess(bool hit) const;
+        void updatePendingPeak(uint32_t outstanding) const;
+    };
+
+    StageEventHub stage_event_hub_;
+
+    StatsReporter stats_reporter_;
+    // Extracted accumulator/cache helpers (constructed in ctor)
+    std::unique_ptr<AccumulatorOps> acc_ops_;
+    WeightCacheOps weight_cache_ops_;
+    bool bcsr_rowptr_file_fallback_enable_ = false;
+    bool enable_extended_diagnostics_ = false; // 参数化诊断开关（替代环境变量 SNNDL_DIAG_ENABLE）
+    // Per-window aggregation counters (PE-level flush on stage events)
+    uint64_t acc_updates_count_ = 0;
+    uint64_t acc_posts_touched_count_ = 0;
+    uint64_t acc_spill_records_count_ = 0;
+    uint64_t acc_spilled_bytes_sum_ = 0;
+    uint64_t acc_hwm_bytes_max_ = 0;
+    // Stats pointers
+    Statistic<uint64_t>* stat_gas_apply_acc_updates_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_acc_posts_touched_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_scatter_spikes_emitted_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_acc_hwm_bytes_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_acc_spill_records_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_acc_spilled_bytes_total_ = nullptr;
+    // GAS superstep duration statistics (cycles)
+    Statistic<uint64_t>* stat_gas_superstep_gather_cycles_  = nullptr;
+    Statistic<uint64_t>* stat_gas_superstep_apply_cycles_   = nullptr;
+    Statistic<uint64_t>* stat_gas_superstep_scatter_cycles_ = nullptr;
+    Statistic<uint64_t>* stat_gas_superstep_total_cycles_   = nullptr;
+    // Last window spikes emitted (for stage CSV EndScatter)
+    uint64_t spikes_emitted_window_ = 0;
+    // Accumulate all spikes fired within current GAS window (regardless of phase)
+    // 每窗口发放统计（低开销）：
+    // - window_spikes_all_: 窗口内由 handleNeuronFire_ 累计（仅当 apply_acc_enable_ && gas_window_mode_）。
+    // - spikes_generated_base_: BeginScatter 时记录的累计发放基线；
+    //   若 EndScatter 计算到 to_emit==0，则用 (count_spikes_generated_ - spikes_generated_base_) 兜底，
+    //   保证窗口口径与总口径对齐，且仅在缺失时触发一次 O(1) 计算。
+    uint64_t window_spikes_all_ = 0;
+    uint64_t spikes_generated_base_ = 0;
+    // Per-run unique firing tracker（O(N) 字节/核，统计去重口径）
+    std::vector<uint8_t> fired_ever_;
+    // Diagnostics: recordEdge outcome counters (per GAS window)
+    uint64_t diag_edges_record_hits_ = 0;
+    uint64_t diag_edges_stage_skips_ = 0;
+    uint64_t diag_edges_cond_skips_ = 0;
+    // Diagnostics: spike arrival counters by GAS stage (per window)
+    uint64_t diag_spikes_stage_gather_ = 0;
+    uint64_t diag_spikes_stage_apply_ = 0;
+    uint64_t diag_spikes_stage_scatter_ = 0;
+    uint64_t diag_spikes_stage_idle_ = 0;
+    // Window-read edges/posts/pres 已下沉到 WeightMemorySubsystem（Phase A）
+    // Helpers (phase‑1)
+    inline void accReset_() {
+        if (acc_ops_) acc_ops_->reset();
+    }
+    inline void accUpdate_(uint32_t post, float dv) {
+        if (acc_ops_) acc_ops_->update(post, dv);
+    }
+
+    // === Learning writeback hook (called by compute core) ===
+    bool applyLocalWeightUpdates_(const std::unordered_map<uint64_t, float>& grads,
+                                  float learning_rate,
+                                  float weight_decay);
+
+    // === Activity f (per-window active axons ratio) ===
+    bool activity_stats_enable_ = true;
+    uint32_t activity_window_seq_ = 0;
+    std::unordered_set<uint32_t> activity_pre_set_;
+    inline void activityReset_() { activity_pre_set_.clear(); }
+    inline void recordActivePre_(uint32_t pre_global) {
+        if (activity_stats_enable_) activity_pre_set_.insert(pre_global);
+    }
+    // 容量配置与统计
+    size_t edge_collector_max_capacity_ = 1000000;
+    bool record_edge_cond_warned_ = false;
+    bool record_edge_stage_warned_ = false;
+    bool record_edge_capacity_warned_ = false;
+    Statistic<uint64_t>* stat_gas_edge_overflow_ = nullptr;
+    inline MultiCorePE* parentPE_() const { return parent_pe_cached_; }
+    void recordEdge_(uint32_t post_local, uint32_t pre_global);
+    inline bool isPreLocal_(uint32_t pre_global) const {
+        return (pre_global >= global_neuron_base_) &&
+               (pre_global < global_neuron_base_ + num_neurons_);
+    }
+    inline uint32_t remapPreGlobalModulo_(uint32_t pre_global) const {
+        if (num_neurons_ == 0) return 0;
+        const uint64_t width = static_cast<uint64_t>(num_neurons_);
+        const uint64_t base = static_cast<uint64_t>(global_neuron_base_) -
+                              static_cast<uint64_t>(static_cast<uint32_t>(core_id_)) * width;
+        const uint64_t diff = static_cast<uint64_t>(pre_global) - base;
+        return static_cast<uint32_t>(diff % width);
+    }
+    inline uint32_t mapPreGlobalToLocal_(uint32_t pre_global) const {
+        if (isPreLocal_(pre_global)) {
+            return static_cast<uint32_t>(pre_global - global_neuron_base_);
+        }
+        return remapPreGlobalModulo_(pre_global);
+    }
+    inline uint32_t weightMatrixWidth_() const {
+        return use_post_row_pre_col_ ? weights_cols_ : num_neurons_;
+    }
+    WeightAccessor weight_accessor_;
+    void activityFlush_();
+
+    bool clockTick(Cycle_t current_cycle);
+    void handleMemoryResponse(SST::Interfaces::StandardMem::Request* req);
+    void initializeStatistics();
+    uint64_t applyAccumulatedWindowAndScatter_();
+    void configureComputeCore_(const Params& params);
+    void processLocalSpike(SpikeEvent* spike_event);
+    void requestWeight(uint32_t pre_neuron, uint32_t post_neuron, std::function<void(float)> callback);
+    bool loadTextWeights(const std::string& weights_file_path);
+    bool loadCSRRowptrFromFile_();
+    void logCSRRowptrSummary_();
+    void reserveWindowContainers_();
+    // Internal helpers for robust memory access
+    bool ensureLoaderReady_();
+    bool ensureMemoryReady_() const { return memory_ != nullptr && memory_ready_; }
+    bool prepareDenseRead_(uint32_t row, uint32_t col, uint32_t width,
+                           uint64_t& req_addr, size_t& req_size,
+                           bool& is_row, uint32_t& col_start, uint32_t& count_floats) const;
+    void issueReadCommon_(uint64_t req_addr, size_t req_size,
+                          bool is_row, uint32_t row, uint32_t col_start, uint32_t count_floats,
+                          std::function<void(float)> single_cb, uint32_t single_col);
+
+    // 方案1辅助
+    inline uint32_t scheme1SliceFromPreGlobal_(uint32_t pre_g) const {
+        if (scheme1_slices_ == 0) return 0;
+        if (scheme1_partition_mod_) return pre_g % scheme1_slices_;
+        uint32_t width = std::max<uint32_t>(1, weights_cols_);
+        uint32_t seg = width / scheme1_slices_ + ((width % scheme1_slices_) ? 1 : 0);
+        uint32_t idx = pre_g / std::max<uint32_t>(1, seg);
+        return (idx >= scheme1_slices_) ? (scheme1_slices_ - 1) : idx;
+    }
+    void scheme1Reset_();
+    bool scheme1Tick_(); // 返回 true 表示本周期已由方案1路径完全处理
+    void scheme1PrefetchSlice_(uint32_t slice_idx);
+    void verifyDenseAccumulator_(uint32_t seq);
+    // 核心输出统一路由：控制层不再直接 fire，每拍/每窗调用 endCycle+drainOutputs 后集中路由
+    void drainCoreOutputsAndRoute_(uint64_t now_cycle);
+    uint64_t routeAndSendOutputs_(const std::vector<FireEvent>& fired);
+    inline size_t pendingMemSize_() const {
+        return mem_backend_ ? mem_backend_->pendingSize() : 0;
+    }
+    // === 窗口读计数下沉到 WeightMemorySubsystem ===
+    inline void windowStateConfigure_() {
+        if (weight_mem_subsystem_) {
+            weight_mem_subsystem_->configureWindow(window_read_budget_, max_outstanding_requests_);
+        }
+    }
+    inline void windowStateBegin_() {
+        if (weight_mem_subsystem_) {
+            weight_mem_subsystem_->beginWindow();
+        }
+    }
+    inline bool windowStateCanIssue_(uint32_t n = 1) const {
+        return weight_mem_subsystem_ ? weight_mem_subsystem_->canIssue(n) : false;
+    }
+    inline void windowStateNoteIssue_(uint32_t n = 1) {
+        if (weight_mem_subsystem_) {
+            weight_mem_subsystem_->noteIssue(n);
+            stats_reporter_.updatePendingPeak(weight_mem_subsystem_->outstanding());
+        }
+    }
+    inline void windowStateNoteComplete_(uint32_t n = 1) {
+        if (weight_mem_subsystem_) {
+            weight_mem_subsystem_->noteComplete(n);
+        }
+    }
+    inline uint32_t windowStateIssued_() const {
+        return weight_mem_subsystem_ ? weight_mem_subsystem_->issued() : 0;
+    }
+    inline uint32_t windowStateOutstanding_() const {
+        return weight_mem_subsystem_ ? weight_mem_subsystem_->outstanding() : 0;
+    }
+
+    // Debug/diagnostic switches (params)
+    bool read_force_single_ = false; // 当为真时，强制按单元素读取（req_size=4B），用于定位对齐/切片问题
+
+    SnnPEParentInterface* parent_;
+    MultiCorePE* parent_pe_cached_ = nullptr;
+    Output* output_;
+    SST::Interfaces::StandardMem* memory_;
+    std::unique_ptr<StandardMemBackend> mem_backend_;
+    GatherBufferIF* gather_buffer_if_ = nullptr;
+    bool manual_window_tick_logged_ = false;
+    bool clock_tick_logged_ = false;
+    SST::Link* memory_link_;
+
+    int core_id_;
+    int total_cores_;
+    uint64_t global_neuron_base_;
+    uint32_t num_neurons_;
+    uint64_t base_addr_;
+    uint32_t node_id_;
+    int verbose_;
+    // 路由/目的节点计算所需：每个PE的神经元数（与 num_neurons_ 不同，后者为本core行数）
+    uint32_t neurons_per_pe_cfg_ = 0;
+    bool enable_weight_fetch_;
+    bool write_weights_on_init_;
+    uint64_t memory_warmup_cycles_;
+    float init_default_weight_;
+    uint32_t max_outstanding_requests_;
+    bool use_event_weight_fallback_;
+    bool base_addr_log_once_ = false;
+    bool route_summary_enable_ = false;
+    bool route_summary_logged_ = false;
+    bool event_weight_fallback_warned_;
+    bool merge_read_cacheline_;
+    bool merge_read_row_;
+    bool merge_read_auto_ = false; // auto choose best merge strategy (default off)
+    uint32_t line_size_bytes_;
+    // GAS control (component-driven phases)
+    bool gas_enable_ = false; // enable GAS control-plane (v1: Begin/EndGather per tick)
+    bool gas_window_mode_ = false; // 当为true时，不再每周期发送Begin/EndGather，由下游window驱动
+    bool gas_manual_window_drive_ = false; // 已弃用，保持字段以兼容旧配置
+    uint64_t manual_gas_counter_ = 0;
+    uint64_t manual_gas_gather_cycles_cfg_ = 200; // fallback
+    bool manual_tick_sampled_ = false;
+    std::string loader_done_key_;
+    bool wait_for_loader_done_ = false;
+    bool loader_ready_latched_ = false;
+    bool loader_ready_logged_ = false;
+    SST::Shared::SharedArray<int> loader_done_shared_;
+    bool loader_done_shared_initialized_ = false;
+
+    // ===== 方案1（slice 顺序执行）开关与参数 =====
+    // 说明：在一个 superstep 内，先 Gather 收集所有脉冲事件，然后按 slice=0..N-1 的顺序：
+    //  1) 载入该 slice 需要的数据（预取对应的权重区间到本地缓存）
+    //  2) 对该 slice 的所有脉冲执行计算（Apply）
+    //  3) 在 Scatter 阶段统一触发膜电位发放与外发（可选）
+    // 默认关闭；启用后将覆盖常规逐周期处理路径。
+    bool scheme1_enable_ = false;
+    uint32_t scheme1_slices_ = 8;              // 切片数
+    uint64_t scheme1_gather_cycles_cfg_ = 100; // Gather 窗口时长（cycles）
+    uint64_t scheme1_slice_gap_cycles_ = 0;    // 相邻 slice 间的间隔（cycles）
+    uint64_t scheme1_scatter_cycles_ = 1;      // Scatter 持续时长（cycles）
+    // 分片映射方式：按 pre_global 连续区间划分（更贴近行/列局部性）
+    bool scheme1_partition_mod_ = false;       // 为 true 则按取模；默认按连续区间
+    // 运行期状态
+    enum class Scheme1Stage { Idle=0, Gather=1, Apply=2, Scatter=3 };
+    Scheme1Stage scheme1_stage_ = Scheme1Stage::Idle;
+    uint32_t scheme1_current_slice_ = 0;
+    uint64_t scheme1_stage_counter_ = 0;
+    bool scheme1_prefetch_issued_ = false;
+    uint32_t scheme1_pending_prefetch_ = 0;    // 仍在等待的预取响应计数
+    bool s1_is_issuing_prefetch_ = false;      // 给 issueReadCommon_ 打标签用
+    std::vector<std::deque<SpikeEvent*>> scheme1_slice_queues_;
+    bool scheme1_queues_inited_ = false;       // 仅首次分配队列；之后跨superstep保留
+    bool scheme1_first_superstep_ = true;      // 第一次superstep用于初始化current_slice_
+
+    // 新增：全网读取模式参数
+    uint32_t weights_cols_;   // 列数（例如16x256中的256）
+    // 诊断：ΔV 汇总（每窗复位）
+    double diag_dv_sum_window_ = 0.0;
+    uint64_t diag_dv_updates_nonzero_ = 0;
+    uint64_t diag_posts_acc_nonzero_ = 0;
+    bool use_post_row_pre_col_; // 索引模式：false=pre_row_post_col，true=post_row_pre_col
+    bool enable_detailed_map_log_;
+    bool log_weight_details_;
+    bool detailed_log_emitted_ = false;
+    bool verify_routing_weights_ = false;
+
+    bool verify_weights_ = false;
+    // Optional barrier cycles to allow external weight loaders to finish (default 0)
+    uint64_t loader_barrier_cycles_ = 0;
+    // 控制收尾阶段的控制台日志
+    bool quiet_finish_logs_ = false;
+    
+    // 权重文件路径
+    std::string weights_file_path_;
+    inline void recordSynapticAccess_() {
+        count_synaptic_accesses_++;
+        if (stat_synaptic_accesses_) stat_synaptic_accesses_->addData(1);
+    }
+    void handleNeuronFire_(uint32_t neuron_idx, float v_before, float v_after);
+    std::queue<SpikeEvent*> incoming_spikes_;
+    inline bool weightCacheTryGet_(uint64_t key, float& out) {
+        return weight_cache_ops_.tryGet(key, out);
+    }
+    inline void weightCacheStore_(uint64_t key, float value) {
+        weight_cache_ops_.store(key, value);
+    }
+    bool window_read_enable_ = false;   // 严格GAS：按窗发起权重读取
+    uint32_t window_read_budget_ = 1024;
+    bool window_read_debug_ = false;    // 控制窗口读相关调试日志
+    uint32_t debug_window_log_count_ = 0;
+    // Debug instrumentation
+    uint32_t debug_window_idx_ = 0;
+    uint32_t pending_reqs_peak_ = 0;
+    uint64_t bcsr_req_edges_ = 0;
+    uint64_t bcsr_req_wait_rowptr_ = 0;
+    uint64_t bcsr_req_block_hit_ = 0;
+    uint64_t bcsr_req_block_miss_ = 0;
+    Cycle_t total_cycles_;
+    Cycle_t active_cycles_;
+    bool boot_read_sent_;
+    bool boot_write_sent_;
+    bool weights_initialized_;
+    bool memory_ready_;
+    bool first_cache_hit_logged_ = false;
+    bool first_cache_miss_logged_ = false;
+
+    Statistic<uint64_t>* stat_spikes_received_;
+    Statistic<uint64_t>* stat_spikes_generated_;
+    Statistic<uint64_t>* stat_neurons_fired_;
+    Statistic<uint64_t>* stat_memory_requests_;
+    Statistic<uint64_t>* stat_weight_cache_hits_;
+    Statistic<uint64_t>* stat_weight_cache_misses_;
+    Statistic<uint64_t>* stat_merged_reads_rows_;
+    Statistic<uint64_t>* stat_merged_reads_cls_;
+    Statistic<uint64_t>* stat_weights_verify_count_;
+    Statistic<uint64_t>* stat_weights_mismatch_count_;
+    Statistic<double>* stat_weights_verify_sum_;
+    // 扩展统计
+    Statistic<uint64_t>* stat_routes_entries_ = nullptr;
+    Statistic<uint64_t>* stat_fanout_per_spike_ = nullptr;
+    Statistic<uint64_t>* stat_cache_evictions_ = nullptr;
+    Statistic<uint64_t>* stat_pending_reqs_peak_ = nullptr;
+    Statistic<uint64_t>* stat_cycles_update_neuron_ = nullptr;
+    Statistic<uint64_t>* stat_synaptic_accesses_ = nullptr;
+    // Scheme1 baseline bytes read (sum of issued Read sizes in scheme1PrefetchSlice_)
+    Statistic<uint64_t>* stat_s1_bytes_read_ = nullptr;
+    // 门控诊断：权重读请求发起计数（用于判定发起端是否触发）
+    Statistic<uint64_t>* stat_weight_read_requests_ = nullptr;
+    Statistic<uint64_t>* stat_window_reads_issued_total_ = nullptr;
+    // GAS totals accumulated from GatherBufferIF via CustomResp
+    Statistic<uint64_t>* stat_gas_unique_reads_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_unique_bytes_total_ = nullptr;
+    
+    // 内部计数器用于getStatistics()方法
+    uint64_t count_spikes_received_;
+    uint64_t count_spikes_generated_;
+    uint64_t count_neurons_fired_;
+    uint64_t count_memory_requests_;
+    // 内部计数：用于收尾摘要打印（不依赖SST统计聚合）
+    uint64_t count_cache_hits_ = 0;
+    uint64_t count_cache_misses_ = 0;
+    uint64_t count_merged_reads_rows_ = 0;
+    uint64_t count_merged_reads_cls_ = 0;
+    uint64_t count_cache_evictions_ = 0;
+    // 往返延迟测量（Cycle）
+    uint64_t accum_mem_latency_cycles_ = 0;
+    uint64_t count_mem_responses_ = 0;
+    uint64_t count_cycles_update_neuron_ = 0;
+    uint64_t count_synaptic_accesses_ = 0;
+
+    // === Batch-A: Memory access detailed statistics (per-core) ===
+    // Histogram candidates (type configured via Python):
+    //  - mem_read_latency_cycles: 端到端读延迟
+    //  - mem_read_latency_cycles_weights/state: 区域分组
+    //  - mem_req_size_bytes: 请求字节大小
+    //  - mem_outstanding_at_issue: 发起时并发请求数
+    Statistic<uint64_t>* stat_mem_read_latency_cycles_ = nullptr;
+    Statistic<uint64_t>* stat_mem_read_latency_cycles_weights_ = nullptr;
+    Statistic<uint64_t>* stat_mem_read_latency_cycles_state_ = nullptr;
+    Statistic<uint64_t>* stat_mem_req_size_bytes_ = nullptr;
+    Statistic<uint64_t>* stat_mem_outstanding_at_issue_ = nullptr;
+
+    // Dense 权重区域上界（用于区域分组）；BCSR 通过 bcsr_kind 判别
+    uint64_t weight_region_end_ = 0; // [base_addr_, weight_region_end_) 视为权重区（dense）
+
+    // BCSR 布局描述（集中校验与寻址）
+    struct BcsrLayout {
+        uint32_t rows = 0;
+        uint32_t cols = 0;
+        uint32_t block_rows = 0;
+        uint32_t block_cols = 0;
+        uint32_t idx_bytes = 0;
+        uint32_t val_bytes = 0;
+        uint64_t rowptr_offset = 0;
+        uint64_t colidx_offset = 0;
+        uint64_t blockdata_offset = 0;
+        uint64_t blockids_offset = 0;
+        uint64_t per_core_stride = 0;
+        bool validate(uint64_t base, Output* out, bool debug, uint32_t core_id, uint32_t node_id) const;
+        uint64_t maxOffset() const {
+            return std::max(std::max(rowptr_offset, colidx_offset),
+                            std::max(blockdata_offset, blockids_offset));
+        }
+    } bcsr_layout_;
+
+    // ===== BCSR 读路径支持 =====
+    bool use_bcsr_ = false;
+    uint32_t bcsr_br_ = 16;                 // block rows
+    uint32_t bcsr_bc_ = 16;                 // block cols
+    uint32_t bcsr_val_bytes_ = 4;           // FP32
+    uint32_t bcsr_idx_bytes_ = 2;           // uint16
+    uint64_t bcsr_colidx_addr_ = 0;         // colidx 基地址
+    uint64_t bcsr_blockdata_addr_ = 0;      // blockdata 基地址
+    uint64_t bcsr_blockids_addr_ = 0;       // blockids 基地址（可选）
+    // 读值守护（诊断/健壮性）：过滤非有限或异常大的权重，避免毒化ΔV（默认开启）
+    bool bcsr_weight_guard_enable_ = true;
+    float bcsr_weight_abs_max_ = 10.0f;
+    uint64_t bcsr_bad_weight_count_ = 0;
+    BcsrWeightManager bcsr_weights_;
+
+    uint32_t bcsr_row_index_cache_cap_ = 64; // 行索引段缓存容量（行数）
+    uint32_t bcsr_block_cache_cap_ = 256;    // 数据块缓存容量（块数）
+    // 行索引缓存：block_row -> colidx 段
+    std::unordered_map<uint32_t, std::vector<uint32_t>> bcsr_row_index_cache_;
+    std::list<uint32_t> bcsr_row_index_lru_;
+    // 数据块缓存：key=(block_row<<32)|block_col -> 块数据
+    struct BcsrBlockEntry { std::vector<float> data; std::list<uint64_t>::iterator it; };
+    std::unordered_map<uint64_t, BcsrBlockEntry> bcsr_block_cache_;
+    std::list<uint64_t> bcsr_block_lru_;
+
+    // BCSR 统计计数（收尾打印）
+    uint64_t bcsr_count_row_reads_ = 0;
+    uint64_t bcsr_count_colidx_reads_ = 0;
+    uint64_t bcsr_count_block_reads_ = 0;
+    uint64_t bcsr_count_block_hits_ = 0;
+    uint64_t bcsr_count_block_misses_ = 0;
+    uint64_t bcsr_count_row_index_hits_ = 0;
+    uint64_t bcsr_count_row_index_fills_ = 0;
+    uint64_t bcsr_bytes_idx_ = 0;
+    uint64_t bcsr_bytes_val_ = 0;
+    bool bcsr_prefetch_all_ = true;
+    bool bcsr_prefetch_issued_ = false;
+
+    // GAS 阶段控制：mirror-only controller（cp4'）
+    std::unique_ptr<GasPhaseController> gas_ctrl_;
+
+    // BCSR 辅助
+    void requestWeightBCSR(uint32_t pre_global, uint32_t post_local, std::function<void(float)> cb);
+    bool bcsrRowIndexGet_(uint32_t block_row, std::vector<uint32_t>& out);
+    void bcsrRowIndexPut_(uint32_t block_row, std::vector<uint32_t>& data);
+    bool bcsrBlockGet_(uint32_t block_row, uint32_t block_col, std::vector<float>& out);
+    void bcsrBlockPut_(uint32_t block_row, uint32_t block_col, std::vector<float>& data);
+    void bcsrPrefetchAll_();
+    void bcsrPrefetchRowBlocks_(uint32_t block_row, const std::vector<uint32_t>& cols, uint32_t row_start);
+    void bcsrPopulateWeightCache_(uint32_t block_row, uint32_t block_col, const std::vector<float>& blk);
+    bool loadBcsrRowptrFromFile_();
+    void ensureRowptrReadyOrFatal_(const char* reason);
+    size_t expectedRowptrEntries_() const;
+    size_t expectedRowptrBytes_() const;
+    bool installRowptrFromBytes_(const uint8_t* data, size_t bytes, const char* source, bool count_stats);
+    bool bcsr_force_file_read_ = false; // 诊断：强制从文件读取BCSR块（绕过内存）
+    // 从权重文件读取单个 (post_local, pre_global) 的权重（仅诊断/验证用）
+    float readBcsrWeightFromFile_(uint32_t post_local, uint32_t pre_global) const;
+
+    // CSR 已移除
+
+    // ===== 权重驱动路由（可选）=====
+    bool routing_weight_driven_ = false;
+    std::string weights_template_;
+    uint32_t total_nodes_cfg_ = 16;
+    float routing_epsilon_ = 1e-8f;
+    uint32_t routing_topk_ = 0;
+    uint32_t routing_topk_per_pe_ = 0;
+    bool route_exclude_self_pe_ = false;
+    std::string route_layers_mask_;
+    bool route_filter_warn_ = true;
+    // 解析后的层间许可表（key=(src_layer<<8)|dst_layer）
+    std::unordered_set<uint32_t> allowed_layer_edges_;
+    bool allow_all_layers_ = true;
+    bool record_edge_apply_enable_ = false;
+    bool record_edge_idle_enable_ = true;
+    bool record_edge_scatter_enable_ = false;
+    // 映射框架集成
+    std::string mapping_mode_;
+    std::string mapping_edges_file_;
+    bool mapping_csv_has_header_ = true;
+    std::string mapping_csv_separator_ = ",";
+    bool mapping_assume_block_ids_ = true;
+    // routes_by_source_[pre_global] = list of destination global neuron ids
+    // 本地路由表（兼容保留，作为共享表不可用时的回退）
+    std::unordered_map<uint32_t, std::vector<uint32_t>> routes_by_source_;
+    // 进程范围共享的路由表指针（多个核心/组件共享，避免重复构建与冗余内存）
+    std::shared_ptr<const std::unordered_map<uint32_t, std::vector<uint32_t>>> routes_shared_;
+    bool routing_diag_logged_ = false;
+    bool buildWeightDrivenRoutes();
+    bool buildRoutesFromEdgesCSV();
+    bool buildWeightDrivenRoutesFromBcsr();
+    bool appendRoutesFromBcsrFile(const std::string& path, uint32_t pe_index, int core_index, uint32_t rows_hint);
+    bool parseBcsrMeta(const std::string& meta_path, uint32_t& rows_out, uint32_t& cols_out,
+                       uint32_t& br_out, uint32_t& bc_out,
+                       uint32_t& idx_bytes_out, uint32_t& val_bytes_out,
+                       uint64_t& rowptr_off_out, uint64_t& colidx_off_out,
+                       uint64_t& blockdata_off_out, uint64_t& blockids_off_out,
+                       uint32_t& total_blocks_out) const;
+    std::string resolveWeightTemplate(uint32_t pe, int core) const;
+    uint32_t getLayerIdFromPE(uint32_t pe) const;
+    // Helpers to reduce duplication in route building
+    bool applyRouteFilter(uint32_t src_global, uint32_t dst_global, uint32_t rows) const;
+    // Helper: given candidates pre_global -> [(score, dst_global)],
+    // apply per-PE topk and/or global topk, then fill routes_by_source_.
+    // When group_by_pe=false, all dst are treated as in one group (used when we
+    // cannot infer PE id from dst_global reliably).
+    void buildRoutesFromCandidates(
+        const std::unordered_map<uint32_t, std::vector<std::pair<float,uint32_t>>>& tmp,
+        uint32_t rows,
+        bool group_by_pe);
+
+    // === 路由共享缓存（进程级）===
+    // 说明：使用基于参数集合的key对构建结果做一次性缓存；
+    // 命中时各核心直接复用共享表，未命中则首次构建并写回缓存。
+    static std::mutex s_route_cache_mtx_;
+    using RouteMap = std::unordered_map<uint32_t, std::vector<uint32_t>>;
+    static std::unordered_map<std::string, std::weak_ptr<const RouteMap>> s_route_cache_;
+    std::string buildRouteCacheKey() const;
+    void logRoutingSummary_(const char* phase, const char* reason = nullptr);
+    // 路由/门控提供器：抽出 handleNeuronFire_ 的路由决策
+    SnnRouteProvider route_provider_;
+    // Stage 事件 CSV 写出互斥，避免多核心重复写表头
+    static std::mutex s_stage_csv_mutex_;
+    void appendStageEventRow_(const char* event_name, uint64_t now_ns, uint64_t spikes_emitted);
+    void handleStageEventWithoutApply_(const GasOpData* op);
+    void prepareEdgeWindowForApply_();
+    void diagEdgeWeight_(const char* tag, uint32_t post_local, uint32_t pre_global,
+                         float weight, uint32_t count);
+    void issueEdgeWeightFetches_();
+    void issueFromEdges_();
+    void issueFromSets_(const std::vector<uint32_t>* posts_to_use,
+                        const std::unordered_set<uint32_t>* pres_to_use);
+    void issueFromSetsBcsr_(const std::vector<uint32_t>* posts_to_use,
+                            const std::unordered_set<uint32_t>* pres_to_use);
+    void issueFallbackReadsIfNeeded_(bool strict_gas_active);
+    bool canIssueMoreReads_() const;
+    void logBcsrWindowStats_(const char* tag);
+    void resetBcsrWindowCounters_();
+
+    // ===== 门控事件缓存 =====
+    bool gating_event_mode_ = false;
+    uint64_t gating_ttl_cycles_cfg_ = 1000;
+    bool gating_scope_inputs_only_ = true;
+    std::unordered_map<uint32_t, GatingEntry> gating_cache_; // key=src_global
+
+public:
+    // 应用门控决策（由父级MultiCorePE调用）
+    void applyGatingDecision(uint32_t src_global, const std::vector<uint32_t>& dest_pes,
+                             uint64_t current_cycle, uint64_t ttl_cycles);
+};
+
+} // namespace SnnDL
+} // namespace SST
+
+#endif // _H_SST_SNN_PE_SUBCOMPONENT

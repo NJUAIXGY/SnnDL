@@ -1,0 +1,36 @@
+# compute/（可替换计算核心层）
+
+本目录存放 **可插拔 compute core 接口与默认 SNN 核心实现**。目标是让 SnnDL 支持未来“替换核心计算范式”，而无需改动控制壳（`control/SnnPESubComponent`）。
+
+## 职责
+
+- 定义 `ISnnComputeCore` 的统一契约：输入、阶段回调、周期收敛、输出事件拉取、统计等。
+- 提供默认实现 `DefaultSnnComputeCore`（当前对应 SNN 动力学/学习/验证）。
+- 聚合与 compute core 强相关的算法/数据结构：神经模型、学习核心、权重验证逻辑等。
+
+## 主要内容
+
+- `SnnComputeCore.{h,cc}`
+  - `ISnnComputeCore`：核心接口（建议只做“动力学/学习/输出判定”）。
+  - `ComputeCoreCapabilities`：能力协商（控制层可按需开/关功能分支）。
+  - `createComputeCoreByName()`：工厂入口（当前支持 `default`/`snn`，未知名称返回空并由控制层回退）。
+  - `DefaultSnnComputeCore`：默认 SNN 实现。
+- `SnnCoreEngine.{h,cc}`：动力学引擎/内核执行器（Default core 使用）。
+- `SnnNeuronModel.h`：神经元模型接口与实现选择（LIF 等）。
+- `SnnLearningCore.{h,cc}`：学习/梯度累加模块（可选启用）。
+- `SnnWeightDiagnostics.{h,cc}`：权重验证/诊断相关逻辑（默认核心可用）。
+- `SynapseManager.h`：突触/连接管理辅助结构（与 compute 侧数据布局相关）。
+
+## 依赖边界（建议）
+
+- `compute/` 应尽量只依赖 `api/`、`events/` 与标准库。
+- 若需要访问权重/缓存/内存，统一通过 `api/SnnWeightReader.h` 的 `IWeightReader` 抽象，而不是直接触碰控制层私有成员。
+
+## 扩展指南（新增计算范式）
+
+- 新增一个实现类 `class XxxComputeCore : public ISnnComputeCore`，并：
+  - 明确自身 `ComputeCoreCapabilities`；
+  - 实现 `endCycle/endCycleCandidates + drainOutputs` 的一致语义（输出由控制层统一路由）。
+- 在 `createComputeCoreByName()` 中注册 `name -> XxxComputeCore`；
+- 在仿真脚本/参数中设置 `compute_core_impl=name`。
+
