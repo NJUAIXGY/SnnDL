@@ -112,11 +112,14 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
     window_csv_ = params.find<std::string>("window_csv", "");
     window_metrics_csv_ = params.find<std::string>("window_metrics_csv", "");
     window_ns_ = window_us_ * 1000ULL; // 1us = 1000ns（组件时钟1GHz，tick≈1ns）
+    diag_fire_log_ = params.find<bool>("diag_fire_log", false);
 
     step_activation_enable_ = params.find<bool>("step_activation_enable", false);
     step_activation_fraction_ = params.find<double>("step_activation_fraction", 0.0);
     step_activation_fanout_ = params.find<uint32_t>("step_activation_fanout", 0);
     step_activation_seed_ = params.find<uint64_t>("step_activation_seed", 0xdecafbadULL);
+    step_activation_period_cycles_ = params.find<uint64_t>("step_activation_period_cycles", 0);
+    step_activation_trigger_core_ = params.find<int>("step_activation_trigger_core", 0);
     step_reset_mem_each_step_ = params.find<bool>("step_reset_mem_each_step", false);
     step_activation_event_weight_ = params.find<double>("step_activation_event_weight", 0.0);
     step_activation_use_bcsr_routes_ = params.find<bool>("step_activation_use_bcsr_routes", false);
@@ -140,6 +143,15 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
     
     //     "🧠 神经元参数: v_thresh=%.3f, v_reset=%.3f, v_rest=%.3f, tau_mem=%.1fms, t_ref=%d\n",
     //     v_thresh_, v_reset_, v_rest_, tau_mem_, t_ref_);
+
+    if (step_activation_trigger_core_ < -1 || step_activation_trigger_core_ >= num_cores_) {
+        if (output_) {
+            output_->verbose(CALL_INFO, 1, 0,
+                "⚠️ step_activation_trigger_core=%d 超出范围[-1,%d)，回退到0\n",
+                step_activation_trigger_core_, num_cores_);
+        }
+        step_activation_trigger_core_ = 0;
+    }
     
     // 验证参数合理性
     if (num_cores_ <= 0 || num_cores_ > 64) {
@@ -319,6 +331,18 @@ void MultiCorePE::init(unsigned int phase) {
     }
 }
 
+void MultiCorePE::complete(unsigned int phase) {
+    // 关键：转发 complete 给所有子核心与网络接口。
+    // 若核心 memory 子组件内部使用 memHierarchy.standardInterface，则 complete() 是完成
+    // init 握手/地址域传播的必要阶段；缺失会导致 getTargetDestination 找不到地址域并 fatal。
+    for (auto* core : cores_) {
+        if (core) core->complete(phase);
+    }
+    if (external_nic_) {
+        external_nic_->complete(phase);
+    }
+}
+
 void MultiCorePE::setup() {
     if (sentinel_enabled_ && output_) { output_->output("[[sentinel-pe-setup]] node=%d enter\n", node_id_); }
     
@@ -455,17 +479,18 @@ void MultiCorePE::finish() {
     if (external_nic_) {
         external_nic_->finish();
     }
-    if (primary_keepalive_) {
-        primaryComponentOKToEndSim();
-    }
+    // 注意：当使用 SST 引擎 stop-at 结束仿真时，finish() 期间再次触发 OKToEndSim
+    // 会导致 Exit 事件被重复调度并在引擎侧触发双重释放；组件主控停止（sim_stop_ns_>0）
+    // 已由 clockTick() 在阈值处触发 OKToEndSim。
 }
 
 bool MultiCorePE::clockTick(Cycle_t current_cycle) {
     current_cycle_ = current_cycle;
     // 当启用组件主控停止时，到达阈值立刻OKToEndSim并停止本组件时钟
     if (sim_stop_ns_ > 0 && current_cycle_ >= sim_stop_ns_) {
-        if (primary_keepalive_ || sim_stop_ns_ > 0) {
+        if (!ok_to_end_sent_) {
             primaryComponentOKToEndSim();
+            ok_to_end_sent_ = true;
         }
         return false;
     }
@@ -488,11 +513,23 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
         }
     }
     
-    // 0a. 若存在延迟的Step注入且已就绪，优先补发
-    if (pending_step_inject_ && step_injection_ready_) {
+    // 0a. legacy: 若存在延迟的Step注入且已就绪，优先补发（仅 BeginGather 时基）
+    if (step_activation_period_cycles_ == 0 && pending_step_inject_ && step_injection_ready_) {
         injectStepActivations(pending_step_seq_, current_cycle_);
         last_step_injection_seq_ = pending_step_seq_;
         pending_step_inject_ = false;
+    }
+    // 0a2. fixed-period: 按固定周期触发 Step 注入，避免 BeginGather 时基漂移引入非确定性
+    if (step_activation_enable_ && step_activation_period_cycles_ > 0 && step_injection_ready_) {
+        if (step_activation_next_cycle_ == 0) {
+            step_activation_next_cycle_ = current_cycle_;
+            step_activation_fixed_seq_ = 1;
+        }
+        if (current_cycle_ >= step_activation_next_cycle_) {
+            injectStepActivations(step_activation_fixed_seq_, current_cycle_);
+            ++step_activation_fixed_seq_;
+            step_activation_next_cycle_ += step_activation_period_cycles_;
+        }
     }
 
     // 0b. 测试注入：在首个有效周期从 core0 向 core1 注入一个跨核脉冲（仅当启用测试流量时）
@@ -950,7 +987,8 @@ void MultiCorePE::accumulateApplyScatterStats(uint64_t acc_updates, uint64_t pos
     if (spilled_bytes && stat_gas_acc_spilled_bytes_total_) stat_gas_acc_spilled_bytes_total_->addData(spilled_bytes);
 }
 
-void MultiCorePE::notifyStageEvent(uint32_t seq, const std::string& event, uint64_t ts_ns, uint64_t spikes_emitted) {
+void MultiCorePE::notifyStageEvent(uint32_t seq, const std::string& event, uint64_t ts_ns,
+                                   uint64_t spikes_emitted, int core_id) {
     auto &m = stage_marks_[seq];
     if (event == "BeginGather") {
         if (m.bg == 0 || ts_ns < m.bg) m.bg = ts_ns;
@@ -968,15 +1006,31 @@ void MultiCorePE::notifyStageEvent(uint32_t seq, const std::string& event, uint6
         }
     }
 
-    if (step_activation_enable_ && event == "BeginGather") {
-        if (last_step_injection_seq_ != seq) {
-            if (step_injection_ready_) {
-                injectStepActivations(seq, ts_ns);
-                last_step_injection_seq_ = seq;
+    // legacy: BeginGather 触发（当 period==0 时保留原始行为）
+    // 修复：多核下仅允许“指定leader core”触发，且要求seq单调递增，避免跨核相位/乱序导致重复注入与非确定性。
+    if (step_activation_period_cycles_ == 0 && step_activation_enable_ && event == "BeginGather") {
+        const bool core_ok = (step_activation_trigger_core_ < 0) ||
+                             (core_id < 0) ||
+                             (core_id == step_activation_trigger_core_);
+        if (core_ok) {
+            // 仅允许前进：避免 seq 在不同core之间交错回退触发重复注入
+            const bool first_inject = (last_step_injection_seq_ == std::numeric_limits<uint32_t>::max());
+            if (first_inject || seq > last_step_injection_seq_) {
+                if (step_injection_ready_) {
+                    injectStepActivations(seq, ts_ns);
+                    last_step_injection_seq_ = seq;
+                } else {
+                    pending_step_inject_ = true;
+                    pending_step_seq_ = seq;
+                    pending_step_ts_ns_ = ts_ns;
+                }
             } else {
-                pending_step_inject_ = true;
-                pending_step_seq_ = seq;
-                pending_step_ts_ns_ = ts_ns;
+                // 限量告警：帮助定位非单调/跨核乱序
+                if (output_ && step_seq_warn_count_ < 16) {
+                    PE_LOG(1, "[step-warn] non-monotonic BeginGather ignored: node=%d core=%d seq=%u last=%u\n",
+                           node_id_, core_id, seq, last_step_injection_seq_);
+                    ++step_seq_warn_count_;
+                }
             }
         }
     }
@@ -1193,6 +1247,19 @@ void MultiCorePE::updateStatistics() {
     // 更新统计信息
     stat_neurons_fired_->addData(total_fired);
     stat_avg_utilization_->addData(total_utilization / num_cores_);
+
+    if (diag_fire_log_ && output_) {
+        std::ostringstream oss;
+        oss << "[diag-pe-fire] node=" << node_id_
+            << " cycle=" << current_cycle_
+            << " total_fired=" << total_fired
+            << " per_core=";
+        for (int i = 0; i < num_cores_; ++i) {
+            if (i) oss << ",";
+            oss << i << ":" << unit_states_[i].neurons_fired;
+        }
+        output_->verbose(CALL_INFO, 1, 0, "%s\n", oss.str().c_str());
+    }
     
     // 详细调试信息
     if (verbose_ >= 3 && current_cycle_ % 10000 == 0) {
@@ -2018,7 +2085,7 @@ uint64_t MultiCorePE::alignUp_(uint64_t value, uint64_t align) const {
     return rem ? (value + align - rem) : value;
 }
 
-bool MultiCorePE::buildRoutesFromBcsrFile_(const std::string& path, uint32_t core_index) {
+bool MultiCorePE::buildRoutesFromBcsrFile_(const std::string& path, uint32_t pe_id, uint32_t core_index) {
     const uint32_t rows_per_core = step_activation_bcsr_rows_per_core_;
     const uint32_t br = step_activation_bcsr_br_ ? step_activation_bcsr_br_ : 16;
     const uint32_t bc = step_activation_bcsr_bc_ ? step_activation_bcsr_bc_ : 16;
@@ -2180,14 +2247,19 @@ bool MultiCorePE::buildRoutesFromBcsrFile_(const std::string& path, uint32_t cor
             for (uint32_t rr = 0; rr < br; ++rr) {
                 uint32_t post_local = block_row * br + rr;
                 if (post_local >= rows_per_core) continue;
+                const uint64_t post_global_64 =
+                    static_cast<uint64_t>(pe_id) * static_cast<uint64_t>(neurons_per_pe) +
+                    static_cast<uint64_t>(core_index) * static_cast<uint64_t>(rows_per_core) +
+                    static_cast<uint64_t>(post_local);
+                if (max_global > 0u && post_global_64 >= static_cast<uint64_t>(max_global)) {
+                    continue;
+                }
+                const uint32_t post_global = static_cast<uint32_t>(post_global_64);
                 for (uint32_t cc = 0; cc < bc; ++cc) {
                     size_t off = static_cast<size_t>(rr) * bc + cc;
-                    uint32_t post_global = blockids[off];
-                    // 路由健壮性守护：过滤无效/越界的post_global，避免后续注入到不存在的节点
-                    if (post_global == 0xFFFFFFFFu) continue;
-                    if (max_global == 0u || post_global >= max_global) {
-                        continue;
-                    }
+                    // blockids 作为稀疏mask：0xFFFFFFFF 表示该位置无边；非mask值不代表 post_global
+                    if (blockids[off] == 0xFFFFFFFFu) continue;
+                    // 权重阈值过滤：避免把块内填充0当作有效边
                     float weight = blockdata[off];
                     if (std::fabs(weight) <= step_activation_bcsr_weight_epsilon_) continue;
                     uint32_t pre_global = pre_base + cc;
@@ -2206,8 +2278,8 @@ bool MultiCorePE::buildRoutesFromBcsrFile_(const std::string& path, uint32_t cor
         uint64_t edges = 0;
         for (auto &v : step_activation_routes_) edges += (uint64_t)v.size();
         output_->verbose(CALL_INFO, 1, 0,
-            "[step-activation] BCSR reachability loaded: core=%u rows=%u br=%u bc=%u total_blocks(rowptr)=%u used=%u edges=%llu\n",
-            core_index, rows_per_core, br, bc, total_blocks_rowptr, total_blocks,
+            "[step-activation] BCSR reachability loaded: pe=%u core=%u rows=%u br=%u bc=%u total_blocks(rowptr)=%u used=%u edges=%llu\n",
+            pe_id, core_index, rows_per_core, br, bc, total_blocks_rowptr, total_blocks,
             static_cast<unsigned long long>(edges));
     }
     return true;
@@ -2240,7 +2312,7 @@ bool MultiCorePE::loadBcsrReachability_() {
             for (int core = 0; core < num_cores_; ++core) {
                 std::string path = formatBcsrPath_(pe, core);
                 if (path.empty()) { success = false; break; }
-                if (!buildRoutesFromBcsrFile_(path, core)) { success = false; break; }
+                if (!buildRoutesFromBcsrFile_(path, static_cast<uint32_t>(pe), static_cast<uint32_t>(core))) { success = false; break; }
             }
             if (!success) break;
         }

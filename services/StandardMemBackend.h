@@ -18,6 +18,11 @@ namespace SST { namespace SnnDL {
 struct MemRequestMeta {
     uint64_t address = 0;
     size_t size = 0;
+    // 对齐读支持：若发起时做了 cacheline 对齐扩展，则 address/size 是对齐后的请求，
+    // orig_address/orig_size 描述调用方想要的原始子区间（用于响应切片解析）。
+    uint64_t orig_address = 0;
+    size_t orig_size = 0;
+    size_t slice_offset = 0; // orig_address - address
     bool is_row = false;
     uint32_t pre = 0;
     uint32_t post_start = 0;

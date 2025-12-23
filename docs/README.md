@@ -4,13 +4,16 @@
 
 ## 当前内容
 
+- `UNIVERSAL_CONTROL_CORE_DESIGN.md`
+  - 通用控制子核（`control/SnnPESubComponent`）目标形态、分层与迁移路线（Phase A/B/C/D）。
+- `SPIKE_COMM_SUBSYSTEM_DESIGN.md`
+  - Spike 通信子系统抽象与落地说明（`api/ISpikeTransport` + `services/SpikeCommSubsystem`）。
 - `PHASE3_BCSR_LAYOUT_ACCUMULATOR_DESIGN.md`
-  - BCSR 布局、窗口累加器（Accumulator）与相关优化点的设计说明。
+  - BCSR 布局集中与累加器 touched-reset/影子验证的设计说明。
 - `SNNDL_CLEANUP_PLAN.md`
-  - 清理与重构计划的阶段记录（用于对照执行与回归验证）。
+  - 历史清理与收敛计划（作为执行对照与回归口径参考）。
 
 ## 约束与建议
 
 - 文档应描述“为什么/做什么/如何验证/风险与回退”，避免重复粘贴代码实现细节。
 - 与可替换 compute core 相关的接口契约，优先维护在仓库根部的 `ISnnComputeCore_SPEC.md`，并在此目录做设计补充与案例记录。
-

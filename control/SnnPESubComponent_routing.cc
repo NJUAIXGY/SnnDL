@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <fstream>
 #include <inttypes.h>
 #include <iterator>
@@ -20,6 +21,11 @@
 
 using namespace SST;
 using namespace SST::SnnDL;
+
+#if 0
+// Phase D:
+// 旧的“控制层持有路由表 + 共享缓存 + 路由构建”实现已迁入 services/SpikeCommSubsystem，
+// 控制层不再持有 routes/pending/cache 等路由细节。此处保留历史实现以便对照，但不参与编译。
 
 // Logging helpers (local to this TU)
 #ifndef SNNDL_LOGPTR
@@ -485,6 +491,8 @@ bool SnnPESubComponent::appendRoutesFromBcsrFile(const std::string& path, uint32
     return true;
 }
 
+#endif // 0
+
 std::string SnnPESubComponent::resolveWeightTemplate(uint32_t pe, int core) const {
     if (weights_template_.empty()) return "";
     std::string path = weights_template_;
@@ -515,8 +523,5 @@ std::string SnnPESubComponent::resolveWeightTemplate(uint32_t pe, int core) cons
 void SnnPESubComponent::applyGatingDecision(uint32_t src_global, const std::vector<uint32_t>& dest_pes,
                              uint64_t current_cycle, uint64_t ttl_cycles)
 {
-    if (!gating_event_mode_) return;
-    GatingEntry e; e.dest_pes = dest_pes; e.expire_cycle = current_cycle + (ttl_cycles ? ttl_cycles : gating_ttl_cycles_cfg_);
-    gating_cache_[src_global] = std::move(e);
-    output_->verbose(CALL_INFO, 3, 0, "📥 应用门控: src_g=%u, k=%zu, expire=%" PRIu64 "\n", src_global, dest_pes.size(), gating_cache_[src_global].expire_cycle);
+    spike_comm_.applyGatingDecision(src_global, dest_pes, current_cycle, ttl_cycles);
 }

@@ -197,7 +197,8 @@ am_libSnnDL_la_OBJECTS = events/SimpleTestEvent.lo \
 	services/OptimizedInternalRing.lo services/SimpleNetworkWrapper.lo \
 	services/SnnBcsrWeightManager.lo services/SnnNetworkAdapter.lo \
 	services/SnnRouteProvider.lo services/WeightAccessor.lo \
-	services/WeightCacheOps.lo services/StandardMemBackend.lo \
+	services/WeightCacheOps.lo services/WeightMemorySubsystem.lo \
+	services/StandardMemBackend.lo \
 	services/SpikeCommSubsystem.lo
 libSnnDL_la_OBJECTS = $(am_libSnnDL_la_OBJECTS)
 AM_V_lt = $(am__v_lt_$(V))
@@ -657,6 +658,7 @@ libSnnDL_la_SOURCES = \
 	services/WeightAccessor.h \
 	services/WeightCacheOps.cc \
 	services/WeightCacheOps.h \
+	services/WeightMemorySubsystem.cc \
 	services/WeightMemorySubsystem.h \
 	services/SpikeCommSubsystem.cc \
 	services/SpikeCommSubsystem.h \

@@ -186,6 +186,15 @@ private:
     uint64_t weight_cache_hits_ = 0;
     uint64_t weight_cache_misses_ = 0;
     uint64_t pending_reqs_peak_ = 0;
+    bool diag_fire_log_ = false;
+
+    // Window-scatter ΔV staging:
+    // 在严格 GAS window 模式下，控制层会在 Scatter 边界将累计 ΔV 批量下发。
+    // 为保持与历史“先泄漏/不应期推进，再整合突触输入，再判定发放”的时序一致，
+    // applySynapticDelta() 先暂存 ΔV；endCycle() 内先 updateNeuronStates()，再一次性应用并 fire()。
+    std::vector<float> pending_dv_;
+    std::vector<uint8_t> pending_dv_touched_;
+    std::vector<uint32_t> pending_dv_list_;
 
 	    // 辅助方法
 	    void performWeightVerificationTick_(uint64_t now_cycle);
@@ -193,6 +202,8 @@ private:
 	    void initCoreEngineState_();
 	    void initVerifyFile_();
 	    void prepareBcsrCaches_();
+        void applyPendingDeltas_();
+        void resetPendingDeltas_();
 };
 
 } } // namespace SST::SnnDL

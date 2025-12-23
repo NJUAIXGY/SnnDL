@@ -128,6 +128,7 @@ public:
 
     // Phases
     void init(unsigned int phase) override;
+    void complete(unsigned int phase) override;
     void setup() override;
     void finish() override;
 
@@ -157,9 +158,23 @@ private:
         uint64_t window_id=0; // gather/apply window ID for this granule
         uint64_t payload_bytes = 0; // sum of upstream sub-request sizes (bytes)
 
+        // 下游分片：为兼容 memHierarchy.Cache（尤其 Incoherent L1），避免一次性发起 size>cache_line 的 GetS
+        // 导致 cache 在回包时越界拼 payload（表现为权重读脏/非确定性/发放归零）。
+        uint32_t frag_bytes = 0;   // 每片字节数（通常=cache line）
+        uint32_t frags_total = 0;  // 总片数
+        uint32_t frags_issued = 0; // 已发起片数
+        uint32_t frags_done = 0;   // 已完成片数
+
         // 缓存排序键（优化2：避免重复计算bankRowIndex/rowIndex）
         mutable uint64_t cached_sort_key = 0;
         mutable bool sort_key_valid = false;
+    };
+
+    struct DownFrag {
+        int buf = 0;
+        uint64_t key = 0;
+        uint32_t off = 0;
+        uint32_t size = 0;
     };
 
     // Helpers
@@ -183,11 +198,12 @@ private:
     void resetGatherAutoCounters_();
     void tryAutoEndGather_();
     bool tryAutoEndApply_();
-    bool finishApplyWindow_();
+    bool finishApplyWindow_(const char* reason);
     void flushStageCycles_(Stage stage, bool window_boundary);
     int stageIndex_(Stage stage) const;
     void controlStep_();
     void applyCtrlConfig_(uint64_t k, uint64_t rowwin_bytes, uint64_t timeout_ns);
+    bool rebuildPendingAsGranules_(int buf);
     static std::vector<uint64_t> parseCsvU64_(const std::string& s);
 
     // Backend
@@ -245,6 +261,7 @@ private:
     std::string export_granules_csv_; // CSV path; empty to disable
     bool export_header_written_ = false;
     uint32_t node_id_param_ = 0;      // optional: for req/owner tile (single-PE defaults)
+    uint32_t core_id_param_ = (uint32_t)-1; // optional: per-core diagnostics
     void exportGranuleRow_(uint64_t start_ns, uint32_t bytes);
     // --- Window metrics export (buffer/inflight peaks) ---
     std::string export_window_metrics_csv_;
@@ -279,6 +296,7 @@ private:
     // State
     Stage stage_ = Stage::Idle;
     uint64_t current_gather_id_ = 0;
+    int diag_granule_build_logged_ = 0;
     // 双缓冲状态
     struct SBState {
         // LRU（RAII）：std::list + 迭代器，杜绝手工new/delete与悬挂指针
@@ -308,8 +326,8 @@ private:
         ~SBState() = default;
     };
     SBState sb_[2];
-    // 全局下行映射：down_id -> (buf_index,key)
-    std::unordered_map<Request::id_t, std::pair<int,uint64_t>> inflight_down_;
+    // 全局下行映射：down_id -> 归属 granule + 片内偏移
+    std::unordered_map<Request::id_t, DownFrag> inflight_down_;
     uint64_t inflight_counts_[2] = {0,0};
     uint64_t stage_counter_ = 0; // cycles elapsed in current stage
     bool apply_pending_emit_ = false;

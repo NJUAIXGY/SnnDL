@@ -35,6 +35,8 @@ void SnnPESubComponent::deliverSpike(SpikeEvent* spike) {
     onSpikeDeliveredCore_(spike);
 
     spike->clearLocalCache();
+    // 统一以“到达本核的仿真时间”作为处理时间戳，避免跨 PE/网络延迟导致的同周期竞态。
+    spike->setTimestamp(getCurrentSimTimeNano());
     output_->verbose(CALL_INFO, 4, 0, "📨 核心%d接收脉冲: 源全局ID=%u, 目标全局ID=%u, 目标神经元=%u, 权重%.3f\n",
                     core_id_, spike->getSourceNeuron(), spike->getDestinationNeuron(), spike->getDestinationNeuron(), spike->getWeight());
 
@@ -59,6 +61,24 @@ void SnnPESubComponent::deliverSpike(SpikeEvent* spike) {
         if (!use_post_row_pre_col_) {
             spike->setCachedPreLocal(mapPreGlobalToLocal_(spike->getSourceNeuron()));
         }
+        // [Critical Fix] 立即维护窗口容器，不等待 clockTick 延迟的 processLocalSpike()
+        // 备份版本 (Dec 11) 在 deliverSpike 时直接填充 posts_list_window_/active_pre_window_，
+        // 确保 BeginApply 到达时容器非空，issueFromEdges() 能正常发起权重读取。
+        // 当前版本将此逻辑移到了 processLocalSpike()，但由于 clockTick 的时间戳延迟检查
+        // (spike->getTimestamp() >= now_ns)，同周期到达的 spike 会被延迟处理，
+        // 导致 BeginApply 时容器为空，神经元无法发放。
+        if (weight_mem_subsystem_ && post_local_valid && post_local < num_neurons_) {
+            weight_mem_subsystem_->noteWindowTouch(post_local, spike->getSourceNeuron(), num_neurons_);
+            recordActivePre_(spike->getSourceNeuron());
+        } else if (window_read_debug_ || debug_window_log_count_ < 8) {
+            // 诊断：记录条件不满足的原因
+            output_->verbose(CALL_INFO, 1, 0,
+                "[DeliverDiag] core=%d skip noteWindowTouch: wms=%s post_valid=%d post_l=%u num=%u\n",
+                core_id_,
+                weight_mem_subsystem_ ? "set" : "null",
+                post_local_valid ? 1 : 0,
+                post_local, num_neurons_);
+        }
         static const uint32_t kLogLimit = 8;
         if (debug_window_log_count_ < kLogLimit) {
             output_->verbose(CALL_INFO, 1, 0,
@@ -66,10 +86,6 @@ void SnnPESubComponent::deliverSpike(SpikeEvent* spike) {
                 core_id_, dest, (uint64_t)global_neuron_base_, num_neurons_, post_local, incoming_spikes_.size());
             debug_window_log_count_++;
         }
-        if (post_local_valid && weight_mem_subsystem_) {
-            weight_mem_subsystem_->noteWindowTouch(post_local, spike->getSourceNeuron(), num_neurons_);
-        }
-        recordActivePre_(spike->getSourceNeuron());
     }
 
     // 更新两种统计：SST统计对象和内部计数器
@@ -228,8 +244,10 @@ void SnnPESubComponent::processLocalSpike(SpikeEvent* spike_event) {
         }
     }
     if (apply_acc_enable_) {
-        // End-to-end semantics: accumulate now if we already have the weight (cache hit)
-        if (have_mem_weight && use_post_row_pre_col_) {
+        // 严格窗口读（window_read_enable_=1）下，所有 ΔV 累加应由窗口 Apply 阶段统一发起与归集，
+        // 避免“同一条边既在 spike 到达时 cache-hit 累加，又在窗口 issueFromEdges 时再次累加”的双计数。
+        // 非窗口读模式下保留旧行为：cache-hit 时可直接累加。
+        if (!window_read_enable_ && have_mem_weight && use_post_row_pre_col_) {
             uint32_t post_local = target_neuron;
             // Debug probe (Option 2/3): cache-hit accumulation path
             if (output_) {

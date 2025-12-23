@@ -94,6 +94,7 @@ libSnnDL_la_SOURCES = \
 	services/WeightAccessor.h \
 	services/WeightCacheOps.cc \
 	services/WeightCacheOps.h \
+	services/WeightMemorySubsystem.cc \
 	services/WeightMemorySubsystem.h \
 	services/SpikeCommSubsystem.cc \
 	services/SpikeCommSubsystem.h \

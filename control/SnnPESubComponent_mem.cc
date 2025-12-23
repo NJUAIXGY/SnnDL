@@ -317,6 +317,15 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
     }
     if (!req) return;
 
+    // Phase E: all data-plane StandardMem responses are handled inside WeightMemorySubsystem.
+    // Control layer keeps only CustomResp (GAS control-plane) processing above.
+    if (weight_mem_subsystem_) {
+        weight_mem_subsystem_->setNowCycle(static_cast<uint64_t>(total_cycles_));
+        if (weight_mem_subsystem_->handleMemoryResponse(req)) {
+            return;
+        }
+    }
+
     output_->verbose(CALL_INFO, 4, 0, "📨 核心%d收到内存响应: ID=%" PRIu64 "\n",
                     core_id_, req->getID());
     MemRequestMeta pending_req;
@@ -664,6 +673,7 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
 void SnnPESubComponent::scheme1PrefetchSlice_(uint32_t slice_idx) {
     if (!ensureMemoryReady_()) return;
     if (weights_cols_ == 0) return;
+    if (!weight_mem_subsystem_) return;
     // 计算该 slice 的列区间 [beg, end)
     uint32_t width = weights_cols_;
     uint32_t seg = std::max<uint32_t>(1, (width + scheme1_slices_ - 1) / scheme1_slices_);
@@ -672,23 +682,17 @@ void SnnPESubComponent::scheme1PrefetchSlice_(uint32_t slice_idx) {
     if (beg >= end) return;
     const uint32_t fpl = std::max<uint32_t>(1, line_size_bytes_ / (uint32_t)sizeof(float));
     s1_is_issuing_prefetch_ = true;
+    weight_mem_subsystem_->setNowCycle(static_cast<uint64_t>(total_cycles_));
     for (uint32_t row = 0; row < num_neurons_; ++row) {
         // 按 cacheline 对齐扫描该区间
         for (uint32_t c = (beg / fpl) * fpl; c < end; c += fpl) {
             uint64_t req_addr = base_addr_ + (static_cast<uint64_t>(row) * width + c) * sizeof(float);
             size_t req_size = std::min<uint32_t>(fpl, end - c) * (uint32_t)sizeof(float);
             if (stat_s1_bytes_read_) stat_s1_bytes_read_->addData(static_cast<uint64_t>(req_size));
-            // 通过公共发起路径以便回填到权重缓存
-            // 设置 is_row=false、col_start=c、count_floats=...，不需要回调
-            PendingMemoryRequest pm{};
-            pm.address = req_addr; pm.size = req_size; pm.is_row = false;
-            pm.pre = row; pm.post_start = c; pm.count_floats = (uint32_t)(req_size / sizeof(float));
-            pm.has_single_cb = false; pm.cb_post = 0; pm.issue_cycle = total_cycles_;
-            pm.is_weight = (req_addr >= base_addr_ && req_addr < weight_region_end_);
-            pm.scheme1_prefetch = true;
-            stats_reporter_.reportMemoryIssue(req_size, true);
-            if (mem_backend_) mem_backend_->sendRead(req_addr, req_size, pm);
-            scheme1_pending_prefetch_++;
+            const uint32_t count_floats = static_cast<uint32_t>(req_size / sizeof(float));
+            const bool issued = weight_mem_subsystem_->issueDensePrefetchRaw(
+                req_addr, req_size, row, c, count_floats, /*scheme1_prefetch*/true);
+            if (issued) scheme1_pending_prefetch_++;
         }
     }
     s1_is_issuing_prefetch_ = false;

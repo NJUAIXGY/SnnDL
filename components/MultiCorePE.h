@@ -108,11 +108,13 @@ public:
         {"window_stats_enable", "启用时间窗口化统计(1=启用,0=关闭)", "0"},
         {"window_us", "统计窗口长度（微秒）", "20"},
         {"window_csv", "窗口化统计输出CSV路径（为空则不输出）", ""},
+        {"diag_fire_log", "启用发放统计诊断日志(1=开启)", "0"},
         {"manual_gas_gather_cycles", "manual_window_drive下每多少周期强制EndGather一次（0=禁用）", "200"},
         {"step_activation_enable", "启用步级随机激活", "0"},
         {"step_activation_fraction", "步级随机激活伯努利概率", "0.0"},
         {"step_activation_fanout", "步级随机激活fanout", "0"},
         {"step_activation_seed", "步级随机激活随机种子", "0xdecafbad"},
+        {"step_activation_period_cycles", "固定周期触发step随机激活(>0启用; 0=沿用BeginGather触发)", "0"},
         {"step_activation_event_weight", "步级注入事件权重（非严格模式备用）", "0.0"},
         {"step_reset_mem_each_step", "步末复位膜电位", "0"},
         {"step_activation_use_bcsr_routes", "随机激活是否使用BCSR路由表", "0"},
@@ -229,6 +231,7 @@ public:
 
     // SST组件生命周期方法
     void init(unsigned int phase) override;
+    void complete(unsigned int phase) override;
     void setup() override;
     void finish() override;
 
@@ -269,7 +272,8 @@ public:
                                      uint64_t spill_records, uint64_t spilled_bytes);
     // PE级阶段事件收敛：核心通知PE，PE只写一次（每窗一行）
     // 接收核心上报的阶段事件；当 event=EndScatter 且 spikes>0 时，同时记录本窗发放
-    void notifyStageEvent(uint32_t seq, const std::string& event, uint64_t ts_ns, uint64_t spikes_emitted = 0);
+    void notifyStageEvent(uint32_t seq, const std::string& event, uint64_t ts_ns,
+                          uint64_t spikes_emitted = 0, int core_id = -1);
     void accumulateUniqueNeuronFired(uint64_t cnt) {
         if (cnt && stat_unique_neurons_fired_total_) stat_unique_neurons_fired_total_->addData(cnt);
     }
@@ -353,6 +357,7 @@ private:
     // 输出控制
     bool print_node_summary_ = true; // 控制finish时是否打印节点汇总
     bool primary_keepalive_ = false; // 仅在单PE脚本需要保持仿真推进时启用
+    bool ok_to_end_sent_ = false; // 防止重复触发 primaryComponentOKToEndSim 导致退出事件重复调度
     bool manual_core_drive_enable_ = false; // 诊断回退：手动驱动子核clock/EndGather
     uint64_t manual_gas_gather_cycles_ = 200; // manual_window_drive回退下的窗口长度（周期）
     
@@ -476,6 +481,7 @@ private:
     uint64_t window_ns_ = 20000;   // 对应纳秒（1us=1000ns）
     std::string window_csv_;
     std::string window_metrics_csv_;
+    bool diag_fire_log_ = false;
     struct WindowAgg {
         uint64_t start_ns = 0;
         uint64_t end_ns = 0;
@@ -528,8 +534,14 @@ private:
     std::vector<std::vector<uint32_t>> step_activation_routes_;
     // 单PE场景下：缓存“存在至少一条出边”的 pre_global 列表，避免在所有神经元上浪费采样
     std::vector<uint32_t> step_activation_pre_with_routes_;
+    // Step 注入调度：若 period>0，则按固定周期触发（去耦 BeginGather 时基漂移）
+    uint64_t step_activation_period_cycles_ = 0;
+    int step_activation_trigger_core_ = 0;  // BeginGather触发的核心：默认core0，-1表示任意核心
+    uint64_t step_activation_next_cycle_ = 0;
+    uint32_t step_activation_fixed_seq_ = 1;
     uint32_t last_step_injection_seq_ = std::numeric_limits<uint32_t>::max();
     uint32_t last_step_reset_seq_ = std::numeric_limits<uint32_t>::max();
+    uint32_t step_seq_warn_count_ = 0;  // 非单调序列告警限流
     void writeWindowCsv_();
     void mergeWindowMetricsFromCsv_();
     
@@ -587,7 +599,7 @@ private:
     void injectStepActivations(uint32_t seq, uint64_t sim_time_ns);
     void resetAllCoreMembranes();
     bool loadBcsrReachability_();
-    bool buildRoutesFromBcsrFile_(const std::string& path, uint32_t core_index);
+    bool buildRoutesFromBcsrFile_(const std::string& path, uint32_t pe_id, uint32_t core_index);
     std::string formatBcsrPath_(int pe, int core) const;
     bool computeBcsrOffsets_(uint32_t n_block_rows, uint32_t total_blocks,
                              uint64_t block_bytes,

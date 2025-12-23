@@ -69,6 +69,7 @@ void DefaultSnnComputeCore::configure(const ComputeCoreContext& ctx, const SST::
     window_read_debug_ = params.find<int>("window_read_debug", 0) != 0;
     window_read_budget_ = params.find<uint32_t>("window_read_budget", 1024);
     max_outstanding_requests_ = params.find<uint32_t>("max_outstanding_requests", 16);
+    diag_fire_log_ = params.find<int>("diag_fire_log", 0) != 0;
     line_size_bytes_ = params.find<uint32_t>("line_size_bytes", 64);
     weights_cols_ = params.find<uint32_t>("weights_cols", 0);
     if (weights_cols_ == 0) weights_cols_ = num_neurons_;
@@ -150,6 +151,10 @@ void DefaultSnnComputeCore::initCoreEngineState_() {
         core_engine_.bindState(&neuron_states_, nullptr, nullptr, nullptr);
     }
     fired_this_window_.assign(num_neurons_, 0);
+    pending_dv_.assign(num_neurons_, 0.0f);
+    pending_dv_touched_.assign(num_neurons_, 0);
+    pending_dv_list_.clear();
+    pending_dv_list_.reserve(std::max<uint32_t>(8u, num_neurons_ / 10u));
 }
 
 void DefaultSnnComputeCore::initVerifyFile_() {
@@ -200,8 +205,29 @@ void DefaultSnnComputeCore::onClockTick(uint64_t now_cycle) {
 }
 
 void DefaultSnnComputeCore::endCycle(uint64_t now_cycle) {
-    // 推进动力学
+    // 诊断：观察 pending dv 列表与膜电位上限（限制次数）
+    if (output_) {
+        static uint32_t diag_end_logs = 0;
+        const uint32_t kLogLimit = 16;
+        if (diag_end_logs < kLogLimit) {
+            float v_max = -1e30f;
+            uint32_t v_max_idx = 0;
+            for (uint32_t i = 0; i < num_neurons_; ++i) {
+                float v = core_engine_.getMem(i);
+                if (v > v_max) { v_max = v; v_max_idx = i; }
+            }
+            output_->verbose(CALL_INFO, 0, 0,
+                "[diag-endcycle] core=%u pending=%zu stage=%d apply_acc=%d gas_window=%d v_max=%.6f idx=%u v_thresh=%.6f\n",
+                ctx_.core_id, pending_dv_list_.size(),
+                static_cast<int>(gas_stage_), apply_acc_enable_ ? 1 : 0,
+                gas_window_mode_ ? 1 : 0, v_max, v_max_idx, v_thresh_);
+            ++diag_end_logs;
+        }
+    }
+
+    // 推进动力学：先泄漏/不应期推进，再整合 Scatter 累计 ΔV，最后判定发放。
     updateNeuronStates();
+    applyPendingDeltas_();
     // 按当前窗口/阶段门控判定发放，复用 fire() 以保持旧语义
     for (uint32_t i = 0; i < num_neurons_; ++i) {
         float v_before = 0.0f, v_after = 0.0f;
@@ -214,6 +240,7 @@ void DefaultSnnComputeCore::endCycleCandidates(uint64_t now_cycle,
     // 与 endCycle() 保持一致的“先推进动力学，再判定发放”顺序。
     // candidates 允许控制层在 window/scatter 场景下仅检查触达的 post 集合。
     updateNeuronStates();
+    applyPendingDeltas_();
 
     if (candidates.empty()) return;
 
@@ -242,7 +269,56 @@ bool DefaultSnnComputeCore::shouldAcceptSynapticInput(uint32_t post_local, uint6
 
 void DefaultSnnComputeCore::applySynapticDelta(uint32_t post_local, float dv) {
     synaptic_accesses_count_++;
+    if (apply_acc_enable_ && gas_window_mode_) {
+        if (post_local >= num_neurons_) return;
+        if (pending_dv_.size() != num_neurons_) {
+            pending_dv_.assign(num_neurons_, 0.0f);
+            pending_dv_touched_.assign(num_neurons_, 0);
+            pending_dv_list_.clear();
+            pending_dv_list_.reserve(std::max<uint32_t>(8u, num_neurons_ / 10u));
+        }
+        pending_dv_[post_local] += dv;
+        if (post_local < pending_dv_touched_.size() && pending_dv_touched_[post_local] == 0) {
+            pending_dv_touched_[post_local] = 1;
+            pending_dv_list_.push_back(post_local);
+        }
+        // 诊断：确认 pending 列表被填充（限制次数，避免日志膨胀）
+        if (output_ && dv != 0.0f) {
+            static uint32_t diag_delta_logs = 0;
+            const uint32_t kLogLimit = 16;
+            if (diag_delta_logs < kLogLimit) {
+                output_->verbose(CALL_INFO, 0, 0,
+                    "[diag-dv] core=%u post=%u dv=%.6f pending_sz=%zu num_neurons=%u\n",
+                    ctx_.core_id, post_local, dv, pending_dv_list_.size(), num_neurons_);
+                ++diag_delta_logs;
+            }
+        }
+        return;
+    }
     core_engine_.addMem(post_local, dv);
+}
+
+void DefaultSnnComputeCore::applyPendingDeltas_() {
+    if (pending_dv_list_.empty()) return;
+    for (uint32_t post_local : pending_dv_list_) {
+        if (post_local >= num_neurons_) continue;
+        const float dv = (post_local < pending_dv_.size()) ? pending_dv_[post_local] : 0.0f;
+        if (dv != 0.0f) {
+            core_engine_.addMem(post_local, dv);
+        }
+        if (post_local < pending_dv_.size()) pending_dv_[post_local] = 0.0f;
+        if (post_local < pending_dv_touched_.size()) pending_dv_touched_[post_local] = 0;
+    }
+    pending_dv_list_.clear();
+}
+
+void DefaultSnnComputeCore::resetPendingDeltas_() {
+    if (pending_dv_list_.empty()) return;
+    for (uint32_t post_local : pending_dv_list_) {
+        if (post_local < pending_dv_.size()) pending_dv_[post_local] = 0.0f;
+        if (post_local < pending_dv_touched_.size()) pending_dv_touched_[post_local] = 0;
+    }
+    pending_dv_list_.clear();
 }
 
 void DefaultSnnComputeCore::onSynapticEvent(const SynapticEvent& ev) {
@@ -396,6 +472,7 @@ void DefaultSnnComputeCore::onStageBeginGather(uint32_t seq) {
     std::fill(fired_this_window_.begin(), fired_this_window_.end(), 0);
     window_spikes_all_ = 0;
     fire_gate_active_ = apply_acc_enable_ && gas_window_mode_;
+    resetPendingDeltas_();
 }
 
 void DefaultSnnComputeCore::onStageBeginApply(uint32_t seq) {
@@ -418,12 +495,14 @@ void DefaultSnnComputeCore::onStageBeginScatter(uint32_t seq) {
     }
     fired_events_window_.clear();
     spikes_generated_base_ = 0; // caller可按需设置
+    resetPendingDeltas_();
 }
 
 void DefaultSnnComputeCore::onStageEndScatter(uint32_t, uint64_t) {
     gas_stage_ = GasStage::Idle;
     fire_gate_active_ = false;
     fired_events_window_.clear();
+    resetPendingDeltas_();
 }
 
 void DefaultSnnComputeCore::onSpikeDelivered(SpikeEvent* spike) {
@@ -461,6 +540,13 @@ void DefaultSnnComputeCore::getStatistics(std::map<std::string, uint64_t>& out) 
     if (learning_core_) {
         learning_core_->getStatistics(out);
     }
+    if (diag_fire_log_ && output_) {
+        output_->verbose(CALL_INFO, 1, 0,
+            "[diag-core-fire] node=%u core=%u fired=%" PRIu64 " spikes=%" PRIu64 " window_events=%zu\n",
+            ctx_.node_id, ctx_.core_id,
+            neurons_fired_count_, spikes_generated_count_,
+            static_cast<size_t>(fired_events_window_.size()));
+    }
 }
 
 void DefaultSnnComputeCore::resetMembraneState(float v_rest_value) {
@@ -468,6 +554,7 @@ void DefaultSnnComputeCore::resetMembraneState(float v_rest_value) {
     if (!fired_this_window_.empty()) {
         std::fill(fired_this_window_.begin(), fired_this_window_.end(), 0);
     }
+    resetPendingDeltas_();
 }
 
 void DefaultSnnComputeCore::performWeightVerificationTick_(uint64_t now_cycle) {

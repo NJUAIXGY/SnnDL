@@ -138,6 +138,7 @@ GatherBufferIF::GatherBufferIF(ComponentId_t id, Params& params, TimeConverter* 
     // P1-2: granule export CSV (optional)
     export_granules_csv_ = params.find<std::string>("export_granules_csv", "");
     node_id_param_ = params.find<uint32_t>("node_id", 0);
+    core_id_param_ = params.find<uint32_t>("core_id", (uint32_t)-1);
     export_window_metrics_csv_ = params.find<std::string>("export_window_metrics_csv", "");
 
     resetGatherAutoCounters_();
@@ -178,6 +179,10 @@ void GatherBufferIF::init(unsigned int phase) {
         }
         sb_[gather_buf_index_].end_gather_seen = false;
     }
+}
+
+void GatherBufferIF::complete(unsigned int phase) {
+    backend_->complete(phase);
 }
 
 void GatherBufferIF::setup() { backend_->setup(); }
@@ -291,7 +296,8 @@ void GatherBufferIF::send(Request* req) {
         // Decide whether we can treat this as gather for the next SB
         bool can_gather_now = (stage_ == Stage::Gather) || (double_buffer_enable_ && stage_ == Stage::Apply);
         if (can_gather_now) {
-            // 在Gather阶段，进入当前gather缓冲；在Apply阶段，上游按边读取属于当前apply窗口，应进入apply缓冲
+            // 回归正确归属：Apply 阶段的读属于当前窗口，应进入 apply_buf。
+            // 混入“下一窗口 gather”会导致当前窗口缺权重；但需要额外防御 pending 悬挂。
             int tgt = (stage_ == Stage::Gather) ? gather_buf_index_ : apply_buf_index_;
             sb_[tgt].pending_up_reads[rd->getID()] = rd;
             gather_bytes_accum_ += (uint64_t)rd->size;
@@ -393,104 +399,211 @@ uint64_t GatherBufferIF::granuleSize() const {
 }
 
 void GatherBufferIF::issueGranuleBuf_(int buf, uint64_t key, Granule& g) {
-    // respect max_inflight (best-effort: simple check) across both buffers
-    if ((inflight_counts_[0] + inflight_counts_[1]) >= max_inflight_reads_) return; // defer; will retry on next resp
-    auto* rd = new StandardMem::Read(g.base, g.size);
-    g.down_id = rd->getID();
-    g.issued = true;
-    g.issue_ns = getCurrentSimTimeNano();
-    out_.verbose(CALL_INFO, 2, 0,
-        "[diag-gbi] issue granule buf=%d key=0x%lx base=0x%lx size=%u id=%" PRIu64 "\n",
-        buf, (unsigned long)key, (unsigned long)g.base, g.size, (uint64_t)g.down_id);
-    inflight_down_[g.down_id] = std::make_pair(buf, key);
-    inflight_counts_[buf]++;
-    if (stat_reads_issued_) stat_reads_issued_->addData(1);
-    backend_->send(rd);
+    // 关键：memHierarchy.Cache（尤其 Incoherent L1）无法正确处理一次性 size>cache_line 的 GetS payload。
+    // 这里将一个 granule 的下游读拆分为 cacheline 级分片并在 SRAM 中拼接，避免权重读出脏/非确定性。
+    const uint64_t gsz_u64 = granuleSize();
+    const uint32_t gsz = (gsz_u64 > 0 && gsz_u64 <= (1ull << 20)) ? static_cast<uint32_t>(gsz_u64) : 64u;
+
+    if (g.frag_bytes == 0) {
+        g.frag_bytes = gsz;
+        g.frags_total = (g.size + g.frag_bytes - 1u) / g.frag_bytes;
+        g.frags_issued = 0;
+        g.frags_done = 0;
+    }
+    if (g.frags_issued >= g.frags_total) return;
+
+    while (g.frags_issued < g.frags_total && (inflight_counts_[0] + inflight_counts_[1]) < max_inflight_reads_) {
+        if (!g.issued) {
+            g.issued = true;
+            g.issue_ns = getCurrentSimTimeNano();
+            if (diagEnabled_(1)) {
+                out_.verbose(CALL_INFO, 1, 0,
+                    "[diag-gbi-issue] node=%u core=%u buf=%d key=0x%lx base=0x%lx size=%u frags=%u frag_bytes=%u window=%" PRIu64 "\n",
+                    node_id_param_, core_id_param_, buf, (unsigned long)key, (unsigned long)g.base, g.size,
+                    g.frags_total, g.frag_bytes, (uint64_t)current_gather_id_);
+            }
+        }
+        const uint32_t off = g.frags_issued * g.frag_bytes;
+        const uint32_t sz = std::min<uint32_t>(g.frag_bytes, g.size - off);
+        auto* rd = new StandardMem::Read(g.base + off, sz);
+        const auto id = rd->getID();
+        g.down_id = id;
+        inflight_down_[id] = DownFrag{buf, key, off, sz};
+        inflight_counts_[buf]++;
+        if (stat_reads_issued_) stat_reads_issued_->addData(1);
+        backend_->send(rd);
+        g.frags_issued++;
+    }
 }
 
 void GatherBufferIF::onDownstreamResp_(Request* r) {
     // Only expecting ReadResp for now
     if (auto* rr = dynamic_cast<StandardMem::ReadResp*>(r)) {
-        out_.verbose(CALL_INFO, 1, 0,
-            "[diag-gbi] got ReadResp id=%" PRIu64 " bytes=%zu\n",
-            (uint64_t)rr->getID(), rr->data.size());
         auto it = inflight_down_.find(rr->getID());
+        if (diagEnabled_(1)) {
+            uint64_t key_dbg = (it != inflight_down_.end()) ? it->second.key : 0;
+            int buf_dbg = (it != inflight_down_.end()) ? it->second.buf : -1;
+            out_.verbose(CALL_INFO, 1, 0,
+                "[diag-gbi] ReadResp id=%" PRIu64 " bytes=%zu buf=%d key=0x%lx node=%u core=%u\n",
+                (uint64_t)rr->getID(), rr->data.size(), buf_dbg, (unsigned long)key_dbg, node_id_param_, core_id_param_);
+        }
         if (it != inflight_down_.end()) {
-            int buf_index = it->second.first; uint64_t key = it->second.second; inflight_down_.erase(it);
+            const int buf_index = it->second.buf;
+            const uint64_t key = it->second.key;
+            const uint32_t frag_off = it->second.off;
+            const uint32_t frag_sz = it->second.size;
+            inflight_down_.erase(it);
             if (buf_index >=0 && buf_index < 2) {
                 auto& sb = sb_[buf_index];
                 auto git = sb.granules.find(key);
                 if (git != sb.granules.end()) {
-                // store into SRAM
-                ensureCapacity_(buf_index, git->second.size);
-                auto& buf = sb.sram_blocks[key];
-                buf.resize(git->second.size);
-                if (!rr->data.empty()) {
-                    std::memcpy(buf.data(), rr->data.data(), std::min<size_t>(buf.size(), rr->data.size()));
+                auto& g = git->second;
+                // allocate SRAM block once per granule
+                auto bit = sb.sram_blocks.find(key);
+                if (bit == sb.sram_blocks.end()) {
+                    ensureCapacity_(buf_index, g.size);
+                    auto& nb = sb.sram_blocks[key];
+                    nb.resize(g.size);
+                    bit = sb.sram_blocks.find(key);
                 }
-                touchLRU_(buf_index, key);
-                git->second.ready = true;
-                if (out_.getVerboseLevel() >= 1) {
-                    out_.verbose(CALL_INFO, 1, 0,
-                        "[diag-gbi] mark ready buf=%d key=0x%lx subs=%zu\n",
-                        buf_index, (unsigned long)key, (size_t)git->second.subs.size());
+                auto& sram = bit->second;
+                // 断言式诊断：下游 ReadResp 必须返回完整分片，否则视为内存层异常（易导致 BCSR 读脏数据）
+                if (frag_sz > 0) {
+                    if (rr->data.size() < frag_sz) {
+                        out_.fatal(CALL_INFO, -1,
+                            "[gbi-assert] node=%u core=%u buf=%d key=0x%lx base=0x%lx frag_off=%u frag_sz=%u resp_bytes=%zu -- payload truncated, potential cache payload corruption\n",
+                            node_id_param_, core_id_param_, buf_index, (unsigned long)key,
+                            (unsigned long)g.base, frag_off, frag_sz, rr->data.size());
+                    }
                 }
+                if (!rr->data.empty() && frag_off < sram.size()) {
+                    const size_t cap = std::min<size_t>(frag_sz, sram.size() - frag_off);
+                    const size_t ncpy = std::min<size_t>(cap, rr->data.size());
+                    std::memcpy(sram.data() + frag_off, rr->data.data(), ncpy);
+                }
+                if (g.frags_total > 0 && g.frags_done < g.frags_total) g.frags_done++;
                 if (inflight_counts_[buf_index] > 0) inflight_counts_[buf_index]--;
-                if (stat_unique_reads_) stat_unique_reads_->addData(1);
-                if (stat_unique_bytes_) stat_unique_bytes_->addData(git->second.size);
-                // Diagnostic: dump per-sub first-float values into CSV
-                // Use SRAM block (blk) as the source of truth so we still produce samples even if rr->data is empty.
-                #ifdef SNNDL_ENABLE_DEBUG_LOG
-                if (!probe_csv_path_.empty()) {
-                    FILE* fp = fopen(probe_csv_path_.c_str(), probe_csv_header_written_? "a" : "w");
-                    if (fp) {
-                        if (!probe_csv_header_written_) { fprintf(fp, "abs_addr,size,f0\n"); probe_csv_header_written_ = true; }
-                        for (auto &sub : git->second.subs) {
-                            float f0 = 0.0f;
-                            if ((size_t)sub.offset + sizeof(float) <= buf.size()) {
-                                std::memcpy(&f0, buf.data()+sub.offset, sizeof(float));
+
+                // 若还有未发分片，继续发起（受 max_inflight 限制）
+                if (g.frags_total > 0 && g.frags_issued < g.frags_total) {
+                    issueGranuleBuf_(buf_index, key, g);
+                }
+
+                bool completed_now = false;
+                // 全部分片完成后，标记 ready 并做一次性统计/LRU
+                if (!g.ready && g.frags_total > 0 && g.frags_done >= g.frags_total) {
+                    // 诊断：落入SRAM时记录首float与地址（全节点，前若干条）
+                    static int diag_sram_store = 0;
+                    if (diagEnabled_(1) && diag_sram_store < 128 && !sram.empty()) {
+                        float f0_store = 0.0f;
+                        std::memcpy(&f0_store, sram.data(), std::min<size_t>(sizeof(float), sram.size()));
+                        out_.verbose(CALL_INFO, 1, 0,
+                            "[diag-sram-store] node=%u core=%u buf=%d key=0x%lx base=0x%lx size=%zu f0=%.6f\n",
+                            node_id_param_, core_id_param_, buf_index, (unsigned long)key,
+                            (unsigned long)g.base, sram.size(), f0_store);
+                        ++diag_sram_store;
+                    }
+                    touchLRU_(buf_index, key);
+                    g.ready = true;
+                    if (out_.getVerboseLevel() >= 1) {
+                        out_.verbose(CALL_INFO, 1, 0,
+                            "[diag-gbi] mark ready buf=%d key=0x%lx subs=%zu\n",
+                            buf_index, (unsigned long)key, (size_t)g.subs.size());
+                    }
+                    if (stat_unique_reads_) stat_unique_reads_->addData(1);
+                    if (stat_unique_bytes_) stat_unique_bytes_->addData(g.size);
+                    completed_now = true;
+                }
+                if (completed_now) {
+                    // Diagnostic: dump per-sub first-float values into CSV
+                    // Use SRAM block (sram) as the source of truth so we still produce samples even if rr->data is empty.
+                    #ifdef SNNDL_ENABLE_DEBUG_LOG
+                    if (!probe_csv_path_.empty()) {
+                        FILE* fp = fopen(probe_csv_path_.c_str(), probe_csv_header_written_? "a" : "w");
+                        if (fp) {
+                            if (!probe_csv_header_written_) { fprintf(fp, "abs_addr,size,f0\n"); probe_csv_header_written_ = true; }
+                            for (auto &sub : g.subs) {
+                                float f0 = 0.0f;
+                                if ((size_t)sub.offset + sizeof(float) <= sram.size()) {
+                                    std::memcpy(&f0, sram.data() + sub.offset, sizeof(float));
+                                }
+                                unsigned long abs = (unsigned long)(g.base + (uint64_t)sub.offset);
+                                fprintf(fp, "0x%lx,%u,%.6f\n", abs, (unsigned)sub.size, f0);
                             }
-                            unsigned long abs = (unsigned long)(git->second.base + (uint64_t)sub.offset);
-                            fprintf(fp, "0x%lx,%u,%.6f\n", abs, (unsigned)sub.size, f0);
+                            fclose(fp);
                         }
-                        fclose(fp);
                     }
-                }
-                #endif
-                // --- Adaptive k: segment timing and payload ---
-                if (k_adapt_enable_ || ctrl_enable_) {
-                    uint64_t end_ns = getCurrentSimTimeNano();
-                    uint64_t t_seg_ns = (end_ns >= git->second.issue_ns) ? (end_ns - git->second.issue_ns) : 0;
-                    const uint64_t payload = git->second.payload_bytes;
-                    // accumulate window metrics
-                    win_payload_bytes_ += payload;
-                    win_bursts_ += 1;
-                    if (t_seg_ns > 0) { win_seg_latency_sum_ns_ += t_seg_ns; win_seg_count_ += 1; }
-                    // update B_eff (EMA) using segment throughput
-                    if (k_adapt_enable_ && t_seg_ns > 0 && payload > 0) {
-                        double inst_bw = (double)payload / (double)t_seg_ns; // bytes/ns
-                        if (bw_eff_bytes_per_ns_ <= 0.0) bw_eff_bytes_per_ns_ = inst_bw;
-                        else bw_eff_bytes_per_ns_ = (1.0 - k_alpha_bw_) * bw_eff_bytes_per_ns_ + k_alpha_bw_ * inst_bw;
-                        // derive O_eff sample (ns): max(0, T - payload/B)
-                        double ideal_ns = (bw_eff_bytes_per_ns_ > 0.0) ? ((double)payload / bw_eff_bytes_per_ns_) : (double)t_seg_ns;
-                        double oeff = std::max(0.0, (double)t_seg_ns - ideal_ns);
-                        oeff_samples_ns_.push_back((uint64_t)std::llround(oeff));
+                    #endif
+
+                    // --- Adaptive k: segment timing and payload ---
+                    if (k_adapt_enable_ || ctrl_enable_) {
+                        uint64_t end_ns = getCurrentSimTimeNano();
+                        uint64_t t_seg_ns = (end_ns >= g.issue_ns) ? (end_ns - g.issue_ns) : 0;
+                        const uint64_t payload = g.payload_bytes;
+                        // accumulate window metrics
+                        win_payload_bytes_ += payload;
+                        win_bursts_ += 1;
+                        if (t_seg_ns > 0) { win_seg_latency_sum_ns_ += t_seg_ns; win_seg_count_ += 1; }
+                        // update B_eff (EMA) using segment throughput
+                        if (k_adapt_enable_ && t_seg_ns > 0 && payload > 0) {
+                            double inst_bw = (double)payload / (double)t_seg_ns; // bytes/ns
+                            if (bw_eff_bytes_per_ns_ <= 0.0) bw_eff_bytes_per_ns_ = inst_bw;
+                            else bw_eff_bytes_per_ns_ = (1.0 - k_alpha_bw_) * bw_eff_bytes_per_ns_ + k_alpha_bw_ * inst_bw;
+                            // derive O_eff sample (ns): max(0, T - payload/B)
+                            double ideal_ns = (bw_eff_bytes_per_ns_ > 0.0) ? ((double)payload / bw_eff_bytes_per_ns_) : (double)t_seg_ns;
+                            double oeff = std::max(0.0, (double)t_seg_ns - ideal_ns);
+                            oeff_samples_ns_.push_back((uint64_t)std::llround(oeff));
+                        }
                     }
-                }
-                // Also propagate a lightweight stat update upstream so PE层可累计到 CSV
-                if (upstream_handler_) {
-                    auto* s = new GasStatData(1, (uint64_t)git->second.size);
-                    auto* cr = new StandardMem::CustomResp((StandardMem::Request::id_t)0, s, 0, 0, 0);
-                    (*upstream_handler_)(cr);
-                }
-                if (stat_buffer_occupancy_bytes_) {
-                    uint64_t sum_bytes = sb_[0].bytes_in_sram + sb_[1].bytes_in_sram;
-                    stat_buffer_occupancy_bytes_->addData(sum_bytes);
-                    if (sum_bytes > win_buffer_max_bytes_) win_buffer_max_bytes_ = sum_bytes;
+
+                    // Also propagate a lightweight stat update upstream so PE层可累计到 CSV
+                    if (upstream_handler_) {
+                        auto* s = new GasStatData(1, (uint64_t)g.size);
+                        auto* cr = new StandardMem::CustomResp((StandardMem::Request::id_t)0, s, 0, 0, 0);
+                        (*upstream_handler_)(cr);
+                    }
+
+                    if (stat_buffer_occupancy_bytes_) {
+                        uint64_t sum_bytes = sb_[0].bytes_in_sram + sb_[1].bytes_in_sram;
+                        stat_buffer_occupancy_bytes_->addData(sum_bytes);
+                        if (sum_bytes > win_buffer_max_bytes_) win_buffer_max_bytes_ = sum_bytes;
+                    }
                 }
                 // 即时回传：若处于Apply阶段且本响应属于当前apply缓冲，尽快向上游发回，避免窗口切换时机错过
                 if (stage_ == Stage::Apply && buf_index == apply_buf_index_) {
                     emitApplyResponsesBuf_(apply_buf_index_);
+                    // 非延后模式：Apply 阶段也需要继续补发未发的 granule，
+                    // 否则在高压力/小 inflight 下可能出现“未发→inflight=0→窗口提前结束”的丢读问题。
+                    if (!defer_issue_until_apply_) {
+                        auto& gmap = sb_[apply_buf_index_].granules;
+                        std::vector<std::pair<uint64_t,uint64_t>> sorted;
+                        sorted.reserve(gmap.size());
+                        for (auto& kv : gmap) {
+                            if (kv.second.issued) continue;
+                            if (!kv.second.sort_key_valid) {
+                                if (sort_ == Sort::Addr) {
+                                    kv.second.cached_sort_key = kv.second.base;
+                                } else if (sort_ == Sort::BankRow) {
+                                    kv.second.cached_sort_key = bankRowIndex(kv.second.base);
+                                } else {
+                                    kv.second.cached_sort_key = rowIndex(kv.second.base);
+                                }
+                                kv.second.sort_key_valid = true;
+                            }
+                            sorted.emplace_back(kv.second.cached_sort_key, kv.first);
+                        }
+                        std::sort(sorted.begin(), sorted.end(),
+                                  [](const auto& a, const auto& b){
+                                      if (a.first != b.first) return a.first < b.first;
+                                      return a.second < b.second;
+                                  });
+                        for (auto& p : sorted) {
+                            auto it2 = gmap.find(p.second);
+                            if (it2 != gmap.end() && !it2->second.issued) {
+                                issueGranuleBuf_(apply_buf_index_, p.second, it2->second);
+                            }
+                        }
+                    }
                 }
             }
             }
@@ -502,8 +615,34 @@ void GatherBufferIF::onDownstreamResp_(Request* r) {
             maybeEnterApply_();
             // 非延后模式：仍在Gather，继续发射未发granule
             if (!defer_issue_until_apply_ && stage_ == Stage::Gather) {
-                for (auto& kv : sb_[gather_buf_index_].granules) {
-                    if (!kv.second.issued) { issueGranuleBuf_(gather_buf_index_, kv.first, kv.second); }
+                auto& gmap = sb_[gather_buf_index_].granules;
+                std::vector<std::pair<uint64_t,uint64_t>> sorted;
+                sorted.reserve(gmap.size());
+                for (auto& kv : gmap) {
+                    if (kv.second.issued) continue;
+                    // Deterministic issue order: break ties by key to avoid unordered_map iteration jitter.
+                    if (!kv.second.sort_key_valid) {
+                        if (sort_ == Sort::Addr) {
+                            kv.second.cached_sort_key = kv.second.base;
+                        } else if (sort_ == Sort::BankRow) {
+                            kv.second.cached_sort_key = bankRowIndex(kv.second.base);
+                        } else {
+                            kv.second.cached_sort_key = rowIndex(kv.second.base);
+                        }
+                        kv.second.sort_key_valid = true;
+                    }
+                    sorted.emplace_back(kv.second.cached_sort_key, kv.first);
+                }
+                std::sort(sorted.begin(), sorted.end(),
+                          [](const auto& a, const auto& b){
+                              if (a.first != b.first) return a.first < b.first;
+                              return a.second < b.second;
+                          });
+                for (auto& p : sorted) {
+                    auto it = gmap.find(p.second);
+                    if (it != gmap.end() && !it->second.issued) {
+                        issueGranuleBuf_(gather_buf_index_, p.second, it->second);
+                    }
                 }
             }
         } else if (stage_ == Stage::Apply && apply_pending_emit_) {
@@ -625,7 +764,11 @@ void GatherBufferIF::maybeEnterApply_() {
             }
             sorted.emplace_back(kv.second.cached_sort_key, kv.first);
         }
-        std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b){ return a.first < b.first; });
+        std::sort(sorted.begin(), sorted.end(),
+                  [](const auto& a, const auto& b){
+                      if (a.first != b.first) return a.first < b.first;
+                      return a.second < b.second;
+                  });
         // Compute pseudo row-adjacency for this window (before issuing)
         if (sorted.size() > 1) {
             for (size_t i = 1; i < sorted.size(); ++i) {
@@ -646,6 +789,36 @@ void GatherBufferIF::maybeEnterApply_() {
             if (it != gmap.end() && !it->second.issued) issueGranuleBuf_(apply_buf_index_, p.second, it->second);
         }
     } else {
+        // 非延后：在窗口切换到 Apply 时也补发未发 granule，避免在 Gather 结束时仍有未发请求被遗漏。
+        auto& gmap = sb_[apply_buf_index_].granules;
+        std::vector<std::pair<uint64_t,uint64_t>> sorted;
+        sorted.reserve(gmap.size());
+        for (auto& kv : gmap) {
+            if (kv.second.issued) continue;
+            if (!kv.second.sort_key_valid) {
+                if (sort_ == Sort::Addr) {
+                    kv.second.cached_sort_key = kv.second.base;
+                } else if (sort_ == Sort::BankRow) {
+                    kv.second.cached_sort_key = bankRowIndex(kv.second.base);
+                } else {
+                    kv.second.cached_sort_key = rowIndex(kv.second.base);
+                }
+                kv.second.sort_key_valid = true;
+            }
+            sorted.emplace_back(kv.second.cached_sort_key, kv.first);
+        }
+        std::sort(sorted.begin(), sorted.end(),
+                  [](const auto& a, const auto& b){
+                      if (a.first != b.first) return a.first < b.first;
+                      return a.second < b.second;
+                  });
+        for (auto& p : sorted) {
+            auto it = gmap.find(p.second);
+            if (it != gmap.end() && !it->second.issued) {
+                issueGranuleBuf_(apply_buf_index_, p.second, it->second);
+            }
+        }
+
         // 非延后：只有当全部ready时才会立刻发放
         bool allReady = true;
         for (auto key : sb_[apply_buf_index_].required_set) {
@@ -761,6 +934,15 @@ void GatherBufferIF::buildGranulesWithGapMergeBuf_(int buf) {
             if (!has) return;
             uint64_t base = cur_base; uint32_t sz = (uint32_t)(cur_end - cur_base);
             uint64_t gkey = (base << 32) ^ (uint64_t)sz;
+            if (diag_granule_build_logged_ < 64) {
+                out_.verbose(CALL_INFO, 0, 0,
+                    "[diag-gbi-granule] node=%u core=%u buf=%d key=0x%llx base=0x%llx size=%u subs=%zu\n",
+                    node_id_param_, core_id_param_, buf,
+                    (unsigned long long)gkey,
+                    (unsigned long long)base,
+                    sz, segSubs.size());
+                ++diag_granule_build_logged_;
+            }
             auto &g = S.granules[gkey];
             if (g.subs.empty()) {
                 g.base = base;
@@ -864,8 +1046,34 @@ void GatherBufferIF::emitApplyResponsesBuf_(int buf) {
     std::vector<uint64_t> completed_keys;
     completed_keys.reserve(S.granules.size());
 
+    // Deterministic traversal: granule and sub-read emission order must be stable across runs.
+    std::vector<std::pair<uint64_t,uint64_t>> sorted_keys;
+    sorted_keys.reserve(S.granules.size());
     for (auto& kvg : S.granules) {
-        uint64_t key = kvg.first; auto& g = kvg.second;
+        auto& g = kvg.second;
+        if (!g.sort_key_valid) {
+            if (sort_ == Sort::Addr) {
+                g.cached_sort_key = g.base;
+            } else if (sort_ == Sort::BankRow) {
+                g.cached_sort_key = bankRowIndex(g.base);
+            } else {
+                g.cached_sort_key = rowIndex(g.base);
+            }
+            g.sort_key_valid = true;
+        }
+        sorted_keys.emplace_back(g.cached_sort_key, kvg.first);
+    }
+    std::sort(sorted_keys.begin(), sorted_keys.end(),
+              [](const auto& a, const auto& b){
+                  if (a.first != b.first) return a.first < b.first;
+                  return a.second < b.second;
+              });
+
+    for (auto& pk : sorted_keys) {
+        uint64_t key = pk.second;
+        auto git = S.granules.find(key);
+        if (git == S.granules.end()) continue;
+        auto& g = git->second;
 
         // 跳过未 ready 的 granule（保留到下次处理）
         if (!g.ready) {
@@ -893,6 +1101,14 @@ void GatherBufferIF::emitApplyResponsesBuf_(int buf) {
             "[diag-gbi] granule key=0x%lx subs=%zu ready=%d buf=%d\n",
             (unsigned long)key, (size_t)g.subs.size(), (int)g.ready, buf);
 
+        // Make sub-read emission stable across runs even when upstream Read arrival order differs.
+        std::sort(g.subs.begin(), g.subs.end(),
+                  [](const SubReq& a, const SubReq& b){
+                      if (a.offset != b.offset) return a.offset < b.offset;
+                      if (a.size != b.size) return a.size < b.size;
+                      return a.up_id < b.up_id;
+                  });
+
         // 发回所有 sub-reads
         for (auto& s : g.subs) {
             // 使用 up_id 构造响应，避免依赖上游 Read* 指针的生命周期
@@ -910,6 +1126,20 @@ void GatherBufferIF::emitApplyResponsesBuf_(int buf) {
                 "[diag-gbi] respond up_id=%" PRIu64 " key=0x%lx off=%u size=%u pending=%zu data_empty=%d buf=%d\n",
                 (uint64_t)s.up_id, (unsigned long)key, (unsigned)s.offset,
                 (unsigned)s.size, (size_t)S.pending_up_reads.size(), resp->data.empty()?1:0, buf);
+            // 限量权重返回探针：仅 node_id=0 打印前16条，附带首float与地址
+            if (node_id_param_ == 0) {
+                static int diag_weightresp_gbi = 0;
+                if (diag_weightresp_gbi < 16 && !resp->data.empty()) {
+                    float f0_dbg = 0.0f;
+                    if (resp->data.size() >= sizeof(float)) {
+                        std::memcpy(&f0_dbg, resp->data.data(), sizeof(float));
+                    }
+                    out_.verbose(CALL_INFO, 0, 0,
+                        "[diag-weightresp-gbi] node=%u key=0x%lx off=%u size=%u f0=%.6f\n",
+                        node_id_param_, (unsigned long)key, (unsigned)s.offset, (unsigned)s.size, f0_dbg);
+                    ++diag_weightresp_gbi;
+                }
+            }
             // Diagnostic probe (no-ops when verbose==0): print first-float value of this sub-read
             if (out_.getVerboseLevel() >= 1 && !resp->data.empty()) {
                 float f0 = 0.0f;
@@ -975,6 +1205,65 @@ void GatherBufferIF::emitApplyResponsesBuf_(int buf) {
     S.end_gather_seen = false;
     S.staging_reads.clear();
     apply_pending_emit_ = false;
+}
+
+bool GatherBufferIF::rebuildPendingAsGranules_(int buf) {
+    auto& S = sb_[buf];
+    if (S.pending_up_reads.empty()) return false;
+    // 仅在当前窗口 granule 为空时尝试重建
+    if (!S.granules.empty()) return false;
+    uint64_t gsz = granuleSize();
+    bool rebuilt = false;
+    for (auto& kv : S.pending_up_reads) {
+        auto* rd = kv.second;
+        if (!rd) continue;
+        bool use_row = (merge_==Merge::Row) || (merge_==Merge::Auto && row_bytes_guess_ > gsz);
+        uint64_t base = (merge_==Merge::Cacheline || (merge_==Merge::Auto && !use_row)) ? alignDown(rd->pAddr, gsz)
+                       : (use_row ? alignDown(rd->pAddr, row_bytes_guess_) : rd->pAddr);
+        uint32_t sz = (merge_==Merge::None) ? rd->size : (use_row ? row_bytes_guess_ : gsz);
+        uint64_t key = (base << 32) ^ (uint64_t)sz;
+        auto& g = S.granules[key];
+        if (g.subs.empty()) {
+            g.base = base;
+            g.size = sz;
+            g.window_id = current_gather_id_;
+            g.payload_bytes = 0;
+            S.required_set.insert(key);
+            if (stat_coalesce_granule_size_) stat_coalesce_granule_size_->addData((uint64_t)sz);
+        }
+        uint64_t off = (rd->pAddr >= base) ? (rd->pAddr - base) : 0;
+        g.subs.push_back({rd->getID(), off, (uint32_t)rd->size});
+        g.payload_bytes += (uint64_t)rd->size;
+        rebuilt = true;
+    }
+    if (rebuilt && !defer_issue_until_apply_) {
+        // issue all granules deterministically
+        std::vector<std::pair<uint64_t,uint64_t>> sorted;
+        sorted.reserve(S.granules.size());
+        for (auto& kv : S.granules) {
+            if (!kv.second.sort_key_valid) {
+                if (sort_ == Sort::Addr) kv.second.cached_sort_key = kv.second.base;
+                else if (sort_ == Sort::BankRow) kv.second.cached_sort_key = bankRowIndex(kv.second.base);
+                else kv.second.cached_sort_key = rowIndex(kv.second.base);
+                kv.second.sort_key_valid = true;
+            }
+            sorted.emplace_back(kv.second.cached_sort_key, kv.first);
+        }
+        std::sort(sorted.begin(), sorted.end(), [](auto&a, auto&b){
+            if (a.first != b.first) return a.first < b.first;
+            return a.second < b.second;
+        });
+        for (auto& p : sorted) {
+            auto it = S.granules.find(p.second);
+            if (it != S.granules.end() && !it->second.issued) issueGranuleBuf_(buf, p.second, it->second);
+        }
+    }
+    if (rebuilt && out_.getVerboseLevel() >= 1) {
+        out_.verbose(CALL_INFO, 1, 0,
+            "[diag-gbi] rebuild pending->granules buf=%d granules=%zu pending=%zu\n",
+            buf, S.granules.size(), S.pending_up_reads.size());
+    }
+    return rebuilt;
 }
 
 void GatherBufferIF::doFlushBuf_(int buf) {
@@ -1079,7 +1368,11 @@ bool GatherBufferIF::clockTick(Cycle_t) {
                 }
                 sorted.emplace_back(kv.second.cached_sort_key, kv.first);
             }
-            std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b){ return a.first < b.first; });
+            std::sort(sorted.begin(), sorted.end(),
+                      [](const auto& a, const auto& b){
+                          if (a.first != b.first) return a.first < b.first;
+                          return a.second < b.second;
+                      });
             for (auto &p : sorted) {
                 auto it = gmap.find(p.second);
                 if (it != gmap.end() && !it->second.issued) issueGranuleBuf_(gather_buf_index_, p.second, it->second);
@@ -1089,7 +1382,7 @@ bool GatherBufferIF::clockTick(Cycle_t) {
             if (tryAutoEndApply_()) return false;
         }
         if (win_cyc_apply_ && stage_counter_ >= win_cyc_apply_) {
-            if (!finishApplyWindow_()) return false;
+            if (!finishApplyWindow_("apply-cycle-limit")) return false;
         }
     } else if (stage_ == Stage::Scatter) {
         bool scatter_due = false;
@@ -1099,6 +1392,13 @@ bool GatherBufferIF::clockTick(Cycle_t) {
             scatter_due = true;
         }
         if (scatter_due) {
+            if (out_.getVerboseLevel() >= 1) {
+                out_.verbose(CALL_INFO, 1, 0,
+                    "[diag-gbi] EndScatter reason=%s gather_id=%" PRIu64 " stage_counter=%" PRIu64 " inflight_apply=%" PRIu64 " inflight_gather=%" PRIu64 "\n",
+                    scatter_immediate_complete_ ? "scatter-immediate" : "scatter-cycle",
+                    current_gather_id_, stage_counter_,
+                    inflight_counts_[apply_buf_index_], inflight_counts_[gather_buf_index_]);
+            }
             flushStageCycles_(Stage::Scatter, true);
             // start new gather window
             if (emit_stage_events_ && upstream_handler_) {
@@ -1208,13 +1508,79 @@ bool GatherBufferIF::tryAutoEndApply_() {
         }
     }
     if (!allReady) return false;
-    return finishApplyWindow_();
+    return finishApplyWindow_("apply-auto-all-ready");
 }
 
-bool GatherBufferIF::finishApplyWindow_() {
+bool GatherBufferIF::finishApplyWindow_(const char* reason) {
+    if (out_.getVerboseLevel() >= 1) {
+        size_t req_sz = sb_[apply_buf_index_].required_set.size();
+        size_t gran_sz = sb_[apply_buf_index_].granules.size();
+        size_t pend_sz = sb_[apply_buf_index_].pending_up_reads.size();
+        out_.verbose(CALL_INFO, 1, 0,
+            "[diag-gbi] FinishApplyWindow reason=%s gather_id=%" PRIu64 " stage_counter=%" PRIu64 " req=%zu granules=%zu pending_up=%zu inflight_apply=%" PRIu64 " inflight_gather=%" PRIu64 " gather_auto_triggered=%d bytes_accum=%" PRIu64 " reads_accum=%" PRIu64 "\n",
+            (reason ? reason : "unspecified"), current_gather_id_, stage_counter_,
+            req_sz, gran_sz, pend_sz,
+            inflight_counts_[apply_buf_index_], inflight_counts_[gather_buf_index_],
+            gather_auto_triggered_ ? 1 : 0, gather_bytes_accum_, gather_reads_accum_);
+    }
     flushStageCycles_(Stage::Apply, false);
     // 始终在窗口结束时向上游发回已ready的响应，避免非defer路径丢失回传
     emitApplyResponsesBuf_(apply_buf_index_);
+    // 非延后模式：确保 Apply 窗口不会在“仍有 required granule 未发/未完成”时结束；
+    // 这类提前结束会导致权重读丢失，从而引入发放统计的非确定性。
+    // 额外防护：如果 granules/required 已空、无 inflight，但 pending_up_reads 仍悬挂，
+    // 先尝试把 pending 重新构造成 granule 并下发；如仍未清理，则维持在 Apply 等待。
+    if (sb_[apply_buf_index_].granules.empty() &&
+        sb_[apply_buf_index_].required_set.empty() &&
+        inflight_counts_[apply_buf_index_] == 0 &&
+        inflight_counts_[gather_buf_index_] == 0 &&
+        !sb_[apply_buf_index_].pending_up_reads.empty()) {
+        if (rebuildPendingAsGranules_(apply_buf_index_)) {
+            apply_pending_emit_ = true;
+            return false; // 等待重建后的读返回
+        }
+        // 如确实无法重建，保持等待，避免零填破坏发放
+        apply_pending_emit_ = true;
+        return false;
+    }
+    if (!defer_issue_until_apply_) {
+        // 先尝试补发未发 granule（inflight 限制由 issueGranuleBuf_ 内部处理）
+        auto& gmap = sb_[apply_buf_index_].granules;
+        std::vector<std::pair<uint64_t,uint64_t>> sorted;
+        sorted.reserve(gmap.size());
+        for (auto& kv : gmap) {
+            if (kv.second.issued) continue;
+            if (!kv.second.sort_key_valid) {
+                if (sort_ == Sort::Addr) {
+                    kv.second.cached_sort_key = kv.second.base;
+                } else if (sort_ == Sort::BankRow) {
+                    kv.second.cached_sort_key = bankRowIndex(kv.second.base);
+                } else {
+                    kv.second.cached_sort_key = rowIndex(kv.second.base);
+                }
+                kv.second.sort_key_valid = true;
+            }
+            sorted.emplace_back(kv.second.cached_sort_key, kv.first);
+        }
+        std::sort(sorted.begin(), sorted.end(),
+                  [](const auto& a, const auto& b){
+                      if (a.first != b.first) return a.first < b.first;
+                      return a.second < b.second;
+                  });
+        for (auto& p : sorted) {
+            auto it = gmap.find(p.second);
+            if (it != gmap.end() && !it->second.issued) {
+                issueGranuleBuf_(apply_buf_index_, p.second, it->second);
+            }
+        }
+        // 若仍有未完成工作，则继续停留在 Apply，等待后续响应/补发完成
+        if (!sb_[apply_buf_index_].required_set.empty() ||
+            !sb_[apply_buf_index_].granules.empty() ||
+            !sb_[apply_buf_index_].pending_up_reads.empty()) {
+            apply_pending_emit_ = true;
+            return false;
+        }
+    }
     if (emit_stage_events_ && upstream_handler_) {
         if (inflight_counts_[apply_buf_index_] == 0 || emit_lenient_) {
             auto* ea = new GasOpData(GasOp::EndApply, (uint32_t)current_gather_id_, 0, 1, false);

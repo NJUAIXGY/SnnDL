@@ -62,7 +62,7 @@ bool SnnPESubComponent::BcsrLayout::validate(uint64_t base, Output* out, bool de
     const bool stride_ok = (stride == 0) ? true : (max_off < stride);
     if (debug && out) {
         out->verbose(CALL_INFO, 0, 0,
-            "[diag-bcsr-base] node=%u core=%u base=0x%lx rp=0x%lx ci=0x%lx bd=0x%lx ids=0x%lx stride=%" PRIu64 " stride_ok=%d align64=%d mono=%d\n",
+            "[diag-bcsr-base] node=%u core=%u base=0x%lx rp=0x%lx ci=0x%lx bd=0x%lx ids=0x%lx stride=%" PRIu64 " stride_ok=%d align64=%d mono=%d br=%u bc=%u idx=%u val=%u\n",
             node_id, core_id,
             (unsigned long)base,
             (unsigned long)(base + rowptr_offset),
@@ -71,7 +71,11 @@ bool SnnPESubComponent::BcsrLayout::validate(uint64_t base, Output* out, bool de
             (unsigned long)(blockids_offset ? base + blockids_offset : 0),
             stride, stride_ok ? 1 : 0,
             aligned64 ? 1 : 0,
-            monotonic ? 1 : 0);
+            monotonic ? 1 : 0,
+            block_rows ? block_rows : 0,
+            block_cols ? block_cols : 0,
+            idx_bytes ? idx_bytes : 0,
+            val_bytes ? val_bytes : 0);
         if (!aligned64 || !monotonic || !stride_ok) {
             out->verbose(CALL_INFO, 0, 0,
                 "[diag-bcsr-base] offsets suspect (aligned64=%d monotonic=%d stride_ok=%d max_off=0x%llx stride=0x%llx)\n",

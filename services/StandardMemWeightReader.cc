@@ -203,6 +203,17 @@ void StandardMemWeightReader::issueReadCommon_(uint64_t req_addr, size_t req_siz
     pmr.issue_cycle = core_->total_cycles_;
     pmr.is_weight = (req_addr >= core_->base_addr_ && req_addr < core_->weight_region_end_);
     core_->stats_reporter_.reportMemoryIssue(req_size, true);
+    // 诊断：权重读发起地址/跨度（限前64条）
+    static int diag_issue_count = 0;
+    if (core_->output_) {
+        const uint64_t key_dbg = (static_cast<uint64_t>(row) << 32) | static_cast<uint64_t>(col_start);
+        core_->output_->verbose(CALL_INFO, 0, 0,
+            "[diag-read-issue] core=%u addr=0x%llx size=%zu is_row=%d row=%u col_start=%u count=%u key=0x%llx\n",
+            core_->core_id_, (unsigned long long)req_addr, (size_t)req_size,
+            is_row ? 1 : 0, row, col_start, count_floats,
+            (unsigned long long)key_dbg);
+        ++diag_issue_count;
+    }
     core_->pending_memory_requests_[reqId] = pmr;
     if (core_->window_read_debug_) {
         core_->output_->verbose(CALL_INFO, 1, 0,
@@ -435,6 +446,18 @@ bool StandardMemWeightReader::handleMemoryResponse(SST::Interfaces::StandardMem:
                 uint32_t post_local = pending_req.bcsr_block_row * core_->bcsr_br_ + pending_req.bcsr_intra_row;
                 core_->accUpdate_(post_local, w);
             }
+            // 诊断：回传权重与地址（仅窗口读调试，限量）
+            if (core_->window_read_debug_ && core_->output_) {
+                static int dbg_weightresp_count = 0;
+                if (dbg_weightresp_count < 32) {
+                    core_->output_->verbose(CALL_INFO, 1, 0,
+                        "[diag-weightresp] core=%u addr=0x%lx size=%zu kind=bcsr post_local=%u pre_eff=%u w=%.6f\n",
+                        core_->core_id_, (unsigned long)pending_req.address,
+                        (size_t)pending_req.size, pending_req.bcsr_block_row * core_->bcsr_br_ + pending_req.bcsr_intra_row,
+                        pending_req.bcsr_pre_effective, w);
+                    ++dbg_weightresp_count;
+                }
+            }
             if (pending_req.has_single_cb && pending_req.single_cb) pending_req.single_cb(w);
         } else {
             uint32_t width = core_->use_post_row_pre_col_ ? core_->weights_cols_ : core_->num_neurons_;
@@ -487,6 +510,17 @@ bool StandardMemWeightReader::handleMemoryResponse(SST::Interfaces::StandardMem:
                         }
                     }
                     core_->accUpdate_(post_local, w);
+                    // 诊断：Dense/row回传权重与地址（仅窗口读调试，限量）
+                    if (core_->window_read_debug_ && core_->output_) {
+                        static int dbg_weightresp_dense_count = 0;
+                        if (dbg_weightresp_dense_count < 32) {
+                            core_->output_->verbose(CALL_INFO, 1, 0,
+                                "[diag-weightresp] core=%u addr=0x%lx size=%zu kind=dense post=%u pre=%u w=%.6f\n",
+                                core_->core_id_, (unsigned long)pending_req.address,
+                                (size_t)pending_req.size, post_local, target_col, w);
+                            ++dbg_weightresp_dense_count;
+                        }
+                    }
                 }
             } else {
                 for (size_t i = 0; i < float_count; ++i) {
@@ -550,4 +584,3 @@ bool StandardMemWeightReader::handleMemoryResponse(SST::Interfaces::StandardMem:
     delete req;
     return true;
 }
-

@@ -10,11 +10,11 @@
 
 ## 主要内容
 
+- `ISnnComputeCore.h`
+  - `ISnnComputeCore` 接口、核心数据结构（`FireEvent` 等）与工厂声明 `createComputeCoreByName()`。
 - `SnnComputeCore.{h,cc}`
-  - `ISnnComputeCore`：核心接口（建议只做“动力学/学习/输出判定”）。
-  - `ComputeCoreCapabilities`：能力协商（控制层可按需开/关功能分支）。
-  - `createComputeCoreByName()`：工厂入口（当前支持 `default`/`snn`，未知名称返回空并由控制层回退）。
-  - `DefaultSnnComputeCore`：默认 SNN 实现。
+  - `DefaultSnnComputeCore`：默认 SNN 实现（动力学/学习/验证）。
+  - `createComputeCoreByName()`：工厂实现（当前支持 `default`/`snn`，未知名称返回空并由控制层回退）。
 - `SnnCoreEngine.{h,cc}`：动力学引擎/内核执行器（Default core 使用）。
 - `SnnNeuronModel.h`：神经元模型接口与实现选择（LIF 等）。
 - `SnnLearningCore.{h,cc}`：学习/梯度累加模块（可选启用）。
@@ -25,6 +25,7 @@
 
 - `compute/` 应尽量只依赖 `api/`、`events/` 与标准库。
 - 若需要访问权重/缓存/内存，统一通过 `api/SnnWeightReader.h` 的 `IWeightReader` 抽象，而不是直接触碰控制层私有成员。
+- 接口行为冻结与契约说明：优先维护 `../ISnnComputeCore_SPEC.md`（仓库根部），此目录文档只补充设计与实现细节。
 
 ## 扩展指南（新增计算范式）
 
@@ -33,4 +34,3 @@
   - 实现 `endCycle/endCycleCandidates + drainOutputs` 的一致语义（输出由控制层统一路由）。
 - 在 `createComputeCoreByName()` 中注册 `name -> XxxComputeCore`；
 - 在仿真脚本/参数中设置 `compute_core_impl=name`。
-

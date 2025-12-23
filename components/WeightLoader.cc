@@ -9,9 +9,174 @@
 #include <cstring>
 #include <algorithm>
 #include <inttypes.h>
+#include <cctype>
+#include <iterator>
 
 using namespace SST;
 using namespace SST::SnnDL;
+
+std::string WeightLoader::hexDump_(const std::vector<uint8_t>& buf, size_t max_bytes) {
+    const size_t n = std::min(max_bytes, buf.size());
+    std::string s;
+    s.reserve(n * 3);
+    for (size_t i = 0; i < n; ++i) {
+        char t[8];
+        std::snprintf(t, sizeof(t), "%02x", buf[i]);
+        if (i) s.push_back(' ');
+        s += t;
+    }
+    return s;
+}
+
+bool WeightLoader::readFileSlice_(const std::string& path, uint64_t off, size_t len, std::vector<uint8_t>& out) {
+    out.clear();
+    std::ifstream fin(path, std::ios::binary);
+    if (!fin.good()) return false;
+    fin.seekg(0, std::ios::end);
+    std::streamoff sz = fin.tellg();
+    if (sz <= 0) return false;
+    if (off >= static_cast<uint64_t>(sz)) return false;
+    const size_t can = static_cast<size_t>(std::min<uint64_t>(static_cast<uint64_t>(sz) - off, static_cast<uint64_t>(len)));
+    fin.seekg(static_cast<std::streamoff>(off), std::ios::beg);
+    out.resize(can);
+    fin.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(can));
+    return fin.good() || fin.eof();
+}
+
+bool WeightLoader::parseMetaU64_(const std::string& meta_text, const char* key, uint64_t& out) {
+    auto pos = meta_text.find(key);
+    if (pos == std::string::npos) return false;
+    pos = meta_text.find(':', pos);
+    if (pos == std::string::npos) return false;
+    ++pos;
+    while (pos < meta_text.size() && (std::isspace(static_cast<unsigned char>(meta_text[pos])) || meta_text[pos] == '"')) ++pos;
+    size_t end = pos;
+    while (end < meta_text.size() && (std::isdigit(static_cast<unsigned char>(meta_text[end])) || meta_text[end] == 'x' || meta_text[end] == 'X')) ++end;
+    if (end <= pos) return false;
+    out = std::strtoull(meta_text.substr(pos, end - pos).c_str(), nullptr, 0);
+    return true;
+}
+
+bool WeightLoader::parseMetaU32_(const std::string& meta_text, const char* key, uint32_t& out) {
+    uint64_t tmp = 0;
+    if (!parseMetaU64_(meta_text, key, tmp)) return false;
+    out = static_cast<uint32_t>(tmp);
+    return true;
+}
+
+std::string WeightLoader::resolveCorePath_(int core, bool meta) const {
+    if (!per_core_files_ || file_template_.empty()) return "";
+    std::string p = file_template_;
+    {
+        auto pos = p.find("{core:02d}");
+        if (pos != std::string::npos) {
+            char buf[16];
+            std::snprintf(buf, sizeof(buf), "%02d", core);
+            p.replace(pos, 10, buf);
+        } else if ((pos = p.find("{core}")) != std::string::npos) {
+            p.replace(pos, 6, std::to_string(core));
+        }
+    }
+    if (meta) p += ".meta.json";
+    return p;
+}
+
+void WeightLoader::issueVerifyReadbacks_() {
+    if (!verify_readback_enable_ || verify_readback_issued_ || verify_readback_done_) return;
+    if (!memory_) return;
+    if (!raw_mode_ || !bcsr_enable_) return;
+
+    const int core = verify_readback_core_;
+    if (core < 0 || core >= num_cores_) return;
+    const std::string bin_path = resolveCorePath_(core, /*meta=*/false);
+    const std::string meta_path = resolveCorePath_(core, /*meta=*/true);
+    if (bin_path.empty() || meta_path.empty()) return;
+
+    std::ifstream mf(meta_path);
+    if (!mf.good()) return;
+    std::string mt((std::istreambuf_iterator<char>(mf)), std::istreambuf_iterator<char>());
+    uint64_t colidx_off = 0;
+    uint32_t idx_bytes = 0;
+    if (!parseMetaU64_(mt, "\"colidx_offset\"", colidx_off)) return;
+    if (!parseMetaU32_(mt, "\"idx_bytes\"", idx_bytes)) idx_bytes = bcsr_idx_bytes_;
+    if (idx_bytes == 0) idx_bytes = bcsr_idx_bytes_;
+    const uint64_t base = base_addr_start_ + static_cast<uint64_t>(core) * per_core_stride_;
+
+    struct Sample { const char* tag; uint64_t file_off; uint64_t mem_addr; };
+    const uint64_t s1 = colidx_off;
+    const uint64_t s2 = colidx_off + static_cast<uint64_t>(verify_colidx_start_index_) * static_cast<uint64_t>(idx_bytes);
+    const Sample samples[] = {
+        {"colidx@0", s1, base + s1},
+        {"colidx@start", s2, base + s2},
+    };
+
+    for (const auto& s : samples) {
+        std::vector<uint8_t> expect;
+        if (!readFileSlice_(bin_path, s.file_off, verify_readback_bytes_, expect)) continue;
+        auto* r = new SST::Interfaces::StandardMem::Read(s.mem_addr, expect.size());
+        const auto id = r->getID();
+        VerifyPending vp;
+        vp.addr = s.mem_addr;
+        vp.tag = s.tag;
+        vp.expect = std::move(expect);
+        verify_pending_[id] = std::move(vp);
+        memory_->sendUntimedData(r);
+        if (output_) {
+            output_->verbose(CALL_INFO, 0, 0,
+                "[WL-verify-issue] core=%d tag=%s addr=0x%llx bytes=%zu file_off=0x%llx\n",
+                core, s.tag,
+                (unsigned long long)s.mem_addr,
+                verify_pending_[id].expect.size(),
+                (unsigned long long)s.file_off);
+        }
+    }
+    verify_readback_issued_ = !verify_pending_.empty();
+}
+
+void WeightLoader::pollVerifyReadbacks_() {
+    if (!verify_readback_enable_ || verify_readback_done_) return;
+    if (!memory_) return;
+    if (verify_pending_.empty()) {
+        if (verify_readback_issued_) verify_readback_done_ = true;
+        return;
+    }
+    // init/complete 阶段：需要主动 poll recvUntimedData()
+    while (true) {
+        auto* req = memory_->recvUntimedData();
+        if (!req) break;
+        auto* rr = dynamic_cast<SST::Interfaces::StandardMem::ReadResp*>(req);
+        if (!rr) {
+            delete req;
+            continue;
+        }
+        auto it = verify_pending_.find(rr->getID());
+        if (it == verify_pending_.end()) {
+            delete req;
+            continue;
+        }
+        const auto& expect = it->second.expect;
+        const auto& got = rr->data;
+        const size_t n = std::min(expect.size(), got.size());
+        size_t mismatch = 0;
+        for (size_t i = 0; i < n; ++i) {
+            if (expect[i] != got[i]) mismatch++;
+        }
+        if (output_) {
+            output_->verbose(CALL_INFO, 0, 0,
+                "[WL-verify-resp] tag=%s addr=0x%llx got=%zu expect=%zu mismatch=%zu head_got=[%s] head_expect=[%s]\n",
+                it->second.tag.c_str(),
+                (unsigned long long)it->second.addr,
+                got.size(), expect.size(), mismatch,
+                hexDump_(got, 16).c_str(),
+                hexDump_(expect, 16).c_str());
+        }
+        verify_pending_.erase(it);
+        delete req;
+    }
+    if (verify_pending_.empty() && verify_readback_issued_) {
+        verify_readback_done_ = true;
+    }
+}
 
 WeightLoader::WeightLoader(ComponentId_t id, Params& params)
     : Component(id), output_(nullptr), memory_(nullptr), loaded_(false) {
@@ -47,8 +212,22 @@ WeightLoader::WeightLoader(ComponentId_t id, Params& params)
     timed_seed_allow_cache_ = params.find<int>("timed_seed_allow_cache", 0) != 0;
     timed_write_window_ = std::max<uint32_t>(timed_seed_count_, 256u);
     loader_done_key_ = params.find<std::string>("loader_done_key", "");
+    verify_readback_enable_ = params.find<int>("verify_readback_enable", 0) != 0;
+    verify_readback_core_ = params.find<int>("verify_readback_core", 0);
+    verify_readback_bytes_ = params.find<uint32_t>("verify_readback_bytes", 64);
+    verify_colidx_start_index_ = params.find<uint32_t>("verify_colidx_start_index", 441);
+    diag_runtime_read_enable_ = params.find<int>("diag_runtime_read_enable", 0) != 0;
+    diag_runtime_read_core_ = params.find<int>("diag_runtime_read_core", 0);
+    diag_runtime_read_offset_ = params.find<uint64_t>("diag_runtime_read_offset", 0);
+    diag_runtime_read_bytes_ = params.find<uint32_t>("diag_runtime_read_bytes", 64);
 
     output_ = new Output("WeightLoader[@p:@l]: ", verbose_, 0, Output::STDOUT);
+    // 无条件记录构造基本配置，便于确认是否实际创建
+    output_->verbose(CALL_INFO, 0, 0,
+        "[WL-diag-init] verbose=%d weight_file=%s file_tmpl=%s single_file=%s base=0x%llx stride=0x%llx num_cores=%d rows=%u cols=%u fill=%.3f raw=%d bcsr=%d\n",
+        verbose_, weight_file_.c_str(), file_template_.c_str(), single_file_.c_str(),
+        (unsigned long long)base_addr_start_, (unsigned long long)per_core_stride_,
+        num_cores_, rows_per_core_, cols_per_core_, fill_value_, raw_mode_ ? 1 : 0, bcsr_enable_ ? 1 : 0);
 
     if (!loader_done_key_.empty()) {
         loader_done_shared_.initialize(loader_done_key_, 1, 0);
@@ -72,6 +251,17 @@ WeightLoader::WeightLoader(ComponentId_t id, Params& params)
     }
     // 规范化/健壮性检查
     normalizeParams_();
+
+    // 运行期单点读回探针地址（仅诊断）：base(core)+offset
+    if (diag_runtime_read_enable_) {
+        const int c = diag_runtime_read_core_;
+        if (c < 0 || c >= num_cores_) {
+            output_->fatal(CALL_INFO, -1, "❌ diag_runtime_read_core=%d 超出范围 [0,%d)\n", c, num_cores_);
+        }
+        diag_runtime_read_addr_ =
+            base_addr_start_ + static_cast<uint64_t>(c) * per_core_stride_ + diag_runtime_read_offset_;
+        if (diag_runtime_read_bytes_ == 0) diag_runtime_read_bytes_ = 64;
+    }
 }
 
 WeightLoader::~WeightLoader() {
@@ -93,66 +283,98 @@ void WeightLoader::init(unsigned int phase) {
         }
     }
     if (phase == 1 && !loaded_) {
-        if (timed_seed_enable_ && timed_seed_allow_cache_) {
-            runtime_load_needed_ = true;
-        } else {
-            loadFileOnce();
-            publishLoaderDone_();
-        }
+        // 关键约束：BCSR 权重数据规模很大（每核 MB 级），若在 timed 仿真阶段通过 memHierarchy
+        // 逐 cacheline 拆分写入，会消耗远超 100us 的模拟时间并导致核心侧长期 loader-not-ready。
+        // 因此：无论是否开启 timed seed，都在 init 阶段完成一次性 untimed 加载（不计入模拟时间）。
+        runtime_load_needed_ = false;
+        loadFileOnce();
+        loaded_ = true;
+        // 调试：写入后立刻在 init 阶段发起读回校验（仅用于定位；注意：StandardMem 的 untimed ReadResp 可能不携带 data）
+        issueVerifyReadbacks_();
+        publishLoaderDone_();
     }
 }
 
 void WeightLoader::setup() {
+    if (memory_) {
+        memory_->setup();
+    }
     // output_->verbose(CALL_INFO, 1, 0, "✅ WeightLoader setup完成\n");
     
-    // 若未启用 timed，则在 setup 阶段直接进行一次性加载并发布完成信号，
-    // 可确保上游在仿真开始前即可看到 loader_done=1（适配短时快测）。
-    if (!timed_seed_enable_) {
-        if (!loaded_) {
-            loadFileOnce();
-        }
-        publishLoaderDone_();
-        runtime_load_needed_ = false;
-    } else {
-        // 启用 timed seed：注册时钟并由运行时驱动加载，完成时在写响应路径发布 loader_done
-        if (!clock_registered_) {
-            // Use Handler2 (supports checkpointing) to silence deprecation warning
-            registerClock("1GHz", new SST::Clock::Handler2<WeightLoader, &WeightLoader::onClockTick>(this));
-            clock_registered_ = true;
-        }
-        // 在setup完成后的第一个时钟周期进行权重加载
-        runtime_load_needed_ = true;
+    // 统一语义：权重必须在 init 阶段完成加载并发布 loader_done；
+    // timed_seed_* 不再触发“运行期全量写入”（避免模拟时间被 WeightLoader 吞没）。
+    if (!loaded_) {
+        output_->fatal(CALL_INFO, -1, "❌ WeightLoader setup 阶段检测到未完成的权重加载（expected in init）。");
+    }
+    runtime_load_needed_ = false;
+
+    // 调试：启用运行期单点读回探针（用于验证 timed read 在当前拓扑下读取到的字节）
+    if (diag_runtime_read_enable_ && !clock_registered_) {
+        registerClock("1GHz", new SST::Clock::Handler2<WeightLoader, &WeightLoader::onClockTick>(this));
+        clock_registered_ = true;
     }
 }
 
 void WeightLoader::finish() {
+    if (memory_) {
+        memory_->finish();
+    }
     // output_->verbose(CALL_INFO, 1, 0, "🏁 WeightLoader 完成\n");
 }
 
 bool WeightLoader::onClockTick(SST::Cycle_t cycle) {
     current_cycle_ = cycle;
-    
-    // 在运行时第一个周期进行权重加载
-    if (runtime_load_needed_) {
-        // output_->verbose(CALL_INFO, 2, 0, "🔄 在运行时第一个周期进行权重加载\n");
-        runtime_load_needed_ = false;
-        loaded_ = false;  // 重置标志以允许重新加载
-        if (!timed_seed_allow_cache_) {
-            output_->verbose(CALL_INFO, 1, 0, "⚠️ timed_seed_allow_cache=0，回退为untimed写入以避免缓存coherence拒绝Write\n");
-            loadFileOnce();
-        } else {
-            // 标记timed写入统计起点
-            write_started_timed_ = true;
-            write_first_issue_cycle_ = current_cycle_;
-            loadFileOnceRuntime();  // 使用运行时加载函数
+    if (diag_runtime_read_enable_ && !diag_runtime_read_issued_) {
+        if (!memory_) return false;
+        auto* r = new SST::Interfaces::StandardMem::Read(diag_runtime_read_addr_, diag_runtime_read_bytes_);
+        diag_runtime_read_id_ = r->getID();
+        diag_runtime_read_issued_ = true;
+        memory_->send(r);
+        if (output_) {
+            output_->verbose(CALL_INFO, 0, 0,
+                "[WL-diag-timed-read-issue] core=%d addr=0x%llx bytes=%u\n",
+                diag_runtime_read_core_,
+                (unsigned long long)diag_runtime_read_addr_,
+                diag_runtime_read_bytes_);
         }
     }
-    driveTimedJobs_();
     return false;
+}
+
+void WeightLoader::complete(unsigned int phase) {
+    // 将 StandardMem 的 complete 透传
+    if (memory_) memory_->complete(phase);
+    // init/complete 阶段：poll 读回校验响应（仅调试）
+    pollVerifyReadbacks_();
+    if (phase == 0 && !loaded_ && !runtime_load_needed_) {
+        output_->verbose(CALL_INFO, 1, 0,
+            "[WL-complete] phase=%u notice: loaded=%d runtime_load_needed=%d", phase,
+            loaded_ ? 1 : 0, runtime_load_needed_ ? 1 : 0);
+    }
 }
 void WeightLoader::handleMemoryResponse(SST::Interfaces::StandardMem::Request* req) {
     if (!req) return;
-    
+
+    // 运行期单点读回探针：打印 timed ReadResp 的首字节（对齐文件预期）
+    if (diag_runtime_read_enable_ && diag_runtime_read_issued_ && req->getID() == diag_runtime_read_id_) {
+        auto* rr = dynamic_cast<SST::Interfaces::StandardMem::ReadResp*>(req);
+        if (!rr) {
+            output_->verbose(CALL_INFO, 0, 0,
+                "[WL-diag-timed-read-resp] id=%" PRIu64 " (non-ReadResp)\n",
+                req->getID());
+            delete req;
+            return;
+        }
+        output_->verbose(CALL_INFO, 0, 0,
+            "[WL-diag-timed-read-resp] id=%" PRIu64 " addr=0x%llx got=%zu head=[%s]\n",
+            rr->getID(),
+            (unsigned long long)rr->pAddr,
+            rr->data.size(),
+            hexDump_(rr->data, 16).c_str());
+        delete req;
+        return;
+    }
+
     // 跟踪写入完成
     if (pending_writes_ > 0) {
         pending_writes_--;
@@ -464,25 +686,127 @@ void WeightLoader::issueWritesRaw(int core, const std::vector<uint8_t>& data, bo
         output_->verbose(CALL_INFO, 2, 0, "⚠️ 核心%d Raw写入数据为空，跳过\n", core);
         return;
     }
-    uint64_t base = base_addr_start_ + static_cast<uint64_t>(core) * per_core_stride_;
-    if (verbose_ > 0) {
-        output_->verbose(CALL_INFO, 1, 0,
-            "[WL-addr] core=%d base=0x%llx stride=%" PRIu64 " bytes=0x%zx\n",
-            core,
-            (unsigned long long)base,
-            per_core_stride_,
-            data.size());
+    // 若配置了 per_core_stride，则要求其必须覆盖文件长度；否则权重地址映射会跨 core/PE 导致非确定性/读回垃圾值
+    if (per_core_stride_ != 0 && data.size() > static_cast<size_t>(per_core_stride_)) {
+        output_->fatal(CALL_INFO, -1,
+            "❌ WeightLoader raw 文件长度(0x%zx)超过 per_core_stride(0x%llx)。"
+            " 这会导致地址映射跨 core 溢出并产生非确定性。请增大 stride（建议取所有 PE/core 的 file_size 最大值并 64B 对齐）。\n",
+            data.size(), (unsigned long long)per_core_stride_);
     }
+    const size_t write_limit = data.size();
+    // 诊断：尝试读取对应 meta 以得到 BCSR offset，便于对齐校验
+    uint64_t diag_rowptr_off = 0, diag_colidx_off = 0, diag_blockdata_off = 0;
+    bool diag_meta_ok = false;
+    if (bcsr_enable_ && per_core_files_ && !file_template_.empty()) {
+        std::string meta_path = file_template_;
+        // 仅替换 {core}，保留 {pe}
+        {
+            auto p = meta_path.find("{core:02d}");
+            if (p != std::string::npos) {
+                char buf[8]; std::snprintf(buf, sizeof(buf), "%02d", core);
+                meta_path.replace(p, 10, buf); // 含末尾右括号
+            } else if ((p = meta_path.find("{core}")) != std::string::npos) {
+                meta_path.replace(p, 6, std::to_string(core));
+            }
+        }
+        // 将 .bin 替换为 .bin.meta.json
+        if (meta_path.size() >= 4 && meta_path.rfind(".bin") == meta_path.size() - 4) {
+            meta_path += ".meta.json";
+        } else {
+            meta_path += ".meta.json";
+        }
+        std::ifstream mf(meta_path);
+        if (mf.good()) {
+            std::string mt((std::istreambuf_iterator<char>(mf)), std::istreambuf_iterator<char>());
+            auto parseU64 = [&](const char* key, uint64_t& out)->bool{
+                auto pos = mt.find(key);
+                if (pos == std::string::npos) return false;
+                pos = mt.find(':', pos);
+                if (pos == std::string::npos) return false;
+                ++pos;
+                while (pos < mt.size() && (std::isspace(static_cast<unsigned char>(mt[pos])) || mt[pos] == '\"')) ++pos;
+                size_t end = pos;
+                while (end < mt.size() && (std::isdigit(static_cast<unsigned char>(mt[end])) || mt[end]=='x' || mt[end]=='X')) ++end;
+                if (end <= pos) return false;
+                out = std::strtoull(mt.substr(pos, end-pos).c_str(), nullptr, 0);
+                return true;
+            };
+            uint64_t tmp=0;
+            if (parseU64("\"rowptr_offset\"", diag_rowptr_off)) diag_meta_ok = true;
+            if (parseU64("\"colidx_offset\"", tmp)) { diag_colidx_off = tmp; diag_meta_ok = true; }
+            if (parseU64("\"blockdata_offset\"", tmp)) { diag_blockdata_off = tmp; diag_meta_ok = true; }
+        }
+        if (!diag_meta_logged_) {
+            output_->verbose(CALL_INFO, 0, 0,
+                "[WL-diag-meta] core=%d meta_path=%s ok=%d rp=0x%llx ci=0x%llx bd=0x%llx\n",
+                core, meta_path.c_str(), diag_meta_ok ? 1 : 0,
+                (unsigned long long)diag_rowptr_off,
+                (unsigned long long)diag_colidx_off,
+                (unsigned long long)diag_blockdata_off);
+            diag_meta_logged_ = true;
+        }
+    }
+    uint64_t base = base_addr_start_ + static_cast<uint64_t>(core) * per_core_stride_;
+    // 无条件记录 Raw 写入的地址区间和首个非零字节
+    uint8_t sample_nz = 0;
+    for (auto b : data) { if (b != 0) { sample_nz = b; break; } }
+    output_->verbose(CALL_INFO, 0, 0,
+        "[WL-raw] core=%d base=0x%llx end=0x%llx stride=0x%llx bytes=0x%zx sample_nz=0x%02x timed=%d\n",
+        core,
+        (unsigned long long)base,
+        (unsigned long long)(base + data.size()),
+        (unsigned long long)per_core_stride_,
+        data.size(),
+        sample_nz,
+        timed ? 1 : 0);
     if (per_core_stride_ != 0 && data.size() > per_core_stride_) {
         output_->verbose(CALL_INFO, 1, 0, "⚠️ 核心%d Raw数据长度(%zu)超过per_core_stride=%" PRIu64 "，仍按实际长度写入\n",
                          core, data.size(), per_core_stride_);
     }
-        const uint32_t chunk = std::max<uint32_t>(16, chunk_size_bytes_);
+    const uint32_t chunk = std::max<uint32_t>(16, chunk_size_bytes_);
     size_t off = 0;
     uint64_t total_writes = 0;
-    while (off < data.size()) {
-        size_t len = std::min<size_t>(chunk, data.size() - off);
+    static int diag_overlap_count = 0;
+    while (off < write_limit) {
+        size_t len = std::min<size_t>(chunk, write_limit - off);
         std::vector<uint8_t> payload(data.begin() + off, data.begin() + off + len);
+        // 诊断：无条件记录 core0 前几个 chunk（含 hex），并注明 meta offset（每实例独立计数）
+        if (core == 0 && diag_chunk_count_ < 12) {
+            auto dump_hex = [&](const std::vector<uint8_t>& buf)->std::string{
+                const size_t dump = std::min<size_t>(buf.size(), 32);
+                std::string s;
+                for (size_t i=0;i<dump;++i){ char t[8]; std::snprintf(t,sizeof(t),"%02x", buf[i]); if(i) s.push_back(' '); s += t; }
+                return s;
+            };
+            output_->output("WeightLoader[issueWritesRaw]: [WL-diag-chunk] core=%d chunk_addr=0x%llx len=%zu rowptr_off=0x%llx colidx_off=0x%llx blockdata_off=0x%llx hex=[%s]\n",
+                core,
+                (unsigned long long)(base + off), len,
+                (unsigned long long)diag_rowptr_off,
+                (unsigned long long)diag_colidx_off,
+                (unsigned long long)diag_blockdata_off,
+                dump_hex(payload).c_str());
+            ++diag_chunk_count_;
+        } else if (diag_meta_ok && diag_chunk_count_ < 32) {
+            uint64_t addr_start = base + off;
+            uint64_t addr_end = addr_start + len;
+            auto dump_hex = [&](const std::vector<uint8_t>& buf)->std::string{
+                const size_t dump = std::min<size_t>(buf.size(), 16);
+                std::string s;
+                for (size_t i=0;i<dump;++i){ char t[8]; std::snprintf(t,sizeof(t),"%02x", buf[i]); if(i) s.push_back(' '); s += t; }
+                return s;
+            };
+            if (addr_start <= base + diag_colidx_off && addr_end > base + diag_colidx_off) {
+                output_->verbose(CALL_INFO, 0, 0,
+                    "[WL-diag-chunk] core=%d chunk_addr=0x%llx len=%zu overlaps colidx_off=0x%llx rowptr_off=0x%llx blockdata_off=0x%llx hex=[%s]\n",
+                    core,
+                    (unsigned long long)addr_start, len,
+                    (unsigned long long)diag_colidx_off,
+                    (unsigned long long)diag_rowptr_off,
+                    (unsigned long long)diag_blockdata_off,
+                    dump_hex(payload).c_str());
+                ++diag_chunk_count_;
+            }
+        }
         sendWrite_(base + off, payload, timed);
         off += len;
         total_writes++;
@@ -510,7 +834,7 @@ void WeightLoader::driveTimedJobs_() {
         size_t remain = job->data.size() - job->offset;
         size_t len = std::min<size_t>(chunk_size_bytes_, remain);
         std::vector<uint8_t> payload(job->data.begin() + job->offset, job->data.begin() + job->offset + len);
-        sendWrite_(job->base + job->offset, payload, /*timed*/true);
+        sendWrite_(job->base + job->offset, payload, /*timed=*/true);
         job->offset += len;
         if (job->offset < job->data.size()) {
             timed_raw_jobs_.push_back(job);
@@ -533,6 +857,20 @@ void WeightLoader::issueWritesForCoreFloatsImpl(int core, const std::vector<floa
         output_->verbose(CALL_INFO, 1, 0, timed ? "⚠️ 运行时核心%d权重长度不足(%zu<%zu)，用fill_value补齐\n"
                                                 : "⚠️ 核心%d权重长度不足(%zu<%zu)，用fill_value补齐\n",
                          core, wbuf.size(), expected);
+    }
+    // 诊断：一次性记录写入地址区间与样本值，核对与 PE 基址/stride 是否一致
+    static std::unordered_set<int> logged_cores;
+    if (logged_cores.find(core) == logged_cores.end()) {
+        float sample_nonzero = 0.0f;
+        for (size_t i = 0; i < wbuf.size(); ++i) {
+            if (wbuf[i] != 0.0f) { sample_nonzero = wbuf[i]; break; }
+        }
+        uint64_t end_addr = base + static_cast<uint64_t>(R) * static_cast<uint64_t>(C) * sizeof(float);
+        output_->verbose(CALL_INFO, 0, 0,
+            "[WL-diag] core=%d base=0x%llx end=0x%llx stride=0x%llx rows=%u cols=%u sample_nonzero=%.6f\n",
+            core, (unsigned long long)base, (unsigned long long)end_addr,
+            (unsigned long long)per_core_stride_, R, C, sample_nonzero);
+        logged_cores.insert(core);
     }
     const uint32_t chunk = std::max<uint32_t>(16, chunk_size_bytes_);
     // Row-major packing per row, then chunked writes
@@ -567,6 +905,8 @@ void WeightLoader::issueWritesForCoreFloats(int core, const std::vector<float>& 
 }
 
 bool WeightLoader::loadSingleFileAllCores(const std::string& path, const std::string& fmt) {
+    output_->verbose(CALL_INFO, 0, 0, "[WL-diag] loadSingleFileAllCores path=%s fmt=%s raw=%d\n",
+        path.c_str(), fmt.c_str(), raw_mode_ ? 1 : 0);
     if (raw_mode_) {
         std::vector<uint8_t> raw;
         if (!readFileRaw(path, raw)) return false;
@@ -615,6 +955,8 @@ bool WeightLoader::loadSingleFileAllCores(const std::string& path, const std::st
 }
 
 bool WeightLoader::loadPerCoreFiles(const std::string& tmpl, const std::string& fmt) {
+    output_->verbose(CALL_INFO, 0, 0, "[WL-diag] loadPerCoreFiles tmpl=%s fmt=%s raw=%d\n",
+        tmpl.c_str(), fmt.c_str(), raw_mode_ ? 1 : 0);
     const uint32_t R = rows_per_core_;
     const uint32_t C = cols_per_core_;
     const size_t per_core = static_cast<size_t>(R) * static_cast<size_t>(C);
@@ -730,11 +1072,62 @@ bool WeightLoader::loadPerCoreFilesRuntime(const std::string& tmpl, const std::s
                 output_->verbose(CALL_INFO, 1, 0, "⚠️ 运行时未找到核心%d原始文件 %s\n", core, path.c_str());
                 continue;
             }
+            // 解析 meta 以便对齐诊断（仅限存在 .meta.json 时）
+            uint64_t diag_rowptr_off = 0, diag_colidx_off = 0, diag_blockdata_off = 0, diag_blockids_off = 0;
+            bool diag_meta_ok = false;
+            std::string meta_path = path + ".meta.json";
+            std::ifstream mf(meta_path);
+            if (mf.good()) {
+                std::string mt((std::istreambuf_iterator<char>(mf)), std::istreambuf_iterator<char>());
+                auto parseU64 = [&](const char* key, uint64_t& out)->bool{
+                    auto pos = mt.find(key);
+                    if (pos == std::string::npos) return false;
+                    pos = mt.find(':', pos);
+                    if (pos == std::string::npos) return false;
+                    ++pos;
+                    while (pos < mt.size() && (std::isspace(static_cast<unsigned char>(mt[pos])) || mt[pos] == '\"')) ++pos;
+                    size_t end = pos;
+                    while (end < mt.size() && (std::isdigit(static_cast<unsigned char>(mt[end])) || mt[end]=='x' || mt[end]=='X')) ++end;
+                    if (end <= pos) return false;
+                    out = std::strtoull(mt.substr(pos, end-pos).c_str(), nullptr, 0);
+                    return true;
+                };
+                uint64_t tmp=0;
+                if (parseU64("\"rowptr_offset\"", diag_rowptr_off)) diag_meta_ok = true;
+                if (parseU64("\"colidx_offset\"", tmp)) { diag_colidx_off = tmp; diag_meta_ok = true; }
+                if (parseU64("\"blockdata_offset\"", tmp)) { diag_blockdata_off = tmp; diag_meta_ok = true; }
+                if (parseU64("\"blockids_offset\"", tmp)) { diag_blockids_off = tmp; diag_meta_ok = true; }
+                output_->verbose(CALL_INFO, 0, 0,
+                    "[WL-diag-meta-timed] core=%d meta=%s ok=%d rp=0x%llx ci=0x%llx bd=0x%llx ids=0x%llx\n",
+                    core, meta_path.c_str(), diag_meta_ok ? 1 : 0,
+                    (unsigned long long)diag_rowptr_off,
+                    (unsigned long long)diag_colidx_off,
+                    (unsigned long long)diag_blockdata_off,
+                    (unsigned long long)diag_blockids_off);
+            }
+            // 诊断：记录队列化的写入区间与样本非零字节
+            uint8_t sample_nz = 0;
+            for (auto b : raw) { if (b != 0) { sample_nz = b; break; } }
+            uint64_t base = base_addr_start_ + static_cast<uint64_t>(core) * per_core_stride_;
+            output_->verbose(CALL_INFO, 0, 0,
+                "[WL-timed-enqueue] core=%d base=0x%llx end=0x%llx stride=0x%llx bytes=0x%zx sample_nz=0x%02x meta_ok=%d\n",
+                core,
+                (unsigned long long)base,
+                (unsigned long long)(base + raw.size()),
+                (unsigned long long)per_core_stride_,
+                raw.size(),
+                sample_nz,
+                diag_meta_ok ? 1 : 0);
             auto job = std::make_shared<TimedRawJob>();
             job->core = core;
-            job->base = base_addr_start_ + static_cast<uint64_t>(core) * per_core_stride_;
+            job->base = base;
             job->data = std::move(raw);
             job->offset = 0;
+            job->rowptr_off = diag_rowptr_off;
+            job->colidx_off = diag_colidx_off;
+            job->blockdata_off = diag_blockdata_off;
+            job->blockids_off = diag_blockids_off;
+            job->meta_ok = diag_meta_ok;
             timed_raw_jobs_.push_back(job);
             driveTimedJobs_();
         } else {

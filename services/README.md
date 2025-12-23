@@ -18,7 +18,8 @@
   - `ReadOrchestrator.{h,cc}`：历史遗留：窗口读发起编排器（已回收至 `control/SnnPEOrchestrators.cc`，当前不再参与构建；文件保留用于参考）。
   - `GasCustomCmd.h`：GAS 相关 CustomCmd/响应定义。
 - 路由/网络辅助：
-  - `SnnRouteProvider.{h,cc}`：fanout 计算与门控缓存应用（供控制层调用）。
+  - `SpikeCommSubsystem.{h,cc}`：通信子系统（fanout + SpikeEvent 构造 + `api/ISpikeTransport` 发送），并内聚路由构建/共享缓存与门控缓存。
+  - `SnnRouteProvider.{h,cc}`：fanout 计算与门控缓存应用（供 `SpikeCommSubsystem` 组合使用；历史上也可由控制层直接调用）。
   - `SimpleNetworkWrapper.{h,cc}`：SimpleNetwork 适配包装。
   - `SnnNetworkAdapter.{h,cc}`：网络侧辅助适配。
 - 内部互连：

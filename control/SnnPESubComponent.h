@@ -27,7 +27,6 @@
 #include "AccumulatorOps.h"
 #include "WeightCacheOps.h"
 #include "StageEventHub.h"
-#include "SnnRouteProvider.h"
 #include "WeightAccessor.h"
 #include "WeightMemorySubsystem.h"
 #include "StandardMemBackend.h"
@@ -36,9 +35,6 @@
 
 namespace SST {
 namespace SnnDL {
-
-// 通用 BCSR 无效 ID 标记（用于路由/稀疏解析）
-constexpr uint32_t BCSR_SENTINEL_ID = 0xFFFFFFFFu;
 
 class MultiCorePE; // forward declaration for parent cast
 class GatherBufferIF;
@@ -202,6 +198,7 @@ public:
 
     virtual void setParentInterface(SnnPEParentInterface* parent);
     virtual void init(unsigned int phase) override;
+    virtual void complete(unsigned int phase) override;
     virtual void setup() override;
     virtual void finish() override;
 
@@ -739,38 +736,11 @@ private:
 
     // CSR 已移除
 
-    // ===== 权重驱动路由（可选）=====
-    bool routing_weight_driven_ = false;
+    // weights_template_ 保留：用于 BCSR 文件兜底与诊断读取
     std::string weights_template_;
-    uint32_t total_nodes_cfg_ = 16;
-    float routing_epsilon_ = 1e-8f;
-    uint32_t routing_topk_ = 0;
-    uint32_t routing_topk_per_pe_ = 0;
-    bool route_exclude_self_pe_ = false;
-    std::string route_layers_mask_;
-    bool route_filter_warn_ = true;
-    // 解析后的层间许可表（key=(src_layer<<8)|dst_layer）
-    std::unordered_set<uint32_t> allowed_layer_edges_;
-    bool allow_all_layers_ = true;
     bool record_edge_apply_enable_ = false;
     bool record_edge_idle_enable_ = true;
     bool record_edge_scatter_enable_ = false;
-    // 映射框架集成
-    std::string mapping_mode_;
-    std::string mapping_edges_file_;
-    bool mapping_csv_has_header_ = true;
-    std::string mapping_csv_separator_ = ",";
-    bool mapping_assume_block_ids_ = true;
-    // routes_by_source_[pre_global] = list of destination global neuron ids
-    // 本地路由表（兼容保留，作为共享表不可用时的回退）
-    std::unordered_map<uint32_t, std::vector<uint32_t>> routes_by_source_;
-    // 进程范围共享的路由表指针（多个核心/组件共享，避免重复构建与冗余内存）
-    std::shared_ptr<const std::unordered_map<uint32_t, std::vector<uint32_t>>> routes_shared_;
-    bool routing_diag_logged_ = false;
-    bool buildWeightDrivenRoutes();
-    bool buildRoutesFromEdgesCSV();
-    bool buildWeightDrivenRoutesFromBcsr();
-    bool appendRoutesFromBcsrFile(const std::string& path, uint32_t pe_index, int core_index, uint32_t rows_hint);
     bool parseBcsrMeta(const std::string& meta_path, uint32_t& rows_out, uint32_t& cols_out,
                        uint32_t& br_out, uint32_t& bc_out,
                        uint32_t& idx_bytes_out, uint32_t& val_bytes_out,
@@ -778,28 +748,6 @@ private:
                        uint64_t& blockdata_off_out, uint64_t& blockids_off_out,
                        uint32_t& total_blocks_out) const;
     std::string resolveWeightTemplate(uint32_t pe, int core) const;
-    uint32_t getLayerIdFromPE(uint32_t pe) const;
-    // Helpers to reduce duplication in route building
-    bool applyRouteFilter(uint32_t src_global, uint32_t dst_global, uint32_t rows) const;
-    // Helper: given candidates pre_global -> [(score, dst_global)],
-    // apply per-PE topk and/or global topk, then fill routes_by_source_.
-    // When group_by_pe=false, all dst are treated as in one group (used when we
-    // cannot infer PE id from dst_global reliably).
-    void buildRoutesFromCandidates(
-        const std::unordered_map<uint32_t, std::vector<std::pair<float,uint32_t>>>& tmp,
-        uint32_t rows,
-        bool group_by_pe);
-
-    // === 路由共享缓存（进程级）===
-    // 说明：使用基于参数集合的key对构建结果做一次性缓存；
-    // 命中时各核心直接复用共享表，未命中则首次构建并写回缓存。
-    static std::mutex s_route_cache_mtx_;
-    using RouteMap = std::unordered_map<uint32_t, std::vector<uint32_t>>;
-    static std::unordered_map<std::string, std::weak_ptr<const RouteMap>> s_route_cache_;
-    std::string buildRouteCacheKey() const;
-    void logRoutingSummary_(const char* phase, const char* reason = nullptr);
-    // 路由/门控提供器：抽出 handleNeuronFire_ 的路由决策
-    SnnRouteProvider route_provider_;
     // Stage 事件 CSV 写出互斥，避免多核心重复写表头
     static std::mutex s_stage_csv_mutex_;
     void appendStageEventRow_(const char* event_name, uint64_t now_ns, uint64_t spikes_emitted);
@@ -817,12 +765,6 @@ private:
     bool canIssueMoreReads_() const;
     void logBcsrWindowStats_(const char* tag);
     void resetBcsrWindowCounters_();
-
-    // ===== 门控事件缓存 =====
-    bool gating_event_mode_ = false;
-    uint64_t gating_ttl_cycles_cfg_ = 1000;
-    bool gating_scope_inputs_only_ = true;
-    std::unordered_map<uint32_t, GatingEntry> gating_cache_; // key=src_global
 
 public:
     // 应用门控决策（由父级MultiCorePE调用）

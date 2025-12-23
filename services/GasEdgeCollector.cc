@@ -2,6 +2,8 @@
 //
 // GasEdgeCollector: per-window edge collection helper extracted from SnnPESubComponent.
 
+#include <algorithm>
+
 #include "GasEdgeCollector.h"
 
 namespace SST { namespace SnnDL {
@@ -23,6 +25,10 @@ void GasEdgeCollector::flipForApply(bool debug, Output* out, int, uint32_t seq) 
     for (const auto& kv : curr) {
         prev.emplace_back(kv.first, kv.second);
     }
+    // Deterministic iteration order: stable across runs/threads even if unordered_map
+    // insertion order differs (critical for strict-GAS reproducibility under -n multi-thread).
+    std::sort(prev.begin(), prev.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
     if (debug && out) {
         out->verbose(CALL_INFO, 0, 0,
             "[diag-edges] BeginApply seq=%u edges_prev=%zu\n",
@@ -44,4 +50,3 @@ bool GasEdgeCollector::nextPrev(uint64_t& key, uint32_t& count) {
 }
 
 }} // namespace SST::SnnDL
-

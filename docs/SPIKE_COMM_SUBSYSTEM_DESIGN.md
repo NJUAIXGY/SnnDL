@@ -5,7 +5,7 @@ SST-SnnDL 设计文档（草稿）
 
 # Spike 通信子系统抽象（草稿）
 
-状态：Draft（Phase B 设计草稿）
+状态：Phase D 已落地（接口以代码为准，本文为设计/口径补充）
 
 相关上位文档：
 - `docs/UNIVERSAL_CONTROL_CORE_DESIGN.md`（总体路线与分层目标）
@@ -116,44 +116,45 @@ private:
 
 ### 7.2 SpikeCommSubsystem（通信子系统）
 
-建议新增：`services/SpikeCommSubsystem.{h,cc}`
+文件：`services/SpikeCommSubsystem.{h,cc}`（已实现）
 
 职责：
 - 接收控制层的“发放事件”（当前为 `FireEvent` 或 `(neuron_idx, source_global)`）
 - 调用 fanout provider 计算目的集合
 - 构造 `SpikeEvent` 并通过 `ISpikeTransport` 投递
 
-接口草图：
+接口要点（已落地的当前代码形态，简化）：
 
 ```cpp
-struct SpikeCommConfig {
-    Output* log = nullptr;
-    ISpikeTransport* transport = nullptr;
-
-    // fanout provider（现阶段可直接传 SnnRouteProvider*；后续可抽象成 IFanoutProvider）
-    SnnRouteProvider* route = nullptr;
-
-    uint32_t node_id = 0;
-    uint32_t core_id = 0;
-    uint64_t global_neuron_base = 0;
-};
+struct SpikeCommRoutingConfig { /* weights_template/topk/epsilon/mapping/BCSR/... */ };
+struct SpikeCommGatingConfig  { /* event_mode/ttl/scope */ };
+struct SpikeCommRuntimeConfig { /* log/transport/node/core/global_base/stats */ };
 
 class SpikeCommSubsystem {
 public:
-    void init(const SpikeCommConfig& cfg);
+    void configure(const SpikeCommRoutingConfig& routing_cfg,
+                   const SpikeCommGatingConfig& gating_cfg);
+    void bindRuntime(const SpikeCommRuntimeConfig& rt);
+    void initRouting(); // 构建/复用共享路由表，并配置内部 fanout provider
 
-    // 输入：局部 neuron_idx（compute core 的视角）
     void emitNeuronFire(uint32_t neuron_idx, uint64_t now_cycle);
-
-    // 输入：已知 source_global 的场景（可用于未来不同 core/不同映射）
     void emitSource(uint32_t source_global, uint32_t source_local, uint64_t now_cycle);
+
+    void applyGatingDecision(uint32_t src_global,
+                             const std::vector<uint32_t>& dest_pes,
+                             uint64_t current_cycle,
+                             uint64_t ttl_cycles);
 };
 ```
 
-实现要点：
-- `emitNeuronFire()` 内部：`source_global = global_neuron_base + neuron_idx`。
-- 通过 `route->computeFanout(...)` 得到 `(dest_global, dest_node)` 列表；逐个 `new SpikeEvent(...)` 并 `transport->send(...)`。
-- 事件权重 `output_weight` 目前保持 `1.0f`（与现有一致）。
+实现要点（Phase D）：
+- `configure()` 仅保存配置；`initRouting()` 才执行路由表构建/共享缓存注入（避免构造期做重活）。
+- 子系统内部组合 `SnnRouteProvider`：
+  - 路由表构建与共享缓存（进程级）在 `SpikeCommSubsystem` 内部完成，控制层不再持有 `routes_*`/cache key/层掩码解析等状态；
+  - `SnnRouteProvider::computeFanout()` 只依赖“已配置的路由表 + gating_cache”，复用原 fanout 语义。
+- `emitNeuronFire()` 内部：`source_global = global_neuron_base + neuron_idx`，并统一走 `emitCommon_()`：
+  - 先 fanout，再逐条 `new SpikeEvent(...)`，最后 `transport->send(...)`（transport 接管生命周期）。
+- 路由共享缓存 key：保持 v1 语义，且不包含 `(pe,core)` 维度，避免重复构建导致的 RSS/构建耗时爆炸。
 
 ## 8. 所有权/生命周期与线程模型
 
@@ -163,11 +164,13 @@ public:
 
 ## 9. 迁移步骤（最小风险）
 
-Phase B‑1（无行为变化）：
-1. 新增 `ISpikeTransport` 与 `ParentSpikeTransport`（适配现有 parent）。
-2. 新增 `SpikeCommSubsystem`，并在 `SnnPESubComponent::setParentInterface()` 或 `init/setup` 中完成 `transport` 与 `route_provider_` 注入。
-3. 将 `SnnPESubComponent::handleNeuronFire_()` 中 “构造 SpikeEvent + parent_->sendSpike” 替换为 `comm_.emitNeuronFire()`。
-4. 保留旧路径（可用宏/参数开关），便于回滚与对比。
+Phase B‑1（传输层抽象，无行为变化）：
+1. 新增 `api/ISpikeTransport.h` 与 `ParentSpikeTransport`（适配现有 parent）。
+2. `SnnPESubComponent::handleNeuronFire_()` 替换为 `spike_comm_.emitNeuronFire()`。
+
+Phase D（通信子系统闭环化）：
+1. 路由构建/共享缓存/门控缓存迁入 `services/SpikeCommSubsystem`；
+2. 控制层仅负责配置与生命周期编排，不再持有路由表与缓存。
 
 Phase B‑2（可选增强，不影响语义）：
 - 支持批量发送：`emitBatch(const std::vector<...>&)`，减少 `new SpikeEvent` 次数（仅性能优化）。
@@ -184,9 +187,9 @@ make -j4 && make install
 回归实验（以 mesh template 口径为准，详见 `sst_dram_si/docs/mesh_template_guide_20251122-000250.md`）：
 ```bash
 MESH_SIM_TIME=10us sst_dram_si/tools/run_mesh_with_time.sh
+MESH_SIM_TIME=100us sst_dram_si/tools/run_mesh_with_time.sh
 ```
 
 通过标准：
 - 仿真可跑完，无 fatal/断言。
 - 关键输出/统计口径与基线一致（允许非语义性日志差异）。
-
