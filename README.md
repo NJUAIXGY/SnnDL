@@ -1,102 +1,79 @@
-# SnnDL Submission Package
+# SnnDL（SST Element：Spiking Neural Network / Deep Learning）
 
-本目录为提交到 GitHub 的最小自包含包，包含：
+本目录是 `sst-elements` 中的 **SnnDL 元素库源码**，用于在 SST 中模拟多核 Processing Element（PE）上的脉冲神经网络（SNN）工作负载，并支撑 DRAM/NoC/窗口化（GAS）等系统级实验。
 
-- `SnnDL/`：SST 元素库 SnnDL 的源码（仅源码，已剔除构建产物）。
-- `SnnDL_Basic/`：规范的 4x4 分层分类示例与脚本（后续开发的基线模板）。
-- `experimental_features/`：实验性/研究性功能与示例（映射框架、学习测试、网络校验等）。
+核心设计目标：**组件层只做装配与调度，事务下沉到子系统；compute core 可替换；边界清晰可回归。**
 
-## 目录结构
+---
 
-```
-github_submission/
-├── SnnDL/                       # SST 元素：SnnDL 源码（放入 sst-elements 后构建）
-├── SnnDL_Basic/                 # 规范 4x4 分类示例（脚本、权重、脉冲数据、分析）
-└── experimental_features/
-    ├── neuron_mapping_framework # 神经元到 PE 映射框架（独立 C++ 项目）
-    ├── snnDL_learning_tests     # 学习特性实验脚本（试验性）
-    ├── snnDL_network_validator  # 网络配置校验工具（试验性）
-    └── snnDL_neuron_dynamics_tests # 神经元动力学实验脚本（试验性）
+## 快速构建与安装（修改生效必须 install）
+
+> 说明：SnnDL 属于 `sst-elements` 的一部分，通常在已 configure 的工作区内增量编译安装。
+
+```bash
+cd "sst_workspace/sst-elements/src/sst/elements/SnnDL"
+make -j4
+make install
 ```
 
-## 环境与依赖
+---
 
-- 已安装或可构建的 SST 框架（sst-core 与 sst-elements）。
-- 推荐安装前缀：`/home/<user>/SST/sst_install`（如下示例可替换为你的路径）。
-- 运行 Python 脚本需要 Python 3.x。
+## 快速运行回归（4×4 mesh 模板）
 
-## 构建 SnnDL 元素
+推荐使用项目内 mesh 模板驱动（详细见 `sst_dram_si/docs/mesh_template_guide_20251122-000250.md`）：
 
-方式 A：在已有的 sst-elements 工作区内增量构建（推荐）
-
-1) 将本目录下的 `SnnDL/` 拷贝至你的 sst-elements：
-
-```
-cp -a github_submission/SnnDL <你的>/sst-elements/src/sst/elements/SnnDL
+```bash
+cd "sst_dram_si"
+export MESH_SIM_TIME="100us"
+./tools/run_mesh_with_time.sh
 ```
 
-2) 安装 sst-core 与 sst-elements（如已安装可跳过）：
+输出目录通常位于：
+- `sst_dram_si/outputs_large/paper2/dram_mesh_4x4/YYYYMMDD-HHMMSS/`
+  - `essential_summary_mesh.json`：关键指标摘要（用于 100us 回归判定）。
+
+---
+
+## 目录结构（按边界划分）
+
+> 每个子目录都有自己的 README，优先以子目录 README 为准。
 
 ```
-cd <你的>/sst-core
-./configure --prefix=/home/<user>/SST/sst_install
-make -j4 && make install
-
-cd <你的>/sst-elements
-./configure --prefix=/home/<user>/SST/sst_install --with-sst-core=/home/<user>/SST/sst_install
-make -j4 && make install
+SnnDL/
+├── api/            # 跨层稳定接口（窄抽象）
+├── events/         # 事件与数据载体（Spike/Gating 等）
+├── components/     # SST 组件装配壳（ELI 注册对象）
+├── control/        # 控制/编排壳（GAS/内存/路由调度，不含动力学）
+├── compute/        # 可替换 compute core（神经动力学/学习/验证）
+├── services/       # 可复用事务子系统（按子域拆分）
+│   ├── noc/        # NoC 传输域（send/recv/forward/本地投递）
+│   ├── memory/     # 纯内存访问域（地址→字节块）
+│   ├── weights/    # 权重语义与缓存域（dense/BCSR/窗口读编排）
+│   ├── route/      # Synapse/Route 域（路由构建、fanout、gating、发送事务）
+│   ├── stimulus/   # Stimulus 域（Step 注入/外部刺激）
+│   ├── gas/        # GAS 辅助（edge/累加器/CustomCmd 统计载体）
+│   └── legacy/     # 历史遗留/参考实现（默认不进主链路）
+├── docs/           # 设计与阶段性方案文档
+└── tests/          # include 自检等轻量测试
 ```
 
-3) 增量构建 SnnDL 元素：
+---
 
-```
-cd <你的>/sst-elements/src/sst/elements/SnnDL
-make -j4 && make install
-```
+## 关键边界（控制 / 计算 / 路由 / 内存 / 权重）
 
-方式 B：全量构建（当需要重新配置/安装整个 SST 环境时）
+- `components/`：SST 对接与装配壳（端口、Link、Clock、Stat、生命周期）；尽量不写算法事务。
+- `control/`：控制/编排壳（窗口/GAS、内存请求编排、统计汇聚）；**不包含神经动力学**。
+- `compute/`：神经动力学与学习等计算逻辑（`ISnnComputeCore`）；**不直接触碰 StandardMem/NoC**。
+- `services/noc/`：纯传输（send/recv/forward/本地投递）；**不做 fanout/权重语义**。
+- `services/memory/`：纯地址/字节访问；**不出现权重/突触/路由语义**。
+- `services/weights/`：权重语义与缓存（dense/BCSR/窗口读编排）；**不直接操作 NIC/NoC**。
+- `services/route/`：路由构建、fanout、gating、spike 发送事务；**不解析权重 bytes**。
+- `services/stimulus/`：注入时基与选源（Step 等刺激）；通过 NoC/Route 完成投递与外发。
 
-参考方式 A 的完整 configure + make + install 流程。
+---
 
-提示：运行时确保环境变量可找到安装位置：
+## 开发提示
 
-```
-export PATH=/home/<user>/SST/sst_install/bin:$PATH
-export LD_LIBRARY_PATH=/home/<user>/SST/sst_install/lib:/home/<user>/SST/sst_install/lib/sst-elements-library:$LD_LIBRARY_PATH
-```
-
-## 运行 4x4 分类示例（规范模板）
-
-```
-cd github_submission/SnnDL_Basic/scripts
-sst test_classification_4x4.py
-
-# 分析输出（CSV 写在当前目录）
-python analyze_classification_results.py
-```
-
-说明：示例脚本使用就地输出 `./complex_classification_stats.csv`，不依赖外部 `sst_output_data/` 目录。
-
-## 实验性功能（experimental_features）
-
-1) 映射框架（neuron_mapping_framework）编译校验：
-
-```
-cd github_submission/experimental_features/neuron_mapping_framework
-make test-compile
-```
-
-2) 学习测试（snnDL_learning_tests）：
-
-- 示例脚本 `scripts/test_learning_min.py` 使用绝对路径指向本仓 `experimental_features/snnDL_learning_tests` 下的数据/误差文件。
-- 若你在不同路径运行，请相应调整脚本中的路径参数或在根目录下运行以保持路径一致。
-
-## 常见问题
-
-- 若 `sst` 运行时报 MPI/PMIx 相关错误，通常是环境限制导致。可在支持 OpenMPI/PMIx 的环境下运行，或在简单用例中设置单分区（`sst.single`）后再试（并非所有脚本都适用）。
-- 如需更换安装前缀，请同步调整环境变量 `PATH` 与 `LD_LIBRARY_PATH`。
-
-## 许可与贡献
-
-- 源码以研究/实验为主，欢迎在独立分支上提交 PR 讨论改进。
-
+- 修改 C++ 后必须执行 `make install` 才会影响实际 `sst` 运行加载的元素库。
+- 若需要调整构建清单：优先改 `Makefile.am`，并同步保持 `Makefile.in` 与之匹配（`make` 会通过 `config.status` 重生成 `Makefile`）。
+- 回归建议：每个阶段至少跑一次 `MESH_SIM_TIME="100us"`，并对比 `essential_summary_mesh.json` 的关键字段（避免非确定性回归）。

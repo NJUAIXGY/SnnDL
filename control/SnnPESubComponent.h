@@ -22,29 +22,32 @@
 #include "SnnPEParentInterface.h"
 #include "SnnCoreAPI.h"
 #include "SnnProfiler.h"  // 轻量级性能分析（条件编译）
-#include "SnnBcsrWeightManager.h"
+#include "weights/SnnBcsrWeightManager.h"
 #include "ISnnComputeCore.h"
-#include "AccumulatorOps.h"
-#include "WeightCacheOps.h"
+#include "gas/AccumulatorOps.h"
+#include "weights/WeightCacheOps.h"
 #include "StageEventHub.h"
-#include "WeightAccessor.h"
-#include "WeightMemorySubsystem.h"
-#include "StandardMemBackend.h"
+#include "weights/WeightAccessor.h"
+#include "weights/WeightMemorySubsystem.h"
+#include "memory/StandardMemBackend.h"
 #include "IMemoryAccess.h"
 #include "ISpikeTransport.h"
-#include "SpikeCommSubsystem.h"
-#include "SynapseRouteSubsystem.h"
+#include "ICoreControlHooks.h"
+#include "IGasOrchestrator.h"
+#include "NocSpikeTransport.h"
+#include "route/SpikeCommSubsystem.h"
+#include "route/SynapseRouteSubsystem.h"
 
 namespace SST {
 namespace SnnDL {
 
-class MultiCorePE; // forward declaration for parent cast
+class IPeAggregation; // PE级汇聚接口（避免依赖 MultiCorePE 具体实现）
 class GatherBufferIF;
 class StandardMemAccess;
 struct GasOpData;
 class GasPhaseController;
 
-class SnnPESubComponent : public SnnCoreAPI {
+class SnnPESubComponent : public SnnCoreAPI, public ICoreControlHooks, public IGasOrchestrator {
 public:
     SST_ELI_REGISTER_SUBCOMPONENT(
         SnnPESubComponent,
@@ -200,6 +203,7 @@ public:
     ~SnnPESubComponent();
 
     virtual void setParentInterface(SnnPEParentInterface* parent);
+    void setNocTransport(INocTransport* noc) override;
     virtual void init(unsigned int phase) override;
     virtual void complete(unsigned int phase) override;
     virtual void setup() override;
@@ -212,18 +216,18 @@ public:
     void setMemoryLink(SST::Link* link);
     void resetMembraneState(float v_rest) override;
     // 回退驱动：当上层无法自动触发clockTick时，由父组件每拍调用一次
-    inline void driveOneCycle() { (void)clockTick((Cycle_t)0); }
+    inline void driveOneCycle() override { (void)clockTick((Cycle_t)0); }
     // 手动触发：结束当前Gather窗口（仅 manual_window_drive 下有效）
     void forceEndGather() override;
     // GAS 控制镜像（cp4'：仅控制平面，数据路径保持原实现）
     void orchestrateBeginGatherWindowSetup();
-    void orchestratePrepareApplyWindow();
-    void orchestrateApplyWindowEntry();
-    void orchestrateBeginApplyIssueFallback(bool strict_active);
+    void orchestratePrepareApplyWindow() override;
+    void orchestrateApplyWindowEntry() override;
+    void orchestrateBeginApplyIssueFallback(bool strict_active) override;
     void orchestrateContinueIssueReads();
     void orchestrateIssueFromEdgesDirect();
-    void orchestrateBeginScatterSequence();
-    void orchestrateEndScatterSequence();
+    void orchestrateBeginScatterSequence() override;
+    void orchestrateEndScatterSequence() override;
 
 private:
     // Helper modules extracted to standalone files; keep private access via friends.
@@ -241,6 +245,9 @@ private:
     WeightMemorySubsystem* weight_mem_subsystem_ = nullptr;
     // 通信子系统：封装 Spike 事件构造与传输
     std::unique_ptr<ParentSpikeTransport> spike_transport_;
+    // NoC 传输注入（Phase4-A1.3）：优先走 NoC 接口，避免依赖 MultiCorePE 的 send/forward 细节
+    INocTransport* noc_transport_ = nullptr;   // 非拥有；由父组件装配并保证生命周期
+    NocSpikeTransport noc_spike_transport_{};  // 值语义适配器
     // Synapse/Route：权重驱动路由构建 + 共享缓存（Phase2）
     SynapseRouteSubsystem synapse_route_;
     SpikeCommSubsystem spike_comm_;
@@ -376,7 +383,6 @@ private:
     bool record_edge_stage_warned_ = false;
     bool record_edge_capacity_warned_ = false;
     Statistic<uint64_t>* stat_gas_edge_overflow_ = nullptr;
-    inline MultiCorePE* parentPE_() const { return parent_pe_cached_; }
     void recordEdge_(uint32_t post_local, uint32_t pre_global);
     inline bool isPreLocal_(uint32_t pre_global) const {
         return (pre_global >= global_neuron_base_) &&
@@ -476,7 +482,7 @@ private:
     bool read_force_single_ = false; // 当为真时，强制按单元素读取（req_size=4B），用于定位对齐/切片问题
 
     SnnPEParentInterface* parent_;
-    MultiCorePE* parent_pe_cached_ = nullptr;
+    IPeAggregation* parent_pe_cached_ = nullptr;
     Output* output_;
     SST::Interfaces::StandardMem* memory_;
     std::unique_ptr<StandardMemBackend> mem_backend_;
@@ -773,7 +779,7 @@ private:
 public:
     // 应用门控决策（由父级MultiCorePE调用）
     void applyGatingDecision(uint32_t src_global, const std::vector<uint32_t>& dest_pes,
-                             uint64_t current_cycle, uint64_t ttl_cycles);
+                             uint64_t current_cycle, uint64_t ttl_cycles) override;
 };
 
 } // namespace SnnDL

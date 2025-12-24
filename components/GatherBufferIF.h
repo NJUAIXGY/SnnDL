@@ -15,7 +15,7 @@
 #include <sst/core/output.h>
 #include <sst/core/interfaces/stdMem.h>
 
-#include "GasCustomCmd.h"
+#include "gas/GasCustomCmd.h"
 
 namespace SST { namespace SnnDL {
 

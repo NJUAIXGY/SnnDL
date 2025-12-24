@@ -23,6 +23,8 @@ libSnnDL_la_SOURCES = \
 	api/SnnInterface.h \
 	api/SnnPEParentInterface.h \
 	api/ISpikeTransport.h \
+	api/INocTransport.h \
+	api/NocSpikeTransport.h \
 	api/IMemoryAccess.h \
 	api/ISynapseRoute.h \
 	api/SynapseRouteBuildConfig.h \
@@ -46,8 +48,8 @@ libSnnDL_la_SOURCES = \
 	components/SnnNIC.h \
 	components/SnnPE.cc \
 	components/SnnPE.h \
-	components/SpikeSource.cc \
-	components/SpikeSource.h \
+	components/stimulus/SpikeSource.cc \
+	components/stimulus/SpikeSource.h \
 	components/WeightLoader.cc \
 	components/WeightLoader.h \
 	components/mpi/MPIMultiCorePE.cc \
@@ -75,42 +77,42 @@ libSnnDL_la_SOURCES = \
 	compute/SnnWeightDiagnostics.cc \
 	compute/SnnWeightDiagnostics.h \
 	compute/SynapseManager.h \
-	services/AccumulatorOps.cc \
-	services/AccumulatorOps.h \
-	services/GasCustomCmd.h \
-	services/GasEdgeCollector.cc \
-	services/GasEdgeCollector.h \
-	services/GasPhaseController.cc \
-	services/GasPhaseController.h \
-	services/OptimizedInternalRing.cc \
-	services/OptimizedInternalRing.h \
-	services/SimpleNetworkWrapper.cc \
-	services/SimpleNetworkWrapper.h \
-	services/SnnBcsrWeightManager.cc \
-	services/SnnBcsrWeightManager.h \
-	services/SnnNetworkAdapter.cc \
-	services/SnnNetworkAdapter.h \
+	services/gas/AccumulatorOps.cc \
+	services/gas/AccumulatorOps.h \
+	services/gas/GasCustomCmd.h \
+	services/gas/GasEdgeCollector.cc \
+	services/gas/GasEdgeCollector.h \
+	services/gas/GasPhaseController.cc \
+	services/gas/GasPhaseController.h \
+	services/noc/OptimizedInternalRing.cc \
+	services/noc/OptimizedInternalRing.h \
+	services/noc/SimpleNetworkWrapper.cc \
+	services/noc/SimpleNetworkWrapper.h \
+	services/weights/SnnBcsrWeightManager.cc \
+	services/weights/SnnBcsrWeightManager.h \
+	services/noc/SnnNetworkAdapter.cc \
+	services/noc/SnnNetworkAdapter.h \
 	services/SnnProfiler.h \
-	services/SnnRouteProvider.cc \
-	services/SnnRouteProvider.h \
-	services/SynapseRouteSubsystem.cc \
-	services/SynapseRouteSubsystem.h \
-	services/StepActivationSubsystem.cc \
-	services/StepActivationSubsystem.h \
-	services/NocSubsystem.cc \
-	services/NocSubsystem.h \
-	services/WeightAccessor.cc \
-	services/WeightAccessor.h \
-	services/WeightCacheOps.cc \
-	services/WeightCacheOps.h \
-	services/WeightMemorySubsystem.cc \
-	services/WeightMemorySubsystem.h \
-	services/SpikeCommSubsystem.cc \
-	services/SpikeCommSubsystem.h \
-	services/StandardMemAccess.cc \
-	services/StandardMemAccess.h \
-	services/StandardMemBackend.cc \
-	services/StandardMemBackend.h
+	services/route/SnnRouteProvider.cc \
+	services/route/SnnRouteProvider.h \
+	services/route/SynapseRouteSubsystem.cc \
+	services/route/SynapseRouteSubsystem.h \
+	services/stimulus/StepActivationSubsystem.cc \
+	services/stimulus/StepActivationSubsystem.h \
+	services/noc/NocSubsystem.cc \
+	services/noc/NocSubsystem.h \
+	services/weights/WeightAccessor.cc \
+	services/weights/WeightAccessor.h \
+	services/weights/WeightCacheOps.cc \
+	services/weights/WeightCacheOps.h \
+	services/weights/WeightMemorySubsystem.cc \
+	services/weights/WeightMemorySubsystem.h \
+	services/route/SpikeCommSubsystem.cc \
+	services/route/SpikeCommSubsystem.h \
+	services/memory/StandardMemAccess.cc \
+	services/memory/StandardMemAccess.h \
+	services/memory/StandardMemBackend.cc \
+	services/memory/StandardMemBackend.h
 
 #
 # Note: sources above already include GatherBufferIF / MemKCalBench / MPI files.

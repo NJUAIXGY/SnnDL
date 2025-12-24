@@ -9,13 +9,13 @@
 
 namespace SST { namespace SnnDL {
 
-class SnnPESubComponent; // fwd
+class IGasOrchestrator; // fwd
 
 class GasPhaseController {
 public:
     GasPhaseController() = default;
 
-    void init(SnnPESubComponent* core, Output* out) { core_ = core; out_ = out; }
+    void init(IGasOrchestrator* orchestrator, Output* out) { orchestrator_ = orchestrator; out_ = out; }
     void setDebug(bool window_read_debug, bool extended_diag) {
         window_read_debug_ = window_read_debug; extended_diag_ = extended_diag;
     }
@@ -42,7 +42,7 @@ private:
             "[gas-ctrl] ev=%s seq=%u spikes=%" PRIu64 "\n", ev?ev:"-", seq, spikes);
     }
 
-    SnnPESubComponent* core_ = nullptr;
+    IGasOrchestrator* orchestrator_ = nullptr;
     Output* out_ = nullptr;
     bool window_read_debug_ = false;
     bool extended_diag_ = false;
@@ -52,4 +52,3 @@ private:
 }} // namespace
 
 #endif
-

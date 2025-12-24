@@ -2,7 +2,11 @@
 //
 // StandardMemWeightReader: StandardMem-based weight reader/controller extracted from
 // SnnPESubComponent. Implements IWeightReader for compute core and centralizes
-// dense/BCSR read/response handling. Behavior preserved; structural decoupling only.
+// dense/BCSR read/response handling.
+//
+// 说明：该模块为历史遗留/参考实现（当前默认不纳入构建）。
+// 现行数据路径已由 `services/StandardMemAccess`（纯内存） + `services/WeightMemorySubsystem`（权重语义）闭环，
+// 避免 services→control 的反向依赖。
 //
 
 #pragma once
@@ -13,17 +17,17 @@
 
 #include "SnnWeightReader.h" // IWeightReader
 
-namespace SST { namespace Interfaces { class StandardMem; } }
+// 若需处理 StandardMem 回包（legacy API），需要完整类型定义
+#include <sst/core/interfaces/stdMem.h>
 
 namespace SST { namespace SnnDL {
-
-class SnnPESubComponent; // fwd
 
 class StandardMemWeightReader final : public IWeightReader {
 public:
     StandardMemWeightReader() = default;
 
-    void init(SnnPESubComponent* core) { core_ = core; }
+    // 绑定底层实现（建议使用 WeightMemorySubsystem；该 shim 自身不再窥探控制层私有成员）
+    void bind(IWeightReader* impl) { impl_ = impl; }
 
     // IWeightReader
     void requestDense(uint32_t pre, uint32_t post, std::function<void(float)> cb) override;
@@ -31,28 +35,16 @@ public:
     bool tryCache(uint64_t key, float& out) override;
     void putCache(uint64_t key, float value) override;
 
-    // Handle non-Custom StandardMem responses (ReadResp/WriteResp).
-    // Returns true if handled and request deleted.
-    bool handleMemoryResponse(SST::Interfaces::StandardMem::Request* req);
-
-    // Writeback helper used by compute core callback.
+    // Legacy API：写回 helper（现行路径已在 control/SnnPESubComponent_mem.cc 内实现）
     bool applyLocalWeightUpdates(const std::unordered_map<uint64_t, float>& grads,
                                  float learning_rate,
                                  float weight_decay);
 
-    // Scheme1 prefetch helper.
+    // Legacy API：scheme1 预取 helper（现行路径已由 WeightMemorySubsystem::issueDensePrefetchRaw 支持）
     void scheme1PrefetchSlice(uint32_t slice_idx);
 
 private:
-    bool prepareDenseRead_(uint32_t row, uint32_t col, uint32_t width,
-                           uint64_t& req_addr, size_t& req_size,
-                           bool& is_row, uint32_t& col_start, uint32_t& count_floats) const;
-    void issueReadCommon_(uint64_t req_addr, size_t req_size,
-                          bool is_row, uint32_t row, uint32_t col_start, uint32_t count_floats,
-                          std::function<void(float)> single_cb, uint32_t single_col);
-
-    SnnPESubComponent* core_ = nullptr;
+    IWeightReader* impl_ = nullptr; // non-owning
 };
 
 }} // namespace SST::SnnDL
-

@@ -8,15 +8,15 @@
 #include <sst/core/sst_config.h>
 #include "SnnPESubComponent.h"
 #include <fstream>
-#include "GasCustomCmd.h"
-#include "GasPhaseController.h"
-#include "MultiCorePE.h"
+#include "gas/GasCustomCmd.h"
+#include "gas/GasPhaseController.h"
+#include "IPeAggregation.h"
 #include "GatherBufferIF.h"
-#include "WeightMemorySubsystem.h"
-#include "StandardMemBackend.h"
-#include "StandardMemAccess.h"
+#include "weights/WeightMemorySubsystem.h"
+#include "memory/StandardMemBackend.h"
+#include "memory/StandardMemAccess.h"
 #include "ISpikeTransport.h"
-#include "SpikeCommSubsystem.h"
+#include "route/SpikeCommSubsystem.h"
 
 #include <iostream>
 #include <cmath>
@@ -272,6 +272,7 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     
     // 读取配置参数
     core_id_ = params.find<int>("core_id", 0);
+    noc_spike_transport_.setSourceCore(core_id_);
     if (kSentinelOn && output_) {
         SNNDL_LOG(0, "[[sentinel-core-ctor]] core_ctor enter\n");
         SNNDL_LOG(0, "[[sentinel-core-ctor]] after params: core_id=%d\n", core_id_);
@@ -699,7 +700,7 @@ size_t SnnPESubComponent::pendingMemSize_() const {
 
 void SnnPESubComponent::setParentInterface(SnnPEParentInterface* parent) {
     parent_ = parent;
-    parent_pe_cached_ = dynamic_cast<MultiCorePE*>(parent);
+    parent_pe_cached_ = dynamic_cast<IPeAggregation*>(parent);
     // output_->verbose(CALL_INFO, 2, 0, "🔗 核心%d设置父级接口\n", core_id_);
     if (!spike_transport_) {
         spike_transport_ = std::make_unique<ParentSpikeTransport>(parent_);
@@ -714,13 +715,21 @@ void SnnPESubComponent::setParentInterface(SnnPEParentInterface* parent) {
                                static_cast<uint32_t>(neurons_per_pe_cfg_),
                                stat_routes_entries_);
     synapse_route_.bindFanoutStat(stat_fanout_per_spike_);
+    ISpikeTransport* transport = spike_transport_.get();
+    if (noc_transport_) transport = &noc_spike_transport_;
     SpikeCommRuntimeConfig rt{};
     rt.log = output_;
-    rt.transport = spike_transport_.get();
+    rt.transport = transport;
     rt.synapse_route = &synapse_route_;
     rt.global_neuron_base = static_cast<uint64_t>(global_neuron_base_);
     spike_comm_.bindRuntime(rt);
     spike_comm_ready_ = spike_comm_.ready();
+}
+
+void SnnPESubComponent::setNocTransport(INocTransport* noc) {
+    noc_transport_ = noc;
+    noc_spike_transport_.setNocTransport(noc);
+    noc_spike_transport_.setSourceCore(core_id_);
 }
 
 void SnnPESubComponent::configureComputeCore_(const Params& params) {
@@ -916,9 +925,11 @@ void SnnPESubComponent::init(unsigned int phase) {
                                        static_cast<uint32_t>(neurons_per_pe_cfg_),
                                        stat_routes_entries_);
             synapse_route_.bindFanoutStat(stat_fanout_per_spike_);
+            ISpikeTransport* transport = spike_transport_.get();
+            if (noc_transport_) transport = &noc_spike_transport_;
             SpikeCommRuntimeConfig rt{};
             rt.log = output_;
-            rt.transport = spike_transport_.get();
+            rt.transport = transport;
             rt.synapse_route = &synapse_route_;
             rt.global_neuron_base = static_cast<uint64_t>(global_neuron_base_);
             spike_comm_.bindRuntime(rt);

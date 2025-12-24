@@ -22,6 +22,7 @@ namespace SST { namespace Statistics { template <typename T> class Statistic; } 
 namespace SST { namespace SnnDL {
 
 class SpikeEvent;
+class INocTransport;
 
 class StepActivationSubsystem final {
 public:
@@ -68,6 +69,9 @@ public:
         bool sentinel_enabled = false;
         long step_diag_cap_cfg = 0;
         int step_diag_enable_cfg = 0;
+
+        // NoC 抽象接口（Phase4-A1.3）：优先使用该接口进行注入/外发
+        INocTransport* noc = nullptr;
 
         // 注入回调（由 MultiCorePE 提供，保持“直达目标 core / 外部 NIC”语义不变）
         std::function<void(int /*core_id*/, SpikeEvent*)> deliver_to_core;
@@ -147,4 +151,3 @@ private:
 };
 
 }} // namespace SST::SnnDL
-

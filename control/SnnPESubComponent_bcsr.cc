@@ -14,7 +14,7 @@
 #include <iterator>
 #include <algorithm>
 #include <cstdlib>
-#include "StandardMemBackend.h"
+#include "memory/StandardMemBackend.h"
 
 using namespace SST;
 using namespace SST::SnnDL;

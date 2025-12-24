@@ -7,11 +7,11 @@
 
 #include <sst/core/sst_config.h>
 #include "MultiCorePE.h"
-#include "SnnNetworkAdapter.h"
-#include "OptimizedInternalRing.h"
+#include "noc/SnnNetworkAdapter.h"
+#include "noc/OptimizedInternalRing.h"
 #include "SnnNIC.h"
 #include "GatingDecisionEvent.h"
-#include "SnnPESubComponent.h"
+#include "ICoreControlHooks.h"
 
 #include <fstream>
 #include <sstream>
@@ -89,6 +89,13 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
     
     // 环形网络实现选择
     use_optimized_ring_ = params.find<bool>("use_optimized_ring", true);
+    // Phase5：冻结 legacy InternalRing 分支（use_optimized_ring=0）
+    // - NoC 子系统已以 OptimizedInternalRing 为唯一片上互连后端完成闭环
+    // - legacy InternalRing 会引入维护成本与语义漂移风险，故在此明确禁用
+    if (!use_optimized_ring_ && num_cores_ > 1) {
+        output_->fatal(CALL_INFO, -1,
+            "❌ 配置错误：use_optimized_ring=0 (legacy InternalRing) 已冻结/不再支持，请设置 use_optimized_ring=1\n");
+    }
     // 输出控制：是否打印节点汇总
     print_node_summary_ = params.find<bool>("print_node_summary", true);
     primary_keepalive_ = params.find<bool>("primary_keepalive", false);
@@ -155,6 +162,7 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
         step_rt.sentinel_enabled = sentinel_enabled_;
         step_rt.step_diag_cap_cfg = step_diag_cap_cfg_;
         step_rt.step_diag_enable_cfg = step_diag_enable_cfg_;
+        step_rt.noc = &noc_subsys_;
         step_rt.deliver_to_core = [this](int core_id, SpikeEvent* spike) { deliverSpikeToCore(core_id, spike); };
         step_rt.send_external = [this](SpikeEvent* spike) { sendExternalSpike(spike); };
         step_rt.reset_membranes = [this]() { resetAllCoreMembranes(); };
@@ -201,7 +209,6 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
     memory_interface_ = nullptr;
     external_nic_ = nullptr;
     optimized_ring_ = nullptr;
-    internal_ring_ = nullptr;
     controller_ = nullptr;
     
     // 初始化端口指针为空
@@ -230,27 +237,19 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
 
         NocSubsystem::Stats noc_st;
         noc_st.external_spikes_received = stat_external_spikes_received_;
+        noc_st.external_spikes_sent = stat_external_spikes_sent_;
+        noc_st.inter_core_messages = stat_inter_core_messages_;
         noc_subsys_.bindStats(noc_st);
 
         NocSubsystem::Runtime noc_rt;
         noc_rt.log = output_;
         noc_rt.node_id = node_id_;
         noc_rt.num_cores = num_cores_;
+        noc_rt.nic = nullptr;  // init 后再注入
+        noc_rt.optimized_ring = nullptr;  // init 后再注入
+        noc_rt.external_spike_output_link = nullptr;  // init(phase0) link configured 后再注入
         noc_rt.determine_target_unit = [this](int neuron_id) { return determineTargetUnit(neuron_id); };
         noc_rt.deliver_to_core = [this](int core_id, SpikeEvent* spike) { deliverSpikeToCore(core_id, spike); };
-        noc_rt.route_internal = [this](int src_core, int dst_core, SpikeEvent* spike) {
-            routeInternalSpike(src_core, dst_core, spike);
-        };
-        noc_rt.send_external = [this](SpikeEvent* spike) { sendExternalSpike(spike); };
-        noc_rt.forward_external = [this](SpikeEvent* spike) {
-            if (!spike) return;
-            if (external_nic_) {
-                external_nic_->sendSpike(spike);
-            } else {
-                delete spike;
-            }
-        };
-        noc_rt.tick_ring = [this](uint64_t current_cycle) { tickNocRing_(current_cycle); };
         noc_subsys_.bindRuntime(noc_rt);
     }
     // 记录路径（若提供），用于派生输出目录
@@ -268,7 +267,6 @@ MultiCorePE::~MultiCorePE() {
     
     // 清理内部组件
     delete optimized_ring_;
-    delete internal_ring_;
     delete controller_;
     // 避免析构次序竞态：不手动delete日志对象
     output_ = nullptr;
@@ -317,6 +315,20 @@ void MultiCorePE::init(unsigned int phase) {
         // 初始化内部互连
         initializeInternalRing();
         if (sentinel_enabled_ && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=0 ring-initialized\n", node_id_); }
+
+        // Phase4-A1.2：NoC 子系统后端装配（NIC / ring / legacy link）
+        {
+            NocSubsystem::Runtime noc_rt;
+            noc_rt.log = output_;
+            noc_rt.node_id = node_id_;
+            noc_rt.num_cores = num_cores_;
+            noc_rt.nic = external_nic_;
+            noc_rt.optimized_ring = optimized_ring_;
+            noc_rt.external_spike_output_link = external_spike_output_link_;
+            noc_rt.determine_target_unit = [this](int neuron_id) { return determineTargetUnit(neuron_id); };
+            noc_rt.deliver_to_core = [this](int core_id, SpikeEvent* spike) { deliverSpikeToCore(core_id, spike); };
+            noc_subsys_.bindRuntime(noc_rt);
+        }
         
         // 初始化多核控制器
         controller_ = new MultiCoreController(this, output_);
@@ -391,9 +403,9 @@ void MultiCorePE::setup() {
                       num_cores_, cores_.size());
     }
     
-    // 检查内部互连（新的优化版本或旧版本）
+    // 检查内部互连（Phase5：仅保留 OptimizedInternalRing）
     // 单核情况下不需要内部互连
-    if (num_cores_ > 1 && !optimized_ring_ && !internal_ring_) {
+    if (num_cores_ > 1 && !optimized_ring_) {
         output_->fatal(CALL_INFO, -1, "❌ 错误: 多核配置但内部互连未初始化\n");
     }
     // 调用子核心的setup
@@ -556,20 +568,20 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
     step_activation_subsys_.tick(static_cast<uint64_t>(current_cycle_));
 
     // 0b. 测试注入：在首个有效周期从 core0 向 core1 注入一个跨核脉冲（仅当启用测试流量时）
-    if (enable_test_traffic_ && !test_injected_ && num_cores_ > 1 && current_cycle_ == 5000) {
-        // 构造一个从全局神经元0 -> 全局神经元(neurons_per_core_) 的脉冲
-        SpikeEvent* test_spike = new SpikeEvent(0, neurons_per_core_, 0, 0.5f, current_cycle_);
-        int src_core = determineTargetUnit(test_spike->getSourceNeuron());
-        int dst_core = determineTargetUnit(test_spike->getDestinationNeuron());
-        if (src_core >=0 && dst_core >=0 && src_core != dst_core) {
-            routeInternalSpike(src_core, dst_core, test_spike);
-            PE_LOG(1, "🧪 注入跨核脉冲: 核心%d->核心%d\n", src_core, dst_core);
-            test_injected_ = true;
-        } else {
-            delete test_spike;
-            test_injected_ = true;
-        }
-    }
+	    if (enable_test_traffic_ && !test_injected_ && num_cores_ > 1 && current_cycle_ == 5000) {
+	        // 构造一个从全局神经元0 -> 全局神经元(neurons_per_core_) 的脉冲
+	        SpikeEvent* test_spike = new SpikeEvent(0, neurons_per_core_, 0, 0.5f, current_cycle_);
+	        int src_core = determineTargetUnit(test_spike->getSourceNeuron());
+	        int dst_core = determineTargetUnit(test_spike->getDestinationNeuron());
+	        if (src_core >=0 && dst_core >=0 && src_core != dst_core) {
+	            noc_subsys_.sendFromCore(src_core, test_spike);
+	            PE_LOG(1, "🧪 注入跨核脉冲: 核心%d->核心%d\n", src_core, dst_core);
+	            test_injected_ = true;
+	        } else {
+	            delete test_spike;
+	            test_injected_ = true;
+	        }
+	    }
     
     // 1. 处理外部脉冲队列（Phase4-A1.1：下沉至 NoC 子系统）
     noc_subsys_.drainIncomingQueue(static_cast<uint64_t>(current_cycle_));
@@ -579,12 +591,12 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
     if (manual_core_drive_enable_) {
         for (int i = 0; i < num_cores_; i++) {
             if (cores_[i] != nullptr) {
-                if (auto* sc = dynamic_cast<SnnPESubComponent*>(cores_[i])) {
-                    sc->driveOneCycle();
+                if (auto* hooks = dynamic_cast<ICoreControlHooks*>(cores_[i])) {
+                    hooks->driveOneCycle();
                     if (manual_gas_gather_cycles_ > 0 && (current_cycle_ % manual_gas_gather_cycles_) == 0) {
                         PE_LOG(2, "[diag-PE] forceEndGather: core=%d cyc=%" PRIu64 " period=%" PRIu64 "\n",
                                i, (uint64_t)current_cycle_, (uint64_t)manual_gas_gather_cycles_);
-                        sc->forceEndGather();
+                        cores_[i]->forceEndGather();
                     }
                 }
             }
@@ -646,17 +658,6 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
     return false;
 }
 
-void MultiCorePE::tickNocRing_(uint64_t current_cycle) {
-    // 复用原 ring tick + receive 语义（Phase4-A1.1：后端仍在 MultiCorePE 内）
-    if (optimized_ring_) {
-        optimized_ring_->tick(current_cycle);
-        handleOptimizedCrossCoreRouting();
-    } else if (internal_ring_) {
-        internal_ring_->tick();
-        handleCrossCoreRouting();
-    }
-}
-
 void MultiCorePE::handleExternalSpikeEvent(SST::Event* ev) {
     // Phase4-A1.1：外部端口输入逻辑收敛到 NoC 子系统（保持 hop/TTL 与路由语义不变）。
     noc_subsys_.onExternalPortEvent(ev);
@@ -670,87 +671,11 @@ void MultiCorePE::handleExternalSpike(SpikeEvent* spike) {
 void MultiCorePE::sendExternalSpike(SpikeEvent* spike) {
     if (!spike) return;
 
-    // 自环防护：如果目标节点就是本节点，直接丢弃，避免外部回送循环
-    int target_node = static_cast<int>(spike->getDestinationNode());
-    if (target_node == node_id_) {
-        PE_LOG(2, "⚠️ 试图向自身节点发送外部脉冲，丢弃: 源=%d 目标=%d 节点=%d\n",
-                         spike->getSourceNeuron(), spike->getDestinationNeuron(), target_node);
-        delete spike;
-        return;
-    }
-
-    PE_LOG(3, "📤 发送外部脉冲: 源神经元%d -> 目标神经元%d, 跳数%d\n",
-                     spike->getSourceNeuron(), spike->getDestinationNeuron(), spike->getHopCount());
-
-    // 优先使用网络适配器，如果未配置则回退到传统链接
-    static uint64_t s_nic_send_log_count = 0;
-    if (external_nic_) {
-        // 使用网络适配器发送脉冲（这将触发路由计算和统计收集）
-        external_nic_->sendSpike(spike);
-        PE_LOG(3, "🌐 通过网络适配器发送脉冲\n");
-        // debug nic-send removed for production
-    } else if (external_spike_output_link_) {
-        // 回退到传统链接模式
-        external_spike_output_link_->send(spike);
-        PE_LOG(3, "🔗 通过传统链接发送脉冲\n");
-    } else {
-        PE_LOG(2, "⚠️ 没有可用的外部发送方式，丢弃脉冲\n");
-        delete spike;
-        return;
-    }
-    
-    stat_external_spikes_sent_->addData(1);
-}
-
-void MultiCorePE::routeInternalSpike(int src_core, int dst_core, SpikeEvent* spike) {
-    if (!spike) return;
-    
-    if (src_core < 0 || src_core >= num_cores_ || dst_core < 0 || dst_core >= num_cores_) {
-        PE_LOG(1, "⚠️ 无效的核心ID: src=%d, dst=%d\n", src_core, dst_core);
-        delete spike;
-        return;
-    }
-    
-    PE_LOG(4, "🔄 路由内部脉冲: 核心%d -> 核心%d, 神经元%d\n",
-                    src_core, dst_core, spike->getDestinationNeuron());
-    
-    // 单核情况或同一核心内，直接递送
-    if (num_cores_ <= 1 || src_core == dst_core) {
-        deliverSpikeToCore(dst_core, spike);
-        return;
-    }
-    
-    // 创建内部消息
-    RingMessage msg;
-    msg.type = RingMessageType::SPIKE_MESSAGE;
-    msg.src_unit = src_core;
-    msg.dst_unit = dst_core;
-    msg.timestamp = current_cycle_;
-    msg.payload.spike_data = spike;
-    
-    bool sent_successfully = false;
-    
-    // 优先使用优化的环形网络
-    if (optimized_ring_) {
-        sent_successfully = optimized_ring_->sendMessage(src_core, dst_core, msg, 1); // 优先级1
-        if (sent_successfully) {
-            inter_core_messages_count_++;
-            if (stat_inter_core_messages_) stat_inter_core_messages_->addData(1);
-        }
-    } 
-    // 回退到旧的环形网络
-    else if (internal_ring_) {
-        sent_successfully = internal_ring_->sendMessage(msg);
-        if (sent_successfully) {
-            inter_core_messages_count_++;
-            if (stat_inter_core_messages_) stat_inter_core_messages_->addData(1);
-        }
-    }
-    
-    if (!sent_successfully) {
-        PE_LOG(2, "⚠️ 内部环形网络发送失败: 核心%d -> 核心%d\n", src_core, dst_core);
-        delete spike;
-    }
+    // Phase4-A1.2/5：对外发路径做最后一次收敛，统一委托 NoC 子系统负责
+    // - backend 选择（NIC / legacy link）
+    // - 自环防护
+    // - external_spikes_sent 统计口径
+    noc_subsys_.sendExternal(spike);
 }
 
 int MultiCorePE::determineTargetUnit(int neuron_id) const {
@@ -1055,6 +980,10 @@ void MultiCorePE::initializeProcessingUnits() {
         
         if (core) {
             core->setParentInterface(this);
+            // Phase4-A1.3：为 Control 注入 NoC 抽象接口（优先走 NocSubsystem，不依赖 MultiCorePE send/forward 细节）
+            if (auto* hooks = dynamic_cast<ICoreControlHooks*>(core)) {
+                hooks->setNocTransport(&noc_subsys_);
+            }
             // 为每个核心配置内存Link（若用户在Python连接了对应端口则不为None）
             std::string port = "core" + std::to_string(i) + "_mem";
             Link* l = configureLink(port);
@@ -1080,33 +1009,19 @@ void MultiCorePE::initializeInternalRing() {
     // 单核情况下无需内部环形网络
     if (num_cores_ <= 1) {
         optimized_ring_ = nullptr;
-        internal_ring_ = nullptr;
         return;
     }
     
-    // 检查是否使用优化版环形网络（默认使用）
-    // 注意：此时我们在init阶段，需要存储参数以便后续使用
-    bool use_optimized = use_optimized_ring_;
-    
-    if (use_optimized) {
-        
-        // 使用新的OptimizedInternalRing
-        int num_vcs = 2;                // 每方向2个虚拟通道
-        uint32_t credits_per_vc = 8;    // 每VC 8个信用
-        
-        optimized_ring_ = new OptimizedInternalRing(num_cores_, num_vcs, credits_per_vc, output_);
-        internal_ring_ = nullptr;       // 不使用旧实现
-        
-                        // num_cores_, num_vcs, credits_per_vc);
-    } else {
-        
-        // 使用原始InternalRing实现
-        int latency_cycles = 1;  // 默认1周期延迟
-        internal_ring_ = new InternalRing(num_cores_, latency_cycles, output_);
-        optimized_ring_ = nullptr;  // 不使用新实现
-        
-                        // num_cores_, latency_cycles);
+    // Phase5：仅保留 OptimizedInternalRing 作为片上互连后端（legacy InternalRing 已冻结/移除）
+    if (!use_optimized_ring_) {
+        output_->fatal(CALL_INFO, -1,
+            "❌ 配置错误：use_optimized_ring=0 (legacy InternalRing) 已冻结/不再支持，请设置 use_optimized_ring=1\n");
     }
+
+    // 使用新的 OptimizedInternalRing
+    int num_vcs = 2;                // 每方向2个虚拟通道
+    uint32_t credits_per_vc = 8;    // 每VC 8个信用
+    optimized_ring_ = new OptimizedInternalRing(num_cores_, num_vcs, credits_per_vc, output_);
 }
 
 void MultiCorePE::loadAndDistributeWeights() {
@@ -1195,71 +1110,6 @@ void MultiCorePE::generateTestTraffic() {
     }
 }
 
-void MultiCorePE::handleCrossCoreRouting() {
-    if (!internal_ring_) return;
-    
-    // 检查每个处理单元是否有跨核消息
-    for (int i = 0; i < num_cores_; i++) {
-        RingMessage msg;
-        if (internal_ring_->receiveMessage(i, msg)) {
-            if (msg.type == RingMessageType::SPIKE_MESSAGE && msg.payload.spike_data) {
-                // 将脉冲传递给目标处理单元
-                int target_unit = msg.dst_unit;
-                if (target_unit >= 0 && target_unit < num_cores_) {
-                    deliverSpikeToCore(target_unit, msg.payload.spike_data);
-                    
-                    PE_LOG(4, "🔄 跨核脉冲路由: 核心%d -> 核心%d\n", 
-                                   msg.src_unit, msg.dst_unit);
-                } else {
-                    PE_LOG(2, "⚠️ 无效的目标单元: %d\n", target_unit);
-                    delete msg.payload.spike_data;
-                }
-            }
-        }
-    }
-}
-
-void MultiCorePE::handleOptimizedCrossCoreRouting() {
-    if (!optimized_ring_) return;
-    
-    // 检查每个处理单元是否有跨核消息（使用新的优化环形网络）
-    for (int i = 0; i < num_cores_; i++) {
-        RingMessage msg;
-        while (optimized_ring_->receiveMessage(i, msg)) {
-            if (msg.type == RingMessageType::SPIKE_MESSAGE && msg.payload.spike_data) {
-                // 将脉冲传递给目标处理单元
-                int target_unit = msg.dst_unit;
-                if (target_unit >= 0 && target_unit < num_cores_) {
-                    deliverSpikeToCore(target_unit, msg.payload.spike_data);
-                    
-                    // 增加跨核通信统计
-                    inter_core_messages_count_++;
-                    stat_inter_core_messages_->addData(1);
-                    
-                    PE_LOG(4, "🔄 优化跨核脉冲路由: 核心%d -> 核心%d\n", 
-                                   msg.src_unit, msg.dst_unit);
-                } else {
-                    PE_LOG(2, "⚠️ 无效的目标单元: %d\n", target_unit);
-                    delete msg.payload.spike_data;
-                }
-            } else {
-                // 处理其他类型的消息（内存请求、控制消息等）
-                PE_LOG(3, "🔄 处理非脉冲消息: 类型=%d\n", 
-                               static_cast<int>(msg.type));
-            }
-        }
-    }
-    
-    // 定期输出网络统计信息
-    if (current_cycle_ % 5000 == 0 && verbose_ >= 2) {
-        double avg_latency = optimized_ring_->getAverageLatency();
-        double utilization = optimized_ring_->getNetworkUtilization();
-        int pending_msgs = optimized_ring_->getPendingMessageCount();
-        
-        //                 current_cycle_, avg_latency, utilization * 100.0, pending_msgs);
-    }
-}
-
 void MultiCorePE::checkLoadBalance() {
     if (!controller_) return;
     
@@ -1276,158 +1126,6 @@ void MultiCorePE::checkLoadBalance() {
         //                 load_imbalance * 100.0, max_util * 100.0, min_util * 100.0);
         
         controller_->balanceLoad();
-    }
-}
-
-
-
-// ===== InternalRing 实现 =====
-
-InternalRing::InternalRing(int num_nodes, int latency_cycles, SST::Output* output)
-    : num_nodes_(num_nodes), latency_cycles_(latency_cycles), output_(output) {
-    
-    // 初始化每个节点的输入输出队列
-    node_input_queues_.resize(num_nodes_);
-    node_output_queues_.resize(num_nodes_);
-    
-    // 初始化统计变量
-    total_messages_routed_ = 0;
-    total_latency_cycles_ = 0;
-    
-    //                 num_nodes_, latency_cycles_);
-}
-
-InternalRing::~InternalRing() {
-    // 清理所有队列中的消息
-    for (int i = 0; i < num_nodes_; i++) {
-        while (!node_input_queues_[i].empty()) {
-            RingMessage& msg = node_input_queues_[i].front();
-            if (msg.type == RingMessageType::SPIKE_MESSAGE && msg.payload.spike_data) {
-                delete msg.payload.spike_data;
-            }
-            node_input_queues_[i].pop();
-        }
-        
-        while (!node_output_queues_[i].empty()) {
-            RingMessage& msg = node_output_queues_[i].front();
-            if (msg.type == RingMessageType::SPIKE_MESSAGE && msg.payload.spike_data) {
-                delete msg.payload.spike_data;
-            }
-            node_output_queues_[i].pop();
-        }
-    }
-    
-    // 清理环形缓冲区
-    while (!ring_buffer_.empty()) {
-        RingMessage& msg = ring_buffer_.front();
-        if (msg.type == RingMessageType::SPIKE_MESSAGE && msg.payload.spike_data) {
-            delete msg.payload.spike_data;
-        }
-        ring_buffer_.pop();
-    }
-}
-
-bool InternalRing::sendMessage(const RingMessage& msg) {
-    if (msg.src_unit < 0 || msg.src_unit >= num_nodes_ || 
-        msg.dst_unit < 0 || msg.dst_unit >= num_nodes_) {
-                    //    msg.src_unit, msg.dst_unit);
-        return false;
-    }
-    
-    // 检查输出队列是否有空间
-    if (node_output_queues_[msg.src_unit].size() >= 100) {  // 限制队列大小
-        return false;
-    }
-    
-    // 将消息加入源节点的输出队列
-    node_output_queues_[msg.src_unit].push(msg);
-    
-                    // msg.src_unit, msg.dst_unit);
-    
-    return true;
-}
-
-bool InternalRing::receiveMessage(int node_id, RingMessage& msg) {
-    if (node_id < 0 || node_id >= num_nodes_) {
-        return false;
-    }
-    
-    if (node_input_queues_[node_id].empty()) {
-        return false;
-    }
-    
-    msg = node_input_queues_[node_id].front();
-    node_input_queues_[node_id].pop();
-    
-    
-    return true;
-}
-
-void InternalRing::tick() {
-    // 简化的环形网络实现：直接路由消息
-    for (int src = 0; src < num_nodes_; src++) {
-        while (!node_output_queues_[src].empty()) {
-            RingMessage msg = node_output_queues_[src].front();
-            node_output_queues_[src].pop();
-            
-            routeMessage(msg);
-            total_messages_routed_++;
-        }
-    }
-    
-    // 处理环形缓冲区中的延迟消息
-    std::queue<RingMessage> delayed_messages;
-    while (!ring_buffer_.empty()) {
-        RingMessage msg = ring_buffer_.front();
-        ring_buffer_.pop();
-        
-        // 检查延迟是否满足
-        uint64_t current_time = 0;  // 这里简化，实际应该获取当前时钟
-        if (current_time - msg.timestamp >= static_cast<uint64_t>(latency_cycles_)) {
-            // 延迟满足，发送到目标节点
-            node_input_queues_[msg.dst_unit].push(msg);
-            total_latency_cycles_ += (current_time - msg.timestamp);
-        } else {
-            // 延迟未满足，重新加入缓冲区
-            delayed_messages.push(msg);
-        }
-    }
-    
-    // 将延迟消息重新加入缓冲区
-    ring_buffer_ = delayed_messages;
-}
-
-bool InternalRing::hasTrafficForNode(int node_id) const {
-    if (node_id < 0 || node_id >= num_nodes_) {
-        return false;
-    }
-    return !node_input_queues_[node_id].empty();
-}
-
-int InternalRing::getPendingMessageCount() const {
-    int total = ring_buffer_.size();
-    for (int i = 0; i < num_nodes_; i++) {
-        total += node_input_queues_[i].size() + node_output_queues_[i].size();
-    }
-    return total;
-}
-
-double InternalRing::getAverageLatency() const {
-    if (total_messages_routed_ == 0) return 0.0;
-    return static_cast<double>(total_latency_cycles_) / static_cast<double>(total_messages_routed_);
-}
-
-int InternalRing::getNextNode(int current_node) const {
-    return (current_node + 1) % num_nodes_;
-}
-
-void InternalRing::routeMessage(const RingMessage& msg) {
-    if (latency_cycles_ <= 0) {
-        // 零延迟，直接发送
-        node_input_queues_[msg.dst_unit].push(msg);
-    } else {
-        // 有延迟，加入环形缓冲区
-        ring_buffer_.push(msg);
     }
 }
 
@@ -2089,7 +1787,7 @@ void MultiCorePE::initializeNetworkInterface() {
         // 设置脉冲处理回调
         external_nic_->setSpikeHandler([this](SpikeEvent* spike) {
             // 网络接口接收到脉冲时的处理
-            this->handleExternalSpike(spike);
+            this->noc_subsys_.onNicReceive(spike);
         });
         
         // 安装控制事件处理器（若底层NIC支持）
@@ -2103,9 +1801,9 @@ void MultiCorePE::initializeNetworkInterface() {
                 std::vector<uint32_t> dpes = gd->dest_pes;
                 for (auto* core : cores_) {
                     if (!core) continue;
-                    auto* sub = dynamic_cast<SnnPESubComponent*>(core);
-                    if (!sub) continue;
-                    sub->applyGatingDecision(src_global, dpes, current_cycle_, gd->ttl_cycles);
+                    auto* hooks = dynamic_cast<ICoreControlHooks*>(core);
+                    if (!hooks) continue;
+                    hooks->applyGatingDecision(src_global, dpes, current_cycle_, gd->ttl_cycles);
                 }
             });
         }

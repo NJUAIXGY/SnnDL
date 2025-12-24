@@ -1,5 +1,5 @@
 #include "SnnPESubComponent.h"
-#include "MultiCorePE.h"
+#include "IPeAggregation.h"
 
 #include <algorithm>
 #include <cstdint>

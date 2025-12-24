@@ -11,15 +11,16 @@
 
 ## 1. 背景：当前差距（MultiCorePE 仍是 NoC 事务中心）
 
-目前输出路径为：
+当前输出路径为（Phase4-A1.3 后默认形态）：
 
 ```
 ComputeCore::drainOutputs
   -> control/SnnPESubComponent
     -> services/SpikeCommSubsystem (fanout 已下沉至 Synapse/Route)
-      -> api/ISpikeTransport (ParentSpikeTransport)
-        -> components/MultiCorePE::sendSpike
-           -> 本地投递 / ring 路由 / NIC 外发
+      -> api/ISpikeTransport (NocSpikeTransport)
+        -> api/INocTransport
+          -> services/NocSubsystem
+             -> 本地投递 / ring 路由 / NIC 外发
 ```
 
 输入路径分散在：
@@ -59,33 +60,38 @@ ComputeCore::drainOutputs
 
 为降低风险，Phase4-A1 采用两段式：
 
-### 3.1 Phase4-A1.1（适配器/编排层）——推荐先落地
-- 新增 `services/NocSubsystem.{h,cc}`（NoC 编排层）：
-  - 内部维护 `incoming_queue_`（统一收敛 NIC/端口/方向链路输入）
-  - 负责解析 `SpikeEventWrapper` → `SpikeEvent`（复制必要字段）
-  - 负责“目的地判定 + 分流策略”
-  - 通过回调调用 MultiCorePE 提供的后端能力（保持最小耦合）：
-    - `deliver_to_core(core_id, SpikeEvent*)`
-    - `route_internal(src_core, dst_core, SpikeEvent*)`
-    - `send_external(SpikeEvent*)`
-    - （可选）`log/stat` 指针注入
-- MultiCorePE 变薄：其 `sendSpike/handleExternalSpike*/link handlers` 只做转发到 `NocSubsystem`。
+### 3.1 Phase4-A1.1（适配器/编排层）——已完成
+- `services/NocSubsystem.{h,cc}` 先以编排层形式落地：统一收敛输入侧，并在输出侧做“目的地判定 + 分流策略”。
+- MultiCorePE 变薄：其 `sendSpike/handleExternalSpike*/link handlers` 只做转发到 `NocSubsystem`（冻结行为与统计口径）。
 
 优点：改动可控、行为不变风险低、可快速通过 100us 回归。
 
-### 3.2 Phase4-A1.2（后端搬迁）
-在 A1.1 稳定后，再逐步把后端实现也搬出 MultiCorePE：
-- ring 路由 + tick/receive 循环迁入 NoC（并将 legacy InternalRing 退役/封存）
-- NIC 外发逻辑迁入 NoC（MultiCorePE 仅持有 `SnnInterface*` 并注入）
-- 逐步删掉 MultiCorePE 中与 NoC 相关的成员与函数（只保留端口装配与生命周期转发）
+### 3.2 Phase4-A1.2（后端搬迁）——已完成（NoC 真正闭环）
+- `NocSubsystem::Runtime` 由 MultiCorePE 装配并注入后端指针：`SnnInterface* nic`、`OptimizedInternalRing* optimized_ring`、`SST::Link* external_spike_output_link`。
+- NoC 内部实现并闭环：
+  - ring：`sendMessage/tick/receive/deliver`（优先 optimized ring）
+  - 外发/中继：`sendExternal`（计 sent）/ `forwardExternal`（不计 sent）
+- 备注：当前主要覆盖 optimized ring；若需要严格兼容 legacy `InternalRing`（`use_optimized_ring=0`），可作为后续补齐项。
+
+### 3.3 Phase4-A1.3（接口化：INocTransport）——已完成
+- 新增 `api/INocTransport.h` 冻结 NoC 调用面：`sendFromCore` / `injectLocal` / `sendExternal`。
+- `services/NocSubsystem` 实现 `INocTransport`，成为 Control/Step 的唯一 NoC 依赖入口。
+- Control/Step 接入：
+- `api/NocSpikeTransport.h`：将 `SpikeCommSubsystem` 的 `ISpikeTransport` 落到 `INocTransport::sendFromCore(src_core, ev)`。
+  - `services/stimulus/StepActivationSubsystem`：注入/外发优先走 `INocTransport`。
 
 ---
 
 ## 4. 最小接口草案（面向代码落地）
 
-> 下面接口以“能搬家 + 不改语义”为第一优先；后续可再抽 `api/INocTransport` 冻结跨组件接口。
+> Phase4-A1.3 已落地 `api/INocTransport`，用于冻结跨组件 NoC 调用面（Control/Step 只依赖该接口）。
 
-`services/NocSubsystem` 入口建议：
+`api/INocTransport`（最小接口）：
+- `sendFromCore(int src_core, SpikeEvent*)`：常规发放（NoC 内部分流本地/跨核/跨 PE）。
+- `injectLocal(int dst_core, SpikeEvent*)`：本 PE 内本地直达注入（不走 ring；用于 Step/控制面）。
+- `sendExternal(SpikeEvent*)`：跨 PE 外发（计入 `external_spikes_sent`）。
+
+`services/NocSubsystem` 关键入口：
 - `configure(cfg)`：仅保存配置（如 hop 限制/自环策略/verbose 门控）
 - `bindRuntime(rt)`：注入后端与回调（Output/NIC/ring/links/parent hooks）
 - `onCoreSend(SpikeEvent* ev)`：来自 compute 输出（ParentSpikeTransport → parent->sendSpike）
@@ -120,4 +126,3 @@ ComputeCore::drainOutputs
 - **时序/顺序漂移**（queue 处理与 ring tick 顺序变化）：Phase4-A1.1 强制保持原 `clockTick()` 调用顺序（先 drain incoming，再 tick ring）。
 - **所有权/重复释放**：NoC 子系统入口统一接管 `SpikeEvent*`；投递到 core 后由 core 接管；向 NIC 外发后由 NIC 接管；其余路径 NoC 负责 delete。
 - **legacy InternalRing**：先保持兼容（仍由 MultiCorePE 提供 callback）；稳定后再迁移/封存。
-

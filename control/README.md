@@ -7,7 +7,7 @@
 - SST 生命周期对接：`init/setup/finish`、clock 驱动。
 - GAS（Gather/Apply/Scatter）窗口状态机与窗口边界事件上报。
 - 内存读写请求编排（StandardMem）、缓存命中统计、请求合并策略等控制面逻辑。
-- 路由与 fanout：从 compute core 拉取发放事件，交由 `services/SpikeCommSubsystem` 完成 fanout/封包/发送（控制层不持有路由表/缓存）。
+- 路由与 fanout：从 compute core 拉取发放事件，交由 `services/route/SpikeCommSubsystem` 完成 fanout/封包/发送（控制层不持有路由表/缓存）。
 - 统计汇总：对上层（MultiCorePE）汇报窗口/内存/发放等统计。
 
 > 重要：本层 **不应包含具体 SNN 动力学**（膜电位、不应期、阈值判定等），这些应全部由 `compute/` 中的 `ISnnComputeCore` 实现。
@@ -21,7 +21,7 @@
   - `SnnPESubComponent_spike.cc`：输入侧 spike 递送与本地处理路径。
   - `SnnPESubComponent_mem.cc`：StandardMem 读写/回调/写回等内存控制面。
   - `SnnPESubComponent_bcsr.cc`：BCSR 相关控制面与诊断（不含动力学）。
-  - `SnnPESubComponent_routing.cc`：历史路由实现封存（已迁入 `services/SpikeCommSubsystem`）；当前仅保留模板解析与门控转发入口。
+  - `SnnPESubComponent_routing.cc`：历史路由实现封存（已迁入 `services/route/SpikeCommSubsystem`）；当前仅保留模板解析与门控转发入口。
   - `SnnPESubComponent_scheme1.cc`：scheme1（slice 顺序执行）控制路径。
 - `SnnPEApplyScatter.cc`：窗口累加器 Apply/Scatter 的控制面执行与输出收敛点。
 - `SnnPEOrchestrators.cc`：控制层小型 orchestrator/统计汇聚辅助结构（含窗口读发起编排：`issueFromEdges_/issueFromSets_/issueFallbackReadsIfNeeded_`）。

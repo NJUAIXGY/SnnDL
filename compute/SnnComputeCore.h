@@ -15,7 +15,7 @@
 #include <sst/core/params.h>
 
 #include "SpikeEvent.h"
-#include "GasCustomCmd.h"
+#include "gas/GasCustomCmd.h"
 #include "SnnWeightReader.h"
 #include "SnnCoreEngine.h"
 #include "SnnWeightDiagnostics.h"

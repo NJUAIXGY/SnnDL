@@ -32,16 +32,16 @@
 #include "SpikeEventWrapper.h"
 #include "SnnInterface.h"
 #include "SnnPEParentInterface.h"
+#include "IPeAggregation.h"
 #include "SnnCoreAPI.h"
-#include "OptimizedInternalRing.h"
-#include "StepActivationSubsystem.h"
-#include "NocSubsystem.h"
+#include "noc/OptimizedInternalRing.h"
+#include "stimulus/StepActivationSubsystem.h"
+#include "noc/NocSubsystem.h"
 
 namespace SST {
 namespace SnnDL {
 
 // 前置声明
-class InternalRing;
 class MultiCoreController;
 class SnnNetworkAdapter;
 
@@ -68,7 +68,7 @@ struct ProcessingUnitState {
  * 
  * 集成多个ProcessingUnit、共享L2缓存、内部互连网络
  */
-class MultiCorePE : public SST::Component, public SnnPEParentInterface {
+class MultiCorePE : public SST::Component, public SnnPEParentInterface, public IPeAggregation {
 public:
     // ELI注册信息
     SST_ELI_REGISTER_COMPONENT(
@@ -312,7 +312,6 @@ public:
     int getTotalNeurons() const override { return total_neurons_; }
 
     // 友元类声明
-    friend class InternalRing;
     friend class MultiCoreController;
 
 private:
@@ -443,7 +442,6 @@ private:
     
     // 内部架构组件
     OptimizedInternalRing* optimized_ring_;
-    InternalRing* internal_ring_;  // 保留兼容性
     MultiCoreController* controller_;
     
     // 处理单元状态跟踪
@@ -518,7 +516,6 @@ private:
      * @brief 时钟滴答处理器
      */
     bool clockTick(SST::Cycle_t current_cycle);
-    void tickNocRing_(uint64_t current_cycle);
     
     /**
      * @brief 处理外部脉冲事件（从Link接收）
@@ -528,8 +525,6 @@ private:
     /**
      * @brief 处理内部脉冲路由
      */
-    void routeInternalSpike(int src_core, int dst_core, SpikeEvent* spike);
-    
     /**
      * @brief 处理内存响应
      */
@@ -611,16 +606,6 @@ private:
     void generateTestTraffic();
     
     /**
-     * @brief 处理跨核脉冲路由
-     */
-    void handleCrossCoreRouting();
-    
-    /**
-     * @brief 处理优化的跨核脉冲路由
-     */
-    void handleOptimizedCrossCoreRouting();
-    
-    /**
      * @brief 负载均衡检查
      */
     void checkLoadBalance();
@@ -637,46 +622,6 @@ private:
 };
 
 
-
-/**
- * @brief 内部环形互连（简化版）
- */
-class InternalRing {
-public:
-    InternalRing(int num_nodes, int latency_cycles, SST::Output* output);
-    ~InternalRing();
-    
-    // 消息传递接口
-    bool sendMessage(const RingMessage& msg);
-    bool receiveMessage(int node_id, RingMessage& msg);
-    
-    // 路由和仲裁
-    void tick();
-    bool hasTrafficForNode(int node_id) const;
-    int getPendingMessageCount() const;
-    
-    // 统计信息
-    uint64_t getTotalMessagesRouted() const { return total_messages_routed_; }
-    double getAverageLatency() const;
-
-private:
-    int num_nodes_;
-    int latency_cycles_;
-    SST::Output* output_;
-    
-    // 环形缓冲区
-    std::vector<std::queue<RingMessage>> node_input_queues_;
-    std::vector<std::queue<RingMessage>> node_output_queues_;
-    std::queue<RingMessage> ring_buffer_;
-    
-    // 统计信息
-    uint64_t total_messages_routed_;
-    uint64_t total_latency_cycles_;
-    
-    // 内部方法
-    int getNextNode(int current_node) const;
-    void routeMessage(const RingMessage& msg);
-};
 
 /**
  * @brief 多核控制器

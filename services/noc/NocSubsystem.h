@@ -14,16 +14,21 @@
 #include <queue>
 #include <string>
 
+#include "INocTransport.h"
+
 namespace SST { class Event; }
+namespace SST { class Link; }
 namespace SST { class Output; }
 namespace SST { namespace Statistics { template <typename T> class Statistic; } }
 
 namespace SST { namespace SnnDL {
 
+class OptimizedInternalRing;
+class SnnInterface;
 class SpikeEvent;
 class SpikeEventWrapper;
 
-class NocSubsystem final {
+class NocSubsystem final : public INocTransport {
 public:
     struct Config {
         bool log_enable = false;
@@ -34,23 +39,22 @@ public:
         int node_id = 0;
         int num_cores = 1;
 
+        // NoC backends（由 MultiCorePE 装配并保证生命周期）
+        SnnInterface* nic = nullptr;
+        OptimizedInternalRing* optimized_ring = nullptr;
+        SST::Link* external_spike_output_link = nullptr;  // legacy fallback
+
         // neuron_id -> core_id；返回 -1 表示不在本 PE
         std::function<int(int /*neuron_id*/)> determine_target_unit;
 
-        // 投递/路由/外发回调（由 MultiCorePE 提供实现）
+        // 投递回调（由 MultiCorePE 提供实现，保持 core->deliverSpike 语义不变）
         std::function<void(int /*core_id*/, SpikeEvent*)> deliver_to_core;
-        std::function<void(int /*src_core*/, int /*dst_core*/, SpikeEvent*)> route_internal;
-        // 本 PE 产生的远端发送（沿用 sendExternalSpike 语义：更新 external_spikes_sent 等统计）
-        std::function<void(SpikeEvent*)> send_external;
-        // 中继转发（沿用 clockTick 中继语义：仅调用 external_nic_->sendSpike，不更新 external_spikes_sent）
-        std::function<void(SpikeEvent*)> forward_external;
-
-        // ring tick/receive（Phase4-A1.1 可直接复用 MultiCorePE 现有实现）
-        std::function<void(uint64_t /*current_cycle*/)> tick_ring;
     };
 
     struct Stats {
         SST::Statistics::Statistic<uint64_t>* external_spikes_received = nullptr;
+        SST::Statistics::Statistic<uint64_t>* external_spikes_sent = nullptr;
+        SST::Statistics::Statistic<uint64_t>* inter_core_messages = nullptr;
     };
 
     ~NocSubsystem();
@@ -61,6 +65,11 @@ public:
 
     // === Output side ===
     void onCoreSend(SpikeEvent* event);
+
+    // === INocTransport ===
+    void sendFromCore(int src_core, SpikeEvent* event) override;
+    void injectLocal(int dst_core, SpikeEvent* event) override;
+    void sendExternal(SpikeEvent* event) override;
 
     // === Input side ===
     void onNicReceive(SpikeEvent* spike);
@@ -76,6 +85,10 @@ public:
 private:
     SpikeEvent* extractSpikeFromWrapper_(SpikeEventWrapper* wrapper);
     void enqueueIncoming_(SpikeEvent* spike);
+    void sendExternalSpike_(SpikeEvent* spike);
+    void forwardExternalSpike_(SpikeEvent* spike);
+    void routeInternalSpike_(int src_core, int dst_core, SpikeEvent* spike);
+    void tickOptimizedRing_(uint64_t current_cycle);
 
     Config cfg_{};
     Runtime rt_{};
@@ -85,4 +98,3 @@ private:
 };
 
 }} // namespace SST::SnnDL
-

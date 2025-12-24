@@ -48,17 +48,17 @@ SST-SnnDL 设计文档（草稿）
 ```
 ComputeCore::drainOutputs -> [FireEvent]
   -> SnnPESubComponent::handleNeuronFire_
-      -> route_provider_.computeFanout(...)
+      -> synapse_route_.computeFanout(...)
           -> new SpikeEvent(...)
-              -> parent_->sendSpike(event)
-                  -> MultiCorePE::sendSpike
-                      -> routeInternalSpike / sendExternalSpike -> NIC/MPI/Link
+              -> ISpikeTransport::send(event)
+                  -> (默认) ParentSpikeTransport -> parent_->sendSpike -> MultiCorePE::sendSpike -> NocSubsystem
+                  -> (优先) NocSpikeTransport -> INocTransport -> NocSubsystem -> (local/ring/nic)
 ```
 
 其中 `SnnPESubComponent` 同时承担了：
 - fanout 计算（策略/门控）
 - 事件构造（SpikeEvent）
-- 传输发出（父接口）
+- 传输发出（`ISpikeTransport` 抽象）
 
 ## 6. 方案概览：分层与依赖方向
 

@@ -6,11 +6,11 @@
 
 #include <sst/core/sst_config.h>
 #include "SnnPESubComponent.h"
-#include "GasCustomCmd.h"
-#include "GasPhaseController.h"
-#include "MultiCorePE.h"
-#include "StandardMemBackend.h"
-#include "StandardMemAccess.h"
+#include "gas/GasCustomCmd.h"
+#include "gas/GasPhaseController.h"
+#include "IPeAggregation.h"
+#include "memory/StandardMemBackend.h"
+#include "memory/StandardMemAccess.h"
 
 #include <algorithm>
 #include <cmath>

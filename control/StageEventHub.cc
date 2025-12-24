@@ -4,7 +4,7 @@
 
 #include "StageEventHub.h"
 #include "SnnPESubComponent.h"
-#include "GasPhaseController.h"
+#include "gas/GasPhaseController.h"
 #include <algorithm>
 
 namespace SST { namespace SnnDL {

@@ -1,7 +1,8 @@
-# SnnDL 子系统化终局路线图（Memory / Synapse+Route / NoC / NeuralCompute）
+# SnnDL 子系统化终局路线图（Memory / Synapse+Route / Stimulus / NoC / NeuralCompute）
 
 > 主人目标（最终态）：**MultiCorePE 变“纯控制壳”**，SNN 事务全部下沉到子系统；  
-> 路由归入 **Synapse/Route**（而不是 NoC）；内存子系统 **彻底不出现“权重/突触”语义**，只提供“地址→字节块”的访问能力喵 (..•˘_˘•..)
+> 路由归入 **Synapse/Route**（而不是 NoC）；Stimulus（Step 注入/外部刺激）独立成域并依赖 Synapse/Route + NoC；  
+> 内存子系统 **彻底不出现“权重/突触”语义**，只提供“地址→字节块”的访问能力喵 (..•˘_˘•..)
 
 本路线图在 `docs/UNIVERSAL_CONTROL_CORE_DESIGN.md` 的基础上进一步“收紧边界”，用于指导后续多阶段重构推进。  
 推进原则：**每一步都必须能跑通 `MESH_SIM_TIME=100us` 回归**，并保持关键统计口径稳定（允许极小浮动，但禁止出现 `neurons_fired_total=0` 的非确定性回归）。
@@ -18,7 +19,8 @@
 - 代码范围：`sst_workspace/sst-elements/src/sst/elements/SnnDL/**`
 - 目标拆分：
   - **Memory**：纯地址/字节读写 + pending/回包分发 +（可选）聚合/缓存前端（但不含权重语义）
-  - **Synapse/Route**：权重/BCSR 语义、窗口边集合、ΔV 累加、路由构建与 fanout 查询、Step 注入（使用路由）
+  - **Synapse/Route**：权重/BCSR 语义、窗口边集合、ΔV 累加、路由构建与 fanout 查询（不负责注入时基）
+  - **Stimulus**：Step 注入/外部刺激；选源 +（可选）调用路由 fanout 生成 spikes；通过 NoC 投递/外发
   - **NoC**：send/recv/forward（消息传输与本地转发），不做 fanout 选择，不解析权重
   - **NeuralCompute**：神经动力学与发放判定（已由 `compute/ISnnComputeCore` 实现）
 - **MultiCorePE**：只负责装配/调度/统计汇聚/端口连接；不包含“step 选源、BCSR 解析、fanout 选择、ΔV 计算”等 SNN 事务逻辑。
@@ -78,7 +80,7 @@
    - Phase2/Phase3 已将“路由构建 + fanout/gating”收敛到 `services/SynapseRouteSubsystem.*`（Synapse/Route 域）。
    - 但 **send/recv/forward/本地投递** 仍主要落在 `components/MultiCorePE.*`，NoC 尚未形成“独立闭环子系统”（Phase4-A1 的核心目标）。
 4) **MultiCorePE 仍承载部分 SNN 事务（需要下沉）**
-   - Phase3 已将 Step 注入（调度 + BCSR reachability 解析 + 注入）下沉为 `services/StepActivationSubsystem.*`（事务域归入 Synapse/Route）。
+   - Phase3 已将 Step 注入（调度 + BCSR reachability 解析 + 注入）下沉为 `services/stimulus/StepActivationSubsystem.*`（事务域归入 Stimulus；路由依赖 Synapse/Route）。
    - 下一步需要把 **NoC 事务**（send/recv/forward/本地投递 + ring tick）从 `MultiCorePE` 迁出，进一步把 MultiCorePE 收敛为纯装配/调度壳。
 
 ### 1.3 目录结构“职责表”（现状）
@@ -117,7 +119,7 @@
   - BCSR 元数据与缓存：`services/SnnBcsrWeightManager.*`
   - 窗口边集合/累加器：`services/GasEdgeCollector.*`、`services/AccumulatorOps.*`
   - 路由构建（从权重导出）：`services/SnnRouteProvider.*`（未来归到 Synapse/Route，而不是 NoC）
-  - Step 注入：已迁移为 `services/StepActivationSubsystem.*`（事务域归入 Synapse/Route；后续可与 `SynapseRouteSubsystem` 共享 BCSR 元信息/数据源以避免口径漂移）
+  - Step 注入：已迁移为 `services/stimulus/StepActivationSubsystem.*`（事务域归入 Stimulus；后续可与 `SynapseRouteSubsystem` 共享 BCSR 元信息/数据源以避免口径漂移）
 - **最终放哪里**（建议）：
   - `services/synapse/`（或 `services/synapse_route/`）作为“权重+路由”同域模块
   - 对 control 暴露：`api/ISynapseRoute.h`（后续 Phase 2 冻结）
@@ -153,13 +155,14 @@
 components/MultiCorePE (装配/调度/统计汇聚)
   ├─ control/SnnPESubComponent (通用控制子核：GAS 编排/事务调度)
   │    ├─ NeuralCompute (compute/ISnnComputeCore)
-  │    ├─ Synapse+Route Subsystem (权重/BCSR/ΔV/路由/Step 注入)
+  │    ├─ Synapse+Route Subsystem (权重/BCSR/ΔV/路由)
+  │    ├─ Stimulus Subsystem (Step 注入/外部刺激)
   │    ├─ NoC Subsystem (send/recv/forward)
   │    └─ Memory Subsystem (read/write bytes)
   └─ components/SnnNIC (NoC 后端实现之一：merlin/linkcontrol)
 ```
 
-### 2.1 四个子系统对外接口（建议）
+### 2.1 五个子系统对外接口（建议）
 
 > 这里只定义职责与接口形状，具体函数名可在 Phase 1 落地时再冻结。
 
@@ -178,16 +181,23 @@ components/MultiCorePE (装配/调度/统计汇聚)
 - 路由：
   - `buildRoutes()`（从 BCSR/权重元数据构建路由表；可缓存/共享）
   - `fanout(source_global) -> span<dest_global>`（只做选择，不发送）
-- Step 注入：
-  - `tickStep(seq, now_cycle)`：内部选源 + fanout（调用路由）→ 生成 SpikeEvents → 交给 NoC 发送
 
-#### (C) NoC：`INocTransport`（只做 send/recv/forward）
+#### (C) Stimulus：`StepActivationSubsystem`（注入时基 + 选源 + 注入）
+- 目标：把 Step/外部刺激的**时基与注入事务**从 Synapse/Route 与 MultiCorePE 中剥离出来，避免与窗口/GAS 时钟节奏耦合。
+- 入口（与现有实现对齐）：
+  - `tick(now_cycle)`：固定周期注入（`step_activation_period_cycles>0`）与 pending 注入处理
+  - `onBeginGather(seq, ts_ns, core_id)`：legacy BeginGather 触发（`period_cycles==0`）
+  - `onEndScatter(seq)`：可选 `reset_membranes`（`step_reset_mem_each_step=1`）
+- 依赖方向：Stimulus →（可选）Synapse/Route（fanout/可达性）→ NoC；不反向依赖 control 实现细节。
+- 现状备注：当前 `step_activation_use_bcsr_routes=1` 的 reachability 解析仍由 Step 子系统自持；后续建议与 `SynapseRouteSubsystem` 共享 BCSR 元信息以避免口径漂移。
+
+#### (D) NoC：`INocTransport`（只做 send/recv/forward）
 - `send(SpikeEvent*)`（接管生命周期）
 - `deliverLocal(SpikeEvent*)`（本 PE 内转发到目标 core）
 - `pollRecv()` / callback handler（来自 NIC/LinkControl）
 - **禁止出现**：fanout/weight-driven route 选择逻辑（路由由 Synapse/Route 给出）
 
-#### (D) NeuralCompute：`ISnnComputeCore`（已存在）
+#### (E) NeuralCompute：`ISnnComputeCore`（已存在）
 - `applySynapticDelta / endCycle / drainOutputs / updateNeuronStates` 等
 - **禁止直接触碰**：StandardMem / NoC / 路由表（通过控制层与子系统交互）
 
@@ -334,8 +344,29 @@ components/MultiCorePE (装配/调度/统计汇聚)
 ### 6.4 已完成：Phase3（fanout/gating 下沉 + Step 注入下沉）
 - 关键改动（摘要）：
   - fanout/gating 下沉至 `services/SynapseRouteSubsystem.*`；`services/SpikeCommSubsystem.*` 退化为 transport façade。
-  - Step 注入下沉至 `services/StepActivationSubsystem.*`；MultiCorePE 仅转发 tick/阶段事件。
+  - Step 注入下沉至 `services/stimulus/StepActivationSubsystem.*`；MultiCorePE 仅转发 tick/阶段事件。
 - 回归验证（seed=314159，use_bcsr_routes=1）：
   - 10us：`sst_dram_si/outputs_large/paper2/dram_mesh_4x4/20251224-000114`
   - 100us：`sst_dram_si/outputs_large/paper2/dram_mesh_4x4/20251224-000249`
   - 100us（同配置重复 1 次完全一致）：`sst_dram_si/outputs_large/paper2/dram_mesh_4x4/20251224-000446`
+
+### 6.5 已完成：Phase4（NoC 子系统全覆盖 + INocTransport 接口化）
+- Phase4-A1.1（NoC 编排层）：`services/NocSubsystem` 统一收敛 send/recv/forward + 本地投递（后端仍可复用 MultiCorePE 现有能力）。
+  - 10us：`sst_dram_si/outputs_large/paper2/dram_mesh_4x4/20251224-093307`（`neurons_fired_total=5`）
+  - 100us：`sst_dram_si/outputs_large/paper2/dram_mesh_4x4/20251224-093407`
+  - 100us（同配置重复 1 次完全一致）：`sst_dram_si/outputs_large/paper2/dram_mesh_4x4/20251224-093512`
+- Phase4-A1.2（NoC 后端实现搬迁，真正闭环）：ring tick/receive + 外发/中继逻辑迁入 `services/NocSubsystem`，MultiCorePE 更壳化。
+  - 10us：`sst_dram_si/outputs_large/paper2/dram_mesh_4x4/20251224-103032`（`neurons_fired_total=5`）
+  - 100us：`sst_dram_si/outputs_large/paper2/dram_mesh_4x4/20251224-103128`
+  - 100us（同配置重复 1 次完全一致）：`sst_dram_si/outputs_large/paper2/dram_mesh_4x4/20251224-103231`
+    - `neurons_fired_total=12854`、`gas_scatter_spikes_emitted_total=406`、`window_spikes_total=812`、`step_activation.invocations=51`
+- Phase4-A1.3（接口化：Control/Step 只调用 NoC 接口）：新增 `api/INocTransport` + `api/NocSpikeTransport`，并将 Control/Step 接入。
+  - 10us：`sst_dram_si/outputs_large/paper2/dram_mesh_4x4/20251224-105709`（`neurons_fired_total=5`）
+  - 100us：`sst_dram_si/outputs_large/paper2/dram_mesh_4x4/20251224-105808`
+  - 100us（同配置重复 1 次完全一致）：`sst_dram_si/outputs_large/paper2/dram_mesh_4x4/20251224-105912`
+    - `neurons_fired_total=12854`、`gas_scatter_spikes_emitted_total=406`、`window_spikes_total=812`、`step_activation.invocations=51`
+
+### 6.6 已完成：Phase6（Stimulus 域：StepActivationSubsystem 目录归位）
+- 关键改动：将 Step 子系统从 `services/StepActivationSubsystem.*` 移动到 `services/stimulus/StepActivationSubsystem.*`，并补齐 Makefile 对子目录的 depfiles/dirstamp 支持，确保 `make -j4` 稳定可复现。
+- 回归验证（100us）：`sst_dram_si/outputs_large/paper2/dram_mesh_4x4/20251224-145051`
+  - `neurons_fired_total=12854`、`gas_scatter_spikes_emitted_total=406`、`window_spikes_total=812`、`step_activation.invocations=51`

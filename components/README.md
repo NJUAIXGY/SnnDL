@@ -20,7 +20,7 @@
   - GAS window 驱动的 StandardMem 前端（用于 Gather/Apply/Scatter 的窗口化时序）。
 - `GatingPE.{h,cc}`
   - 门控组件：生成/传播 `GatingDecisionEvent`，控制 fanout 目的集合。
-- `SpikeSource.{h,cc}`
+- `stimulus/SpikeSource.{h,cc}`
   - 可选 spike 源（在部分实验脚本中可能禁用）。
 - `MemKCalBench.{h,cc}`
   - micro-benchmark：用于 K 校准或 memory 访问特征测试。
@@ -29,6 +29,7 @@
 
 ## 子目录
 
+- `components/stimulus/`：Stimulus 域的注入型组件（例如 `SpikeSource`）。
 - `components/mpi/`：MPI 扩展相关组件与类型（可选编译）。
 
 ## 依赖边界（建议）
@@ -41,4 +42,3 @@
 - 新增 SST 组件时：
   - 保持 ELI 注册信息（库名/组件名/参数文档）与现有脚本兼容；
   - 业务逻辑尽量委托给 `control/` 或 `compute/`，组件层只做装配与资源管理。
-

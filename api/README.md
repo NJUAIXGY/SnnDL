@@ -16,6 +16,11 @@
   - 子核心（SnnPESubComponent）与父组件（MultiCorePE）之间的调用接口（发 spike、统计汇聚等）。
 - `SnnInterface.h`
   - NIC/PE 等更高层组件使用的接口类型（例如发送/接收事件的抽象入口）。
+- `INocTransport.h`
+  - NoC 抽象接口：只做 send/recv/forward/本地注入的传输语义，不包含 fanout/权重/路由构建。
+  - 典型实现：`services/noc/NocSubsystem`。
+- `NocSpikeTransport.h`
+  - `ISpikeTransport` 的 NoC 适配器：将 `SpikeCommSubsystem` 的 `transport->send(ev)` 映射为 `INocTransport::sendFromCore(src_core, ev)`。
 - `SnnWeightReader.h`
   - `IWeightReader` 抽象：为 compute core 提供统一的权重读取/缓存接口（实现通常在控制层/服务层）。
 
@@ -31,4 +36,3 @@
   - **最小可用**（KISS）：只暴露跨层必须信息；
   - **可替换**（SOLID-D）：依赖抽象，不依赖具体类；
   - **向后兼容**：避免破坏现有仿真脚本与组件装配方式。
-

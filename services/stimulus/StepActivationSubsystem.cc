@@ -18,6 +18,7 @@
 #include <sst/core/output.h>
 #include <sst/core/statapi/stataccumulator.h>
 
+#include "INocTransport.h"
 #include "SpikeEvent.h"
 
 namespace SST { namespace SnnDL {
@@ -227,7 +228,8 @@ void StepActivationSubsystem::injectStepActivations_(uint32_t seq, uint64_t sim_
                 auto* spike = new SpikeEvent(pre_global, post_global, static_cast<uint32_t>(rt_.node_id), 1.0f, sim_time_ns);
                 int dst_core = determineTargetUnit_(post_global);
                 if (dst_core >= 0) {
-                    if (rt_.deliver_to_core) rt_.deliver_to_core(dst_core, spike);
+                    if (rt_.noc) rt_.noc->injectLocal(dst_core, spike);
+                    else if (rt_.deliver_to_core) rt_.deliver_to_core(dst_core, spike);
                     else delete spike;
                     spikes_injected++;
                 } else {
@@ -277,14 +279,16 @@ void StepActivationSubsystem::injectStepActivations_(uint32_t seq, uint64_t sim_
                     auto* spike = new SpikeEvent(pre_global, post_global, static_cast<uint32_t>(rt_.node_id), 1.0f, sim_time_ns);
                     int dst_core = determineTargetUnit_(post_global);
                     if (dst_core >= 0) {
-                        if (rt_.deliver_to_core) rt_.deliver_to_core(dst_core, spike);
+                        if (rt_.noc) rt_.noc->injectLocal(dst_core, spike);
+                        else if (rt_.deliver_to_core) rt_.deliver_to_core(dst_core, spike);
                         else delete spike;
                         spikes_injected++;
                     } else {
                         uint32_t denom = (neurons_per_pe > 0) ? static_cast<uint32_t>(neurons_per_pe) : 0u;
                         uint32_t dest_node = (denom > 0) ? (post_global / denom) : 0u;
                         spike->setDestinationNode(dest_node);
-                        if (rt_.send_external) rt_.send_external(spike);
+                        if (rt_.noc) rt_.noc->sendExternal(spike);
+                        else if (rt_.send_external) rt_.send_external(spike);
                         else delete spike;
                         spikes_injected++;
                     }

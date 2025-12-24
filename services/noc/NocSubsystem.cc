@@ -8,9 +8,12 @@
 #include <cinttypes>
 
 #include <sst/core/event.h>
+#include <sst/core/link.h>
 #include <sst/core/output.h>
 #include <sst/core/statapi/stataccumulator.h>
 
+#include "OptimizedInternalRing.h"
+#include "SnnInterface.h"
 #include "SpikeEvent.h"
 #include "SpikeEventWrapper.h"
 
@@ -45,6 +48,70 @@ void NocSubsystem::enqueueIncoming_(SpikeEvent* spike) {
     incoming_queue_.push(spike);
 }
 
+void NocSubsystem::sendExternalSpike_(SpikeEvent* spike) {
+    if (!spike) return;
+
+    // 自环防护：如果目标节点就是本节点，直接丢弃，避免外部回送循环
+    int target_node = static_cast<int>(spike->getDestinationNode());
+    if (target_node == rt_.node_id) {
+        delete spike;
+        return;
+    }
+
+    // 优先使用 NIC；未配置则回退到 legacy output link
+    if (rt_.nic) {
+        rt_.nic->sendSpike(spike);
+    } else if (rt_.external_spike_output_link) {
+        rt_.external_spike_output_link->send(spike);
+    } else {
+        delete spike;
+        return;
+    }
+
+    if (st_.external_spikes_sent) st_.external_spikes_sent->addData(1);
+}
+
+void NocSubsystem::forwardExternalSpike_(SpikeEvent* spike) {
+    if (!spike) return;
+    // 中继转发语义：仅调用 nic->sendSpike，不更新 external_spikes_sent
+    if (rt_.nic) {
+        rt_.nic->sendSpike(spike);
+    } else {
+        delete spike;
+    }
+}
+
+void NocSubsystem::routeInternalSpike_(int src_core, int dst_core, SpikeEvent* spike) {
+    if (!spike) return;
+
+    if (src_core < 0 || src_core >= rt_.num_cores || dst_core < 0 || dst_core >= rt_.num_cores) {
+        delete spike;
+        return;
+    }
+
+    // 单核情况或同一核心内，直接递送
+    if (rt_.num_cores <= 1 || src_core == dst_core || !rt_.optimized_ring) {
+        if (rt_.deliver_to_core) rt_.deliver_to_core(dst_core, spike);
+        else delete spike;
+        return;
+    }
+
+    RingMessage msg;
+    msg.type = RingMessageType::SPIKE_MESSAGE;
+    msg.src_unit = src_core;
+    msg.dst_unit = dst_core;
+    msg.timestamp = 0;
+    msg.priority = 1;
+    msg.payload.spike_data = spike;
+
+    bool sent = rt_.optimized_ring->sendMessage(src_core, dst_core, msg, 1);
+    if (sent) {
+        if (st_.inter_core_messages) st_.inter_core_messages->addData(1);
+    } else {
+        delete spike;
+    }
+}
+
 void NocSubsystem::onCoreSend(SpikeEvent* event) {
     if (!event) return;
 
@@ -55,23 +122,49 @@ void NocSubsystem::onCoreSend(SpikeEvent* event) {
         const int src_core =
             rt_.determine_target_unit ? rt_.determine_target_unit(static_cast<int>(event->getSourceNeuron())) : -1;
 
-        if (src_core >= 0 && src_core < rt_.num_cores && rt_.route_internal) {
-            rt_.route_internal(src_core, target_unit, event);
+        if (src_core >= 0 && src_core < rt_.num_cores) {
+            routeInternalSpike_(src_core, target_unit, event);
             return;
         }
-        if (rt_.deliver_to_core) {
-            rt_.deliver_to_core(target_unit, event);
-            return;
-        }
-        delete event;
+        if (rt_.deliver_to_core) rt_.deliver_to_core(target_unit, event);
+        else delete event;
         return;
     }
 
-    if (rt_.send_external) {
-        rt_.send_external(event);
+    sendExternalSpike_(event);
+}
+
+void NocSubsystem::sendFromCore(int src_core, SpikeEvent* event) {
+    if (!event) return;
+
+    const int target_unit =
+        rt_.determine_target_unit ? rt_.determine_target_unit(static_cast<int>(event->getDestinationNeuron())) : -1;
+
+    if (target_unit >= 0 && target_unit < rt_.num_cores) {
+        if (src_core >= 0 && src_core < rt_.num_cores) {
+            routeInternalSpike_(src_core, target_unit, event);
+        } else {
+            if (rt_.deliver_to_core) rt_.deliver_to_core(target_unit, event);
+            else delete event;
+        }
         return;
     }
-    delete event;
+
+    sendExternalSpike_(event);
+}
+
+void NocSubsystem::injectLocal(int dst_core, SpikeEvent* event) {
+    if (!event) return;
+    if (dst_core < 0 || dst_core >= rt_.num_cores) {
+        delete event;
+        return;
+    }
+    if (rt_.deliver_to_core) rt_.deliver_to_core(dst_core, event);
+    else delete event;
+}
+
+void NocSubsystem::sendExternal(SpikeEvent* event) {
+    sendExternalSpike_(event);
 }
 
 void NocSubsystem::onNicReceive(SpikeEvent* spike) {
@@ -124,12 +217,7 @@ void NocSubsystem::onExternalPortEvent(SST::Event* event) {
     }
 
     // 目标不在本 PE，走外发（保持原实现：sendExternalSpike 接管生命周期）
-    if (rt_.send_external) {
-        rt_.send_external(spike);
-        return;
-    }
-
-    delete spike;
+    sendExternalSpike_(spike);
 }
 
 SpikeEvent* NocSubsystem::extractSpikeFromWrapper_(SpikeEventWrapper* wrapper) {
@@ -195,17 +283,39 @@ void NocSubsystem::drainIncomingQueue(uint64_t /*current_cycle*/) {
         }
 
         // 中继转发（保持原 clockTick 语义：不更新 external_spikes_sent）
-        if (rt_.forward_external) {
-            rt_.forward_external(spike);
-        } else {
-            delete spike;
-        }
+        forwardExternalSpike_(spike);
     }
 }
 
 void NocSubsystem::tickRing(uint64_t current_cycle) {
-    if (rt_.tick_ring) rt_.tick_ring(current_cycle);
+    tickOptimizedRing_(current_cycle);
+}
+
+void NocSubsystem::tickOptimizedRing_(uint64_t current_cycle) {
+    if (!rt_.optimized_ring) return;
+
+    rt_.optimized_ring->tick(current_cycle);
+
+    // 与历史 MultiCorePE 行为保持一致：对每个 core 轮询 ejection queue
+    for (int i = 0; i < rt_.num_cores; i++) {
+        RingMessage msg;
+        while (rt_.optimized_ring->receiveMessage(i, msg)) {
+            if (msg.type == RingMessageType::SPIKE_MESSAGE && msg.payload.spike_data) {
+                int target_unit = msg.dst_unit;
+                if (target_unit >= 0 && target_unit < rt_.num_cores) {
+                    if (rt_.deliver_to_core) rt_.deliver_to_core(target_unit, msg.payload.spike_data);
+                    else delete msg.payload.spike_data;
+
+                    // 与历史口径保持一致：receive 侧也计一次 inter_core_messages
+                    if (st_.inter_core_messages) st_.inter_core_messages->addData(1);
+                } else {
+                    delete msg.payload.spike_data;
+                }
+            } else {
+                // non-spike message: keep legacy behavior (ignore)
+            }
+        }
+    }
 }
 
 }} // namespace SST::SnnDL
-

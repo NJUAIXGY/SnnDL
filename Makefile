@@ -181,7 +181,7 @@ am_libSnnDL_la_OBJECTS = events/SimpleTestEvent.lo \
 	events/SpikeEventWrapper.lo components/GatherBufferIF.lo \
 	components/GatingPE.lo components/MemKCalBench.lo \
 	components/MultiCorePE.lo components/SnnNIC.lo \
-	components/SnnPE.lo components/SpikeSource.lo \
+	components/SnnPE.lo components/stimulus/SpikeSource.lo \
 	components/WeightLoader.lo components/mpi/MPIMultiCorePE.lo \
 	components/mpi/MPITypes.lo control/SnnPESubComponent.lo \
 	control/SnnPESubComponent_bcsr.lo \
@@ -192,17 +192,17 @@ am_libSnnDL_la_OBJECTS = events/SimpleTestEvent.lo \
 	control/SnnPEApplyScatter.lo control/SnnPEOrchestrators.lo \
 	control/StageEventHub.lo compute/SnnComputeCore.lo \
 	compute/SnnCoreEngine.lo compute/SnnLearningCore.lo \
-	compute/SnnWeightDiagnostics.lo services/AccumulatorOps.lo \
-	services/GasEdgeCollector.lo services/GasPhaseController.lo \
-	services/OptimizedInternalRing.lo services/SimpleNetworkWrapper.lo \
-	services/SnnBcsrWeightManager.lo services/SnnNetworkAdapter.lo \
-	services/SnnRouteProvider.lo services/SynapseRouteSubsystem.lo \
-	services/StepActivationSubsystem.lo \
-	services/NocSubsystem.lo \
-	services/WeightAccessor.lo services/WeightCacheOps.lo \
-	services/WeightMemorySubsystem.lo \
-	services/StandardMemAccess.lo services/StandardMemBackend.lo \
-	services/SpikeCommSubsystem.lo
+	compute/SnnWeightDiagnostics.lo services/gas/AccumulatorOps.lo \
+	services/gas/GasEdgeCollector.lo services/gas/GasPhaseController.lo \
+	services/noc/OptimizedInternalRing.lo services/noc/SimpleNetworkWrapper.lo \
+	services/weights/SnnBcsrWeightManager.lo services/noc/SnnNetworkAdapter.lo \
+	services/route/SnnRouteProvider.lo services/route/SynapseRouteSubsystem.lo \
+	services/stimulus/StepActivationSubsystem.lo \
+	services/noc/NocSubsystem.lo \
+	services/weights/WeightAccessor.lo services/weights/WeightCacheOps.lo \
+	services/weights/WeightMemorySubsystem.lo \
+	services/memory/StandardMemAccess.lo services/memory/StandardMemBackend.lo \
+	services/route/SpikeCommSubsystem.lo
 libSnnDL_la_OBJECTS = $(am_libSnnDL_la_OBJECTS)
 AM_V_lt = $(am__v_lt_$(V))
 am__v_lt_ = $(am__v_lt_$(AM_DEFAULT_VERBOSITY))
@@ -231,7 +231,7 @@ am__depfiles_remade = components/$(DEPDIR)/GatherBufferIF.Plo \
 	components/$(DEPDIR)/MemKCalBench.Plo \
 	components/$(DEPDIR)/MultiCorePE.Plo \
 	components/$(DEPDIR)/SnnNIC.Plo components/$(DEPDIR)/SnnPE.Plo \
-	components/$(DEPDIR)/SpikeSource.Plo \
+	components/stimulus/$(DEPDIR)/SpikeSource.Plo \
 	components/$(DEPDIR)/WeightLoader.Plo \
 	components/mpi/$(DEPDIR)/MPIMultiCorePE.Plo \
 	components/mpi/$(DEPDIR)/MPITypes.Plo \
@@ -250,17 +250,23 @@ am__depfiles_remade = components/$(DEPDIR)/GatherBufferIF.Plo \
 	control/$(DEPDIR)/StageEventHub.Plo \
 	events/$(DEPDIR)/SimpleTestEvent.Plo \
 	events/$(DEPDIR)/SpikeEventWrapper.Plo \
-	services/$(DEPDIR)/AccumulatorOps.Plo \
-	services/$(DEPDIR)/GasEdgeCollector.Plo \
-	services/$(DEPDIR)/GasPhaseController.Plo \
-	services/$(DEPDIR)/OptimizedInternalRing.Plo \
-	services/$(DEPDIR)/ReadOrchestrator.Plo \
-	services/$(DEPDIR)/SimpleNetworkWrapper.Plo \
-	services/$(DEPDIR)/SnnBcsrWeightManager.Plo \
-	services/$(DEPDIR)/SnnNetworkAdapter.Plo \
-	services/$(DEPDIR)/SnnRouteProvider.Plo \
-	services/$(DEPDIR)/WeightAccessor.Plo \
-	services/$(DEPDIR)/WeightCacheOps.Plo
+	services/gas/$(DEPDIR)/AccumulatorOps.Plo \
+	services/gas/$(DEPDIR)/GasEdgeCollector.Plo \
+	services/gas/$(DEPDIR)/GasPhaseController.Plo \
+	services/noc/$(DEPDIR)/OptimizedInternalRing.Plo \
+	services/noc/$(DEPDIR)/SimpleNetworkWrapper.Plo \
+	services/weights/$(DEPDIR)/SnnBcsrWeightManager.Plo \
+	services/noc/$(DEPDIR)/SnnNetworkAdapter.Plo \
+	services/noc/$(DEPDIR)/NocSubsystem.Plo \
+	services/route/$(DEPDIR)/SnnRouteProvider.Plo \
+	services/route/$(DEPDIR)/SynapseRouteSubsystem.Plo \
+	services/weights/$(DEPDIR)/WeightAccessor.Plo \
+	services/weights/$(DEPDIR)/WeightCacheOps.Plo \
+	services/weights/$(DEPDIR)/WeightMemorySubsystem.Plo \
+	services/memory/$(DEPDIR)/StandardMemAccess.Plo \
+	services/memory/$(DEPDIR)/StandardMemBackend.Plo \
+	services/route/$(DEPDIR)/SpikeCommSubsystem.Plo \
+	services/stimulus/$(DEPDIR)/StepActivationSubsystem.Plo
 am__mv = mv -f
 CXXCOMPILE = $(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) \
 	$(AM_CPPFLAGS) $(CPPFLAGS) $(AM_CXXFLAGS) $(CXXFLAGS)
@@ -590,6 +596,8 @@ libSnnDL_la_SOURCES = \
 	api/SnnInterface.h \
 	api/SnnPEParentInterface.h \
 	api/ISpikeTransport.h \
+	api/INocTransport.h \
+	api/NocSpikeTransport.h \
 	api/IMemoryAccess.h \
 	api/ISynapseRoute.h \
 	api/SynapseRouteBuildConfig.h \
@@ -613,8 +621,8 @@ libSnnDL_la_SOURCES = \
 	components/SnnNIC.h \
 	components/SnnPE.cc \
 	components/SnnPE.h \
-	components/SpikeSource.cc \
-	components/SpikeSource.h \
+	components/stimulus/SpikeSource.cc \
+	components/stimulus/SpikeSource.h \
 	components/WeightLoader.cc \
 	components/WeightLoader.h \
 	components/mpi/MPIMultiCorePE.cc \
@@ -642,42 +650,42 @@ libSnnDL_la_SOURCES = \
 	compute/SnnWeightDiagnostics.cc \
 	compute/SnnWeightDiagnostics.h \
 	compute/SynapseManager.h \
-	services/AccumulatorOps.cc \
-	services/AccumulatorOps.h \
-	services/GasCustomCmd.h \
-	services/GasEdgeCollector.cc \
-	services/GasEdgeCollector.h \
-	services/GasPhaseController.cc \
-	services/GasPhaseController.h \
-	services/OptimizedInternalRing.cc \
-	services/OptimizedInternalRing.h \
-	services/SimpleNetworkWrapper.cc \
-	services/SimpleNetworkWrapper.h \
-	services/SnnBcsrWeightManager.cc \
-	services/SnnBcsrWeightManager.h \
-	services/SnnNetworkAdapter.cc \
-	services/SnnNetworkAdapter.h \
+	services/gas/AccumulatorOps.cc \
+	services/gas/AccumulatorOps.h \
+	services/gas/GasCustomCmd.h \
+	services/gas/GasEdgeCollector.cc \
+	services/gas/GasEdgeCollector.h \
+	services/gas/GasPhaseController.cc \
+	services/gas/GasPhaseController.h \
+	services/noc/OptimizedInternalRing.cc \
+	services/noc/OptimizedInternalRing.h \
+	services/noc/SimpleNetworkWrapper.cc \
+	services/noc/SimpleNetworkWrapper.h \
+	services/weights/SnnBcsrWeightManager.cc \
+	services/weights/SnnBcsrWeightManager.h \
+	services/noc/SnnNetworkAdapter.cc \
+	services/noc/SnnNetworkAdapter.h \
 	services/SnnProfiler.h \
-	services/SnnRouteProvider.cc \
-	services/SnnRouteProvider.h \
-	services/SynapseRouteSubsystem.cc \
-	services/SynapseRouteSubsystem.h \
-	services/StepActivationSubsystem.cc \
-	services/StepActivationSubsystem.h \
-	services/NocSubsystem.cc \
-	services/NocSubsystem.h \
-	services/WeightAccessor.cc \
-	services/WeightAccessor.h \
-	services/WeightCacheOps.cc \
-	services/WeightCacheOps.h \
-	services/WeightMemorySubsystem.cc \
-	services/WeightMemorySubsystem.h \
-	services/SpikeCommSubsystem.cc \
-	services/SpikeCommSubsystem.h \
-	services/StandardMemAccess.cc \
-	services/StandardMemAccess.h \
-	services/StandardMemBackend.cc \
-	services/StandardMemBackend.h
+	services/route/SnnRouteProvider.cc \
+	services/route/SnnRouteProvider.h \
+	services/route/SynapseRouteSubsystem.cc \
+	services/route/SynapseRouteSubsystem.h \
+	services/stimulus/StepActivationSubsystem.cc \
+	services/stimulus/StepActivationSubsystem.h \
+	services/noc/NocSubsystem.cc \
+	services/noc/NocSubsystem.h \
+	services/weights/WeightAccessor.cc \
+	services/weights/WeightAccessor.h \
+	services/weights/WeightCacheOps.cc \
+	services/weights/WeightCacheOps.h \
+	services/weights/WeightMemorySubsystem.cc \
+	services/weights/WeightMemorySubsystem.h \
+	services/route/SpikeCommSubsystem.cc \
+	services/route/SpikeCommSubsystem.h \
+	services/memory/StandardMemAccess.cc \
+	services/memory/StandardMemAccess.h \
+	services/memory/StandardMemBackend.cc \
+	services/memory/StandardMemBackend.h
 
 
 #
@@ -780,8 +788,14 @@ components/SnnNIC.lo: components/$(am__dirstamp) \
 	components/$(DEPDIR)/$(am__dirstamp)
 components/SnnPE.lo: components/$(am__dirstamp) \
 	components/$(DEPDIR)/$(am__dirstamp)
-components/SpikeSource.lo: components/$(am__dirstamp) \
-	components/$(DEPDIR)/$(am__dirstamp)
+components/stimulus/$(am__dirstamp):
+	@$(MKDIR_P) components/stimulus
+	@: > components/stimulus/$(am__dirstamp)
+components/stimulus/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) components/stimulus/$(DEPDIR)
+	@: > components/stimulus/$(DEPDIR)/$(am__dirstamp)
+components/stimulus/SpikeSource.lo: components/stimulus/$(am__dirstamp) \
+	components/stimulus/$(DEPDIR)/$(am__dirstamp)
 components/WeightLoader.lo: components/$(am__dirstamp) \
 	components/$(DEPDIR)/$(am__dirstamp)
 components/mpi/$(am__dirstamp):
@@ -838,6 +852,14 @@ services/$(am__dirstamp):
 services/$(DEPDIR)/$(am__dirstamp):
 	@$(MKDIR_P) services/$(DEPDIR)
 	@: > services/$(DEPDIR)/$(am__dirstamp)
+services/stimulus/$(am__dirstamp):
+	@$(MKDIR_P) services/stimulus
+	@: > services/stimulus/$(am__dirstamp)
+services/stimulus/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) services/stimulus/$(DEPDIR)
+	@: > services/stimulus/$(DEPDIR)/$(am__dirstamp)
+services/stimulus/StepActivationSubsystem.lo: services/stimulus/$(am__dirstamp) \
+	services/stimulus/$(DEPDIR)/$(am__dirstamp)
 services/AccumulatorOps.lo: services/$(am__dirstamp) \
 	services/$(DEPDIR)/$(am__dirstamp)
 services/GasEdgeCollector.lo: services/$(am__dirstamp) \
@@ -845,8 +867,6 @@ services/GasEdgeCollector.lo: services/$(am__dirstamp) \
 services/GasPhaseController.lo: services/$(am__dirstamp) \
 	services/$(DEPDIR)/$(am__dirstamp)
 services/OptimizedInternalRing.lo: services/$(am__dirstamp) \
-	services/$(DEPDIR)/$(am__dirstamp)
-services/ReadOrchestrator.lo: services/$(am__dirstamp) \
 	services/$(DEPDIR)/$(am__dirstamp)
 services/SimpleNetworkWrapper.lo: services/$(am__dirstamp) \
 	services/$(DEPDIR)/$(am__dirstamp)
@@ -878,6 +898,8 @@ mostlyclean-compile:
 	-rm -f events/*.lo
 	-rm -f services/*.$(OBJEXT)
 	-rm -f services/*.lo
+	-rm -f services/stimulus/*.$(OBJEXT)
+	-rm -f services/stimulus/*.lo
 
 distclean-compile:
 	-rm -f *.tab.c
@@ -888,7 +910,7 @@ include components/$(DEPDIR)/MemKCalBench.Plo # am--include-marker
 include components/$(DEPDIR)/MultiCorePE.Plo # am--include-marker
 include components/$(DEPDIR)/SnnNIC.Plo # am--include-marker
 include components/$(DEPDIR)/SnnPE.Plo # am--include-marker
-include components/$(DEPDIR)/SpikeSource.Plo # am--include-marker
+include components/stimulus/$(DEPDIR)/SpikeSource.Plo # am--include-marker
 include components/$(DEPDIR)/WeightLoader.Plo # am--include-marker
 include components/mpi/$(DEPDIR)/MPIMultiCorePE.Plo # am--include-marker
 include components/mpi/$(DEPDIR)/MPITypes.Plo # am--include-marker
@@ -907,17 +929,23 @@ include control/$(DEPDIR)/SnnPESubComponent_spike.Plo # am--include-marker
 include control/$(DEPDIR)/StageEventHub.Plo # am--include-marker
 include events/$(DEPDIR)/SimpleTestEvent.Plo # am--include-marker
 include events/$(DEPDIR)/SpikeEventWrapper.Plo # am--include-marker
-include services/$(DEPDIR)/AccumulatorOps.Plo # am--include-marker
-include services/$(DEPDIR)/GasEdgeCollector.Plo # am--include-marker
-include services/$(DEPDIR)/GasPhaseController.Plo # am--include-marker
-include services/$(DEPDIR)/OptimizedInternalRing.Plo # am--include-marker
-include services/$(DEPDIR)/ReadOrchestrator.Plo # am--include-marker
-include services/$(DEPDIR)/SimpleNetworkWrapper.Plo # am--include-marker
-include services/$(DEPDIR)/SnnBcsrWeightManager.Plo # am--include-marker
-include services/$(DEPDIR)/SnnNetworkAdapter.Plo # am--include-marker
-include services/$(DEPDIR)/SnnRouteProvider.Plo # am--include-marker
-include services/$(DEPDIR)/WeightAccessor.Plo # am--include-marker
-include services/$(DEPDIR)/WeightCacheOps.Plo # am--include-marker
+include services/gas/$(DEPDIR)/AccumulatorOps.Plo # am--include-marker
+include services/gas/$(DEPDIR)/GasEdgeCollector.Plo # am--include-marker
+include services/gas/$(DEPDIR)/GasPhaseController.Plo # am--include-marker
+include services/noc/$(DEPDIR)/OptimizedInternalRing.Plo # am--include-marker
+include services/noc/$(DEPDIR)/SimpleNetworkWrapper.Plo # am--include-marker
+include services/weights/$(DEPDIR)/SnnBcsrWeightManager.Plo # am--include-marker
+include services/noc/$(DEPDIR)/SnnNetworkAdapter.Plo # am--include-marker
+include services/noc/$(DEPDIR)/NocSubsystem.Plo # am--include-marker
+include services/route/$(DEPDIR)/SnnRouteProvider.Plo # am--include-marker
+include services/route/$(DEPDIR)/SynapseRouteSubsystem.Plo # am--include-marker
+include services/weights/$(DEPDIR)/WeightAccessor.Plo # am--include-marker
+include services/weights/$(DEPDIR)/WeightCacheOps.Plo # am--include-marker
+include services/weights/$(DEPDIR)/WeightMemorySubsystem.Plo # am--include-marker
+include services/memory/$(DEPDIR)/StandardMemAccess.Plo # am--include-marker
+include services/memory/$(DEPDIR)/StandardMemBackend.Plo # am--include-marker
+include services/route/$(DEPDIR)/SpikeCommSubsystem.Plo # am--include-marker
+include services/stimulus/$(DEPDIR)/StepActivationSubsystem.Plo # am--include-marker
 
 $(am__depfiles_remade):
 	@$(MKDIR_P) $(@D)
@@ -926,7 +954,7 @@ $(am__depfiles_remade):
 am--depfiles: $(am__depfiles_remade)
 
 .cc.o:
-	$(AM_V_CXX)depbase=`echo $@ | sed 's|[^/]*$$|$(DEPDIR)/&|;s|\.o$$||'`;\
+	$(AM_V_CXX)depbase=`echo $@ | sed 's|[^/]*$$|$(DEPDIR)/&|;s|\.o$$||'`; $(MKDIR_P) $(@D)/$(DEPDIR);\
 	$(CXXCOMPILE) -MT $@ -MD -MP -MF $$depbase.Tpo -c -o $@ $< &&\
 	$(am__mv) $$depbase.Tpo $$depbase.Po
 #	$(AM_V_CXX)source='$<' object='$@' libtool=no \
@@ -942,7 +970,7 @@ am--depfiles: $(am__depfiles_remade)
 #	$(AM_V_CXX_no)$(CXXCOMPILE) -c -o $@ `$(CYGPATH_W) '$<'`
 
 .cc.lo:
-	$(AM_V_CXX)depbase=`echo $@ | sed 's|[^/]*$$|$(DEPDIR)/&|;s|\.lo$$||'`;\
+	$(AM_V_CXX)depbase=`echo $@ | sed 's|[^/]*$$|$(DEPDIR)/&|;s|\.lo$$||'`; $(MKDIR_P) $(@D)/$(DEPDIR);\
 	$(LTCXXCOMPILE) -MT $@ -MD -MP -MF $$depbase.Tpo -c -o $@ $< &&\
 	$(am__mv) $$depbase.Tpo $$depbase.Plo
 #	$(AM_V_CXX)source='$<' object='$@' libtool=yes \
@@ -1091,6 +1119,8 @@ distclean-generic:
 	-rm -f events/$(am__dirstamp)
 	-rm -f services/$(DEPDIR)/$(am__dirstamp)
 	-rm -f services/$(am__dirstamp)
+	-rm -f services/stimulus/$(DEPDIR)/$(am__dirstamp)
+	-rm -f services/stimulus/$(am__dirstamp)
 
 maintainer-clean-generic:
 	@echo "This command is intended for maintainers to use"
@@ -1107,7 +1137,7 @@ distclean: distclean-am
 	-rm -f components/$(DEPDIR)/MultiCorePE.Plo
 	-rm -f components/$(DEPDIR)/SnnNIC.Plo
 	-rm -f components/$(DEPDIR)/SnnPE.Plo
-	-rm -f components/$(DEPDIR)/SpikeSource.Plo
+	-rm -f components/stimulus/$(DEPDIR)/SpikeSource.Plo
 	-rm -f components/$(DEPDIR)/WeightLoader.Plo
 	-rm -f components/mpi/$(DEPDIR)/MPIMultiCorePE.Plo
 	-rm -f components/mpi/$(DEPDIR)/MPITypes.Plo
@@ -1126,17 +1156,22 @@ distclean: distclean-am
 	-rm -f control/$(DEPDIR)/StageEventHub.Plo
 	-rm -f events/$(DEPDIR)/SimpleTestEvent.Plo
 	-rm -f events/$(DEPDIR)/SpikeEventWrapper.Plo
-	-rm -f services/$(DEPDIR)/AccumulatorOps.Plo
-	-rm -f services/$(DEPDIR)/GasEdgeCollector.Plo
-	-rm -f services/$(DEPDIR)/GasPhaseController.Plo
-	-rm -f services/$(DEPDIR)/OptimizedInternalRing.Plo
-	-rm -f services/$(DEPDIR)/ReadOrchestrator.Plo
-	-rm -f services/$(DEPDIR)/SimpleNetworkWrapper.Plo
-	-rm -f services/$(DEPDIR)/SnnBcsrWeightManager.Plo
-	-rm -f services/$(DEPDIR)/SnnNetworkAdapter.Plo
-	-rm -f services/$(DEPDIR)/SnnRouteProvider.Plo
-	-rm -f services/$(DEPDIR)/WeightAccessor.Plo
-	-rm -f services/$(DEPDIR)/WeightCacheOps.Plo
+	-rm -f services/gas/$(DEPDIR)/AccumulatorOps.Plo
+	-rm -f services/gas/$(DEPDIR)/GasEdgeCollector.Plo
+	-rm -f services/gas/$(DEPDIR)/GasPhaseController.Plo
+	-rm -f services/noc/$(DEPDIR)/OptimizedInternalRing.Plo
+	-rm -f services/noc/$(DEPDIR)/SimpleNetworkWrapper.Plo
+	-rm -f services/weights/$(DEPDIR)/SnnBcsrWeightManager.Plo
+	-rm -f services/noc/$(DEPDIR)/SnnNetworkAdapter.Plo
+	-rm -f services/noc/$(DEPDIR)/NocSubsystem.Plo
+	-rm -f services/route/$(DEPDIR)/SnnRouteProvider.Plo
+	-rm -f services/route/$(DEPDIR)/SynapseRouteSubsystem.Plo
+	-rm -f services/route/$(DEPDIR)/SpikeCommSubsystem.Plo
+	-rm -f services/weights/$(DEPDIR)/WeightAccessor.Plo
+	-rm -f services/weights/$(DEPDIR)/WeightCacheOps.Plo
+	-rm -f services/weights/$(DEPDIR)/WeightMemorySubsystem.Plo
+	-rm -f services/memory/$(DEPDIR)/StandardMemAccess.Plo
+	-rm -f services/memory/$(DEPDIR)/StandardMemBackend.Plo
 	-rm -f Makefile
 distclean-am: clean-am distclean-compile distclean-generic \
 	distclean-tags
@@ -1188,7 +1223,7 @@ maintainer-clean: maintainer-clean-am
 	-rm -f components/$(DEPDIR)/MultiCorePE.Plo
 	-rm -f components/$(DEPDIR)/SnnNIC.Plo
 	-rm -f components/$(DEPDIR)/SnnPE.Plo
-	-rm -f components/$(DEPDIR)/SpikeSource.Plo
+	-rm -f components/stimulus/$(DEPDIR)/SpikeSource.Plo
 	-rm -f components/$(DEPDIR)/WeightLoader.Plo
 	-rm -f components/mpi/$(DEPDIR)/MPIMultiCorePE.Plo
 	-rm -f components/mpi/$(DEPDIR)/MPITypes.Plo
@@ -1207,17 +1242,22 @@ maintainer-clean: maintainer-clean-am
 	-rm -f control/$(DEPDIR)/StageEventHub.Plo
 	-rm -f events/$(DEPDIR)/SimpleTestEvent.Plo
 	-rm -f events/$(DEPDIR)/SpikeEventWrapper.Plo
-	-rm -f services/$(DEPDIR)/AccumulatorOps.Plo
-	-rm -f services/$(DEPDIR)/GasEdgeCollector.Plo
-	-rm -f services/$(DEPDIR)/GasPhaseController.Plo
-	-rm -f services/$(DEPDIR)/OptimizedInternalRing.Plo
-	-rm -f services/$(DEPDIR)/ReadOrchestrator.Plo
-	-rm -f services/$(DEPDIR)/SimpleNetworkWrapper.Plo
-	-rm -f services/$(DEPDIR)/SnnBcsrWeightManager.Plo
-	-rm -f services/$(DEPDIR)/SnnNetworkAdapter.Plo
-	-rm -f services/$(DEPDIR)/SnnRouteProvider.Plo
-	-rm -f services/$(DEPDIR)/WeightAccessor.Plo
-	-rm -f services/$(DEPDIR)/WeightCacheOps.Plo
+	-rm -f services/gas/$(DEPDIR)/AccumulatorOps.Plo
+	-rm -f services/gas/$(DEPDIR)/GasEdgeCollector.Plo
+	-rm -f services/gas/$(DEPDIR)/GasPhaseController.Plo
+	-rm -f services/noc/$(DEPDIR)/OptimizedInternalRing.Plo
+	-rm -f services/noc/$(DEPDIR)/SimpleNetworkWrapper.Plo
+	-rm -f services/weights/$(DEPDIR)/SnnBcsrWeightManager.Plo
+	-rm -f services/noc/$(DEPDIR)/SnnNetworkAdapter.Plo
+	-rm -f services/noc/$(DEPDIR)/NocSubsystem.Plo
+	-rm -f services/route/$(DEPDIR)/SnnRouteProvider.Plo
+	-rm -f services/route/$(DEPDIR)/SynapseRouteSubsystem.Plo
+	-rm -f services/route/$(DEPDIR)/SpikeCommSubsystem.Plo
+	-rm -f services/weights/$(DEPDIR)/WeightAccessor.Plo
+	-rm -f services/weights/$(DEPDIR)/WeightCacheOps.Plo
+	-rm -f services/weights/$(DEPDIR)/WeightMemorySubsystem.Plo
+	-rm -f services/memory/$(DEPDIR)/StandardMemAccess.Plo
+	-rm -f services/memory/$(DEPDIR)/StandardMemBackend.Plo
 	-rm -f Makefile
 maintainer-clean-am: distclean-am maintainer-clean-generic
 

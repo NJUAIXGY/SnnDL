@@ -1,3 +1,4 @@
+#if 0
 // -*- c++ -*-
 //
 // StandardMemWeightReader.cc: implementation.
@@ -5,8 +6,7 @@
 
 #include <sst/core/sst_config.h>
 #include "StandardMemWeightReader.h"
-#include "SnnPESubComponent.h"
-#include "MultiCorePE.h"
+#include "IPeAggregation.h"
 
 #include <algorithm>
 #include <cmath>
@@ -583,4 +583,59 @@ bool StandardMemWeightReader::handleMemoryResponse(SST::Interfaces::StandardMem:
 
     delete req;
     return true;
+}
+#endif
+
+// -*- c++ -*-
+//
+// StandardMemWeightReader.cc: minimal shim implementation.
+//
+// 说明：
+// - 该文件为历史遗留/参考实现（当前默认不纳入构建）。
+// - 现行权重/窗口读数据路径已由 `StandardMemAccess` + `WeightMemorySubsystem` 闭环；
+// - 这里保留一个“委托式”IWeightReader 适配器，避免 services→control 的反向依赖。
+//
+
+#include <sst/core/sst_config.h>
+
+#include "StandardMemWeightReader.h"
+
+using namespace SST::SnnDL;
+
+void StandardMemWeightReader::requestDense(uint32_t pre, uint32_t post, std::function<void(float)> cb) {
+    if (!impl_) {
+        if (cb) cb(0.0f);
+        return;
+    }
+    impl_->requestDense(pre, post, std::move(cb));
+}
+
+void StandardMemWeightReader::requestBCSR(uint32_t pre_global, uint32_t post_local, std::function<void(float)> cb) {
+    if (!impl_) {
+        if (cb) cb(0.0f);
+        return;
+    }
+    impl_->requestBCSR(pre_global, post_local, std::move(cb));
+}
+
+bool StandardMemWeightReader::tryCache(uint64_t key, float& out) {
+    return impl_ ? impl_->tryCache(key, out) : false;
+}
+
+void StandardMemWeightReader::putCache(uint64_t key, float value) {
+    if (impl_) impl_->putCache(key, value);
+}
+
+bool StandardMemWeightReader::applyLocalWeightUpdates(const std::unordered_map<uint64_t, float>& grads,
+                                                      float learning_rate,
+                                                      float weight_decay) {
+    (void)learning_rate;
+    (void)weight_decay;
+    // Legacy API: keep a conservative behavior.
+    return grads.empty();
+}
+
+void StandardMemWeightReader::scheme1PrefetchSlice(uint32_t slice_idx) {
+    (void)slice_idx;
+    // Legacy API: no-op in shim.
 }

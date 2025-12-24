@@ -5,7 +5,7 @@
 #include <functional>
 #include <string>
 
-#include "SnnBcsrWeightManager.h"
+#include "weights/SnnBcsrWeightManager.h"
 
 namespace SST { namespace SnnDL {
 
