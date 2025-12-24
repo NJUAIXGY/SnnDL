@@ -30,8 +30,7 @@
 ## 与其他域的交互
 
 - **NoC 域**：通过 `INocTransport` 完成本地投递与外发（Stimulus 不直接操作 NIC/ring）。
-- **Route 域**：当前 Step 的 “BCSR reachability” 解析由 Stimulus 内部实现（仅影响 post 选择）；长期可考虑与 `services/route` 共享元信息以避免口径漂移。
+- **Route 域**：当前 Step 的 “BCSR reachability” 解析由 Stimulus 内部实现（仅影响 post 选择）；长期可考虑与 `services/synapse/route` 共享元信息以避免口径漂移。
 - **Control/Components**：
   - `MultiCorePE` 负责把阶段事件（BeginGather/EndScatter）与 tick 转发给 Stimulus；
   - Stimulus 负责把注入事务封装起来，控制层不直接持有注入细节。
-

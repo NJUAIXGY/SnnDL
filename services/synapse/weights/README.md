@@ -1,4 +1,4 @@
-# services/weights/（权重语义与缓存子系统）
+# services/synapse/weights/（权重语义与缓存子系统）
 
 本目录存放 **Weights 域** 的实现：权重地址解析、BCSR 元数据与缓存、窗口读编排（budget/outstanding）、以及面向 compute core 的统一 `IWeightReader` 入口。
 
@@ -57,12 +57,11 @@
 - **Compute 域**：
   - Compute core 只依赖 `IWeightReader`；不直接触碰 StandardMem 与 BCSR 缓存细节。
 - **Route 域**：
-  - Weights 不构建路由表；路由与 fanout 由 `services/route` 负责。
+  - Weights 不构建路由表；路由与 fanout 由 `services/synapse/route` 负责。
 
 ---
 
 ## 约束与建议
 
-- **禁止**：Weights 域内直接发送 NoC 消息或操作 NIC（应由 `services/noc` 与 `services/route` 负责）。
+- **禁止**：Weights 域内直接发送 NoC 消息或操作 NIC（应由 `services/noc` 与 `services/synapse/route` 负责）。
 - **建议**：对外只暴露 `IWeightReader` 等窄接口；其余复杂编排通过 `configureOrchestrator()` 注入，避免 services→control 反向依赖。
-

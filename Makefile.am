@@ -77,38 +77,38 @@ libSnnDL_la_SOURCES = \
 	compute/SnnWeightDiagnostics.cc \
 	compute/SnnWeightDiagnostics.h \
 	compute/SynapseManager.h \
-	services/gas/AccumulatorOps.cc \
-	services/gas/AccumulatorOps.h \
-	services/gas/GasCustomCmd.h \
-	services/gas/GasEdgeCollector.cc \
-	services/gas/GasEdgeCollector.h \
-	services/gas/GasPhaseController.cc \
-	services/gas/GasPhaseController.h \
+	services/synapse/gas/AccumulatorOps.cc \
+	services/synapse/gas/AccumulatorOps.h \
+	services/synapse/gas/GasCustomCmd.h \
+	services/synapse/gas/GasEdgeCollector.cc \
+	services/synapse/gas/GasEdgeCollector.h \
+	services/synapse/gas/GasPhaseController.cc \
+	services/synapse/gas/GasPhaseController.h \
 	services/noc/OptimizedInternalRing.cc \
 	services/noc/OptimizedInternalRing.h \
 	services/noc/SimpleNetworkWrapper.cc \
 	services/noc/SimpleNetworkWrapper.h \
-	services/weights/SnnBcsrWeightManager.cc \
-	services/weights/SnnBcsrWeightManager.h \
+	services/synapse/weights/SnnBcsrWeightManager.cc \
+	services/synapse/weights/SnnBcsrWeightManager.h \
 	services/noc/SnnNetworkAdapter.cc \
 	services/noc/SnnNetworkAdapter.h \
 	services/SnnProfiler.h \
-	services/route/SnnRouteProvider.cc \
-	services/route/SnnRouteProvider.h \
-	services/route/SynapseRouteSubsystem.cc \
-	services/route/SynapseRouteSubsystem.h \
+	services/synapse/route/SnnRouteProvider.cc \
+	services/synapse/route/SnnRouteProvider.h \
+	services/synapse/route/SynapseRouteSubsystem.cc \
+	services/synapse/route/SynapseRouteSubsystem.h \
 	services/stimulus/StepActivationSubsystem.cc \
 	services/stimulus/StepActivationSubsystem.h \
 	services/noc/NocSubsystem.cc \
 	services/noc/NocSubsystem.h \
-	services/weights/WeightAccessor.cc \
-	services/weights/WeightAccessor.h \
-	services/weights/WeightCacheOps.cc \
-	services/weights/WeightCacheOps.h \
-	services/weights/WeightMemorySubsystem.cc \
-	services/weights/WeightMemorySubsystem.h \
-	services/route/SpikeCommSubsystem.cc \
-	services/route/SpikeCommSubsystem.h \
+	services/synapse/weights/WeightAccessor.cc \
+	services/synapse/weights/WeightAccessor.h \
+	services/synapse/weights/WeightCacheOps.cc \
+	services/synapse/weights/WeightCacheOps.h \
+	services/synapse/weights/WeightMemorySubsystem.cc \
+	services/synapse/weights/WeightMemorySubsystem.h \
+	services/synapse/route/SpikeCommSubsystem.cc \
+	services/synapse/route/SpikeCommSubsystem.h \
 	services/memory/StandardMemAccess.cc \
 	services/memory/StandardMemAccess.h \
 	services/memory/StandardMemBackend.cc \

@@ -1,0 +1,25 @@
+# services/synapse/（突触语义域：Synapse 事务闭环）
+
+本目录存放 **与“突触语义（synapse semantics）”强相关** 的事务子系统：权重（weights）、路由/可达性（route）、以及 GAS 窗口辅助（gas）。
+
+> 目标：将“fanout/可达性/路由构建、权重读取与缓存、GAS 辅助数据结构”收敛到一个清晰的 Synapse 域；让 NoC 保持纯传输、Memory 保持纯字节访问，Control/Component 只做装配与调度壳。
+
+---
+
+## 子域目录
+
+- `services/synapse/weights/`：权重语义与缓存子系统（dense/BCSR/窗口读编排），实现 `api/SnnWeightReader.h`
+  - 详见：`services/synapse/weights/README.md`
+- `services/synapse/route/`：Synapse/Route 路由与通信事务子系统（路由构建、fanout、gating、SpikeEvent 构造与发送）
+  - 详见：`services/synapse/route/README.md`
+- `services/synapse/gas/`：GAS 窗口与累加辅助子系统（edge 收集、累加器、CustomCmd/统计载体）
+  - 详见：`services/synapse/gas/README.md`
+
+---
+
+## 依赖边界（建议）
+
+- `synapse/*` **可以依赖**：`api/`、`events/`、少量 SST 基础类型、以及 `services/memory`（通过 `api/IMemoryAccess`）。
+- `synapse/*` **不应依赖**：`services/noc` 的具体实现（应通过 `api/ISpikeTransport` / `api/INocTransport` 交互）。
+- `services/memory` **不出现**：权重/突触/路由语义；它只负责“地址→字节块”。
+

@@ -48,10 +48,8 @@ SnnDL/
 ├── services/       # 可复用事务子系统（按子域拆分）
 │   ├── noc/        # NoC 传输域（send/recv/forward/本地投递）
 │   ├── memory/     # 纯内存访问域（地址→字节块）
-│   ├── weights/    # 权重语义与缓存域（dense/BCSR/窗口读编排）
-│   ├── route/      # Synapse/Route 域（路由构建、fanout、gating、发送事务）
+│   ├── synapse/    # 突触语义域（weights/route/gas 事务闭环）
 │   ├── stimulus/   # Stimulus 域（Step 注入/外部刺激）
-│   ├── gas/        # GAS 辅助（edge/累加器/CustomCmd 统计载体）
 │   └── legacy/     # 历史遗留/参考实现（默认不进主链路）
 ├── docs/           # 设计与阶段性方案文档
 └── tests/          # include 自检等轻量测试
@@ -66,8 +64,7 @@ SnnDL/
 - `compute/`：神经动力学与学习等计算逻辑（`ISnnComputeCore`）；**不直接触碰 StandardMem/NoC**。
 - `services/noc/`：纯传输（send/recv/forward/本地投递）；**不做 fanout/权重语义**。
 - `services/memory/`：纯地址/字节访问；**不出现权重/突触/路由语义**。
-- `services/weights/`：权重语义与缓存（dense/BCSR/窗口读编排）；**不直接操作 NIC/NoC**。
-- `services/route/`：路由构建、fanout、gating、spike 发送事务；**不解析权重 bytes**。
+- `services/synapse/`：权重语义/路由与 fanout/GAS 辅助（weights/route/gas 事务闭环）。
 - `services/stimulus/`：注入时基与选源（Step 等刺激）；通过 NoC/Route 完成投递与外发。
 
 ---

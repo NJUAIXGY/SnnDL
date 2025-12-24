@@ -3,7 +3,7 @@
 #include <fstream>
 #include <vector>
 
-#include "weights/SnnBcsrWeightManager.h"
+#include "synapse/weights/SnnBcsrWeightManager.h"
 
 namespace SST { namespace SnnDL {
 

@@ -17,7 +17,7 @@
 #include <utility>
 #include <vector>
 
-#include "gas/GasEdgeCollector.h"
+#include "synapse/gas/GasEdgeCollector.h"
 #include "SnnWeightReader.h"
 #include "IMemoryAccess.h"
 #include "WeightAccessor.h"

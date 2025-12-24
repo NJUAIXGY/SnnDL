@@ -1,4 +1,4 @@
-# services/route/（Synapse/Route 路由与通信事务子系统）
+# services/synapse/route/（Synapse/Route 路由与通信事务子系统）
 
 本目录存放 **Synapse/Route 域** 的实现：路由构建（权重驱动或映射文件驱动）、fanout 查询、gating 决策缓存，以及 spike 事件构造与发送事务的封装。
 
@@ -50,4 +50,3 @@
 
 - **禁止**：Route 域内直接依赖 `StandardMem` 或解析权重 bytes（属于 Weights/Mem 域职责）。
 - **建议**：路由构建成本高时优先复用 `SynapseRouteSubsystem` 的进程级缓存（避免每核重复构建）。
-

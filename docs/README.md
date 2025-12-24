@@ -7,7 +7,7 @@
 - `UNIVERSAL_CONTROL_CORE_DESIGN.md`
   - 通用控制子核（`control/SnnPESubComponent`）目标形态、分层与迁移路线（Phase A/B/C/D）。
 - `SPIKE_COMM_SUBSYSTEM_DESIGN.md`
-  - Spike 通信子系统抽象与落地说明（`api/ISpikeTransport` + `services/route/SpikeCommSubsystem`）。
+  - Spike 通信子系统抽象与落地说明（`api/ISpikeTransport` + `services/synapse/route/SpikeCommSubsystem`）。
 - `NOC_SUBSYSTEM_DESIGN.md`
   - NoC 子系统化：`services/noc/NocSubsystem` 接管 send/recv/forward + 本地投递，并通过 `api/INocTransport` 冻结跨层调用面。
 - `SUBSYSTEM_MODULARIZATION_ROADMAP.md`

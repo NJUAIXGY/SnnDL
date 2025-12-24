@@ -24,7 +24,7 @@
 - **定位**：更底层的 StandardMem pending 后端：仅提供 `sendRead/sendWrite` 与 `popPending`。
 - **说明**：
   - 当前的 `MemRequestMeta` 中仍包含一些与 BCSR/权重诊断耦合的字段（历史包袱/过渡形态）；
-  - 长期目标是让该结构退化为“纯内存元信息”（addr/size/对齐/issue_cycle），把权重语义移动到 `services/weights` 或 `services/route` 的私有结构里。
+  - 长期目标是让该结构退化为“纯内存元信息”（addr/size/对齐/issue_cycle），把权重语义移动到 `services/synapse/weights` 或 `services/synapse/route` 的私有结构里。
 
 ---
 
@@ -33,7 +33,7 @@
 - `control/SnnPESubComponent` 在 `setup/init` 时装配：
   - 创建 `StandardMemAccess`（对外提供纯 `IMemoryAccess`）；
   - 仍可保留 `StandardMemBackend` 用于历史路径或更细粒度的 meta 跟踪（逐步收敛中）。
-- `services/weights/WeightMemorySubsystem` 推荐只依赖 `api/IMemoryAccess`：
+- `services/synapse/weights/WeightMemorySubsystem` 推荐只依赖 `api/IMemoryAccess`：
   - Memory 负责返回 bytes；
   - Weights 负责解释 bytes（例如 float 解码、rowptr/colidx/blockdata 解析）。
 
@@ -42,5 +42,4 @@
 ## 约束与建议
 
 - **禁止**：在 `services/memory` 里出现 `weight/synapse/bcsr/route` 的业务语义。
-- **建议**：任何回包解析（float/idx 解码）放到 `services/weights` 的语义层；Memory 只保证“正确的字节块”。
-
+- **建议**：任何回包解析（float/idx 解码）放到 `services/synapse/weights` 的语义层；Memory 只保证“正确的字节块”。

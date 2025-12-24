@@ -6,8 +6,8 @@
 
 #include <sst/core/sst_config.h>
 #include "SnnPESubComponent.h"
-#include "gas/GasCustomCmd.h"
-#include "gas/GasPhaseController.h"
+#include "synapse/gas/GasCustomCmd.h"
+#include "synapse/gas/GasPhaseController.h"
 #include "IPeAggregation.h"
 #include "memory/StandardMemBackend.h"
 #include "memory/StandardMemAccess.h"

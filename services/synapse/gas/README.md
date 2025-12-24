@@ -1,4 +1,4 @@
-# services/gas/（GAS 窗口与累加辅助子系统）
+# services/synapse/gas/（GAS 窗口与累加辅助子系统）
 
 本目录存放 **GAS（Gather / Apply / Scatter）窗口相关的辅助模块**，用于把窗口边集合、累加器实现、以及与 GatherBufferIF 交互的 CustomCmd/统计数据结构从控制层抽离出来。
 
@@ -41,5 +41,4 @@
 
 - `components/GatherBufferIF` 使用 `GasCustomCmd` 发送阶段事件/统计到 PE；
 - `control/SnnPESubComponent` 使用 `GasEdgeCollector` 与 `AccumulatorOps` 承载窗口边与累加状态；
-- `services/weights/WeightMemorySubsystem` 读取 `GasEdgeCollector` 的 prev 边集合，在 Apply 阶段发起窗口读并更新累加器。
-
+- `services/synapse/weights/WeightMemorySubsystem` 读取 `GasEdgeCollector` 的 prev 边集合，在 Apply 阶段发起窗口读并更新累加器。

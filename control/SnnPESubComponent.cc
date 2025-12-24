@@ -8,15 +8,15 @@
 #include <sst/core/sst_config.h>
 #include "SnnPESubComponent.h"
 #include <fstream>
-#include "gas/GasCustomCmd.h"
-#include "gas/GasPhaseController.h"
+#include "synapse/gas/GasCustomCmd.h"
+#include "synapse/gas/GasPhaseController.h"
 #include "IPeAggregation.h"
 #include "GatherBufferIF.h"
-#include "weights/WeightMemorySubsystem.h"
+#include "synapse/weights/WeightMemorySubsystem.h"
 #include "memory/StandardMemBackend.h"
 #include "memory/StandardMemAccess.h"
 #include "ISpikeTransport.h"
-#include "route/SpikeCommSubsystem.h"
+#include "synapse/route/SpikeCommSubsystem.h"
 
 #include <iostream>
 #include <cmath>

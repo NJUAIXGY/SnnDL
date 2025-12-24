@@ -12,14 +12,10 @@
   - 详见：`services/noc/README.md`
 - `services/memory/`：纯内存访问域（地址→字节块），实现 `api/IMemoryAccess.h`  
   - 详见：`services/memory/README.md`
-- `services/weights/`：权重语义与缓存域（dense/BCSR/窗口读编排），实现 `api/SnnWeightReader.h`  
-  - 详见：`services/weights/README.md`
-- `services/route/`：Synapse/Route 路由与通信事务域（路由构建、fanout、gating、SpikeEvent 构造与发送）  
-  - 详见：`services/route/README.md`
+- `services/synapse/`：突触语义域（Synapse 事务闭环：weights/route/gas 的聚合域）  
+  - 详见：`services/synapse/README.md`
 - `services/stimulus/`：Stimulus 刺激/注入域（Step 注入/外部刺激）  
   - 详见：`services/stimulus/README.md`
-- `services/gas/`：GAS 窗口与累加辅助域（edge 收集、累加器、CustomCmd/统计载体）  
-  - 详见：`services/gas/README.md`
 - `services/legacy/`：历史遗留/参考实现（默认不参与主链路构建）  
   - 详见：`services/legacy/README.md`
 
@@ -38,5 +34,5 @@
 - 域间边界应保持清晰：
   - NoC 不做 fanout/权重语义；
   - Memory 不出现权重/突触/路由语义；
-  - Weights 不直接操作 NIC/NoC；
-  - Route 不解析权重 bytes。
+  - Synapse 不直接操纵 NoC 具体实现（通过 api 交互）；
+  - Synapse 内部：Route 不解析权重 bytes，Weights 不做 NIC/NoC 事务。

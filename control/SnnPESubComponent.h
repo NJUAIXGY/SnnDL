@@ -22,21 +22,21 @@
 #include "SnnPEParentInterface.h"
 #include "SnnCoreAPI.h"
 #include "SnnProfiler.h"  // 轻量级性能分析（条件编译）
-#include "weights/SnnBcsrWeightManager.h"
+#include "synapse/weights/SnnBcsrWeightManager.h"
 #include "ISnnComputeCore.h"
-#include "gas/AccumulatorOps.h"
-#include "weights/WeightCacheOps.h"
+#include "synapse/gas/AccumulatorOps.h"
+#include "synapse/weights/WeightCacheOps.h"
 #include "StageEventHub.h"
-#include "weights/WeightAccessor.h"
-#include "weights/WeightMemorySubsystem.h"
+#include "synapse/weights/WeightAccessor.h"
+#include "synapse/weights/WeightMemorySubsystem.h"
 #include "memory/StandardMemBackend.h"
 #include "IMemoryAccess.h"
 #include "ISpikeTransport.h"
 #include "ICoreControlHooks.h"
 #include "IGasOrchestrator.h"
 #include "NocSpikeTransport.h"
-#include "route/SpikeCommSubsystem.h"
-#include "route/SynapseRouteSubsystem.h"
+#include "synapse/route/SpikeCommSubsystem.h"
+#include "synapse/route/SynapseRouteSubsystem.h"
 
 namespace SST {
 namespace SnnDL {

@@ -43,7 +43,7 @@
 
 ### Core 发放 → 外发/本地投递
 1) `compute/ISnnComputeCore` 产出 fire events；
-2) `control/SnnPESubComponent` 调用 `services/route/SpikeCommSubsystem`；
+2) `control/SnnPESubComponent` 调用 `services/synapse/route/SpikeCommSubsystem`；
 3) `SpikeCommSubsystem` 通过 `api/ISpikeTransport` 发出 spike（常见实现是 `api/NocSpikeTransport`）；
 4) `NocSpikeTransport` → `INocTransport::sendFromCore(...)`；
 5) `NocSubsystem` 根据 `determine_target_unit` 做本 PE 内投递或外发：
@@ -59,7 +59,6 @@
 
 ## 约束与建议
 
-- **禁止**：在 NoC 域内做 fanout 选择或路由表构建（应由 `services/route` 负责）。
-- **禁止**：在 NoC 域内出现权重/BCSR 语义（应由 `services/weights` 与 `services/route` 负责）。
+- **禁止**：在 NoC 域内做 fanout 选择或路由表构建（应由 `services/synapse/route` 负责）。
+- **禁止**：在 NoC 域内出现权重/BCSR 语义（应由 `services/synapse/weights` 与 `services/synapse/route` 负责）。
 - **允许**：NoC 域依赖 `api/` 与 `events/`，并使用少量 SST 基础类型（`SST::Link`、`SST::Output`、`SST::Statistics`）。
-

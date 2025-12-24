@@ -3,7 +3,7 @@
 // ReadOrchestrator: window-read issue logic extracted from SnnPESubComponent.
 
 #include "ReadOrchestrator.h"
-#include "weights/WeightMemorySubsystem.h"
+#include "synapse/weights/WeightMemorySubsystem.h"
 
 using namespace SST::SnnDL;
 

@@ -13,11 +13,10 @@
 
 ### `ReadOrchestrator.{h,cc}`
 - **定位**：历史窗口读发起编排器（window-read issue logic）。
-- **现状**：已被主路径回收/替代（主路径由 `services/weights/WeightMemorySubsystem` 闭环承载，并在控制层 orchestrator 中完成窗口读编排）。
+- **现状**：已被主路径回收/替代（主路径由 `services/synapse/weights/WeightMemorySubsystem` 闭环承载，并在控制层 orchestrator 中完成窗口读编排）。
 - **保留原因**：作为“issueFromEdges/issueFromSets/fallback” 逻辑的参考实现与对照。
 
 ### `StandardMemWeightReader.{h,cc}`
 - **定位**：历史的 StandardMem 权重读取 shim（实现 `IWeightReader`）。
-- **现状**：主路径已由 `services/memory/StandardMemAccess`（纯内存） + `services/weights/WeightMemorySubsystem`（权重语义）闭环承载。
+- **现状**：主路径已由 `services/memory/StandardMemAccess`（纯内存） + `services/synapse/weights/WeightMemorySubsystem`（权重语义）闭环承载。
 - **保留原因**：兼容旧接口/旧调试口径的参考。
-
