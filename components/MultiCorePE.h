@@ -34,6 +34,8 @@
 #include "SnnPEParentInterface.h"
 #include "SnnCoreAPI.h"
 #include "OptimizedInternalRing.h"
+#include "StepActivationSubsystem.h"
+#include "NocSubsystem.h"
 
 namespace SST {
 namespace SnnDL {
@@ -316,7 +318,6 @@ public:
 private:
     // 诊断打印节流（成员化，替代函数静态）
     bool first_tick_logged_ = false;
-    bool route_diag_done_ = false;
     // P2: 参数化门控（优先参数，其次回退环境变量）
     bool sentinel_enabled_ = false;
     long step_diag_cap_cfg_ = -1;
@@ -419,12 +420,6 @@ private:
     // 本地统计：仅在环形跨核投递成功时累加
     uint64_t inter_core_messages_count_ = 0;
 
-    // === 新增：Step 注入就绪与延迟注入缓冲 ===
-    bool step_injection_ready_ = false;         // 在外部NIC完成init之后置为true
-    bool pending_step_inject_ = false;          // 是否有延迟注入待执行
-    uint32_t pending_step_seq_ = 0;             // 待注入的窗口序号
-    uint64_t pending_step_ts_ns_ = 0;           // 待注入的时间戳（ns）
-
     // PE-level per-window spikes aggregation
     std::unordered_map<uint32_t, uint64_t> window_spikes_pe_;
     std::string stage_events_csv_path_;
@@ -467,7 +462,6 @@ private:
     SST::Link* network_link_;
     
     // 内部数据结构
-    std::queue<SpikeEvent*> external_spike_queue_;
     std::unordered_map<uint64_t, SpikeEvent*> pending_memory_requests_;
     
     // 时钟计数器和测试流量
@@ -511,37 +505,10 @@ private:
         return w;
     }
 
-    // Step-level random activation injection
-    bool step_activation_enable_ = false;
-    double step_activation_fraction_ = 0.0;
-    uint32_t step_activation_fanout_ = 0;
-    uint64_t step_activation_seed_ = 0;
-    double step_activation_event_weight_ = 0.0;
-    bool step_reset_mem_each_step_ = false;
-    bool step_activation_use_bcsr_routes_ = false;
-    std::string step_activation_bcsr_template_;
-    uint32_t step_activation_bcsr_rows_per_core_ = 0;
-    uint32_t step_activation_bcsr_br_ = 0;
-    uint32_t step_activation_bcsr_bc_ = 0;
-    uint32_t step_activation_bcsr_idx_bytes_ = 2;
-    uint32_t step_activation_bcsr_val_bytes_ = 4;
-    uint64_t step_activation_bcsr_rowptr_offset_ = 0;
-    uint64_t step_activation_bcsr_colidx_offset_ = 0;
-    uint64_t step_activation_bcsr_blockdata_offset_ = 0;
-    uint64_t step_activation_bcsr_blockids_offset_ = 0;
-    double step_activation_bcsr_weight_epsilon_ = 0.0;
-    bool step_activation_log_enable_ = false;
-    std::vector<std::vector<uint32_t>> step_activation_routes_;
-    // 单PE场景下：缓存“存在至少一条出边”的 pre_global 列表，避免在所有神经元上浪费采样
-    std::vector<uint32_t> step_activation_pre_with_routes_;
-    // Step 注入调度：若 period>0，则按固定周期触发（去耦 BeginGather 时基漂移）
-    uint64_t step_activation_period_cycles_ = 0;
-    int step_activation_trigger_core_ = 0;  // BeginGather触发的核心：默认core0，-1表示任意核心
-    uint64_t step_activation_next_cycle_ = 0;
-    uint32_t step_activation_fixed_seq_ = 1;
-    uint32_t last_step_injection_seq_ = std::numeric_limits<uint32_t>::max();
-    uint32_t last_step_reset_seq_ = std::numeric_limits<uint32_t>::max();
-    uint32_t step_seq_warn_count_ = 0;  // 非单调序列告警限流
+    // Step-level random activation injection (Phase3-B): 下沉为独立子系统
+    StepActivationSubsystem step_activation_subsys_{};
+    // NoC 子系统（Phase4-A1.1）：收敛 send/recv/forward + 本地投递
+    NocSubsystem noc_subsys_{};
     void writeWindowCsv_();
     void mergeWindowMetricsFromCsv_();
     
@@ -551,16 +518,12 @@ private:
      * @brief 时钟滴答处理器
      */
     bool clockTick(SST::Cycle_t current_cycle);
+    void tickNocRing_(uint64_t current_cycle);
     
     /**
      * @brief 处理外部脉冲事件（从Link接收）
      */
     void handleExternalSpikeEvent(SST::Event* ev);
-    
-    /**
-     * @brief 从SpikeEventWrapper中提取SpikeEvent数据
-     */
-    SpikeEvent* extractSpikeFromWrapper(SpikeEventWrapper* wrapper);
     
     /**
      * @brief 处理内部脉冲路由
@@ -596,25 +559,7 @@ private:
      * @brief 向指定核心递送脉冲
      */
     void deliverSpikeToCore(int core_id, SpikeEvent* spike);
-    void injectStepActivations(uint32_t seq, uint64_t sim_time_ns);
     void resetAllCoreMembranes();
-    bool loadBcsrReachability_();
-    bool buildRoutesFromBcsrFile_(const std::string& path, uint32_t pe_id, uint32_t core_index);
-    std::string formatBcsrPath_(int pe, int core) const;
-    bool computeBcsrOffsets_(uint32_t n_block_rows, uint32_t total_blocks,
-                             uint64_t block_bytes,
-                             uint64_t& rowptr_offset, uint64_t& colidx_offset,
-                             uint64_t& blockdata_offset, uint64_t& blockids_offset) const;
-    bool checkBcsrOffsets_(uint64_t file_size, uint32_t n_block_rows,
-                           uint32_t total_blocks, uint64_t block_bytes,
-                           uint64_t& rowptr_offset, uint64_t& colidx_offset,
-                           uint64_t& blockdata_offset, uint64_t& blockids_offset) const;
-    uint64_t alignUp_(uint64_t value, uint64_t align) const;
-    void computeRouteRatios_() const;
-    bool step_activation_route_ack_logged_ = false;
-    bool step_activation_route_warned_ = false;
-    bool step_activation_build_local_only_ = true;
-    uint64_t step_activation_bcsr_align_ = 64;
     
     // === 网络端口事件处理器 ===
     
@@ -643,10 +588,7 @@ private:
      */
     void handleNetworkLinkEvent(SST::Event* event);
     
-    /**
-     * @brief 转发事件给SnnNetworkAdapter
-     */
-    void forwardEventToNetworkAdapter(SST::Event* event, const std::string& direction);
+
     
     /**
      * @brief 初始化内部互连

@@ -1,9 +1,9 @@
 // -*- c++ -*-
 //
-// SpikeCommSubsystem: fanout + 事件构造 + 传输调用
+// SynapseRouteSubsystem: 权重驱动路由构建 + 进程级共享缓存
 //
 
-#include "SpikeCommSubsystem.h"
+#include "SynapseRouteSubsystem.h"
 
 #include <algorithm>
 #include <cctype>
@@ -17,13 +17,15 @@
 #include <sstream>
 #include <unordered_set>
 
+#include <sst/core/output.h>
 #include <sst/core/statapi/stataccumulator.h>
-
-#include "SpikeEvent.h"
 
 namespace SST { namespace SnnDL {
 
-#if 0
+// Process-wide shared route cache (avoid per-core route table duplication).
+std::mutex SynapseRouteSubsystem::s_route_cache_mtx_;
+std::unordered_map<std::string, std::weak_ptr<const SynapseRouteSubsystem::RouteMap>> SynapseRouteSubsystem::s_route_cache_;
+
 namespace {
 
 constexpr uint32_t kBcsrSentinelId = 0xFFFFFFFFu;
@@ -121,7 +123,7 @@ void parseLayerMask_(const std::string& mask_in,
     }
 }
 
-std::string buildRouteCacheKey_(const SpikeCommRoutingConfig& cfg) {
+std::string buildRouteCacheKey_(const SynapseRouteBuildConfig& cfg) {
     std::ostringstream oss;
     oss << "routes-v1"
         << "-rows" << cfg.rows
@@ -148,13 +150,13 @@ std::string buildRouteCacheKey_(const SpikeCommRoutingConfig& cfg) {
     return oss.str();
 }
 
-void buildRoutesFromCandidates_(const SpikeCommRoutingConfig& cfg,
+void buildRoutesFromCandidates_(const SynapseRouteBuildConfig& cfg,
                                Output* out,
                                bool verify_routing_weights,
                                const std::unordered_map<uint32_t, std::vector<std::pair<float,uint32_t>>>& tmp,
                                uint32_t rows,
                                bool group_by_pe,
-                               SpikeCommSubsystem::RouteMap& routes_out) {
+                               SynapseRouteSubsystem::RouteMap& routes_out) {
     for (auto& kv : tmp) {
         uint32_t pre = kv.first;
         const auto& lst_in = kv.second;
@@ -279,11 +281,11 @@ void buildRoutesFromCandidates_(const SpikeCommRoutingConfig& cfg,
     }
 }
 
-bool buildRoutesFromEdgesCSV_(const SpikeCommRoutingConfig& cfg,
+bool buildRoutesFromEdgesCSV_(const SynapseRouteBuildConfig& cfg,
                              Output* out,
                              const std::unordered_set<uint32_t>& allowed_layer_edges,
                              bool allow_all_layers,
-                             SpikeCommSubsystem::RouteMap& routes_out) {
+                             SynapseRouteSubsystem::RouteMap& routes_out) {
     routes_out.clear();
     const uint32_t rows = cfg.rows;
     std::ifstream fin(cfg.mapping_edges_file);
@@ -336,13 +338,13 @@ bool buildRoutesFromEdgesCSV_(const SpikeCommRoutingConfig& cfg,
     return !routes_out.empty();
 }
 
-bool appendRoutesFromBcsrFile_(const SpikeCommRoutingConfig& cfg,
+bool appendRoutesFromBcsrFile_(const SynapseRouteBuildConfig& cfg,
                                Output* out,
                                const std::string& path,
                                uint32_t pe_index,
                                int core_index,
                                uint32_t rows_hint,
-                               SpikeCommSubsystem::RouteMap& routes_out) {
+                               SynapseRouteSubsystem::RouteMap& routes_out) {
     uint32_t rows = rows_hint;
     uint32_t cols = cfg.cols;
     uint32_t br = cfg.bcsr_br ? cfg.bcsr_br : 16;
@@ -478,9 +480,9 @@ std::string resolveBcsrTemplate_(const std::string& tmpl, uint32_t pe, int core)
     return path;
 }
 
-bool buildWeightDrivenRoutesFromBcsr_(const SpikeCommRoutingConfig& cfg,
+bool buildWeightDrivenRoutesFromBcsr_(const SynapseRouteBuildConfig& cfg,
                                      Output* out,
-                                     SpikeCommSubsystem::RouteMap& routes_out) {
+                                     SynapseRouteSubsystem::RouteMap& routes_out) {
     routes_out.clear();
     const uint32_t cores_per_pe = (cfg.cores_per_pe > 0) ? cfg.cores_per_pe : 1u;
     uint32_t rows_hint = (cores_per_pe > 0) ? static_cast<uint32_t>((cfg.rows + cores_per_pe - 1) / cores_per_pe) : cfg.rows;
@@ -504,11 +506,11 @@ bool buildWeightDrivenRoutesFromBcsr_(const SpikeCommRoutingConfig& cfg,
     return !routes_out.empty();
 }
 
-bool buildWeightDrivenRoutesDense_(const SpikeCommRoutingConfig& cfg,
+bool buildWeightDrivenRoutesDense_(const SynapseRouteBuildConfig& cfg,
                                   Output* out,
                                   const std::unordered_set<uint32_t>& allowed_layer_edges,
                                   bool allow_all_layers,
-                                  SpikeCommSubsystem::RouteMap& routes_out) {
+                                  SynapseRouteSubsystem::RouteMap& routes_out) {
     routes_out.clear();
     if (cfg.weights_template.empty()) {
         if (out) out->verbose(CALL_INFO, 1, 0, "⚠️ 路由构建失败：weights_template 未提供\n");
@@ -575,85 +577,208 @@ bool buildWeightDrivenRoutesDense_(const SpikeCommRoutingConfig& cfg,
                         uint32_t key = (la<<8) | lb;
                         if (allowed_layer_edges.find(key) == allowed_layer_edges.end()) { dropped_layer_mask++; continue; }
                     }
-                    tmp[pre_global].emplace_back(w, dest_global);
+                    tmp[pre_global].emplace_back(std::fabs(w), dest_global);
                 }
             }
         }
     }
-
-    buildRoutesFromCandidates_(cfg, out, cfg.verify_routing_weights, tmp, rows,
-                              /*group_by_pe=*/true, routes_out);
-    if (cfg.route_exclude_self_pe || !allow_all_layers) {
-        if (cfg.route_filter_warn && out) {
-            out->verbose(CALL_INFO, 1, 0,
-                "⚠️ 路由过滤已启用: exclude_self_pe=%d, layers_mask='%s' (丢弃: self_pe=%" PRIu64 ", layer_mask=%" PRIu64 ")\n",
-                cfg.route_exclude_self_pe ? 1 : 0, cfg.route_layers_mask.c_str(), dropped_self_pe, dropped_layer_mask);
-        } else if (out) {
-            out->verbose(CALL_INFO, 2, 0,
-                "路由过滤: exclude_self_pe=%d, layers_mask='%s' (丢弃: self_pe=%" PRIu64 ", layer_mask=%" PRIu64 ")\n",
-                cfg.route_exclude_self_pe ? 1 : 0, cfg.route_layers_mask.c_str(), dropped_self_pe, dropped_layer_mask);
-        }
+    buildRoutesFromCandidates_(cfg, out, cfg.verify_routing_weights, tmp, rows, /*group_by_pe=*/true, routes_out);
+    if ((cfg.route_exclude_self_pe || !allow_all_layers) && cfg.route_filter_warn && out) {
+        out->verbose(CALL_INFO, 1, 0,
+            "⚠️ 路由过滤启用: exclude_self_pe=%d, layers_mask='%s' (丢弃: self_pe=%" PRIu64 ", layer_mask=%" PRIu64 ")\n",
+            cfg.route_exclude_self_pe ? 1 : 0, cfg.route_layers_mask.c_str(), dropped_self_pe, dropped_layer_mask);
     }
     return !routes_out.empty();
 }
 
 } // namespace
-#endif
 
-void SpikeCommSubsystem::configure() {
-    route_provider_ready_ = false;
+void SynapseRouteSubsystem::configure(const SynapseRouteBuildConfig& cfg) {
+    cfg_ = cfg;
+    routing_weight_driven_active_ = false;
+    routes_shared_.reset();
+    routes_local_fallback_.clear();
+    route_summary_logged_ = false;
+    fanout_provider_ready_ = false;
+    gating_cache_.clear();
 }
 
-void SpikeCommSubsystem::bindRuntime(const SpikeCommRuntimeConfig& rt) {
-    if (rt.log) log_ = rt.log;
-    if (rt.transport) transport_ = rt.transport;
-    if (rt.synapse_route) synapse_route_ = rt.synapse_route;
-    global_neuron_base_ = rt.global_neuron_base;
-    route_provider_ready_ = false;
+void SynapseRouteSubsystem::configureGating(bool gating_event_mode,
+                                            uint64_t gating_ttl_cycles,
+                                            bool gating_scope_inputs_only) {
+    gating_event_mode_ = gating_event_mode;
+    gating_ttl_cycles_ = gating_ttl_cycles;
+    gating_scope_inputs_only_ = gating_scope_inputs_only;
 }
 
-void SpikeCommSubsystem::initRouting() {
-    route_provider_ready_ = false;
-    if (!synapse_route_) return;
-    // Phase3：fanout provider 已下沉至 Synapse/Route；SpikeComm 仅确保其初始化。
-    (void)synapse_route_->initRoutes();
-    route_provider_ready_ = true;
+void SynapseRouteSubsystem::bindRuntime(Output* log,
+                                        uint32_t node_id,
+                                        uint32_t core_id,
+                                        uint32_t num_neurons,
+                                        uint32_t neurons_per_pe_cfg,
+                                        SST::Statistics::Statistic<uint64_t>* stat_routes_entries) {
+    if (log) log_ = log;
+    node_id_ = node_id;
+    core_id_ = core_id;
+    num_neurons_ = num_neurons;
+    neurons_per_pe_cfg_ = neurons_per_pe_cfg;
+    if (stat_routes_entries) stat_routes_entries_ = stat_routes_entries;
 }
 
-void SpikeCommSubsystem::emitNeuronFire(uint32_t neuron_idx, uint64_t now_cycle) {
-    uint32_t source_global = static_cast<uint32_t>(global_neuron_base_ + neuron_idx);
-    emitCommon_(source_global, neuron_idx, now_cycle);
+void SynapseRouteSubsystem::bindFanoutStat(SST::Statistics::Statistic<uint64_t>* stat_fanout_per_spike) {
+    if (stat_fanout_per_spike) stat_fanout_per_spike_ = stat_fanout_per_spike;
 }
 
-void SpikeCommSubsystem::emitSource(uint32_t source_global, uint32_t source_local, uint64_t now_cycle) {
-    emitCommon_(source_global, source_local, now_cycle);
+bool SynapseRouteSubsystem::initRoutes() {
+    routes_shared_.reset();
+    routes_local_fallback_.clear();
+    fanout_provider_ready_ = false;
+
+    routing_weight_driven_active_ = cfg_.routing_weight_driven;
+    if (!routing_weight_driven_active_) {
+        // fixed 路由模式：无需构建 routes，但仍需配置 fanout provider。
+        configureFanoutProvider_();
+        return false;
+    }
+
+    const std::string cache_key = buildRouteCacheKey_(cfg_);
+    bool ok = false;
+    bool hit_cache = false;
+
+    if (!cache_key.empty()) {
+        std::shared_ptr<const RouteMap> hit;
+        {
+            std::lock_guard<std::mutex> g(s_route_cache_mtx_);
+            auto it = s_route_cache_.find(cache_key);
+            if (it != s_route_cache_.end()) hit = it->second.lock();
+        }
+        if (hit) {
+            routes_shared_ = hit;
+            ok = true;
+            hit_cache = true;
+            uint64_t total_entries = 0;
+            for (auto& kv : *routes_shared_) total_entries += (uint64_t)kv.second.size();
+            if (stat_routes_entries_) stat_routes_entries_->addData(total_entries);
+            if (log_) {
+                log_->verbose(CALL_INFO, 3, 0,
+                    "🔁 命中共享路由缓存: 核心%u, 源条目=%zu, 总目的=%" PRIu64 "\n",
+                    core_id_, routes_shared_->size(), total_entries);
+            }
+        }
+    }
+
+    if (!ok) {
+        std::unordered_set<uint32_t> allowed_layer_edges;
+        bool allow_all_layers = true;
+        parseLayerMask_(cfg_.route_layers_mask, allowed_layer_edges, allow_all_layers);
+
+        RouteMap built_routes;
+        if (cfg_.mapping_mode == "edges_csv" && !cfg_.mapping_edges_file.empty()) {
+            ok = buildRoutesFromEdgesCSV_(cfg_, log_, allowed_layer_edges, allow_all_layers, built_routes);
+        } else {
+            ok = buildWeightDrivenRoutesDense_(cfg_, log_, allowed_layer_edges, allow_all_layers, built_routes);
+        }
+
+        if (!ok) {
+            if (log_) {
+                log_->verbose(CALL_INFO, 1, 0,
+                    "⚠️ 核心%u权重驱动路由构建失败，将回退fixed路由\n",
+                    core_id_);
+            }
+            routing_weight_driven_active_ = false;
+        } else {
+            auto shared = std::make_shared<RouteMap>(std::move(built_routes));
+            routes_shared_ = shared;
+            uint64_t total_entries = 0;
+            for (auto& kv : *routes_shared_) total_entries += (uint64_t)kv.second.size();
+            if (stat_routes_entries_) stat_routes_entries_->addData(total_entries);
+
+            // One-shot local/remote ratio summary (per core)
+            if (cfg_.route_summary_enable && log_ && !route_summary_logged_) {
+                route_summary_logged_ = true;
+                uint64_t local_edges = 0, remote_edges = 0;
+                const uint32_t denom = (neurons_per_pe_cfg_ > 0) ? neurons_per_pe_cfg_ : num_neurons_;
+                for (const auto& kv : *routes_shared_) {
+                    for (auto post_global : kv.second) {
+                        uint32_t pe_of_post = (denom ? (post_global / denom) : 0);
+                        if (pe_of_post == node_id_) ++local_edges; else ++remote_edges;
+                    }
+                }
+                double local_ratio = (total_entries > 0) ? (double)local_edges / (double)total_entries : 0.0;
+                double remote_ratio = (total_entries > 0) ? (double)remote_edges / (double)total_entries : 0.0;
+                log_->verbose(CALL_INFO, 0, 0,
+                    "[route-summary] node=%u core=%u entries=%zu total=%" PRIu64
+                    " local=%" PRIu64 " (%.2f) remote=%" PRIu64 " (%.2f)\n",
+                    node_id_, core_id_, routes_shared_->size(), total_entries,
+                    local_edges, local_ratio, remote_edges, remote_ratio);
+            }
+
+            if (!cache_key.empty()) {
+                std::lock_guard<std::mutex> g(s_route_cache_mtx_);
+                s_route_cache_[cache_key] = shared;
+            }
+        }
+    }
+
+    if (cfg_.route_summary_enable && log_) {
+        logRoutingSummary_("init", routing_weight_driven_active_ ? (hit_cache ? "active(cache)" : "active") : "fallback_fixed");
+    }
+
+    configureFanoutProvider_();
+    return routing_weight_driven_active_;
 }
 
-void SpikeCommSubsystem::emitCommon_(uint32_t source_global, uint32_t source_local, uint64_t now_cycle) {
-    if (!transport_ || !route_provider_ready_ || !synapse_route_) return;
-    std::vector<ISynapseRoute::FanoutEntry> fanouts;
-    bool applied_gating = false;
-    synapse_route_->computeFanout(source_global, source_local, now_cycle, fanouts, applied_gating);
-    if (fanouts.empty()) return;
+void SynapseRouteSubsystem::computeFanout(uint32_t source_global, uint32_t neuron_idx,
+                                          uint64_t now_cycles,
+                                          std::vector<FanoutEntry>& out_entries,
+                                          bool& applied_gating) const {
+    out_entries.clear();
+    applied_gating = false;
+    if (!fanout_provider_ready_) return;
+    fanout_provider_.computeFanout(source_global, neuron_idx, now_cycles, out_entries, applied_gating);
+}
 
-    for (const auto& fe : fanouts) {
-        auto* ev = new SpikeEvent(
-            source_global,
-            fe.dest_global,
-            fe.dest_node,
-            /*weight=*/1.0,
-            now_cycle);
-        // 传输层接管生命周期
-        transport_->send(ev);
+void SynapseRouteSubsystem::applyGatingDecision(uint32_t src_global,
+                                                const std::vector<uint32_t>& dest_pes,
+                                                uint64_t current_cycle,
+                                                uint64_t ttl_cycles) {
+    if (!gating_event_mode_) return;
+    GatingEntry e;
+    e.dest_pes = dest_pes;
+    e.expire_cycle = current_cycle + (ttl_cycles ? ttl_cycles : gating_ttl_cycles_);
+    gating_cache_[src_global] = std::move(e);
+    if (log_) {
+        log_->verbose(CALL_INFO, 3, 0,
+            "📥 应用门控: src_g=%u, k=%zu, expire=%" PRIu64 "\n",
+            src_global, dest_pes.size(), gating_cache_[src_global].expire_cycle);
     }
 }
 
-void SpikeCommSubsystem::applyGatingDecision(uint32_t src_global,
-                                             const std::vector<uint32_t>& dest_pes,
-                                             uint64_t current_cycle,
-                                             uint64_t ttl_cycles) {
-    if (!synapse_route_) return;
-    synapse_route_->applyGatingDecision(src_global, dest_pes, current_cycle, ttl_cycles);
+void SynapseRouteSubsystem::configureFanoutProvider_() {
+    SnnRouteProvider::Config cfg{};
+    cfg.routing_weight_driven = routing_weight_driven_active_;
+    cfg.log_weight_details = cfg_.log_weight_details;
+    cfg.num_neurons = num_neurons_;
+    cfg.neurons_per_pe_cfg = neurons_per_pe_cfg_;
+    cfg.node_id = node_id_;
+    cfg.gating_event_mode = gating_event_mode_;
+    cfg.gating_scope_inputs_only = gating_scope_inputs_only_;
+    cfg.gating_cache = &gating_cache_;
+    cfg.out = log_;
+    cfg.stat_fanout = stat_fanout_per_spike_;
+
+    fanout_provider_.configure(cfg, routes_shared_, &routes_local_fallback_);
+    fanout_provider_ready_ = true;
+}
+
+void SynapseRouteSubsystem::logRoutingSummary_(const char* phase, const char* reason) const {
+    if (!(cfg_.route_summary_enable && log_)) return;
+    const size_t shared_entries = routes_shared_ ? routes_shared_->size() : 0;
+    const size_t local_entries = shared_entries ? 0 : routes_local_fallback_.size();
+    log_->verbose(CALL_INFO, 0, 0,
+        "[route-summary][%s] node=%u core=%u routes_shared=%zu routes_local=%zu %s\n",
+        phase ? phase : "-", node_id_, core_id_, shared_entries, local_entries,
+        reason ? reason : "");
 }
 
 }} // namespace SST::SnnDL

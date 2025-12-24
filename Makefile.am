@@ -23,6 +23,9 @@ libSnnDL_la_SOURCES = \
 	api/SnnInterface.h \
 	api/SnnPEParentInterface.h \
 	api/ISpikeTransport.h \
+	api/IMemoryAccess.h \
+	api/ISynapseRoute.h \
+	api/SynapseRouteBuildConfig.h \
 	api/SnnWeightReader.h \
 	events/GatingDecisionEvent.h \
 	events/SimpleTestEvent.cc \
@@ -90,6 +93,12 @@ libSnnDL_la_SOURCES = \
 	services/SnnProfiler.h \
 	services/SnnRouteProvider.cc \
 	services/SnnRouteProvider.h \
+	services/SynapseRouteSubsystem.cc \
+	services/SynapseRouteSubsystem.h \
+	services/StepActivationSubsystem.cc \
+	services/StepActivationSubsystem.h \
+	services/NocSubsystem.cc \
+	services/NocSubsystem.h \
 	services/WeightAccessor.cc \
 	services/WeightAccessor.h \
 	services/WeightCacheOps.cc \
@@ -98,6 +107,8 @@ libSnnDL_la_SOURCES = \
 	services/WeightMemorySubsystem.h \
 	services/SpikeCommSubsystem.cc \
 	services/SpikeCommSubsystem.h \
+	services/StandardMemAccess.cc \
+	services/StandardMemAccess.h \
 	services/StandardMemBackend.cc \
 	services/StandardMemBackend.h
 

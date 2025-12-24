@@ -14,6 +14,7 @@
 #include "GatherBufferIF.h"
 #include "WeightMemorySubsystem.h"
 #include "StandardMemBackend.h"
+#include "StandardMemAccess.h"
 #include "ISpikeTransport.h"
 #include "SpikeCommSubsystem.h"
 
@@ -517,7 +518,7 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
         neurons_per_pe_cfg_ = computed_neurons_per_pe;
     }
 
-    // 读取门控事件参数（Phase D：门控缓存归入 SpikeCommSubsystem）
+    // 读取门控事件参数（Phase3：门控缓存归入 Synapse/Route）
     const std::string gating_mode = params.find<std::string>("gating_mode", "off");
     const uint64_t gating_ttl_cycles = params.find<uint64_t>("gating_ttl_cycles", 1000);
     const std::string gating_scope = params.find<std::string>("gating_scope", "inputs");
@@ -559,12 +560,11 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     comm_routing.bcsr_blockdata_addr = bcsr_blockdata_addr_;
     comm_routing.bcsr_blockids_addr = bcsr_blockids_addr_;
 
-    SpikeCommGatingConfig comm_gating{};
-    comm_gating.gating_event_mode = (gating_mode == "event");
-    comm_gating.gating_ttl_cycles = gating_ttl_cycles;
-    comm_gating.gating_scope_inputs_only = (gating_scope != "all");
-
-    spike_comm_.configure(comm_routing, comm_gating);
+    synapse_route_.configure(comm_routing);
+    synapse_route_.configureGating(/*gating_event_mode=*/(gating_mode == "event"),
+                                   /*gating_ttl_cycles=*/gating_ttl_cycles,
+                                   /*gating_scope_inputs_only=*/(gating_scope != "all"));
+    spike_comm_.configure();
     
     // 获取权重文件路径
     weights_file_path_ = params.find<std::string>("weights_file", "");
@@ -690,6 +690,13 @@ void SnnPESubComponent::activityFlush_() {
     activityReset_();
 }
 
+size_t SnnPESubComponent::pendingMemSize_() const {
+    size_t n = 0;
+    if (mem_backend_) n += mem_backend_->pendingSize();
+    if (stdmem_access_) n += stdmem_access_->pendingSize();
+    return n;
+}
+
 void SnnPESubComponent::setParentInterface(SnnPEParentInterface* parent) {
     parent_ = parent;
     parent_pe_cached_ = dynamic_cast<MultiCorePE*>(parent);
@@ -700,16 +707,18 @@ void SnnPESubComponent::setParentInterface(SnnPEParentInterface* parent) {
         spike_transport_->setParent(parent_);
     }
     // 绑定通信子系统运行时依赖（路由表将在 init(phase0) 中构建/注入）
+    synapse_route_.bindRuntime(output_,
+                               static_cast<uint32_t>(node_id_),
+                               static_cast<uint32_t>(core_id_),
+                               static_cast<uint32_t>(num_neurons_),
+                               static_cast<uint32_t>(neurons_per_pe_cfg_),
+                               stat_routes_entries_);
+    synapse_route_.bindFanoutStat(stat_fanout_per_spike_);
     SpikeCommRuntimeConfig rt{};
     rt.log = output_;
     rt.transport = spike_transport_.get();
-    rt.node_id = static_cast<uint32_t>(node_id_);
-    rt.core_id = static_cast<uint32_t>(core_id_);
+    rt.synapse_route = &synapse_route_;
     rt.global_neuron_base = static_cast<uint64_t>(global_neuron_base_);
-    rt.num_neurons = num_neurons_;
-    rt.neurons_per_pe_cfg = neurons_per_pe_cfg_;
-    rt.stat_fanout = stat_fanout_per_spike_;
-    rt.stat_routes_entries = stat_routes_entries_;
     spike_comm_.bindRuntime(rt);
     spike_comm_ready_ = spike_comm_.ready();
 }
@@ -867,9 +876,12 @@ void SnnPESubComponent::init(unsigned int phase) {
             if (!mem_backend_) {
                 mem_backend_ = std::make_unique<StandardMemBackend>(memory_);
             }
-            // Phase E: StandardMem 后端绑定到 WeightMemorySubsystem（pending/回调/解析闭环下沉）。
+            if (!stdmem_access_) {
+                stdmem_access_ = std::make_unique<StandardMemAccess>(memory_, output_, node_id_, core_id_);
+            }
+            // Phase1: 通过纯内存接口绑定到 WeightMemorySubsystem（语义留在子系统）。
             if (weight_mem_subsystem_) {
-                weight_mem_subsystem_->bindStandardMem(memory_);
+                weight_mem_subsystem_->bindMemory(stdmem_access_.get());
             }
             // output_->verbose(CALL_INFO, 1, 0, "✅ 核心%d加载StandardMem成功\n", core_id_);
             // 若已成功加载 StandardMem 子组件，则认为内存就绪（即使未显式提供 memory_link_）
@@ -889,23 +901,26 @@ void SnnPESubComponent::init(unsigned int phase) {
             }
         } else {
             // output_->verbose(CALL_INFO, 1, 0, "⚠️ 核心%d未加载StandardMem，将使用默认权重\n", core_id_);
+            stdmem_access_.reset();
             if (weight_mem_subsystem_) {
-                weight_mem_subsystem_->bindStandardMem(nullptr);
+                weight_mem_subsystem_->bindMemory(nullptr);
             }
         }
 
         // 通信子系统：构建/复用路由表并配置内部 route provider
         {
+            synapse_route_.bindRuntime(output_,
+                                       static_cast<uint32_t>(node_id_),
+                                       static_cast<uint32_t>(core_id_),
+                                       static_cast<uint32_t>(num_neurons_),
+                                       static_cast<uint32_t>(neurons_per_pe_cfg_),
+                                       stat_routes_entries_);
+            synapse_route_.bindFanoutStat(stat_fanout_per_spike_);
             SpikeCommRuntimeConfig rt{};
             rt.log = output_;
             rt.transport = spike_transport_.get();
-            rt.node_id = static_cast<uint32_t>(node_id_);
-            rt.core_id = static_cast<uint32_t>(core_id_);
+            rt.synapse_route = &synapse_route_;
             rt.global_neuron_base = static_cast<uint64_t>(global_neuron_base_);
-            rt.num_neurons = num_neurons_;
-            rt.neurons_per_pe_cfg = neurons_per_pe_cfg_;
-            rt.stat_fanout = stat_fanout_per_spike_;
-            rt.stat_routes_entries = stat_routes_entries_;
             spike_comm_.bindRuntime(rt);
             spike_comm_.initRouting();
             spike_comm_ready_ = spike_comm_.ready();

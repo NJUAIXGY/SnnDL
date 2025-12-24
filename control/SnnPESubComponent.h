@@ -30,14 +30,17 @@
 #include "WeightAccessor.h"
 #include "WeightMemorySubsystem.h"
 #include "StandardMemBackend.h"
+#include "IMemoryAccess.h"
 #include "ISpikeTransport.h"
 #include "SpikeCommSubsystem.h"
+#include "SynapseRouteSubsystem.h"
 
 namespace SST {
 namespace SnnDL {
 
 class MultiCorePE; // forward declaration for parent cast
 class GatherBufferIF;
+class StandardMemAccess;
 struct GasOpData;
 class GasPhaseController;
 
@@ -238,6 +241,8 @@ private:
     WeightMemorySubsystem* weight_mem_subsystem_ = nullptr;
     // 通信子系统：封装 Spike 事件构造与传输
     std::unique_ptr<ParentSpikeTransport> spike_transport_;
+    // Synapse/Route：权重驱动路由构建 + 共享缓存（Phase2）
+    SynapseRouteSubsystem synapse_route_;
     SpikeCommSubsystem spike_comm_;
     bool spike_comm_ready_ = false;
     inline void applySynapticDelta_(uint32_t idx, float dv) {
@@ -434,9 +439,7 @@ private:
     // 核心输出统一路由：控制层不再直接 fire，每拍/每窗调用 endCycle+drainOutputs 后集中路由
     void drainCoreOutputsAndRoute_(uint64_t now_cycle);
     uint64_t routeAndSendOutputs_(const std::vector<FireEvent>& fired);
-    inline size_t pendingMemSize_() const {
-        return mem_backend_ ? mem_backend_->pendingSize() : 0;
-    }
+    size_t pendingMemSize_() const;
     // === 窗口读计数下沉到 WeightMemorySubsystem ===
     inline void windowStateConfigure_() {
         if (weight_mem_subsystem_) {
@@ -477,6 +480,7 @@ private:
     Output* output_;
     SST::Interfaces::StandardMem* memory_;
     std::unique_ptr<StandardMemBackend> mem_backend_;
+    std::unique_ptr<StandardMemAccess> stdmem_access_;
     GatherBufferIF* gather_buffer_if_ = nullptr;
     bool manual_window_tick_logged_ = false;
     bool clock_tick_logged_ = false;

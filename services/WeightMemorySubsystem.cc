@@ -55,6 +55,23 @@ void WeightMemorySubsystem::onClockTick(uint64_t now_cycle) {
     maybeIssueBcsrRowptrPrefetch_();
 }
 
+uint64_t WeightMemorySubsystem::issueRead_(PendingMeta meta) {
+    if (!mem_access_ || meta.size == 0) {
+        if (meta.has_single_cb && meta.single_cb) meta.single_cb(0.0f);
+        return 0;
+    }
+    if (orch_.report_mem_issue) {
+        orch_.report_mem_issue(meta.size, meta.count_weight_read);
+    }
+    const uint64_t addr = meta.address;
+    const size_t bytes = meta.size;
+    return mem_access_->read(
+        addr, bytes,
+        [this, meta = std::move(meta)](uint64_t req_id, uint64_t resp_addr, std::vector<uint8_t>&& data) mutable {
+            handleReadResp_(req_id, resp_addr, std::move(meta), std::move(data));
+        });
+}
+
 bool WeightMemorySubsystem::prepareDenseRead_(uint32_t row, uint32_t col, uint32_t width,
                                              uint64_t& req_addr, size_t& req_size,
                                              bool& is_row, uint32_t& col_start, uint32_t& count_floats) const {
@@ -115,7 +132,7 @@ bool WeightMemorySubsystem::prepareDenseRead_(uint32_t row, uint32_t col, uint32
 
 void WeightMemorySubsystem::issueDenseResolved_(uint32_t row, uint32_t col, uint32_t cb_col,
                                                std::function<void(float)> cb) {
-    if (!mem_backend_) {
+    if (!mem_access_) {
         if (cb) cb(orch_.init_default_weight);
         return;
     }
@@ -132,7 +149,7 @@ void WeightMemorySubsystem::issueDenseResolved_(uint32_t row, uint32_t col, uint
     uint32_t count_floats = 1;
     (void)prepareDenseRead_(row, col, width, req_addr, req_size, is_row, col_start, count_floats);
 
-    MemRequestMeta meta{};
+    PendingMeta meta{};
     meta.address = req_addr;
     meta.size = req_size;
     meta.is_row = is_row;
@@ -145,19 +162,16 @@ void WeightMemorySubsystem::issueDenseResolved_(uint32_t row, uint32_t col, uint
     meta.issue_cycle = now_cycle_;
     meta.bcsr_kind = 0;
     meta.is_weight = (req_addr >= orch_.base_addr && req_addr < orch_.weight_region_end);
-
-    if (orch_.report_mem_issue) {
-        orch_.report_mem_issue(req_size, /*count_weight_read*/true);
-    }
-    mem_backend_->sendRead(req_addr, req_size, meta);
+    meta.count_weight_read = true;
+    (void)issueRead_(std::move(meta));
 }
 
 bool WeightMemorySubsystem::issueDensePrefetchRaw(uint64_t req_addr, size_t req_size,
                                                   uint32_t row, uint32_t col_start, uint32_t count_floats,
                                                   bool scheme1_prefetch) {
-    if (!mem_backend_) return false;
+    if (!mem_access_) return false;
     if (req_size == 0) return false;
-    MemRequestMeta meta{};
+    PendingMeta meta{};
     meta.address = req_addr;
     meta.size = req_size;
     meta.is_row = false;
@@ -169,12 +183,9 @@ bool WeightMemorySubsystem::issueDensePrefetchRaw(uint64_t req_addr, size_t req_
     meta.issue_cycle = now_cycle_;
     meta.bcsr_kind = 0;
     meta.is_weight = (req_addr >= orch_.base_addr && req_addr < orch_.weight_region_end);
+    meta.count_weight_read = true;
     meta.scheme1_prefetch = scheme1_prefetch;
-    if (orch_.report_mem_issue) {
-        orch_.report_mem_issue(req_size, /*count_weight_read*/true);
-    }
-    mem_backend_->sendRead(req_addr, req_size, meta);
-    return true;
+    return issueRead_(std::move(meta)) != 0;
 }
 
 void WeightMemorySubsystem::requestDense_(uint32_t pre, uint32_t post, std::function<void(float)> cb) {
@@ -214,7 +225,7 @@ void WeightMemorySubsystem::requestBCSR_(uint32_t pre_global, uint32_t post_loca
         if (cb) cb(0.0f);
         return;
     }
-    if (!mem_backend_) {
+    if (!mem_access_) {
         if (cb) cb(0.0f);
         return;
     }
@@ -255,7 +266,7 @@ void WeightMemorySubsystem::requestBCSR_(uint32_t pre_global, uint32_t post_loca
         size_t req_size = bytes;
         size_t slice_off = 0;
         prepareAlignedRead(addr, bytes, orch_.line_size_bytes, req_addr, req_size, slice_off);
-        MemRequestMeta meta{};
+        PendingMeta meta{};
         meta.address = req_addr;
         meta.size = req_size;
         meta.orig_address = addr;
@@ -271,6 +282,7 @@ void WeightMemorySubsystem::requestBCSR_(uint32_t pre_global, uint32_t post_loca
         meta.has_single_cb = (cb != nullptr);
         meta.single_cb = std::move(cb);
         meta.is_weight = true; // 归类为权重域（延迟分组）
+        meta.count_weight_read = false;
         // 诊断：colidx 读取发起地址/跨度
         static int dbg_colidx_issue = 0;
         if (diag_out_ && diag_node_id_ == 0 && dbg_colidx_issue < 64) {
@@ -282,10 +294,7 @@ void WeightMemorySubsystem::requestBCSR_(uint32_t pre_global, uint32_t post_loca
                 block_col, intra_row, intra_col);
             ++dbg_colidx_issue;
         }
-        if (orch_.report_mem_issue) {
-            orch_.report_mem_issue(req_size, /*count_weight_read*/false);
-        }
-        mem_backend_->sendRead(req_addr, req_size, meta);
+        (void)issueRead_(std::move(meta));
         return;
     }
 
@@ -318,7 +327,7 @@ void WeightMemorySubsystem::requestBCSR_(uint32_t pre_global, uint32_t post_loca
     size_t req_size = block_bytes;
     size_t slice_off = 0;
     prepareAlignedRead(addr, block_bytes, orch_.line_size_bytes, req_addr, req_size, slice_off);
-    MemRequestMeta meta{};
+    PendingMeta meta{};
     meta.address = req_addr;
     meta.size = req_size;
     meta.orig_address = addr;
@@ -336,6 +345,7 @@ void WeightMemorySubsystem::requestBCSR_(uint32_t pre_global, uint32_t post_loca
     meta.has_single_cb = (cb != nullptr);
     meta.single_cb = std::move(cb);
     meta.is_weight = true;
+    meta.count_weight_read = true;
     // 诊断：blockdata 读取发起地址/跨度
     static int dbg_block_issue = 0;
     if (diag_out_ && diag_node_id_ == 0 && dbg_block_issue < 64) {
@@ -347,15 +357,12 @@ void WeightMemorySubsystem::requestBCSR_(uint32_t pre_global, uint32_t post_loca
             intra_row, intra_col, start, idx_in_row);
         ++dbg_block_issue;
     }
-    if (orch_.report_mem_issue) {
-        orch_.report_mem_issue(req_size, /*count_weight_read*/true);
-    }
-    mem_backend_->sendRead(req_addr, req_size, meta);
+    (void)issueRead_(std::move(meta));
 }
 
 void WeightMemorySubsystem::maybeIssueBcsrRowptrPrefetch_() {
     if (!orch_.use_bcsr || !orch_.bcsr_mgr) return;
-    if (!mem_backend_) return;
+    if (!mem_access_) return;
     if (orch_.bcsr_mgr->isRowptrReady()) return;
     if (orch_.bcsr_mgr->isRowptrReadPending()) return;
     if (now_cycle_ < orch_.memory_warmup_cycles) return;
@@ -370,7 +377,7 @@ void WeightMemorySubsystem::maybeIssueBcsrRowptrPrefetch_() {
     size_t slice_off = 0;
     prepareAlignedRead(addr, bytes, orch_.line_size_bytes, req_addr, req_size, slice_off);
 
-    MemRequestMeta meta{};
+    PendingMeta meta{};
     meta.address = req_addr;
     meta.size = req_size;
     meta.orig_address = addr;
@@ -379,6 +386,7 @@ void WeightMemorySubsystem::maybeIssueBcsrRowptrPrefetch_() {
     meta.issue_cycle = now_cycle_;
     meta.bcsr_kind = 1;
     meta.is_weight = true;
+    meta.count_weight_read = false;
     if (diag_out_) {
         diag_out_->verbose(CALL_INFO, 0, 0,
             "[diag-bcsr-rowptr-issue] node=%d core=%d addr=0x%llx bytes=%zu aligned=(0x%llx,%zu off=%zu) nBlockRows=%u\n",
@@ -387,18 +395,16 @@ void WeightMemorySubsystem::maybeIssueBcsrRowptrPrefetch_() {
             (unsigned long long)req_addr, req_size, slice_off,
             nBlockRows);
     }
-    if (orch_.report_mem_issue) {
-        orch_.report_mem_issue(req_size, /*count_weight_read*/false);
+    if (issueRead_(std::move(meta)) != 0) {
+        orch_.bcsr_mgr->setRowptrReadPending(true);
     }
-    mem_backend_->sendRead(req_addr, req_size, meta);
-    orch_.bcsr_mgr->setRowptrReadPending(true);
 }
 
 void WeightMemorySubsystem::bcsrPrefetchAll_() {
     if (!orch_.use_bcsr || !orch_.bcsr_mgr) return;
     if (!orch_.bcsr_prefetch_all) return;
     if (bcsr_prefetch_issued_) return;
-    if (!mem_backend_) return;
+    if (!mem_access_) return;
     if (!orch_.bcsr_mgr->isRowptrReady()) return;
 
     const uint32_t br = orch_.bcsr_mgr->effectiveBlockRows();
@@ -422,7 +428,7 @@ void WeightMemorySubsystem::bcsrPrefetchAll_() {
         size_t req_size = bytes;
         size_t slice_off = 0;
         prepareAlignedRead(addr, bytes, orch_.line_size_bytes, req_addr, req_size, slice_off);
-        MemRequestMeta meta{};
+        PendingMeta meta{};
         meta.address = req_addr;
         meta.size = req_size;
         meta.orig_address = addr;
@@ -435,17 +441,15 @@ void WeightMemorySubsystem::bcsrPrefetchAll_() {
         meta.bcsr_prefetch_all = true;
         meta.bcsr_target_block_col = UINT32_MAX;
         meta.is_weight = true;
-        if (orch_.report_mem_issue) {
-            orch_.report_mem_issue(req_size, /*count_weight_read*/false);
-        }
-        mem_backend_->sendRead(req_addr, req_size, meta);
+        meta.count_weight_read = false;
+        (void)issueRead_(std::move(meta));
     }
     bcsr_prefetch_issued_ = true;
 }
 
 void WeightMemorySubsystem::bcsrPrefetchRowBlocks_(uint32_t block_row, const std::vector<uint32_t>& cols, uint32_t row_start) {
     if (!orch_.use_bcsr || !orch_.bcsr_mgr) return;
-    if (!mem_backend_) return;
+    if (!mem_access_) return;
     const size_t block_bytes = orch_.bcsr_mgr->blockBytes();
     for (size_t i = 0; i < cols.size(); ++i) {
         uint32_t block_col = cols[i];
@@ -456,7 +460,7 @@ void WeightMemorySubsystem::bcsrPrefetchRowBlocks_(uint32_t block_row, const std
         size_t req_size = block_bytes;
         size_t slice_off = 0;
         prepareAlignedRead(addr, block_bytes, orch_.line_size_bytes, req_addr, req_size, slice_off);
-        MemRequestMeta meta{};
+        PendingMeta meta{};
         meta.address = req_addr;
         meta.size = req_size;
         meta.orig_address = addr;
@@ -471,10 +475,8 @@ void WeightMemorySubsystem::bcsrPrefetchRowBlocks_(uint32_t block_row, const std
         meta.bcsr_global_block_index = global_block_index;
         meta.bcsr_prefetch_all = true;
         meta.is_weight = true;
-        if (orch_.report_mem_issue) {
-            orch_.report_mem_issue(req_size, /*count_weight_read*/true);
-        }
-        mem_backend_->sendRead(req_addr, req_size, meta);
+        meta.count_weight_read = true;
+        (void)issueRead_(std::move(meta));
     }
 }
 
@@ -503,18 +505,9 @@ void WeightMemorySubsystem::bcsrPopulateWeightCache_(uint32_t block_row, uint32_
     }
 }
 
-bool WeightMemorySubsystem::handleMemoryResponse(SST::Interfaces::StandardMem::Request* req) {
-    if (!req) return true;
-    if (!mem_backend_) {
-        delete req;
-        return true;
-    }
-
-    MemRequestMeta meta{};
-    if (!mem_backend_->popPending(req->getID(), meta)) {
-        // 非本子系统发起的响应：交由上层处理（保持 legacy/其它子系统兼容）
-        return false;
-    }
+void WeightMemorySubsystem::handleReadResp_(uint64_t req_id, uint64_t addr, PendingMeta meta, std::vector<uint8_t>&& data) {
+    (void)req_id;
+    meta.address = addr;
 
     if (orch_.report_mem_latency && now_cycle_ >= meta.issue_cycle) {
         orch_.report_mem_latency(static_cast<uint64_t>(now_cycle_ - meta.issue_cycle), meta.is_weight);
@@ -523,13 +516,7 @@ bool WeightMemorySubsystem::handleMemoryResponse(SST::Interfaces::StandardMem::R
         orch_.on_scheme1_prefetch_resp();
     }
 
-    auto* readResp = dynamic_cast<SST::Interfaces::StandardMem::ReadResp*>(req);
-    if (!readResp) {
-        delete req;
-        return true;
-    }
-
-    const std::vector<uint8_t>& bytes = readResp->data;
+    const std::vector<uint8_t>& bytes = data;
     const size_t float_count = bytes.size() / sizeof(float);
     const float* fptr = (float_count > 0) ? reinterpret_cast<const float*>(bytes.data()) : nullptr;
 
@@ -555,27 +542,24 @@ bool WeightMemorySubsystem::handleMemoryResponse(SST::Interfaces::StandardMem::R
                 }
             }
         }
-        delete req;
-        return true;
+        return;
     }
+
     if (meta.bcsr_kind == 2) {
         // colidx
         if (!orch_.bcsr_mgr) {
             if (meta.has_single_cb && meta.single_cb) meta.single_cb(0.0f);
-            delete req;
-            return true;
+            return;
         }
         if (bytes.size() < meta.size) {
             if (meta.has_single_cb && meta.single_cb) meta.single_cb(0.0f);
-            delete req;
-            return true;
+            return;
         }
         const size_t slice_off = meta.slice_offset;
         const size_t slice_len = meta.orig_size ? meta.orig_size : meta.size;
         if (bytes.size() < slice_off + slice_len) {
             if (meta.has_single_cb && meta.single_cb) meta.single_cb(0.0f);
-            delete req;
-            return true;
+            return;
         }
         const uint8_t* slice = bytes.data() + slice_off;
         const uint32_t idx_bytes = orch_.bcsr_mgr->effectiveIdxBytes();
@@ -615,8 +599,7 @@ bool WeightMemorySubsystem::handleMemoryResponse(SST::Interfaces::StandardMem::R
         (void)orch_.bcsr_mgr->rowIndexGet(meta.bcsr_block_row, cached_cols);
         if (meta.bcsr_prefetch_all) {
             bcsrPrefetchRowBlocks_(meta.bcsr_block_row, cached_cols, meta.bcsr_row_start);
-            delete req;
-            return true;
+            return;
         }
 
         uint32_t idx_in_row = 0;
@@ -630,8 +613,7 @@ bool WeightMemorySubsystem::handleMemoryResponse(SST::Interfaces::StandardMem::R
         }
         if (!found) {
             if (meta.has_single_cb && meta.single_cb) meta.single_cb(0.0f);
-            delete req;
-            return true;
+            return;
         }
         std::vector<float> blk;
         if (orch_.bcsr_mgr->blockGet(meta.bcsr_block_row, meta.bcsr_target_block_col, blk)) {
@@ -639,21 +621,20 @@ bool WeightMemorySubsystem::handleMemoryResponse(SST::Interfaces::StandardMem::R
             const uint32_t off = meta.bcsr_intra_row * bc + meta.bcsr_intra_col;
             float w = (off < blk.size()) ? blk[off] : 0.0f;
             if (meta.has_single_cb && meta.single_cb) meta.single_cb(applyWeightGuards(orch_, w));
-            delete req;
-            return true;
+            return;
         }
         const uint32_t start = meta.bcsr_row_start;
         const uint32_t global_block_index = start + idx_in_row;
         const size_t block_bytes = orch_.bcsr_mgr->blockBytes();
-        const uint64_t addr = orch_.bcsr_mgr->blockDataAddr(global_block_index);
-        uint64_t req_addr = addr;
+        const uint64_t block_addr = orch_.bcsr_mgr->blockDataAddr(global_block_index);
+        uint64_t req_addr = block_addr;
         size_t req_size = block_bytes;
         size_t slice_off2 = 0;
-        prepareAlignedRead(addr, block_bytes, orch_.line_size_bytes, req_addr, req_size, slice_off2);
-        MemRequestMeta next{};
+        prepareAlignedRead(block_addr, block_bytes, orch_.line_size_bytes, req_addr, req_size, slice_off2);
+        PendingMeta next{};
         next.address = req_addr;
         next.size = req_size;
-        next.orig_address = addr;
+        next.orig_address = block_addr;
         next.orig_size = block_bytes;
         next.slice_offset = slice_off2;
         next.issue_cycle = now_cycle_;
@@ -666,21 +647,18 @@ bool WeightMemorySubsystem::handleMemoryResponse(SST::Interfaces::StandardMem::R
         next.bcsr_idx_in_row = idx_in_row;
         next.bcsr_global_block_index = global_block_index;
         next.has_single_cb = meta.has_single_cb;
-        next.single_cb = meta.single_cb;
+        next.single_cb = std::move(meta.single_cb);
         next.is_weight = true;
-        if (orch_.report_mem_issue) {
-            orch_.report_mem_issue(req_size, /*count_weight_read*/true);
-        }
-        mem_backend_->sendRead(req_addr, req_size, next);
-        delete req;
-        return true;
+        next.count_weight_read = true;
+        (void)issueRead_(std::move(next));
+        return;
     }
+
     if (meta.bcsr_kind == 3) {
         // block data
         if (!orch_.bcsr_mgr) {
             if (meta.has_single_cb && meta.single_cb) meta.single_cb(0.0f);
-            delete req;
-            return true;
+            return;
         }
         const uint32_t br = orch_.bcsr_mgr->effectiveBlockRows();
         const uint32_t bc = orch_.bcsr_mgr->effectiveBlockCols();
@@ -727,8 +705,7 @@ bool WeightMemorySubsystem::handleMemoryResponse(SST::Interfaces::StandardMem::R
                 meta.single_cb(applyWeightGuards(orch_, w));
             }
         }
-        delete req;
-        return true;
+        return;
     }
 
     // ---- Dense ----
@@ -757,7 +734,4 @@ bool WeightMemorySubsystem::handleMemoryResponse(SST::Interfaces::StandardMem::R
         if (orch_.readresp_zero_fallback && w == 0.0f) w = orch_.init_default_weight;
         meta.single_cb(w);
     }
-
-    delete req;
-    return true;
 }

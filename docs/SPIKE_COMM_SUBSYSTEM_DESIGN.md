@@ -126,20 +126,24 @@ private:
 接口要点（已落地的当前代码形态，简化）：
 
 ```cpp
-struct SpikeCommRoutingConfig { /* weights_template/topk/epsilon/mapping/BCSR/... */ };
-struct SpikeCommGatingConfig  { /* event_mode/ttl/scope */ };
-struct SpikeCommRuntimeConfig { /* log/transport/node/core/global_base/stats */ };
+struct SpikeCommRuntimeConfig {
+    Output* log = nullptr;
+    ISpikeTransport* transport = nullptr;
+    ISynapseRoute* synapse_route = nullptr;
+    uint64_t global_neuron_base = 0;
+};
 
 class SpikeCommSubsystem {
 public:
-    void configure(const SpikeCommRoutingConfig& routing_cfg,
-                   const SpikeCommGatingConfig& gating_cfg);
+    // Phase3：通信层退化为 transport façade；路由/fanout/gating 委托 Synapse/Route
+    void configure();
     void bindRuntime(const SpikeCommRuntimeConfig& rt);
-    void initRouting(); // 构建/复用共享路由表，并配置内部 fanout provider
+    void initRouting(); // 委托 synapse_route->initRoutes()（幂等）
 
     void emitNeuronFire(uint32_t neuron_idx, uint64_t now_cycle);
     void emitSource(uint32_t source_global, uint32_t source_local, uint64_t now_cycle);
 
+    // 门控决策同样委托给 Synapse/Route
     void applyGatingDecision(uint32_t src_global,
                              const std::vector<uint32_t>& dest_pes,
                              uint64_t current_cycle,
@@ -147,14 +151,12 @@ public:
 };
 ```
 
-实现要点（Phase D）：
-- `configure()` 仅保存配置；`initRouting()` 才执行路由表构建/共享缓存注入（避免构造期做重活）。
-- 子系统内部组合 `SnnRouteProvider`：
-  - 路由表构建与共享缓存（进程级）在 `SpikeCommSubsystem` 内部完成，控制层不再持有 `routes_*`/cache key/层掩码解析等状态；
-  - `SnnRouteProvider::computeFanout()` 只依赖“已配置的路由表 + gating_cache”，复用原 fanout 语义。
-- `emitNeuronFire()` 内部：`source_global = global_neuron_base + neuron_idx`，并统一走 `emitCommon_()`：
-  - 先 fanout，再逐条 `new SpikeEvent(...)`，最后 `transport->send(...)`（transport 接管生命周期）。
-- 路由共享缓存 key：保持 v1 语义，且不包含 `(pe,core)` 维度，避免重复构建导致的 RSS/构建耗时爆炸。
+实现要点（Phase3：fanout/gating 下沉至 Synapse/Route）：
+- `SpikeCommSubsystem` 不再持有路由构建参数、不再维护 fanout provider、不再缓存 gating 状态；其唯一职责是：
+  - 调用 `synapse_route_->computeFanout(...)` 得到目的集合
+  - 构造 `SpikeEvent` 并 `transport_->send(ev)`（传输层接管生命周期）
+- `initRouting()`：仅确保 `synapse_route_->initRoutes()` 已完成（幂等）。
+- `applyGatingDecision()`：直接委托 `synapse_route_->applyGatingDecision(...)`。
 
 ## 8. 所有权/生命周期与线程模型
 
@@ -168,8 +170,8 @@ Phase B‑1（传输层抽象，无行为变化）：
 1. 新增 `api/ISpikeTransport.h` 与 `ParentSpikeTransport`（适配现有 parent）。
 2. `SnnPESubComponent::handleNeuronFire_()` 替换为 `spike_comm_.emitNeuronFire()`。
 
-Phase D（通信子系统闭环化）：
-1. 路由构建/共享缓存/门控缓存迁入 `services/SpikeCommSubsystem`；
+Phase D/Phase2（通信闭环 + 路由下沉）：
+1. 路由构建/共享缓存迁入 `services/SynapseRouteSubsystem`；门控缓存仍在 `services/SpikeCommSubsystem`；
 2. 控制层仅负责配置与生命周期编排，不再持有路由表与缓存。
 
 Phase B‑2（可选增强，不影响语义）：

@@ -19,7 +19,7 @@
 
 #include "GasEdgeCollector.h"
 #include "SnnWeightReader.h"
-#include "StandardMemBackend.h"
+#include "IMemoryAccess.h"
 #include "WeightAccessor.h"
 
 namespace SST { class Output; }
@@ -97,18 +97,11 @@ public:
 
     WeightMemorySubsystem() = default;
 
-    // ===== Runtime binding (Phase E) =====
-    void bindStandardMem(SST::Interfaces::StandardMem* mem) {
-        if (mem) {
-            mem_backend_ = std::make_unique<StandardMemBackend>(mem);
-        } else {
-            mem_backend_.reset();
-        }
-    }
-    size_t pendingSize() const { return mem_backend_ ? mem_backend_->pendingSize() : 0; }
+    // ===== Runtime binding (Phase1) =====
+    void bindMemory(IMemoryAccess* mem) { mem_access_ = mem; }
+    size_t pendingSize() const { return mem_access_ ? mem_access_->pendingSize() : 0; }
     void setNowCycle(uint64_t now_cycle) { now_cycle_ = now_cycle; }
     void onClockTick(uint64_t now_cycle);
-    bool handleMemoryResponse(SST::Interfaces::StandardMem::Request* req);
     // 低层 dense 预取发起（scheme1 baseline 使用）：由调用方提供地址/大小与 row/col 起点。
     bool issueDensePrefetchRaw(uint64_t req_addr, size_t req_size,
                                uint32_t row, uint32_t col_start, uint32_t count_floats,
@@ -590,10 +583,42 @@ private:
     int diag_core_id_ = 0;
     uint32_t diag_seq_ = 0;
 
-    // ===== Phase E: pending tracking owned by subsystem (backend already encapsulates map) =====
-    std::unique_ptr<StandardMemBackend> mem_backend_;
+    // ===== Phase1: memory is pure; semantic pending stays in this subsystem =====
+    struct PendingMeta {
+        uint64_t address = 0;
+        size_t size = 0;
+        uint64_t orig_address = 0;
+        size_t orig_size = 0;
+        size_t slice_offset = 0;
+        bool is_row = false;
+        uint32_t pre = 0;
+        uint32_t post_start = 0;
+        uint32_t count_floats = 0;
+        bool is_weight = true;
+        bool count_weight_read = true;
+        uint64_t issue_cycle = 0;
+        // 0=dense, 1=rowptr, 2=colidx, 3=blockdata
+        int bcsr_kind = 0;
+        uint32_t bcsr_block_row = 0;
+        uint32_t bcsr_target_block_col = 0;
+        uint32_t bcsr_intra_row = 0;
+        uint32_t bcsr_intra_col = 0;
+        uint32_t bcsr_row_start = 0;
+        uint32_t bcsr_idx_in_row = 0;
+        uint32_t bcsr_global_block_index = 0;
+        bool bcsr_prefetch_all = false;
+        bool scheme1_prefetch = false;
+        bool has_single_cb = false;
+        uint32_t cb_post = 0;
+        std::function<void(float)> single_cb;
+    };
+
+    IMemoryAccess* mem_access_ = nullptr;
     uint64_t now_cycle_ = 0;
     bool bcsr_prefetch_issued_ = false;
+
+    void handleReadResp_(uint64_t req_id, uint64_t addr, PendingMeta meta, std::vector<uint8_t>&& data);
+    uint64_t issueRead_(PendingMeta meta);
 
     bool prepareDenseRead_(uint32_t row, uint32_t col, uint32_t width,
                            uint64_t& req_addr, size_t& req_size,

@@ -114,29 +114,54 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
     window_ns_ = window_us_ * 1000ULL; // 1us = 1000ns（组件时钟1GHz，tick≈1ns）
     diag_fire_log_ = params.find<bool>("diag_fire_log", false);
 
-    step_activation_enable_ = params.find<bool>("step_activation_enable", false);
-    step_activation_fraction_ = params.find<double>("step_activation_fraction", 0.0);
-    step_activation_fanout_ = params.find<uint32_t>("step_activation_fanout", 0);
-    step_activation_seed_ = params.find<uint64_t>("step_activation_seed", 0xdecafbadULL);
-    step_activation_period_cycles_ = params.find<uint64_t>("step_activation_period_cycles", 0);
-    step_activation_trigger_core_ = params.find<int>("step_activation_trigger_core", 0);
-    step_reset_mem_each_step_ = params.find<bool>("step_reset_mem_each_step", false);
-    step_activation_event_weight_ = params.find<double>("step_activation_event_weight", 0.0);
-    step_activation_use_bcsr_routes_ = params.find<bool>("step_activation_use_bcsr_routes", false);
-    step_activation_bcsr_template_ = params.find<std::string>("step_activation_bcsr_template", "");
-    step_activation_bcsr_rows_per_core_ = params.find<uint32_t>("step_activation_bcsr_rows_per_core", neurons_per_core_);
-    step_activation_bcsr_br_ = params.find<uint32_t>("step_activation_bcsr_br", 16);
-    step_activation_bcsr_bc_ = params.find<uint32_t>("step_activation_bcsr_bc", 16);
-    step_activation_bcsr_idx_bytes_ = params.find<uint32_t>("step_activation_bcsr_idx_bytes", 2);
-    step_activation_bcsr_val_bytes_ = params.find<uint32_t>("step_activation_bcsr_val_bytes", 4);
-    step_activation_bcsr_rowptr_offset_ = params.find<uint64_t>("step_activation_bcsr_rowptr_offset", 0);
-    step_activation_bcsr_colidx_offset_ = params.find<uint64_t>("step_activation_bcsr_colidx_offset", 0);
-    step_activation_bcsr_blockdata_offset_ = params.find<uint64_t>("step_activation_bcsr_blockdata_offset", 0);
-    step_activation_bcsr_blockids_offset_ = params.find<uint64_t>("step_activation_bcsr_blockids_offset", 0);
-    step_activation_bcsr_weight_epsilon_ = params.find<double>("step_activation_bcsr_weight_epsilon", 0.0);
-    step_activation_log_enable_ = params.find<bool>("step_activation_log_enable", false);
-    // 仅本节点构建路由，降低IO与规避跨PE元数据不一致风险（可由脚本覆盖）
-    step_activation_build_local_only_ = params.find<bool>("step_activation_build_local_only", true);
+    // Step-level random activation injection (Phase3-B): 下沉为独立子系统（MultiCorePE 仅转发 tick/阶段事件）
+    {
+        StepActivationSubsystem::Config step_cfg;
+        step_cfg.enable = params.find<bool>("step_activation_enable", false);
+        step_cfg.fraction = params.find<double>("step_activation_fraction", 0.0);
+        step_cfg.fanout = params.find<uint32_t>("step_activation_fanout", 0);
+        step_cfg.seed = params.find<uint64_t>("step_activation_seed", 0xdecafbadULL);
+        step_cfg.period_cycles = params.find<uint64_t>("step_activation_period_cycles", 0);
+        step_cfg.trigger_core = params.find<int>("step_activation_trigger_core", 0);
+        step_cfg.reset_mem_each_step = params.find<bool>("step_reset_mem_each_step", false);
+        step_cfg.event_weight = params.find<double>("step_activation_event_weight", 0.0);
+        step_cfg.use_bcsr_routes = params.find<bool>("step_activation_use_bcsr_routes", false);
+        step_cfg.bcsr_template = params.find<std::string>("step_activation_bcsr_template", "");
+        step_cfg.bcsr_rows_per_core = params.find<uint32_t>(
+            "step_activation_bcsr_rows_per_core", static_cast<uint32_t>(neurons_per_core_));
+        step_cfg.bcsr_br = params.find<uint32_t>("step_activation_bcsr_br", 16);
+        step_cfg.bcsr_bc = params.find<uint32_t>("step_activation_bcsr_bc", 16);
+        step_cfg.bcsr_idx_bytes = params.find<uint32_t>("step_activation_bcsr_idx_bytes", 2);
+        step_cfg.bcsr_val_bytes = params.find<uint32_t>("step_activation_bcsr_val_bytes", 4);
+        step_cfg.bcsr_rowptr_offset = params.find<uint64_t>("step_activation_bcsr_rowptr_offset", 0);
+        step_cfg.bcsr_colidx_offset = params.find<uint64_t>("step_activation_bcsr_colidx_offset", 0);
+        step_cfg.bcsr_blockdata_offset = params.find<uint64_t>("step_activation_bcsr_blockdata_offset", 0);
+        step_cfg.bcsr_blockids_offset = params.find<uint64_t>("step_activation_bcsr_blockids_offset", 0);
+        step_cfg.bcsr_weight_epsilon = params.find<double>("step_activation_bcsr_weight_epsilon", 0.0);
+        step_cfg.log_enable = params.find<bool>("step_activation_log_enable", false);
+        step_cfg.build_local_only = params.find<bool>("step_activation_build_local_only", true);
+        step_cfg.bcsr_align = params.find<uint64_t>("step_activation_bcsr_align", 64);
+
+        step_activation_subsys_.configure(step_cfg);
+
+        StepActivationSubsystem::Runtime step_rt;
+        step_rt.log = output_;
+        step_rt.node_id = node_id_;
+        step_rt.total_nodes = total_nodes_;
+        step_rt.global_neuron_base = global_neuron_base_;
+        step_rt.num_cores = num_cores_;
+        step_rt.neurons_per_core = neurons_per_core_;
+        step_rt.neurons_per_pe_cfg = neurons_per_pe_cfg_;
+        step_rt.sentinel_enabled = sentinel_enabled_;
+        step_rt.step_diag_cap_cfg = step_diag_cap_cfg_;
+        step_rt.step_diag_enable_cfg = step_diag_enable_cfg_;
+        step_rt.deliver_to_core = [this](int core_id, SpikeEvent* spike) { deliverSpikeToCore(core_id, spike); };
+        step_rt.send_external = [this](SpikeEvent* spike) { sendExternalSpike(spike); };
+        step_rt.reset_membranes = [this]() { resetAllCoreMembranes(); };
+
+        step_activation_subsys_.bindRuntime(step_rt);
+        step_activation_subsys_.initBcsrReachabilityIfEnabled();
+    }
     
     //     "🔧 多核PE配置: cores=%d, neurons_per_core=%d, total_neurons=%d, node_id=%d\n",
     //     num_cores_, neurons_per_core_, total_neurons_, node_id_);
@@ -144,15 +169,6 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
     //     "🧠 神经元参数: v_thresh=%.3f, v_reset=%.3f, v_rest=%.3f, tau_mem=%.1fms, t_ref=%d\n",
     //     v_thresh_, v_reset_, v_rest_, tau_mem_, t_ref_);
 
-    if (step_activation_trigger_core_ < -1 || step_activation_trigger_core_ >= num_cores_) {
-        if (output_) {
-            output_->verbose(CALL_INFO, 1, 0,
-                "⚠️ step_activation_trigger_core=%d 超出范围[-1,%d)，回退到0\n",
-                step_activation_trigger_core_, num_cores_);
-        }
-        step_activation_trigger_core_ = 0;
-    }
-    
     // 验证参数合理性
     if (num_cores_ <= 0 || num_cores_ > 64) {
         output_->fatal(CALL_INFO, -1, "❌ 错误: num_cores必须在1-64之间，当前值=%d\n", num_cores_);
@@ -163,18 +179,6 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
         output_->fatal(CALL_INFO, -1, "❌ 错误: neurons_per_core必须在1-65536之间，当前值=%d\n", neurons_per_core_);
     }
 
-    if (step_activation_enable_ && step_activation_use_bcsr_routes_) {
-    bool sentinel_on = sentinel_enabled_;
-    if (sentinel_on && output_) output_->output("[[sentinel-pe-ctor]] node=%d building step BCSR reachability\n", node_id_);
-        if (!loadBcsrReachability_()) {
-            output_->verbose(CALL_INFO, 1, 0,
-                "⚠️ step_activation_use_bcsr_routes=1 但 BCSR 索引加载失败，回退到均匀采样\n");
-            step_activation_use_bcsr_routes_ = false;
-        } else {
-    if (sentinel_on && output_) output_->output("[[sentinel-pe-ctor]] node=%d step BCSR reachability built\n", node_id_);
-        }
-    }
-    
     // 初始化时钟计数器
     current_cycle_ = 0;
     test_cycle_counter_ = 0;
@@ -208,6 +212,47 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
     
     // 初始化统计收集（必须在构造函数中）
     initializeStatistics();
+    {
+        StepActivationSubsystem::Stats st;
+        st.invocations = stat_step_activation_invocations_;
+        st.pre_selected = stat_step_activation_pre_selected_;
+        st.spike_attempts = stat_step_activation_spike_attempts_;
+        st.spikes_injected = stat_step_activation_spikes_injected_;
+        st.route_hits = stat_step_activation_route_hits_;
+        st.route_misses = stat_step_activation_route_misses_;
+        st.local_drops = stat_step_activation_local_drops_;
+        step_activation_subsys_.bindStats(st);
+    }
+    {
+        NocSubsystem::Config noc_cfg;
+        noc_cfg.log_enable = (verbose_ >= 5);
+        noc_subsys_.configure(noc_cfg);
+
+        NocSubsystem::Stats noc_st;
+        noc_st.external_spikes_received = stat_external_spikes_received_;
+        noc_subsys_.bindStats(noc_st);
+
+        NocSubsystem::Runtime noc_rt;
+        noc_rt.log = output_;
+        noc_rt.node_id = node_id_;
+        noc_rt.num_cores = num_cores_;
+        noc_rt.determine_target_unit = [this](int neuron_id) { return determineTargetUnit(neuron_id); };
+        noc_rt.deliver_to_core = [this](int core_id, SpikeEvent* spike) { deliverSpikeToCore(core_id, spike); };
+        noc_rt.route_internal = [this](int src_core, int dst_core, SpikeEvent* spike) {
+            routeInternalSpike(src_core, dst_core, spike);
+        };
+        noc_rt.send_external = [this](SpikeEvent* spike) { sendExternalSpike(spike); };
+        noc_rt.forward_external = [this](SpikeEvent* spike) {
+            if (!spike) return;
+            if (external_nic_) {
+                external_nic_->sendSpike(spike);
+            } else {
+                delete spike;
+            }
+        };
+        noc_rt.tick_ring = [this](uint64_t current_cycle) { tickNocRing_(current_cycle); };
+        noc_subsys_.bindRuntime(noc_rt);
+    }
     // 记录路径（若提供），用于派生输出目录
     stage_events_csv_path_ = params.find<std::string>("stage_events_csv", "");
     stats_csv_path_ = params.find<std::string>("stats_csv", "");
@@ -227,12 +272,6 @@ MultiCorePE::~MultiCorePE() {
     delete controller_;
     // 避免析构次序竞态：不手动delete日志对象
     output_ = nullptr;
-    
-    // 清理外部脉冲队列
-    while (!external_spike_queue_.empty()) {
-        delete external_spike_queue_.front();
-        external_spike_queue_.pop();
-    }
     
     // 清理挂起的内存请求
     for (auto& pair : pending_memory_requests_) {
@@ -295,8 +334,8 @@ void MultiCorePE::init(unsigned int phase) {
             external_nic_->init(phase);
         }
         if (sentinel_enabled_ && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=0 nic-init-done\n", node_id_); }
-        // 标记Step注入就绪（保证NIC已完成init）
-        step_injection_ready_ = true;
+        // 标记 Step 注入就绪（保证 NIC 已完成 init）
+        step_activation_subsys_.setInjectionReady(true);
     }
     else if (phase == 1) {
         if (sentinel_enabled_ && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=1 enter\n", node_id_); }
@@ -509,28 +548,12 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
         const bool node_ok = (progress_log_node_ < 0) || (progress_log_node_ == node_id_);
         if (node_ok && current_cycle_ > 0 && (static_cast<uint64_t>(current_cycle_) % progress_log_interval_ns_ == 0)) {
             PE_LOG(0, "[progress] node=%d cyc=%" PRIu64 " extq=%zu\n",
-                   node_id_, (uint64_t)current_cycle_, external_spike_queue_.size());
+                   node_id_, (uint64_t)current_cycle_, noc_subsys_.incomingQueueSize());
         }
     }
     
-    // 0a. legacy: 若存在延迟的Step注入且已就绪，优先补发（仅 BeginGather 时基）
-    if (step_activation_period_cycles_ == 0 && pending_step_inject_ && step_injection_ready_) {
-        injectStepActivations(pending_step_seq_, current_cycle_);
-        last_step_injection_seq_ = pending_step_seq_;
-        pending_step_inject_ = false;
-    }
-    // 0a2. fixed-period: 按固定周期触发 Step 注入，避免 BeginGather 时基漂移引入非确定性
-    if (step_activation_enable_ && step_activation_period_cycles_ > 0 && step_injection_ready_) {
-        if (step_activation_next_cycle_ == 0) {
-            step_activation_next_cycle_ = current_cycle_;
-            step_activation_fixed_seq_ = 1;
-        }
-        if (current_cycle_ >= step_activation_next_cycle_) {
-            injectStepActivations(step_activation_fixed_seq_, current_cycle_);
-            ++step_activation_fixed_seq_;
-            step_activation_next_cycle_ += step_activation_period_cycles_;
-        }
-    }
+    // 0a. Step 注入调度（Phase3-B 下沉为 StepActivationSubsystem）
+    step_activation_subsys_.tick(static_cast<uint64_t>(current_cycle_));
 
     // 0b. 测试注入：在首个有效周期从 core0 向 core1 注入一个跨核脉冲（仅当启用测试流量时）
     if (enable_test_traffic_ && !test_injected_ && num_cores_ > 1 && current_cycle_ == 5000) {
@@ -548,32 +571,8 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
         }
     }
     
-    // 1. 处理外部脉冲队列
-    // Debug output disabled to prevent excessive logging
-    while (!external_spike_queue_.empty()) {
-        SpikeEvent* spike = external_spike_queue_.front();
-        external_spike_queue_.pop();
-        
-            // Debug output removed to reduce log noise
-            int target_unit = determineTargetUnit(spike->getDestinationNeuron());
-            if (target_unit >= 0 && target_unit < num_cores_) {
-                // 目标在本节点，直接投递给对应的处理单元
-                // Debug output removed
-                deliverSpikeToCore(target_unit, spike);
-            } else {
-            // 目标不在本节点，需要转发到其他节点
-            if (external_nic_) {
-                PE_LOG(3, "🔄 中继转发脉冲: 神经元%d -> 目标节点%d\n", 
-                               spike->getDestinationNeuron(), spike->getDestinationNode());
-                external_nic_->sendSpike(spike);
-                // 不要删除spike，已经转交给网络适配器
-            } else {
-                PE_LOG(2, "⚠️ 无网络接口，丢弃跨节点脉冲: 神经元%d\n", 
-                               spike->getDestinationNeuron());
-                delete spike;
-            }
-        }
-    }
+    // 1. 处理外部脉冲队列（Phase4-A1.1：下沉至 NoC 子系统）
+    noc_subsys_.drainIncomingQueue(static_cast<uint64_t>(current_cycle_));
     
     // 2. SubComponent时钟由SST自动管理，无需手动调用tick
     // 若子组件未被SST调度（某些环境组合下可能发生），则回退为手动驱动一拍，确保窗口推进与队列消费
@@ -619,18 +618,8 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
         }
     }
     
-    // 3. 内部互连时钟滴答
-    if (optimized_ring_) {
-        optimized_ring_->tick(current_cycle);
-        
-        // 处理跨核脉冲路由（使用新的优化环形网络）
-        handleOptimizedCrossCoreRouting();
-    } else if (internal_ring_) {
-        internal_ring_->tick();
-        
-        // 处理跨核脉冲路由（旧版本兼容）
-        handleCrossCoreRouting();
-    }
+    // 3. 内部互连（ring）时钟滴答（Phase4-A1.1：由 NoC 子系统编排）
+    noc_subsys_.tickRing(static_cast<uint64_t>(current_cycle));
     
     // 4. 多核控制器时钟滴答
     if (controller_) {
@@ -657,97 +646,25 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
     return false;
 }
 
-void MultiCorePE::handleExternalSpikeEvent(SST::Event* ev) {
-    PE_LOG(1, "📥[MultiCorePE] handleExternalSpikeEvent被调用，节点ID=%d\n", node_id_);
-    fflush(stdout);
-
-    SpikeEvent* spike = dynamic_cast<SpikeEvent*>(ev);
-    if (!spike) {
-        PE_LOG(1, "⚠️ 接收到非SpikeEvent事件\n");
-        delete ev;
-        return;
-    }
-    
-    // Debug output disabled to prevent excessive logging
-    // printf("DEBUG: SpikeEvent转换成功，神经元%d -> 神经元%d\n", 
-    //        spike->getSourceNeuron(), spike->getDestinationNeuron());
-    fflush(stdout);
-    
-    // 检查跳数限制，防止无限循环
-    if (spike->isExpired()) {
-        PE_LOG(2, "⚠️ 脉冲达到最大跳数限制，丢弃: 源神经元%d -> 目标神经元%d\n",
-                        spike->getSourceNeuron(), spike->getDestinationNeuron());
-        delete spike;
-        return;
-    }
-    
-    spike->incrementHopCount();
-    
-    PE_LOG(3, "📨 接收外部脉冲: 源神经元%d -> 目标神经元%d, 权重%.3f, 跳数%d\n",
-                    spike->getSourceNeuron(), spike->getDestinationNeuron(), spike->getWeight(), spike->getHopCount());
-    
-    stat_external_spikes_received_->addData(1);
-    
-    // 检查是否为本地节点（基于目标节点ID而不是神经元ID）
-    uint32_t dest_node = spike->getDestinationNode();
-    bool is_local = (dest_node == static_cast<uint32_t>(node_id_));
-
-    // 调试输出：显示节点判断结果
-    PE_LOG(2, "🔍 脉冲路由判断: 目标神经元=%d, 目标节点=%u, 本地节点=%d, 本地判断=%s\n",
-                     spike->getDestinationNeuron(), dest_node, node_id_, is_local ? "本地" : "跨节点");
-    // Debug output removed
-    fflush(stdout);
-    
-    if (is_local) {
-        // 本地脉冲，加入队列处理
-        // Debug output removed
-        fflush(stdout);
-        external_spike_queue_.push(spike);
-        PE_LOG(4, "✅ 本地脉冲已加入队列\n");
-    } else {
-        // 跨核（同一MultiCorePE内不同处理单元）或外部（非本PE）
-        int target_unit = determineTargetUnit(spike->getDestinationNeuron());
-        if (target_unit >= 0 && target_unit < num_cores_) {
-            // 目标在本MultiCorePE内的其他处理单元，直接分发给目标处理单元
-            SpikeEvent* cross_core_spike = new SpikeEvent(
-                spike->getSourceNeuron(),
-                spike->getDestinationNeuron(),
-                spike->getDestinationNode(),
-                spike->getWeight(),
-                spike->getSpikeTime()
-            );
-            cross_core_spike->hop_count = spike->getHopCount();  // 传递跳数
-            deliverSpikeToCore(target_unit, cross_core_spike);
-            PE_LOG(4, "🔄 外部脉冲直接分发到核心%d\n", target_unit);
-        } else {
-            // 目标不在本MultiCorePE，视为外部转发（若配置了外部输出端口）
-            PE_LOG(2, "🔍 准备转发跨节点脉冲: 神经元%d, 目标节点%d, external_nic_=%p, external_spike_output_link_=%p\n",
-                           spike->getDestinationNeuron(), spike->getDestinationNode(),
-                           (void*)external_nic_, (void*)external_spike_output_link_);
-            if (external_nic_) {
-                PE_LOG(2, "🌐 尝试通过SnnNIC发送跨节点脉冲: 神经元%d -> 目标节点%d\n",
-                               spike->getDestinationNeuron(), spike->getDestinationNode());
-                sendExternalSpike(spike);
-                PE_LOG(2, "📤 外部转发脉冲到其他PE: 目标神经元%d, 跳数%d, 目标节点%d\n",
-                                spike->getDestinationNeuron(), spike->getHopCount(), spike->getDestinationNode());
-                return; // sendExternalSpike会接管事件
-            } else {
-                PE_LOG(1, "⚠️ 无法确定目标处理单元且无外部输出，丢弃: 神经元%d\n",
-                                 spike->getDestinationNeuron());
-            }
-        }
-        delete spike;
+void MultiCorePE::tickNocRing_(uint64_t current_cycle) {
+    // 复用原 ring tick + receive 语义（Phase4-A1.1：后端仍在 MultiCorePE 内）
+    if (optimized_ring_) {
+        optimized_ring_->tick(current_cycle);
+        handleOptimizedCrossCoreRouting();
+    } else if (internal_ring_) {
+        internal_ring_->tick();
+        handleCrossCoreRouting();
     }
 }
 
+void MultiCorePE::handleExternalSpikeEvent(SST::Event* ev) {
+    // Phase4-A1.1：外部端口输入逻辑收敛到 NoC 子系统（保持 hop/TTL 与路由语义不变）。
+    noc_subsys_.onExternalPortEvent(ev);
+}
+
 void MultiCorePE::handleExternalSpike(SpikeEvent* spike) {
-    if (!spike) return;
-    
-    PE_LOG(3, "🔄 处理外部脉冲: 目标神经元%d\n", spike->getDestinationNeuron());
-    
-    // 将脉冲加入外部队列，由时钟处理器处理
-    external_spike_queue_.push(spike);
-    stat_external_spikes_received_->addData(1);
+    // Phase4-A1.1：NIC 回调输入路径收敛到 NoC 子系统。
+    noc_subsys_.onNicReceive(spike);
 }
 
 void MultiCorePE::sendExternalSpike(SpikeEvent* spike) {
@@ -1006,39 +923,11 @@ void MultiCorePE::notifyStageEvent(uint32_t seq, const std::string& event, uint6
         }
     }
 
-    // legacy: BeginGather 触发（当 period==0 时保留原始行为）
-    // 修复：多核下仅允许“指定leader core”触发，且要求seq单调递增，避免跨核相位/乱序导致重复注入与非确定性。
-    if (step_activation_period_cycles_ == 0 && step_activation_enable_ && event == "BeginGather") {
-        const bool core_ok = (step_activation_trigger_core_ < 0) ||
-                             (core_id < 0) ||
-                             (core_id == step_activation_trigger_core_);
-        if (core_ok) {
-            // 仅允许前进：避免 seq 在不同core之间交错回退触发重复注入
-            const bool first_inject = (last_step_injection_seq_ == std::numeric_limits<uint32_t>::max());
-            if (first_inject || seq > last_step_injection_seq_) {
-                if (step_injection_ready_) {
-                    injectStepActivations(seq, ts_ns);
-                    last_step_injection_seq_ = seq;
-                } else {
-                    pending_step_inject_ = true;
-                    pending_step_seq_ = seq;
-                    pending_step_ts_ns_ = ts_ns;
-                }
-            } else {
-                // 限量告警：帮助定位非单调/跨核乱序
-                if (output_ && step_seq_warn_count_ < 16) {
-                    PE_LOG(1, "[step-warn] non-monotonic BeginGather ignored: node=%d core=%d seq=%u last=%u\n",
-                           node_id_, core_id, seq, last_step_injection_seq_);
-                    ++step_seq_warn_count_;
-                }
-            }
-        }
-    }
-    if (step_reset_mem_each_step_ && event == "EndScatter") {
-        if (last_step_reset_seq_ != seq) {
-            resetAllCoreMembranes();
-            last_step_reset_seq_ = seq;
-        }
+    // Step 注入事件转发（Phase3-B 下沉为 StepActivationSubsystem）
+    if (event == "BeginGather") {
+        step_activation_subsys_.onBeginGather(seq, ts_ns, core_id);
+    } else if (event == "EndScatter") {
+        step_activation_subsys_.onEndScatter(seq);
     }
 }
 
@@ -1705,26 +1594,12 @@ void MultiCorePE::handleMemoryResponse(SST::Interfaces::StandardMem::Request* re
 
 void MultiCorePE::sendSpike(SpikeEvent* event) {
     if (!event) return;
-    
+
     PE_LOG(4, "📤 从SubComponent接收脉冲: 源神经元%d -> 目标神经元%d\n",
                     event->getSourceNeuron(), event->getDestinationNeuron());
-    
-    int target_unit = determineTargetUnit(event->getDestinationNeuron());
-    
-    if (target_unit >= 0 && target_unit < num_cores_) {
-        // 目标在本PE内，通过内部互连路由
-        // 确定源核心（由于这是从SubComponent调用的，我们需要找到源核心）
-        int src_core = determineTargetUnit(event->getSourceNeuron());
-        if (src_core >= 0 && src_core < num_cores_) {
-            routeInternalSpike(src_core, target_unit, event);
-        } else {
-            // 源不在本PE，直接递送给目标
-            deliverSpikeToCore(target_unit, event);
-        }
-    } else {
-        // 目标在其他PE，通过外部接口发送
-        sendExternalSpike(event);
-    }
+
+    // Phase4-A1.1：send 路径收敛到 NoC 子系统（保持路由/统计口径不变）。
+    noc_subsys_.onCoreSend(event);
 }
 
 void MultiCorePE::requestMemoryAccess(uint64_t address, size_t size, 
@@ -1770,226 +1645,6 @@ void MultiCorePE::deliverSpikeToCore(int core_id, SpikeEvent* spike) {
                     core_id, spike->getDestinationNeuron());
 }
 
-void MultiCorePE::injectStepActivations(uint32_t seq, uint64_t sim_time_ns) {
-    if (!step_activation_enable_ || step_activation_fanout_ == 0 || total_neurons_ <= 0) {
-        return;
-    }
-    double fraction = step_activation_fraction_;
-    if (fraction <= 0.0) return;
-    if (fraction > 1.0) fraction = 1.0;
-
-    if (stat_step_activation_invocations_) {
-        stat_step_activation_invocations_->addData(1);
-    }
-
-    const uint64_t local_total = static_cast<uint64_t>(total_neurons_);
-    const uint64_t neurons_per_pe = static_cast<uint64_t>(neurons_per_pe_cfg_);
-    const uint64_t max_global = (total_nodes_ > 0 && neurons_per_pe > 0)
-        ? static_cast<uint64_t>(total_nodes_) * neurons_per_pe
-        : 0ULL;
-    const uint64_t diag_cap = (step_diag_cap_cfg_ > 0) ? static_cast<uint64_t>(step_diag_cap_cfg_) : 0ULL;
-    std::mt19937_64 rng(step_activation_seed_ ^ (static_cast<uint64_t>(seq) + (static_cast<uint64_t>(node_id_) << 32)));
-    std::uniform_int_distribution<uint64_t> post_dist(0, local_total - 1);
-    std::bernoulli_distribution pick(fraction);
-    const bool activate_all = (fraction >= 0.999999);
-    uint64_t spikes_injected = 0;
-    uint64_t sources_selected = 0;
-    uint64_t spike_attempts = 0;
-    uint64_t route_hits = 0;
-    uint64_t route_misses = 0;
-    uint64_t local_drops = 0;
-    bool diag_cap_hit = false;
-
-    // 诊断：仅在 node_id_=0 且 seq 较小时，对路由表做一次全局采样，避免日志爆炸
-    const bool step_diag_enabled = (step_diag_enable_cfg_ != 0);
-
-    if (step_diag_enabled && !route_diag_done_ && node_id_ == 0 && seq <= 1 && step_activation_use_bcsr_routes_) {
-        uint64_t with_routes = 0;
-        uint64_t max_routes = 0;
-        uint64_t local_edges = 0;
-        uint64_t remote_edges = 0;
-        for (size_t i = 0; i < step_activation_routes_.size(); ++i) {
-            const auto& v = step_activation_routes_[i];
-            if (!v.empty()) {
-                ++with_routes;
-                if (v.size() > max_routes) max_routes = (uint64_t)v.size();
-                for (auto post : v) {
-                    uint32_t pe_of_post = (neurons_per_pe > 0) ? static_cast<uint32_t>(post / neurons_per_pe) : 0;
-                    if (pe_of_post == (uint32_t)node_id_) ++local_edges; else ++remote_edges;
-                }
-            }
-        }
-        if (output_) {
-            double denom_edges = (local_edges + remote_edges) ? (double)(local_edges + remote_edges) : 1.0;
-            double local_ratio = local_edges / denom_edges;
-            double remote_ratio = remote_edges / denom_edges;
-            output_->verbose(CALL_INFO, 0, 0,
-                "[step-activation-summary] node=%d routes_nonempty=%" PRIu64 " total_pre=%zu max_routes=%" PRIu64 " max_global=%" PRIu64 " local=%" PRIu64 " (%.2f) remote=%" PRIu64 " (%.2f)\n",
-                node_id_, with_routes, step_activation_routes_.size(), max_routes, max_global,
-                local_edges, local_ratio, remote_edges, remote_ratio);
-        }
-        route_diag_done_ = true;
-    }
-
-    // 单PE + BCSR 路由场景：优先只在“存在出边的 pre_global”集合上采样，避免在无出边神经元上浪费激活尝试。
-    const bool single_pe_bcsr = (total_nodes_ == 1) &&
-                                step_activation_use_bcsr_routes_ &&
-                                !step_activation_pre_with_routes_.empty();
-
-    if (single_pe_bcsr) {
-        for (uint32_t pre_global : step_activation_pre_with_routes_) {
-            if (max_global > 0 && pre_global >= max_global) continue;
-            if (!activate_all && !pick(rng)) continue;
-            ++sources_selected;
-            const bool use_routes = step_activation_use_bcsr_routes_ &&
-                                    pre_global < step_activation_routes_.size();
-            const auto* routes = use_routes ? &step_activation_routes_[pre_global] : nullptr;
-            if (!routes || routes->empty()) continue;
-            // 诊断：采样少量带路由的 pre，观察路由规模（沿用原有逻辑）
-            static uint64_t route_sampled = 0;
-            if (step_diag_enabled && use_routes && node_id_ == 0 && seq <= 1 && route_sampled < 16) {
-                PE_LOG(1, "[[step-diag-pre]] node=%d seq=%u pre_global=%u routes=%zu\n",
-                       node_id_, seq, pre_global, routes->size());
-                ++route_sampled;
-            }
-            for (uint32_t fan = 0; fan < step_activation_fanout_; ++fan) {
-                ++spike_attempts;
-                uint64_t post_global_64 = 0;
-                uint32_t post_global = 0;
-                // 在已有路由集合中随机挑选一个 post_global
-                std::uniform_int_distribution<size_t> route_pick(0, routes->size() - 1);
-                post_global = (*routes)[route_pick(rng)];
-                post_global_64 = post_global;
-                if (max_global > 0 && post_global_64 >= max_global) {
-                    ++local_drops;
-                    continue;
-                }
-                route_hits++;
-                auto* spike = new SpikeEvent(pre_global, post_global, node_id_, 1.0f, sim_time_ns);
-                int dst_core = determineTargetUnit(post_global);
-                if (dst_core >= 0) {
-                    // 目标在本PE
-                    deliverSpikeToCore(dst_core, spike);
-                    spikes_injected++;
-                } else {
-                    // 单PE场景理论上不应出现跨PE目标；若出现则丢弃以避免意外流量
-                    delete spike;
-                    ++local_drops;
-                }
-                if (diag_cap && spikes_injected >= diag_cap) {
-                    diag_cap_hit = true;
-                    break;
-                }
-            }
-            if (diag_cap_hit) break;
-        }
-    } else {
-        for (int core = 0; core < num_cores_; ++core) {
-        uint64_t base = global_neuron_base_ + static_cast<uint64_t>(core) * static_cast<uint64_t>(neurons_per_core_);
-        for (int n = 0; n < neurons_per_core_; ++n) {
-            if (!activate_all && !pick(rng)) continue;
-            ++sources_selected;
-            uint64_t pre_global_64 = base + static_cast<uint64_t>(n);
-            if (max_global > 0 && pre_global_64 >= max_global) continue;
-            uint32_t pre_global = static_cast<uint32_t>(pre_global_64);
-            const bool use_routes = step_activation_use_bcsr_routes_ && pre_global < step_activation_routes_.size();
-            const auto* routes = use_routes ? &step_activation_routes_[pre_global] : nullptr;
-            // 诊断：采样少量带路由的 pre，观察路由规模
-            static uint64_t route_sampled = 0;
-            if (step_diag_enabled && use_routes && routes && !routes->empty() &&
-                node_id_ == 0 && seq <= 1 && route_sampled < 16) {
-                PE_LOG(1, "[[step-diag-pre]] node=%d seq=%u pre_global=%u routes=%zu\n", node_id_, seq, pre_global, routes->size());
-                ++route_sampled;
-            }
-            for (uint32_t fan = 0; fan < step_activation_fanout_; ++fan) {
-                ++spike_attempts;
-                uint64_t post_global_64 = static_cast<uint64_t>(global_neuron_base_) + post_dist(rng);
-                if (max_global > 0 && post_global_64 >= max_global) {
-                    continue;
-                }
-                uint32_t post_global = static_cast<uint32_t>(post_global_64);
-                if (use_routes) {
-                    if (routes && !routes->empty()) {
-                        std::uniform_int_distribution<size_t> route_pick(0, routes->size() - 1);
-                        post_global = (*routes)[route_pick(rng)];
-                        route_hits++;
-                    } else {
-                        route_misses++;
-                    }
-                }
-                auto* spike = new SpikeEvent(pre_global, post_global, node_id_, 1.0f, sim_time_ns);
-                int dst_core = determineTargetUnit(post_global);
-                if (dst_core >= 0) {
-                    // 目标在本PE
-                    deliverSpikeToCore(dst_core, spike);
-                    spikes_injected++;
-                } else {
-                    // 目标在其他PE：通过NIC注入
-                    uint32_t neurons_per_pe32 = static_cast<uint32_t>(neurons_per_pe ? neurons_per_pe : 0ULL);
-                    uint32_t dest_node = (neurons_per_pe32 > 0) ? (post_global / neurons_per_pe32) : 0u;
-                    spike->setDestinationNode(dest_node);
-                    sendExternalSpike(spike);
-                    spikes_injected++;
-                }
-
-                if (diag_cap && spikes_injected >= diag_cap) {
-                    diag_cap_hit = true;
-                    break;
-                }
-            }
-            if (diag_cap_hit) break;
-        }
-        if (diag_cap_hit) break;
-    }
-    }
-
-    if (stat_step_activation_pre_selected_ && sources_selected) {
-        stat_step_activation_pre_selected_->addData(sources_selected);
-    }
-    if (stat_step_activation_spike_attempts_ && spike_attempts) {
-        stat_step_activation_spike_attempts_->addData(spike_attempts);
-    }
-    if (stat_step_activation_spikes_injected_ && spikes_injected) {
-        stat_step_activation_spikes_injected_->addData(spikes_injected);
-    }
-    if (stat_step_activation_route_hits_ && route_hits) {
-        stat_step_activation_route_hits_->addData(route_hits);
-    }
-    if (stat_step_activation_route_misses_ && route_misses) {
-        stat_step_activation_route_misses_->addData(route_misses);
-    }
-    if (stat_step_activation_local_drops_ && local_drops) {
-        stat_step_activation_local_drops_->addData(local_drops);
-    }
-
-    if (output_ && output_->getVerboseLevel() >= 1) {
-        PE_LOG(1,
-            "[step-activation] seq=%u summary sources=%llu attempts=%llu spikes_ok=%llu route_hits=%llu route_miss=%llu local_drop=%llu fraction=%.4g fanout=%u use_routes=%d\n",
-            seq,
-            static_cast<unsigned long long>(sources_selected),
-            static_cast<unsigned long long>(spike_attempts),
-            static_cast<unsigned long long>(spikes_injected),
-            static_cast<unsigned long long>(route_hits),
-            static_cast<unsigned long long>(route_misses),
-            static_cast<unsigned long long>(local_drops),
-            fraction,
-            step_activation_fanout_,
-            step_activation_use_bcsr_routes_ ? 1 : 0);
-    }
-
-    if (step_diag_enabled && node_id_ == 0 && seq <= 1) {
-        PE_LOG(1, "[[step-diag-stats]] node=%d seq=%u sources=%llu attempts=%llu spikes=%llu hits=%llu miss=%llu cap=%" PRIu64 " cap_hit=%d\n",
-               node_id_, seq,
-               (unsigned long long)sources_selected,
-               (unsigned long long)spike_attempts,
-               (unsigned long long)spikes_injected,
-               (unsigned long long)route_hits,
-               (unsigned long long)route_misses,
-               diag_cap,
-               diag_cap_hit ? 1 : 0);
-    }
-}
-
 void MultiCorePE::resetAllCoreMembranes() {
     for (auto* core : cores_) {
         if (!core) continue;
@@ -1997,6 +1652,9 @@ void MultiCorePE::resetAllCoreMembranes() {
     }
 }
 
+#if 0
+// Phase3-B: StepActivationSubsystem 已接管 Step 注入与 BCSR 路由解析；
+// 下面的旧实现仅保留作参考，避免中途回滚时丢失上下文。
 std::string MultiCorePE::formatBcsrPath_(int pe, int core) const {
     if (step_activation_bcsr_template_.empty()) return std::string();
     std::string path = step_activation_bcsr_template_;
@@ -2390,6 +2048,8 @@ void MultiCorePE::computeRouteRatios_() const {
     }
 }
 
+#endif // Phase3-B legacy Step activation helpers
+
 void MultiCorePE::initializeDirectionLinks() {
     
     // 配置方向链路，仅在实际连接时创建处理器
@@ -2490,110 +2150,50 @@ void MultiCorePE::initializeNetworkInterface() {
 
 void MultiCorePE::handleNorthLinkEvent(SST::Event* event) {
     PE_LOG(3, "📡 收到北向链路事件\n");
-    forwardEventToNetworkAdapter(event, "north");
+    if (!external_nic_) {
+        PE_LOG(2, "⚠️ 网络接口未配置，无法处理north方向事件\n");
+        delete event;
+        return;
+    }
+    noc_subsys_.onDirectionalLinkEvent(event, "north");
 }
 
 void MultiCorePE::handleSouthLinkEvent(SST::Event* event) {
     PE_LOG(3, "📡 收到南向链路事件\n");
-    forwardEventToNetworkAdapter(event, "south");
+    if (!external_nic_) {
+        PE_LOG(2, "⚠️ 网络接口未配置，无法处理south方向事件\n");
+        delete event;
+        return;
+    }
+    noc_subsys_.onDirectionalLinkEvent(event, "south");
 }
 
 void MultiCorePE::handleEastLinkEvent(SST::Event* event) {
     PE_LOG(3, "📡 收到东向链路事件\n");
-    forwardEventToNetworkAdapter(event, "east");
+    if (!external_nic_) {
+        PE_LOG(2, "⚠️ 网络接口未配置，无法处理east方向事件\n");
+        delete event;
+        return;
+    }
+    noc_subsys_.onDirectionalLinkEvent(event, "east");
 }
 
 void MultiCorePE::handleWestLinkEvent(SST::Event* event) {
     PE_LOG(3, "📡 收到西向链路事件\n");
-    forwardEventToNetworkAdapter(event, "west");
+    if (!external_nic_) {
+        PE_LOG(2, "⚠️ 网络接口未配置，无法处理west方向事件\n");
+        delete event;
+        return;
+    }
+    noc_subsys_.onDirectionalLinkEvent(event, "west");
 }
 
 void MultiCorePE::handleNetworkLinkEvent(SST::Event* event) {
     PE_LOG(3, "📡 收到通用网络链路事件\n");
-    forwardEventToNetworkAdapter(event, "network");
-}
-
-void MultiCorePE::forwardEventToNetworkAdapter(SST::Event* event, const std::string& direction) {
     if (!external_nic_) {
-        PE_LOG(2, "⚠️ 网络接口未配置，无法转发%s方向事件\n", direction.c_str());
-        delete event;  // 清理事件内存
+        PE_LOG(2, "⚠️ 网络接口未配置，无法处理network方向事件\n");
+        delete event;
         return;
     }
-    
-    // 首先尝试将事件转换为SpikeEvent（直接脉冲事件）
-    SpikeEvent* spike_event = dynamic_cast<SpikeEvent*>(event);
-    if (spike_event) {
-        PE_LOG(3, "🔄 转发%s方向的直接脉冲事件: 神经元%u\n", 
-                        direction.c_str(), spike_event->getNeuronId());
-        handleExternalSpike(spike_event);
-        return;
-    }
-    
-    // 尝试将事件转换为SpikeEventWrapper（SST网络传输的脉冲事件）
-    SpikeEventWrapper* wrapper_event = dynamic_cast<SpikeEventWrapper*>(event);
-    if (wrapper_event) {
-        PE_LOG(3, "📦 收到%s方向的SpikeEventWrapper，开始解包\n", direction.c_str());
-        
-        // 从wrapper中提取SpikeEvent数据并创建新的SpikeEvent对象
-        SpikeEvent* extracted_spike = extractSpikeFromWrapper(wrapper_event);
-        if (extracted_spike) {
-            PE_LOG(3, "✅ SpikeEventWrapper解包成功: 神经元%u -> 神经元%u\n", 
-                            extracted_spike->getSourceNeuron(), extracted_spike->getDestinationNeuron());
-            handleExternalSpike(extracted_spike);
-        } else {
-            PE_LOG(1, "❌ SpikeEventWrapper解包失败\n");
-        }
-        
-        // 清理wrapper（SST会自动管理，但我们需要显式删除）
-        delete wrapper_event;
-        return;
-    }
-    
-    // 如果都不是脉冲相关事件，记录并忽略
-    PE_LOG(2, "⚠️ %s方向收到未知类型事件，忽略\n", direction.c_str());
-    delete event;
-}
-
-SpikeEvent* MultiCorePE::extractSpikeFromWrapper(SpikeEventWrapper* wrapper) {
-    if (!wrapper) {
-        PE_LOG(1, "❌ extractSpikeFromWrapper: wrapper为空\n");
-        return nullptr;
-    }
-    
-    try {
-        PE_LOG(3, "🔍 extractSpikeFromWrapper: 开始从wrapper提取SpikeEvent\n");
-        
-        // 从wrapper中获取原始的SpikeEvent
-        SpikeEvent* original_spike = wrapper->getSpikeEvent();
-        if (!original_spike) {
-            PE_LOG(1, "❌ wrapper中的SpikeEvent为空\n");
-            return nullptr;
-        }
-        
-        // 创建一个新的SpikeEvent副本，避免内存管理冲突
-        SpikeEvent* extracted_spike = new SpikeEvent(
-            original_spike->getNeuronId(),
-            original_spike->getDestinationNeuron(),
-            original_spike->getDestinationNode(),
-            original_spike->getWeight(),
-            original_spike->getTimestamp()
-        );
-        
-        // 复制hop_count属性（直接访问public字段）
-        extracted_spike->hop_count = original_spike->hop_count;
-        
-        PE_LOG(3, "✅ extractSpikeFromWrapper成功: 神经元%u -> 神经元%u (节点%u)\n", 
-                        extracted_spike->getSourceNeuron(), 
-                        extracted_spike->getDestinationNeuron(), 
-                        extracted_spike->getDestinationNode());
-        
-        return extracted_spike;
-        
-    } catch (const std::exception& e) {
-        PE_LOG(1, "❌ extractSpikeFromWrapper异常: %s\n", e.what());
-        return nullptr;
-    } catch (...) {
-        PE_LOG(1, "❌ extractSpikeFromWrapper未知异常\n");
-        return nullptr;
-    }
+    noc_subsys_.onDirectionalLinkEvent(event, "network");
 }

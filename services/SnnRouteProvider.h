@@ -8,6 +8,8 @@
 
 #include <sst/core/output.h>
 
+#include "ISynapseRoute.h"
+
 namespace SST {
 namespace Statistics {
 template <typename T> class Statistic;
@@ -20,10 +22,7 @@ struct GatingEntry { std::vector<uint32_t> dest_pes; uint64_t expire_cycle; };
 class SnnRouteProvider {
 public:
     using RouteMap = std::unordered_map<uint32_t, std::vector<uint32_t>>;
-    struct FanoutEntry {
-        uint32_t dest_global = 0;
-        uint32_t dest_node = 0;
-    };
+    using FanoutEntry = ISynapseRoute::FanoutEntry;
     struct Config {
         bool routing_weight_driven = false;
         bool log_weight_details = false;

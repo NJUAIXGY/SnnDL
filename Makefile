@@ -196,9 +196,12 @@ am_libSnnDL_la_OBJECTS = events/SimpleTestEvent.lo \
 	services/GasEdgeCollector.lo services/GasPhaseController.lo \
 	services/OptimizedInternalRing.lo services/SimpleNetworkWrapper.lo \
 	services/SnnBcsrWeightManager.lo services/SnnNetworkAdapter.lo \
-	services/SnnRouteProvider.lo services/WeightAccessor.lo \
-	services/WeightCacheOps.lo services/WeightMemorySubsystem.lo \
-	services/StandardMemBackend.lo \
+	services/SnnRouteProvider.lo services/SynapseRouteSubsystem.lo \
+	services/StepActivationSubsystem.lo \
+	services/NocSubsystem.lo \
+	services/WeightAccessor.lo services/WeightCacheOps.lo \
+	services/WeightMemorySubsystem.lo \
+	services/StandardMemAccess.lo services/StandardMemBackend.lo \
 	services/SpikeCommSubsystem.lo
 libSnnDL_la_OBJECTS = $(am_libSnnDL_la_OBJECTS)
 AM_V_lt = $(am__v_lt_$(V))
@@ -484,7 +487,7 @@ PINTOOL3_RUNTIME =
 PINTOOL_CPPFLAGS = 
 PINTOOL_DIR = 
 PINTOOL_LDFLAGS = 
-PINTOOL_PATH = /home/xgy/.local/bin:/home/xgy/remote/sst_install/bin:/tmp/.tmpns6GeD:/home/xgy/codex-0.45.0/vendor/x86_64-unknown-linux-musl/path:/home/xgy/remote/sst_install/bin:/home/xgy/.vscode-server/cli/servers/Stable-0f0d87fa9e96c856c5212fc86db137ac0d783365/server/bin/remote-cli:/home/xgy/miniconda3/bin:/home/xgy/miniconda3/condabin:/home/xgy/.nvm/versions/node/v22.20.0/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/home/xgy/.vscode-server/data/User/globalStorage/github.copilot-chat/debugCommand
+PINTOOL_PATH = /usr/lib/jvm/java-17-openjdk-amd64/bin:/home/xgy/remote/sst_install/bin:/home/xgy/remote/sst_install/bin:/home/xgy/.vscode-server/cli/servers/Stable-0f0d87fa9e96c856c5212fc86db137ac0d783365/server/bin/remote-cli:/home/xgy/.local/bin:/home/xgy/remote/sst_install/bin:/tmp/.tmpns6GeD:/home/xgy/codex-0.45.0/vendor/x86_64-unknown-linux-musl/path:/home/xgy/remote/sst_install/bin:/home/xgy/.vscode-server/cli/servers/Stable-0f0d87fa9e96c856c5212fc86db137ac0d783365/server/bin/remote-cli:/home/xgy/miniconda3/bin:/home/xgy/miniconda3/condabin:/home/xgy/.nvm/versions/node/v22.20.0/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/home/xgy/.vscode-server/data/User/globalStorage/github.copilot-chat/debugCommand:/home/xgy/.vscode-server/data/User/globalStorage/github.copilot-chat/debugCommand
 PINTOOL_RUNTIME = 
 PIN_CPPFLAGS = -g   -Wall   -Werror   -Wno-unknown-pragmas   -D__PIN__=1 -DPIN_CRT=1   -fno-stack-protector   -fno-exceptions   -funwind-tables   -fasynchronous-unwind-tables   -fomit-frame-pointer   -fno-strict-aliasing   -fno-rtti   -faligned-new   -fpic   -DTARGET_IA32E   -DHOST_IA32E   -DTARGET_LINUX   -DPIN_VERSION_MINOR=
 PIN_CPPFLAGS_COMPILER = -fno-exceptions          -fabi-version=2
@@ -587,6 +590,9 @@ libSnnDL_la_SOURCES = \
 	api/SnnInterface.h \
 	api/SnnPEParentInterface.h \
 	api/ISpikeTransport.h \
+	api/IMemoryAccess.h \
+	api/ISynapseRoute.h \
+	api/SynapseRouteBuildConfig.h \
 	api/SnnWeightReader.h \
 	events/GatingDecisionEvent.h \
 	events/SimpleTestEvent.cc \
@@ -654,6 +660,12 @@ libSnnDL_la_SOURCES = \
 	services/SnnProfiler.h \
 	services/SnnRouteProvider.cc \
 	services/SnnRouteProvider.h \
+	services/SynapseRouteSubsystem.cc \
+	services/SynapseRouteSubsystem.h \
+	services/StepActivationSubsystem.cc \
+	services/StepActivationSubsystem.h \
+	services/NocSubsystem.cc \
+	services/NocSubsystem.h \
 	services/WeightAccessor.cc \
 	services/WeightAccessor.h \
 	services/WeightCacheOps.cc \
@@ -662,6 +674,8 @@ libSnnDL_la_SOURCES = \
 	services/WeightMemorySubsystem.h \
 	services/SpikeCommSubsystem.cc \
 	services/SpikeCommSubsystem.h \
+	services/StandardMemAccess.cc \
+	services/StandardMemAccess.h \
 	services/StandardMemBackend.cc \
 	services/StandardMemBackend.h
 

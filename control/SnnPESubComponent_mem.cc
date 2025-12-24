@@ -10,6 +10,7 @@
 #include "GasPhaseController.h"
 #include "MultiCorePE.h"
 #include "StandardMemBackend.h"
+#include "StandardMemAccess.h"
 
 #include <algorithm>
 #include <cmath>
@@ -317,13 +318,13 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
     }
     if (!req) return;
 
-    // Phase E: all data-plane StandardMem responses are handled inside WeightMemorySubsystem.
+    // Phase E/Phase1: data-plane StandardMem responses should first be dispatched by StandardMemAccess.
     // Control layer keeps only CustomResp (GAS control-plane) processing above.
     if (weight_mem_subsystem_) {
         weight_mem_subsystem_->setNowCycle(static_cast<uint64_t>(total_cycles_));
-        if (weight_mem_subsystem_->handleMemoryResponse(req)) {
-            return;
-        }
+    }
+    if (stdmem_access_ && stdmem_access_->handleMemoryResponse(req)) {
+        return;
     }
 
     output_->verbose(CALL_INFO, 4, 0, "📨 核心%d收到内存响应: ID=%" PRIu64 "\n",

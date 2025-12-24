@@ -1,0 +1,62 @@
+// -*- c++ -*-
+//
+// SynapseRouteBuildConfig:
+// - 权重驱动路由构建（dense/BCSR/edges_csv）所需的参数集合。
+//
+// 注意：该配置不包含传输/封包语义；未来将作为 Synapse/Route 子系统的配置输入。
+// 为保持兼容，Phase2 期间保留旧别名 `SpikeCommRoutingConfig`（原本定义于 SpikeCommSubsystem.h）。
+
+#pragma once
+
+#include <cstdint>
+#include <string>
+
+namespace SST { namespace SnnDL {
+
+struct SynapseRouteBuildConfig {
+    bool routing_weight_driven = false;
+    bool log_weight_details = false;
+    bool verify_routing_weights = false;
+    bool route_summary_enable = false;
+
+    // Route inputs (keep consistent with legacy cache key semantics).
+    uint32_t rows = 0;            // per-core rows (num_neurons)
+    uint32_t cols = 0;            // global cols (weights_cols)
+    uint32_t total_nodes = 16;    // total PEs
+    uint32_t cores_per_pe = 1;    // total_cores
+    uint32_t neurons_per_pe = 0;  // derived; used for denom & cache-key
+    bool use_post_row_pre_col = false;
+
+    std::string weights_template;
+    float routing_epsilon = 1e-8f;
+    uint32_t routing_topk = 0;
+    uint32_t routing_topk_per_pe = 0;
+    bool route_exclude_self_pe = false;
+    std::string route_layers_mask;
+    bool route_filter_warn = true;
+
+    // Mapping integration
+    std::string mapping_mode;
+    std::string mapping_edges_file;
+    bool mapping_csv_has_header = true;
+    std::string mapping_csv_separator = ",";
+    bool mapping_assume_block_ids = true;
+
+    // Optional: BCSR route parsing parameters (used when weights_template points to BCSR bin).
+    bool use_bcsr = false;
+    uint32_t bcsr_br = 0;
+    uint32_t bcsr_bc = 0;
+    uint32_t bcsr_idx_bytes = 0;
+    uint32_t bcsr_val_bytes = 0;
+    uint64_t base_addr = 0;
+    uint64_t bcsr_rowptr_addr = 0;
+    uint64_t bcsr_colidx_addr = 0;
+    uint64_t bcsr_blockdata_addr = 0;
+    uint64_t bcsr_blockids_addr = 0;
+};
+
+// 兼容：旧名仍可用（Phase2 以后可逐步替换为 SynapseRouteBuildConfig）。
+using SpikeCommRoutingConfig = SynapseRouteBuildConfig;
+
+}} // namespace SST::SnnDL
+
