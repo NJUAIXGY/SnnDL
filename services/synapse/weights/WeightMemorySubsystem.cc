@@ -262,10 +262,13 @@ void WeightMemorySubsystem::requestBCSR_(uint32_t pre_global, uint32_t post_loca
         const uint32_t block_count = end - start;
         const size_t bytes = orch_.bcsr_mgr->colIndexBytes(block_count);
         const uint64_t addr = orch_.bcsr_mgr->colIndexAddr(start);
-        uint64_t req_addr = addr;
-        size_t req_size = bytes;
-        size_t slice_off = 0;
-        prepareAlignedRead(addr, bytes, orch_.line_size_bytes, req_addr, req_size, slice_off);
+        // NOTE: 对 colidx 段不要扩展到整 cacheline 读（例如 450B→512B）。在 memHierarchy.Cache
+        // 的 non-coherent/L1 配置下，多 cacheline 的“扩展读”在部分地址上会返回全 0 的 rr->data，
+        // 而同地址的 64B 单行读却是正确的；这会直接导致 BCSR miss→权重=0→发放归零。
+        // 保持与稳定版本一致：按原始 addr/bytes 发起。
+        const uint64_t req_addr = addr;
+        const size_t req_size = bytes;
+        const size_t slice_off = 0;
         PendingMeta meta{};
         meta.address = req_addr;
         meta.size = req_size;

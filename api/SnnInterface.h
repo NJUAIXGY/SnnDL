@@ -2,7 +2,7 @@
 //
 // Copyright 2025 SST Contributors
 //
-// SnnInterface.h: SNN网络接口基类
+// SnnInterface.h: 通用网络接口基类（payload-agnostic）
 //
 
 #ifndef _SNNINTERFACE_H
@@ -12,13 +12,14 @@
 #include <sst/core/params.h>
 #include <functional>
 #include <string>
-#include "SpikeEvent.h"
+
+namespace SST { class Event; }
 
 namespace SST {
 namespace SnnDL {
 
 /**
- * @brief SNN网络接口基类
+ * @brief 通用网络接口基类（不包含 Spike/BCSR/权重语义）
  * 
  * 这是一个SubComponent基类，定义了SnnPE与网络通信的标准接口。
  * 类似于miranda.BaseCPU使用memory和generator插槽的方式，
@@ -27,10 +28,10 @@ namespace SnnDL {
 class SnnInterface : public SST::SubComponent {
 public:
     /**
-     * @brief 脉冲处理回调函数类型
-     * @param spike_event 接收到的脉冲事件指针
+     * @brief 通用接收回调（接管 event 生命周期）
+     * @param event 接收到的事件指针
      */
-    typedef std::function<void(SpikeEvent*)> SpikeHandler;
+    typedef std::function<void(SST::Event*)> ReceiveHandler;
 
     /**
      * @brief 构造函数
@@ -54,16 +55,17 @@ public:
     // === 纯虚接口方法 ===
 
     /**
-     * @brief 设置脉冲接收处理器
-     * @param handler 脉冲处理回调函数
+     * @brief 设置接收处理器（接管 event 生命周期）
+     * @param handler 接收回调函数
      */
-    virtual void setSpikeHandler(SpikeHandler handler) = 0;
+    virtual void setReceiveHandler(ReceiveHandler handler) = 0;
 
     /**
-     * @brief 发送脉冲事件
-     * @param spike_event 要发送的脉冲事件
+     * @brief 发送事件到目标节点（接管 event 生命周期）
+     * @param dest_node 目标节点ID
+     * @param event 要发送的事件
      */
-    virtual void sendSpike(SpikeEvent* spike_event) = 0;
+    virtual void sendToNode(uint32_t dest_node, SST::Event* event) = 0;
 
     /**
      * @brief 设置网络节点ID

@@ -15,6 +15,7 @@
 #include <string>
 
 #include "INocTransport.h"
+#include "NocPacketEvent.h"
 
 namespace SST { class Event; }
 namespace SST { class Link; }
@@ -25,8 +26,6 @@ namespace SST { namespace SnnDL {
 
 class OptimizedInternalRing;
 class SnnInterface;
-class SpikeEvent;
-class SpikeEventWrapper;
 
 class NocSubsystem final : public INocTransport {
 public:
@@ -44,11 +43,8 @@ public:
         OptimizedInternalRing* optimized_ring = nullptr;
         SST::Link* external_spike_output_link = nullptr;  // legacy fallback
 
-        // neuron_id -> core_id；返回 -1 表示不在本 PE
-        std::function<int(int /*neuron_id*/)> determine_target_unit;
-
-        // 投递回调（由 MultiCorePE 提供实现，保持 core->deliverSpike 语义不变）
-        std::function<void(int /*core_id*/, SpikeEvent*)> deliver_to_core;
+        // 投递回调（由 MultiCorePE 提供实现）：NoC 只负责把 packet 投递到目标 endpoint
+        std::function<void(int /*endpoint_id*/, NocPacketEvent*)> deliver_to_endpoint;
     };
 
     struct Stats {
@@ -64,15 +60,15 @@ public:
     void bindStats(const Stats& st);
 
     // === Output side ===
-    void onCoreSend(SpikeEvent* event);
+    void onCoreSend(NocPacketEvent* packet);
 
     // === INocTransport ===
-    void sendFromCore(int src_core, SpikeEvent* event) override;
-    void injectLocal(int dst_core, SpikeEvent* event) override;
-    void sendExternal(SpikeEvent* event) override;
+    void sendFromCore(int src_core, NocPacketEvent* packet) override;
+    void injectLocal(int dst_core, NocPacketEvent* packet) override;
+    void sendExternal(NocPacketEvent* packet) override;
 
     // === Input side ===
-    void onNicReceive(SpikeEvent* spike);
+    void onNicReceive(NocPacketEvent* packet);
     void onExternalPortEvent(SST::Event* event);
     void onDirectionalLinkEvent(SST::Event* event, const std::string& direction);
 
@@ -83,18 +79,17 @@ public:
     size_t incomingQueueSize() const { return incoming_queue_.size(); }
 
 private:
-    SpikeEvent* extractSpikeFromWrapper_(SpikeEventWrapper* wrapper);
-    void enqueueIncoming_(SpikeEvent* spike);
-    void sendExternalSpike_(SpikeEvent* spike);
-    void forwardExternalSpike_(SpikeEvent* spike);
-    void routeInternalSpike_(int src_core, int dst_core, SpikeEvent* spike);
+    void enqueueIncoming_(NocPacketEvent* packet);
+    void sendExternalPacket_(NocPacketEvent* packet);
+    void forwardExternalPacket_(NocPacketEvent* packet);
+    void routeInternalPacket_(int src_core, int dst_core, NocPacketEvent* packet);
     void tickOptimizedRing_(uint64_t current_cycle);
 
     Config cfg_{};
     Runtime rt_{};
     Stats st_{};
 
-    std::queue<SpikeEvent*> incoming_queue_;
+    std::queue<NocPacketEvent*> incoming_queue_;
 };
 
 }} // namespace SST::SnnDL

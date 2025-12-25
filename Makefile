@@ -192,16 +192,17 @@ am_libSnnDL_la_OBJECTS = events/SimpleTestEvent.lo \
 	control/SnnPEApplyScatter.lo control/SnnPEOrchestrators.lo \
 	control/StageEventHub.lo compute/SnnComputeCore.lo \
 	compute/SnnCoreEngine.lo compute/SnnLearningCore.lo \
-	compute/SnnWeightDiagnostics.lo services/synapse/gas/AccumulatorOps.lo \
+	services/synapse/weights/SnnWeightDiagnostics.lo services/synapse/gas/AccumulatorOps.lo \
 	services/synapse/gas/GasEdgeCollector.lo services/synapse/gas/GasPhaseController.lo \
-	services/noc/OptimizedInternalRing.lo services/noc/SimpleNetworkWrapper.lo \
-	services/synapse/weights/SnnBcsrWeightManager.lo services/noc/SnnNetworkAdapter.lo \
-	services/synapse/route/SnnRouteProvider.lo services/synapse/route/SynapseRouteSubsystem.lo \
+	services/noc/OptimizedInternalRing.lo components/noc/SimpleNetworkWrapper.lo \
+	services/synapse/weights/SnnBcsrWeightManager.lo components/noc/SnnNetworkAdapter.lo \
+	services/synapse/route/SnnRouteProvider.lo services/synapse/route/BcsrRouteBuilder.lo \
+	services/synapse/route/StepBcsrReachability.lo services/synapse/route/SynapseRouteSubsystem.lo \
 	services/stimulus/StepActivationSubsystem.lo \
 	services/noc/NocSubsystem.lo \
 	services/synapse/weights/WeightAccessor.lo services/synapse/weights/WeightCacheOps.lo \
 	services/synapse/weights/WeightMemorySubsystem.lo \
-	services/memory/StandardMemAccess.lo services/memory/StandardMemBackend.lo \
+	services/memory/StandardMemAccess.lo \
 	services/synapse/route/SpikeCommSubsystem.lo
 libSnnDL_la_OBJECTS = $(am_libSnnDL_la_OBJECTS)
 AM_V_lt = $(am__v_lt_$(V))
@@ -238,7 +239,7 @@ am__depfiles_remade = components/$(DEPDIR)/GatherBufferIF.Plo \
 	compute/$(DEPDIR)/SnnComputeCore.Plo \
 	compute/$(DEPDIR)/SnnCoreEngine.Plo \
 	compute/$(DEPDIR)/SnnLearningCore.Plo \
-	compute/$(DEPDIR)/SnnWeightDiagnostics.Plo \
+	services/synapse/weights/$(DEPDIR)/SnnWeightDiagnostics.Plo \
 	control/$(DEPDIR)/SnnPEApplyScatter.Plo \
 	control/$(DEPDIR)/SnnPEOrchestrators.Plo \
 	control/$(DEPDIR)/SnnPESubComponent.Plo \
@@ -254,17 +255,18 @@ am__depfiles_remade = components/$(DEPDIR)/GatherBufferIF.Plo \
 	services/synapse/gas/$(DEPDIR)/GasEdgeCollector.Plo \
 	services/synapse/gas/$(DEPDIR)/GasPhaseController.Plo \
 	services/noc/$(DEPDIR)/OptimizedInternalRing.Plo \
-	services/noc/$(DEPDIR)/SimpleNetworkWrapper.Plo \
+	components/noc/$(DEPDIR)/SimpleNetworkWrapper.Plo \
 	services/synapse/weights/$(DEPDIR)/SnnBcsrWeightManager.Plo \
-	services/noc/$(DEPDIR)/SnnNetworkAdapter.Plo \
+	components/noc/$(DEPDIR)/SnnNetworkAdapter.Plo \
 	services/noc/$(DEPDIR)/NocSubsystem.Plo \
 	services/synapse/route/$(DEPDIR)/SnnRouteProvider.Plo \
+	services/synapse/route/$(DEPDIR)/BcsrRouteBuilder.Plo \
+	services/synapse/route/$(DEPDIR)/StepBcsrReachability.Plo \
 	services/synapse/route/$(DEPDIR)/SynapseRouteSubsystem.Plo \
 	services/synapse/weights/$(DEPDIR)/WeightAccessor.Plo \
 	services/synapse/weights/$(DEPDIR)/WeightCacheOps.Plo \
 	services/synapse/weights/$(DEPDIR)/WeightMemorySubsystem.Plo \
 	services/memory/$(DEPDIR)/StandardMemAccess.Plo \
-	services/memory/$(DEPDIR)/StandardMemBackend.Plo \
 	services/synapse/route/$(DEPDIR)/SpikeCommSubsystem.Plo \
 	services/stimulus/$(DEPDIR)/StepActivationSubsystem.Plo
 am__mv = mv -f
@@ -598,6 +600,7 @@ libSnnDL_la_SOURCES = \
 	api/ISpikeTransport.h \
 	api/INocTransport.h \
 	api/NocSpikeTransport.h \
+	api/IManualWindowDrive.h \
 	api/IMemoryAccess.h \
 	api/ISynapseRoute.h \
 	api/SynapseRouteBuildConfig.h \
@@ -647,8 +650,6 @@ libSnnDL_la_SOURCES = \
 	compute/SnnLearningCore.cc \
 	compute/SnnLearningCore.h \
 	compute/SnnNeuronModel.h \
-	compute/SnnWeightDiagnostics.cc \
-	compute/SnnWeightDiagnostics.h \
 	compute/SynapseManager.h \
 	services/synapse/gas/AccumulatorOps.cc \
 	services/synapse/gas/AccumulatorOps.h \
@@ -659,15 +660,21 @@ libSnnDL_la_SOURCES = \
 	services/synapse/gas/GasPhaseController.h \
 	services/noc/OptimizedInternalRing.cc \
 	services/noc/OptimizedInternalRing.h \
-	services/noc/SimpleNetworkWrapper.cc \
-	services/noc/SimpleNetworkWrapper.h \
+	components/noc/SimpleNetworkWrapper.cc \
+	components/noc/SimpleNetworkWrapper.h \
 	services/synapse/weights/SnnBcsrWeightManager.cc \
 	services/synapse/weights/SnnBcsrWeightManager.h \
-	services/noc/SnnNetworkAdapter.cc \
-	services/noc/SnnNetworkAdapter.h \
+	services/synapse/weights/SnnWeightDiagnostics.cc \
+	services/synapse/weights/SnnWeightDiagnostics.h \
+	components/noc/SnnNetworkAdapter.cc \
+	components/noc/SnnNetworkAdapter.h \
 	services/SnnProfiler.h \
 	services/synapse/route/SnnRouteProvider.cc \
 	services/synapse/route/SnnRouteProvider.h \
+	services/synapse/route/BcsrRouteBuilder.cc \
+	services/synapse/route/BcsrRouteBuilder.h \
+	services/synapse/route/StepBcsrReachability.cc \
+	services/synapse/route/StepBcsrReachability.h \
 	services/synapse/route/SynapseRouteSubsystem.cc \
 	services/synapse/route/SynapseRouteSubsystem.h \
 	services/stimulus/StepActivationSubsystem.cc \
@@ -683,9 +690,7 @@ libSnnDL_la_SOURCES = \
 	services/synapse/route/SpikeCommSubsystem.cc \
 	services/synapse/route/SpikeCommSubsystem.h \
 	services/memory/StandardMemAccess.cc \
-	services/memory/StandardMemAccess.h \
-	services/memory/StandardMemBackend.cc \
-	services/memory/StandardMemBackend.h
+	services/memory/StandardMemAccess.h
 
 
 #
@@ -844,8 +849,6 @@ compute/SnnCoreEngine.lo: compute/$(am__dirstamp) \
 	compute/$(DEPDIR)/$(am__dirstamp)
 compute/SnnLearningCore.lo: compute/$(am__dirstamp) \
 	compute/$(DEPDIR)/$(am__dirstamp)
-compute/SnnWeightDiagnostics.lo: compute/$(am__dirstamp) \
-	compute/$(DEPDIR)/$(am__dirstamp)
 services/$(am__dirstamp):
 	@$(MKDIR_P) services
 	@: > services/$(am__dirstamp)
@@ -917,7 +920,7 @@ include components/mpi/$(DEPDIR)/MPITypes.Plo # am--include-marker
 include compute/$(DEPDIR)/SnnComputeCore.Plo # am--include-marker
 include compute/$(DEPDIR)/SnnCoreEngine.Plo # am--include-marker
 include compute/$(DEPDIR)/SnnLearningCore.Plo # am--include-marker
-include compute/$(DEPDIR)/SnnWeightDiagnostics.Plo # am--include-marker
+include services/synapse/weights/$(DEPDIR)/SnnWeightDiagnostics.Plo # am--include-marker
 include control/$(DEPDIR)/SnnPEApplyScatter.Plo # am--include-marker
 include control/$(DEPDIR)/SnnPEOrchestrators.Plo # am--include-marker
 include control/$(DEPDIR)/SnnPESubComponent.Plo # am--include-marker
@@ -933,17 +936,18 @@ include services/synapse/gas/$(DEPDIR)/AccumulatorOps.Plo # am--include-marker
 include services/synapse/gas/$(DEPDIR)/GasEdgeCollector.Plo # am--include-marker
 include services/synapse/gas/$(DEPDIR)/GasPhaseController.Plo # am--include-marker
 include services/noc/$(DEPDIR)/OptimizedInternalRing.Plo # am--include-marker
-include services/noc/$(DEPDIR)/SimpleNetworkWrapper.Plo # am--include-marker
+include components/noc/$(DEPDIR)/SimpleNetworkWrapper.Plo # am--include-marker
 include services/synapse/weights/$(DEPDIR)/SnnBcsrWeightManager.Plo # am--include-marker
-include services/noc/$(DEPDIR)/SnnNetworkAdapter.Plo # am--include-marker
+include components/noc/$(DEPDIR)/SnnNetworkAdapter.Plo # am--include-marker
 include services/noc/$(DEPDIR)/NocSubsystem.Plo # am--include-marker
 include services/synapse/route/$(DEPDIR)/SnnRouteProvider.Plo # am--include-marker
+include services/synapse/route/$(DEPDIR)/BcsrRouteBuilder.Plo # am--include-marker
+include services/synapse/route/$(DEPDIR)/StepBcsrReachability.Plo # am--include-marker
 include services/synapse/route/$(DEPDIR)/SynapseRouteSubsystem.Plo # am--include-marker
 include services/synapse/weights/$(DEPDIR)/WeightAccessor.Plo # am--include-marker
 include services/synapse/weights/$(DEPDIR)/WeightCacheOps.Plo # am--include-marker
 include services/synapse/weights/$(DEPDIR)/WeightMemorySubsystem.Plo # am--include-marker
 include services/memory/$(DEPDIR)/StandardMemAccess.Plo # am--include-marker
-include services/memory/$(DEPDIR)/StandardMemBackend.Plo # am--include-marker
 include services/synapse/route/$(DEPDIR)/SpikeCommSubsystem.Plo # am--include-marker
 include services/stimulus/$(DEPDIR)/StepActivationSubsystem.Plo # am--include-marker
 
@@ -1144,7 +1148,7 @@ distclean: distclean-am
 	-rm -f compute/$(DEPDIR)/SnnComputeCore.Plo
 	-rm -f compute/$(DEPDIR)/SnnCoreEngine.Plo
 	-rm -f compute/$(DEPDIR)/SnnLearningCore.Plo
-	-rm -f compute/$(DEPDIR)/SnnWeightDiagnostics.Plo
+	-rm -f services/synapse/weights/$(DEPDIR)/SnnWeightDiagnostics.Plo
 	-rm -f control/$(DEPDIR)/SnnPEApplyScatter.Plo
 	-rm -f control/$(DEPDIR)/SnnPEOrchestrators.Plo
 	-rm -f control/$(DEPDIR)/SnnPESubComponent.Plo
@@ -1165,13 +1169,14 @@ distclean: distclean-am
 	-rm -f services/noc/$(DEPDIR)/SnnNetworkAdapter.Plo
 	-rm -f services/noc/$(DEPDIR)/NocSubsystem.Plo
 	-rm -f services/synapse/route/$(DEPDIR)/SnnRouteProvider.Plo
+	-rm -f services/synapse/route/$(DEPDIR)/BcsrRouteBuilder.Plo
+	-rm -f services/synapse/route/$(DEPDIR)/StepBcsrReachability.Plo
 	-rm -f services/synapse/route/$(DEPDIR)/SynapseRouteSubsystem.Plo
 	-rm -f services/synapse/route/$(DEPDIR)/SpikeCommSubsystem.Plo
 	-rm -f services/synapse/weights/$(DEPDIR)/WeightAccessor.Plo
 	-rm -f services/synapse/weights/$(DEPDIR)/WeightCacheOps.Plo
 	-rm -f services/synapse/weights/$(DEPDIR)/WeightMemorySubsystem.Plo
 	-rm -f services/memory/$(DEPDIR)/StandardMemAccess.Plo
-	-rm -f services/memory/$(DEPDIR)/StandardMemBackend.Plo
 	-rm -f Makefile
 distclean-am: clean-am distclean-compile distclean-generic \
 	distclean-tags
@@ -1230,7 +1235,7 @@ maintainer-clean: maintainer-clean-am
 	-rm -f compute/$(DEPDIR)/SnnComputeCore.Plo
 	-rm -f compute/$(DEPDIR)/SnnCoreEngine.Plo
 	-rm -f compute/$(DEPDIR)/SnnLearningCore.Plo
-	-rm -f compute/$(DEPDIR)/SnnWeightDiagnostics.Plo
+	-rm -f services/synapse/weights/$(DEPDIR)/SnnWeightDiagnostics.Plo
 	-rm -f control/$(DEPDIR)/SnnPEApplyScatter.Plo
 	-rm -f control/$(DEPDIR)/SnnPEOrchestrators.Plo
 	-rm -f control/$(DEPDIR)/SnnPESubComponent.Plo
@@ -1251,13 +1256,14 @@ maintainer-clean: maintainer-clean-am
 	-rm -f services/noc/$(DEPDIR)/SnnNetworkAdapter.Plo
 	-rm -f services/noc/$(DEPDIR)/NocSubsystem.Plo
 	-rm -f services/synapse/route/$(DEPDIR)/SnnRouteProvider.Plo
+	-rm -f services/synapse/route/$(DEPDIR)/BcsrRouteBuilder.Plo
+	-rm -f services/synapse/route/$(DEPDIR)/StepBcsrReachability.Plo
 	-rm -f services/synapse/route/$(DEPDIR)/SynapseRouteSubsystem.Plo
 	-rm -f services/synapse/route/$(DEPDIR)/SpikeCommSubsystem.Plo
 	-rm -f services/synapse/weights/$(DEPDIR)/WeightAccessor.Plo
 	-rm -f services/synapse/weights/$(DEPDIR)/WeightCacheOps.Plo
 	-rm -f services/synapse/weights/$(DEPDIR)/WeightMemorySubsystem.Plo
 	-rm -f services/memory/$(DEPDIR)/StandardMemAccess.Plo
-	-rm -f services/memory/$(DEPDIR)/StandardMemBackend.Plo
 	-rm -f Makefile
 maintainer-clean-am: distclean-am maintainer-clean-generic
 

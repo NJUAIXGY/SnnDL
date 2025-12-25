@@ -15,10 +15,8 @@
 #include <sst/core/params.h>
 
 #include "SpikeEvent.h"
-#include "synapse/gas/GasCustomCmd.h"
 #include "SnnWeightReader.h"
 #include "SnnCoreEngine.h"
-#include "SnnWeightDiagnostics.h"
 #include "SnnLearningCore.h"
 #include "ISnnComputeCore.h"
 
@@ -133,35 +131,6 @@ private:
     // 可替换学习核心（Phase2）
     std::unique_ptr<ILearningCore> learning_core_;
 
-    // BCSR 读与诊断
-    bool use_bcsr_ = false;
-    uint32_t bcsr_br_ = 16;
-    uint32_t bcsr_bc_ = 16;
-    uint32_t bcsr_val_bytes_ = 4;
-    uint32_t bcsr_idx_bytes_ = 2;
-    uint64_t bcsr_colidx_addr_ = 0;
-    uint64_t bcsr_blockdata_addr_ = 0;
-    uint64_t bcsr_blockids_addr_ = 0;
-    BcsrWeightManager bcsr_weights_;
-    bool bcsr_force_file_read_ = false;
-    uint32_t bcsr_row_index_cache_cap_ = 64;
-    uint32_t bcsr_block_cache_cap_ = 256;
-    bool bcsr_prefetch_all_ = true;
-    bool bcsr_prefetch_issued_ = false;
-    // 验证状态
-    bool verify_bcsr_started_ = false;
-    bool verify_bcsr_done_ = false;
-    bool verify_bcsr_inflight_ = false;
-    uint32_t verify_bcsr_post_local_ = 0;
-    uint32_t verify_bcsr_block_col_ = 0;
-    uint32_t verify_bcsr_intra_col_ = 0;
-    bool verify_bcsr_block_resolved_ = false;
-    std::unordered_map<uint32_t, std::vector<uint32_t>> bcsr_row_index_cache_;
-    std::list<uint32_t> bcsr_row_index_lru_;
-    struct BcsrBlockEntry { std::vector<float> data; std::list<uint64_t>::iterator it; };
-    std::unordered_map<uint64_t, BcsrBlockEntry> bcsr_block_cache_;
-    std::list<uint64_t> bcsr_block_lru_;
-
     // GAS 阶段状态/统计
     enum class GasStage { Idle=0, Gather=1, Apply=2, Scatter=3 };
     GasStage gas_stage_ = GasStage::Idle;
@@ -196,14 +165,12 @@ private:
     std::vector<uint8_t> pending_dv_touched_;
     std::vector<uint32_t> pending_dv_list_;
 
-	    // 辅助方法
-	    void performWeightVerificationTick_(uint64_t now_cycle);
-	    void performBcsrProbeTick_(uint64_t now_cycle);
-	    void initCoreEngineState_();
-	    void initVerifyFile_();
-	    void prepareBcsrCaches_();
-        void applyPendingDeltas_();
-        void resetPendingDeltas_();
+    // 辅助方法
+    void performWeightVerificationTick_(uint64_t now_cycle);
+    void initCoreEngineState_();
+    void initVerifyFile_();
+    void applyPendingDeltas_();
+    void resetPendingDeltas_();
 };
 
 } } // namespace SST::SnnDL

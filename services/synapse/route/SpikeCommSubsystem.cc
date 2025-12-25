@@ -355,7 +355,6 @@ bool appendRoutesFromBcsrFile_(const SpikeCommRoutingConfig& cfg,
     uint64_t blockids_off = (cfg.bcsr_blockids_addr > cfg.base_addr) ? (cfg.bcsr_blockids_addr - cfg.base_addr) : 0;
     uint32_t total_blocks = 0;
     uint32_t meta_cols = cols;
-    const uint64_t pe_base_global = static_cast<uint64_t>(pe_index) * static_cast<uint64_t>(cfg.rows);
     const std::string meta_path = path + ".meta.json";
     if (parseBcsrMeta_(meta_path, rows, meta_cols, br, bc, idx_bytes, val_bytes,
                       rowptr_off, colidx_off, blockdata_off, blockids_off, total_blocks)) {
@@ -372,6 +371,11 @@ bool appendRoutesFromBcsrFile_(const SpikeCommRoutingConfig& cfg,
         return false;
     }
     const uint32_t n_block_rows = (rows + br - 1) / br;
+    const uint64_t neurons_per_pe =
+        (cfg.neurons_per_pe > 0)
+            ? static_cast<uint64_t>(cfg.neurons_per_pe)
+            : (cfg.cores_per_pe > 0 ? static_cast<uint64_t>(cfg.cores_per_pe) * static_cast<uint64_t>(rows)
+                                    : static_cast<uint64_t>(rows));
     const uint64_t core_offset_global = (core_index > 0) ? static_cast<uint64_t>(core_index) * static_cast<uint64_t>(rows) : 0ULL;
     std::ifstream fin(path, std::ios::binary);
     if (!fin.good()) {
@@ -413,8 +417,8 @@ bool appendRoutesFromBcsrFile_(const SpikeCommRoutingConfig& cfg,
     const size_t floats_per_block = static_cast<size_t>(br) * static_cast<size_t>(bc);
     std::vector<float> blockdata(floats_per_block, 0.0f);
     std::vector<uint32_t> blockids(floats_per_block, kBcsrSentinelId);
-    const uint64_t total_global_neurons = static_cast<uint64_t>(cfg.total_nodes) *
-        static_cast<uint64_t>(cfg.neurons_per_pe > 0 ? cfg.neurons_per_pe : cfg.rows);
+    const uint64_t total_global_neurons =
+        static_cast<uint64_t>(cfg.total_nodes) * (neurons_per_pe > 0 ? neurons_per_pe : 1ULL);
     uint64_t block_counter = 0;
     for (uint32_t block_row = 0; block_row < n_block_rows; ++block_row) {
         uint32_t begin = rowptr[block_row];
@@ -437,10 +441,12 @@ bool appendRoutesFromBcsrFile_(const SpikeCommRoutingConfig& cfg,
                     size_t off = static_cast<size_t>(rr) * bc + cc;
                     float weight = blockdata[off];
                     if (std::fabs(weight) <= cfg.routing_epsilon) continue;
-                    uint32_t post_global = (blockids_off > 0) ? blockids[off]
-                        : static_cast<uint32_t>(pe_base_global + core_offset_global + post_local);
-                    if (post_global == kBcsrSentinelId) continue;
-                    if (post_global >= total_global_neurons) continue;
+                    // 重要语义：blockids 仅作为有效位/哨兵，不能作为 post_global。
+                    if (blockids_off > 0 && blockids[off] == kBcsrSentinelId) continue;
+                    const uint64_t post_global_64 =
+                        static_cast<uint64_t>(pe_index) * neurons_per_pe + core_offset_global + static_cast<uint64_t>(post_local);
+                    if (post_global_64 >= total_global_neurons) continue;
+                    const uint32_t post_global = static_cast<uint32_t>(post_global_64);
                     uint32_t pre_global = block_col * bc + cc;
                     if (pre_global >= cols) continue;
                     routes_out[pre_global].push_back(post_global);

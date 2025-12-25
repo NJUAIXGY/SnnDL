@@ -14,11 +14,9 @@
 #include <iterator>
 #include <algorithm>
 #include <cstdlib>
-#include "memory/StandardMemBackend.h"
 
 using namespace SST;
 using namespace SST::SnnDL;
-using PendingMemoryRequest = MemRequestMeta;
 
 // Lightweight logging helpers (file-local). Keep consistent with SnnPESubComponent.cc.
 #ifndef SNNDL_LOGPTR
@@ -201,200 +199,12 @@ void SnnPESubComponent::requestWeightBCSR(uint32_t pre_global, uint32_t post_loc
         if (cb) cb(w);
         return;
     }
-    if (!bcsr_weights_.isRowptrReady()) {
-        bcsr_req_wait_rowptr_++;
-        if (window_read_debug_ && output_) {
-            output_->verbose(CALL_INFO, 0, 0,
-                "[diag-bcsr] core=%u rowptr not ready pre=%u post=%u\n",
-                core_id_, pre_global, post_local);
-        }
+    // Phase-1A: BCSR 读语义由 WeightMemorySubsystem 统一承载；控制层仅保留轻量封装。
+    if (!weight_mem_subsystem_) {
         if (cb) cb(0.0f);
         return;
     }
-    uint32_t rows = num_neurons_;
-    uint32_t br = (bcsr_br_>0? bcsr_br_:16);
-    uint32_t bc = (bcsr_bc_>0? bcsr_bc_:16);
-    uint32_t block_row = post_local / br;
-    uint32_t intra_row = post_local % br;
-    uint32_t block_col = pre_global / bc;
-    uint32_t intra_col = pre_global % bc;
-    const auto& rowptr_host = bcsr_weights_.rowptrHost();
-    if (block_row+1 >= rowptr_host.size()) {
-        if (window_read_debug_ && output_) {
-            output_->verbose(CALL_INFO, 0, 0,
-                "[diag-bcsr] core=%u block_row=%u rowptr_size=%zu out-of-range\n",
-                core_id_, block_row, rowptr_host.size());
-        }
-        if (cb) cb(0.0f);
-        return;
-    }
-    uint32_t start = rowptr_host[block_row];
-    uint32_t end   = rowptr_host[block_row+1];
-    if (end <= start) {
-        if (window_read_debug_ && output_) {
-            output_->verbose(CALL_INFO, 0, 0,
-                "[diag-bcsr] core=%u row empty post_local=%u block_row=%u start=%u end=%u\n",
-                core_id_, post_local, block_row, start, end);
-        }
-        if (cb) cb(0.0f);
-        return;
-    }
-    std::vector<uint32_t> cols;
-    if (!bcsrRowIndexGet_(block_row, cols)) {
-        size_t bytes = (size_t)(end - start) * bcsr_idx_bytes_;
-        uint64_t addr = bcsr_colidx_addr_ + (uint64_t)start * bcsr_idx_bytes_;
-        if (window_read_debug_ && output_) {
-            output_->verbose(CALL_INFO, 0, 0,
-                "[diag-bcsr] core=%u issue colidx row=%u start=%u end=%u bytes=%zu addr=0x%llx\n",
-                core_id_, block_row, start, end, bytes, (unsigned long long)addr);
-        }
-        PendingMemoryRequest pm{};
-        pm.address = addr; pm.size = bytes; pm.issue_cycle = total_cycles_;
-        pm.bcsr_kind = 2; pm.bcsr_block_row = block_row; pm.bcsr_target_block_col = block_col; pm.bcsr_intra_row = intra_row; pm.bcsr_intra_col = intra_col;
-        pm.bcsr_row_start = start; pm.has_single_cb = (cb!=nullptr); pm.single_cb = cb;
-        stats_reporter_.reportMemoryIssue(bytes, false);
-        if (mem_backend_) mem_backend_->sendRead(addr, bytes, pm);
-        return;
-    }
-    uint32_t idx_in_row=0; bool found=false;
-    for (size_t i=0;i<cols.size();++i){ if (cols[i]==block_col){ idx_in_row=(uint32_t)i; found=true; break; } }
-    if (!found) {
-        bcsr_req_block_miss_++;
-        if (window_read_debug_ && output_) {
-            std::string sample_cols;
-            if (!cols.empty()) {
-                const size_t limit = std::min<size_t>(cols.size(), 8);
-                sample_cols.reserve(limit * 6);
-                for (size_t si = 0; si < limit; ++si) {
-                    sample_cols += std::to_string(cols[si]);
-                    if (si + 1 < limit) sample_cols += ",";
-                }
-            }
-            output_->verbose(CALL_INFO, 0, 0,
-                "[diag-bcsr] core=%u block_row=%u pre=%u block_col=%u miss colidx range=[%u,%u) sample=[%s]%s\n",
-                core_id_, block_row, pre_global, block_col, start, end,
-                sample_cols.c_str(), cols.size() > 8 ? "..." : "");
-        }
-        if (cb) cb(0.0f);
-        return;
-    }
-    std::vector<float> blk;
-    if (bcsrBlockGet_(block_row, block_col, blk)) {
-        bcsr_req_block_hit_++;
-        uint32_t off = intra_row * bc + intra_col;
-        float w = (off < blk.size() ? blk[off] : 0.0f);
-        if (window_read_debug_ && output_) {
-            uint32_t post_local_dbg = block_row * br + intra_row;
-            uint32_t post_global = global_neuron_base_ + post_local_dbg;
-            uint32_t pre_global_effective = block_col * bc + intra_col;
-            output_->verbose(CALL_INFO, 1, 0,
-                "[diag-bcsr-weight] core=%u post_local=%u post_global=%u pre_global=%u weight=%.6f source=BcsrCache\n",
-                core_id_, post_local_dbg, post_global, pre_global_effective, w);
-        }
-        if (cb) cb(w);
-        return;
-    }
-    size_t block_bytes = (size_t)br * (size_t)bc * bcsr_val_bytes_;
-    uint32_t global_block_index = start + idx_in_row;
-    uint64_t addr = bcsr_blockdata_addr_ + (uint64_t)global_block_index * block_bytes;
-    PendingMemoryRequest pm{}; pm.address = addr; pm.size = block_bytes; pm.issue_cycle = total_cycles_;
-    pm.bcsr_kind = 3; pm.bcsr_block_row = block_row; pm.bcsr_target_block_col = block_col; pm.bcsr_intra_row = intra_row; pm.bcsr_intra_col = intra_col;
-    pm.bcsr_row_start = start; pm.bcsr_idx_in_row = idx_in_row; pm.bcsr_global_block_index = global_block_index;
-    pm.has_single_cb = (cb!=nullptr); pm.single_cb = cb;
-    stats_reporter_.reportMemoryIssue(block_bytes, true);
-    if (mem_backend_) mem_backend_->sendRead(addr, block_bytes, pm);
-    bcsr_count_block_misses_++;
-}
-
-void SnnPESubComponent::bcsrPrefetchAll_() {
-    if (!use_bcsr_) return;
-    if (!bcsr_prefetch_all_) return;
-    if (bcsr_prefetch_issued_) return;
-    if (!memory_) return;
-    if (!bcsr_weights_.isRowptrReady()) return;
-
-    uint32_t rows = num_neurons_;
-    uint32_t br = (bcsr_br_>0? bcsr_br_:16);
-    uint32_t nBlockRows = (rows + br - 1) / br;
-    for (uint32_t block_row = 0; block_row < nBlockRows; ++block_row) {
-        const auto& rp = bcsr_weights_.rowptrHost();
-        if (block_row + 1 >= rp.size()) break;
-        uint32_t start = rp[block_row];
-        uint32_t end   = rp[block_row+1];
-        if (end <= start) continue;
-        std::vector<uint32_t> cached_cols;
-        if (bcsrRowIndexGet_(block_row, cached_cols)) {
-            bcsrPrefetchRowBlocks_(block_row, cached_cols, start);
-            continue;
-        }
-        size_t bytes = (size_t)(end - start) * bcsr_idx_bytes_;
-        uint64_t addr = bcsr_colidx_addr_ + (uint64_t)start * bcsr_idx_bytes_;
-        if (!mem_backend_ && memory_) {
-            mem_backend_ = std::make_unique<StandardMemBackend>(memory_);
-        }
-        if (!mem_backend_) {
-            if (output_) {
-                output_->verbose(CALL_INFO, 0, 0,
-                    "[diag-bcsr][warn] core=%u colidx prefetch skipped: mem_backend_未就绪\n",
-                    core_id_);
-            }
-            continue;
-        }
-        PendingMemoryRequest pm{};
-        pm.address = addr;
-        pm.size = bytes;
-        pm.issue_cycle = total_cycles_;
-        pm.is_weight = true;
-        pm.bcsr_kind = 2;
-        pm.bcsr_block_row = block_row;
-        pm.bcsr_row_start = start;
-        pm.bcsr_prefetch_all = true;
-        pm.bcsr_target_block_col = UINT32_MAX;
-        stats_reporter_.reportMemoryIssue(bytes, false);
-        mem_backend_->sendRead(addr, bytes, pm);
-    }
-    bcsr_prefetch_issued_ = true;
-}
-
-void SnnPESubComponent::bcsrPrefetchRowBlocks_(uint32_t block_row, const std::vector<uint32_t>& cols, uint32_t row_start) {
-    if (!use_bcsr_) return;
-    if (!memory_) return;
-    uint32_t br = (bcsr_br_>0? bcsr_br_:16);
-    uint32_t bc = (bcsr_bc_>0? bcsr_bc_:16);
-    size_t block_bytes = (size_t)br * (size_t)bc * bcsr_val_bytes_;
-    for (size_t i = 0; i < cols.size(); ++i) {
-        uint32_t block_col = cols[i];
-        uint64_t key = ((uint64_t)block_row << 32) | block_col;
-        if (bcsr_block_cache_.find(key) != bcsr_block_cache_.end()) continue;
-        uint32_t global_block_index = row_start + static_cast<uint32_t>(i);
-        uint64_t addr = bcsr_blockdata_addr_ + (uint64_t)global_block_index * block_bytes;
-        if (!mem_backend_ && memory_) {
-            mem_backend_ = std::make_unique<StandardMemBackend>(memory_);
-        }
-        if (!mem_backend_) {
-            if (output_) {
-                output_->verbose(CALL_INFO, 0, 0,
-                    "[diag-bcsr][warn] core=%u block prefetch skipped: mem_backend_未就绪 row=%u col=%u\n",
-                    core_id_, block_row, block_col);
-            }
-            continue;
-        }
-        PendingMemoryRequest pm{};
-        pm.address = addr;
-        pm.size = block_bytes;
-        pm.issue_cycle = total_cycles_;
-        pm.is_weight = true;
-        pm.bcsr_kind = 3;
-        pm.bcsr_block_row = block_row;
-        pm.bcsr_target_block_col = block_col;
-        pm.bcsr_row_start = row_start;
-        pm.bcsr_idx_in_row = static_cast<uint32_t>(i);
-        pm.bcsr_global_block_index = global_block_index;
-        pm.bcsr_prefetch_all = true;
-        stats_reporter_.reportMemoryIssue(block_bytes, true);
-        mem_backend_->sendRead(addr, block_bytes, pm);
-        bcsr_count_block_misses_++;
-    }
+    weight_mem_subsystem_->requestBCSR(pre_global, post_local, std::move(cb));
 }
 
 void SnnPESubComponent::bcsrPopulateWeightCache_(uint32_t block_row, uint32_t block_col, const std::vector<float>& blk) {

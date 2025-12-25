@@ -12,6 +12,9 @@
 #include "SnnNIC.h"
 #include "GatingDecisionEvent.h"
 #include "ICoreControlHooks.h"
+#include "NocPacketEvent.h"
+#include "NocPacketBatchEvent.h"
+#include "synapse/route/SpikeNocCodec.h"
 
 #include <fstream>
 #include <sstream>
@@ -24,6 +27,7 @@
 #include <random>
 #include <cstdlib>
 #include <climits>
+#include <cinttypes>
 
 using namespace SST;
 using namespace SST::SnnDL;
@@ -51,9 +55,6 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
     neurons_per_core_ = params.find<int>("neurons_per_core", 64);
     total_neurons_ = num_cores_ * neurons_per_core_;
     neurons_per_pe_cfg_ = params.find<uint32_t>("neurons_per_pe", 0);
-    if (neurons_per_pe_cfg_ == 0) {
-        neurons_per_pe_cfg_ = static_cast<uint32_t>(num_cores_) * static_cast<uint32_t>(neurons_per_core_);
-    }
     node_id_ = params.find<int>("node_id", 0);
     total_nodes_ = params.find<int>("total_nodes", 1);
     global_neuron_base_ = params.find<uint64_t>("global_neuron_base", 0);
@@ -71,6 +72,40 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
     }
     weights_file_ = params.find<std::string>("weights_file", "");
     enable_numa_ = params.find<bool>("enable_numa", true);
+
+    // ===== 全局ID布局口径（fail-fast）=====
+    // 统一口径：neurons_per_pe 必须等于 num_cores*neurons_per_core（禁止用其它 stride/bytes 误填）
+    const uint64_t derived_neurons_per_pe =
+        static_cast<uint64_t>(num_cores_) * static_cast<uint64_t>(neurons_per_core_);
+    if (neurons_per_pe_cfg_ == 0) {
+        neurons_per_pe_cfg_ = static_cast<uint32_t>(derived_neurons_per_pe);
+    } else if (static_cast<uint64_t>(neurons_per_pe_cfg_) != derived_neurons_per_pe) {
+        output_->fatal(
+            CALL_INFO, -1,
+            "MultiCorePE fatal: neurons_per_pe 参数口径错误：cfg=%u 但期望 num_cores*neurons_per_core=%" PRIu64 "（请检查脚本/配置是否误把 per_core_stride/base_addr 等字节量传入）\n",
+            neurons_per_pe_cfg_, derived_neurons_per_pe);
+    }
+    if (total_nodes_ <= 0) {
+        output_->fatal(CALL_INFO, -1, "MultiCorePE fatal: total_nodes 必须 > 0，当前=%d\n", total_nodes_);
+    }
+    if (node_id_ < 0 || node_id_ >= total_nodes_) {
+        output_->fatal(CALL_INFO, -1, "MultiCorePE fatal: node_id=%d 超出 [0,%d)\n", node_id_, total_nodes_);
+    }
+    global_layout_ = GlobalNeuronLayout(static_cast<uint32_t>(total_nodes_),
+                                        static_cast<uint32_t>(num_cores_),
+                                        static_cast<uint32_t>(neurons_per_core_));
+    if (!global_layout_.valid()) {
+        output_->fatal(CALL_INFO, -1,
+            "MultiCorePE fatal: GlobalNeuronLayout 无效：total_nodes=%d num_cores=%d neurons_per_core=%d\n",
+            total_nodes_, num_cores_, neurons_per_core_);
+    }
+    const uint64_t expected_base = global_layout_.globalBaseOfNode(static_cast<uint32_t>(node_id_));
+    if (global_neuron_base_ != expected_base) {
+        output_->fatal(
+            CALL_INFO, -1,
+            "MultiCorePE fatal: global_neuron_base(0x%" PRIx64 ") 与 node_id=%d 推导基址(0x%" PRIx64 ") 不一致（期望 global_neuron_base=node_id*neurons_per_pe）\n",
+            global_neuron_base_, node_id_, expected_base);
+    }
     
     // 神经元参数
     v_thresh_ = params.find<float>("v_thresh", 1.0f);
@@ -159,6 +194,7 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
         step_rt.num_cores = num_cores_;
         step_rt.neurons_per_core = neurons_per_core_;
         step_rt.neurons_per_pe_cfg = neurons_per_pe_cfg_;
+        step_rt.layout = &global_layout_;
         step_rt.sentinel_enabled = sentinel_enabled_;
         step_rt.step_diag_cap_cfg = step_diag_cap_cfg_;
         step_rt.step_diag_enable_cfg = step_diag_enable_cfg_;
@@ -248,8 +284,13 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
         noc_rt.nic = nullptr;  // init 后再注入
         noc_rt.optimized_ring = nullptr;  // init 后再注入
         noc_rt.external_spike_output_link = nullptr;  // init(phase0) link configured 后再注入
-        noc_rt.determine_target_unit = [this](int neuron_id) { return determineTargetUnit(neuron_id); };
-        noc_rt.deliver_to_core = [this](int core_id, SpikeEvent* spike) { deliverSpikeToCore(core_id, spike); };
+        noc_rt.deliver_to_endpoint = [this](int endpoint_id, NocPacketEvent* pkt) {
+            if (!pkt) return;
+            SpikeEvent* spike = SpikeNocCodec::decode(*pkt);
+            delete pkt;
+            if (!spike) return;
+            deliverSpikeToCore(endpoint_id, spike);
+        };
         noc_subsys_.bindRuntime(noc_rt);
     }
     // 记录路径（若提供），用于派生输出目录
@@ -325,8 +366,13 @@ void MultiCorePE::init(unsigned int phase) {
             noc_rt.nic = external_nic_;
             noc_rt.optimized_ring = optimized_ring_;
             noc_rt.external_spike_output_link = external_spike_output_link_;
-            noc_rt.determine_target_unit = [this](int neuron_id) { return determineTargetUnit(neuron_id); };
-            noc_rt.deliver_to_core = [this](int core_id, SpikeEvent* spike) { deliverSpikeToCore(core_id, spike); };
+            noc_rt.deliver_to_endpoint = [this](int endpoint_id, NocPacketEvent* pkt) {
+                if (!pkt) return;
+                SpikeEvent* spike = SpikeNocCodec::decode(*pkt);
+                delete pkt;
+                if (!spike) return;
+                deliverSpikeToCore(endpoint_id, spike);
+            };
             noc_subsys_.bindRuntime(noc_rt);
         }
         
@@ -568,20 +614,25 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
     step_activation_subsys_.tick(static_cast<uint64_t>(current_cycle_));
 
     // 0b. 测试注入：在首个有效周期从 core0 向 core1 注入一个跨核脉冲（仅当启用测试流量时）
-	    if (enable_test_traffic_ && !test_injected_ && num_cores_ > 1 && current_cycle_ == 5000) {
-	        // 构造一个从全局神经元0 -> 全局神经元(neurons_per_core_) 的脉冲
-	        SpikeEvent* test_spike = new SpikeEvent(0, neurons_per_core_, 0, 0.5f, current_cycle_);
-	        int src_core = determineTargetUnit(test_spike->getSourceNeuron());
-	        int dst_core = determineTargetUnit(test_spike->getDestinationNeuron());
-	        if (src_core >=0 && dst_core >=0 && src_core != dst_core) {
-	            noc_subsys_.sendFromCore(src_core, test_spike);
-	            PE_LOG(1, "🧪 注入跨核脉冲: 核心%d->核心%d\n", src_core, dst_core);
-	            test_injected_ = true;
-	        } else {
-	            delete test_spike;
-	            test_injected_ = true;
-	        }
-	    }
+		    if (enable_test_traffic_ && !test_injected_ && num_cores_ > 1 && current_cycle_ == 5000) {
+		        // 构造一个从本PE core0 -> core1 的跨核脉冲（使用全局ID口径）
+		        const uint32_t src_global = static_cast<uint32_t>(global_neuron_base_);
+		        const uint32_t dst_global =
+		            static_cast<uint32_t>(static_cast<uint64_t>(global_neuron_base_) + static_cast<uint64_t>(neurons_per_core_));
+		        SpikeEvent* test_spike = new SpikeEvent(src_global, dst_global, static_cast<uint32_t>(node_id_), 0.5f, current_cycle_);
+		        int src_core = determineTargetUnit(static_cast<int>(src_global));
+		        int dst_core = determineTargetUnit(static_cast<int>(dst_global));
+		        if (src_core >= 0 && dst_core >= 0 && src_core != dst_core) {
+		            NocPacketEvent* pkt = SpikeNocCodec::encode(*test_spike, global_layout_);
+		            delete test_spike;
+		            if (pkt) noc_subsys_.onCoreSend(pkt);
+		            PE_LOG(1, "🧪 注入跨核脉冲: 核心%d->核心%d\n", src_core, dst_core);
+		            test_injected_ = true;
+		        } else {
+		            delete test_spike;
+		            test_injected_ = true;
+		        }
+		    }
     
     // 1. 处理外部脉冲队列（Phase4-A1.1：下沉至 NoC 子系统）
     noc_subsys_.drainIncomingQueue(static_cast<uint64_t>(current_cycle_));
@@ -659,23 +710,42 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
 }
 
 void MultiCorePE::handleExternalSpikeEvent(SST::Event* ev) {
-    // Phase4-A1.1：外部端口输入逻辑收敛到 NoC 子系统（保持 hop/TTL 与路由语义不变）。
-    noc_subsys_.onExternalPortEvent(ev);
+    if (!ev) return;
+    // Phase4-A1.1：优先走 NoC packet；为兼容旧输入源，保留 SpikeEvent 直投回退。
+    if (auto* pkt = dynamic_cast<NocPacketEvent*>(ev)) {
+        noc_subsys_.onExternalPortEvent(pkt);
+        return;
+    }
+    if (auto* spike = dynamic_cast<SpikeEvent*>(ev)) {
+        handleExternalSpike(spike);
+        return;
+    }
+    delete ev;
 }
 
 void MultiCorePE::handleExternalSpike(SpikeEvent* spike) {
-    // Phase4-A1.1：NIC 回调输入路径收敛到 NoC 子系统。
-    noc_subsys_.onNicReceive(spike);
+    if (!spike) return;
+    // 仅处理发往本节点的脉冲；其它情况视为无效输入直接丢弃（relay 由 NoC packet 路径负责）。
+    if (spike->getDestinationNode() != static_cast<uint32_t>(node_id_)) {
+        delete spike;
+        return;
+    }
+    const int dst_core = determineTargetUnit(static_cast<int>(spike->getDestinationNeuron()));
+    if (dst_core >= 0) {
+        deliverSpikeToCore(dst_core, spike);
+    } else {
+        delete spike;
+    }
 }
 
 void MultiCorePE::sendExternalSpike(SpikeEvent* spike) {
     if (!spike) return;
-
-    // Phase4-A1.2/5：对外发路径做最后一次收敛，统一委托 NoC 子系统负责
-    // - backend 选择（NIC / legacy link）
-    // - 自环防护
-    // - external_spikes_sent 统计口径
-    noc_subsys_.sendExternal(spike);
+    NocPacketEvent* pkt = SpikeNocCodec::encode(*spike, global_layout_);
+    delete spike;
+    if (pkt) {
+        // Phase4-A1.2：统一委托 NoC 子系统负责外发（backend选择/自环防护/统计口径）
+        noc_subsys_.sendExternal(pkt);
+    }
 }
 
 int MultiCorePE::determineTargetUnit(int neuron_id) const {
@@ -1296,8 +1366,10 @@ void MultiCorePE::sendSpike(SpikeEvent* event) {
     PE_LOG(4, "📤 从SubComponent接收脉冲: 源神经元%d -> 目标神经元%d\n",
                     event->getSourceNeuron(), event->getDestinationNeuron());
 
-    // Phase4-A1.1：send 路径收敛到 NoC 子系统（保持路由/统计口径不变）。
-    noc_subsys_.onCoreSend(event);
+    // Phase4-A1.1：send 路径收敛到 NoC 子系统（严格通用化：SpikeEvent 在此处编码为 packet）。
+    NocPacketEvent* pkt = SpikeNocCodec::encode(*event, global_layout_);
+    delete event;
+    if (pkt) noc_subsys_.onCoreSend(pkt);
 }
 
 void MultiCorePE::requestMemoryAccess(uint64_t address, size_t size, 
@@ -1784,20 +1856,33 @@ void MultiCorePE::initializeNetworkInterface() {
         // 配置网络接口的节点ID
         external_nic_->setNodeId(node_id_);
         
-        // 设置脉冲处理回调
-        external_nic_->setSpikeHandler([this](SpikeEvent* spike) {
-            // 网络接口接收到脉冲时的处理
-            this->noc_subsys_.onNicReceive(spike);
-        });
-        
-        // 安装控制事件处理器（若底层NIC支持）
-        if (auto* nic_impl = dynamic_cast<SnnNIC*>(external_nic_)) {
-            nic_impl->setControlHandler([this](SST::Event* ev){
-                auto* gd = dynamic_cast<GatingDecisionEvent*>(ev);
-                if (!gd) return;
-                // 计算源全局ID（同row映射）
-                uint32_t src_global = gd->src_pe * total_neurons_ + gd->src_row;
-                // 向所有核心广播（每核自行判断是否命中）
+        // 设置通用接收回调：NoC packet 与控制面事件在此处分流
+        external_nic_->setReceiveHandler([this](SST::Event* ev) {
+            if (!ev) return;
+            if (auto* pkt = dynamic_cast<NocPacketEvent*>(ev)) {
+                this->noc_subsys_.onNicReceive(pkt); // NoC 接管生命周期
+                return;
+            }
+            // 容错：若底层 NIC 未展开 batch，则在此处展开为单包再入队
+            if (auto* batch = dynamic_cast<NocPacketBatchEvent*>(ev)) {
+                for (auto& p : batch->packets) {
+                    auto* pkt = new NocPacketEvent();
+                    pkt->src_node = batch->src_node;
+                    pkt->dst_node = batch->dst_node;
+                    pkt->src_endpoint = p.src_endpoint;
+                    pkt->dst_endpoint = p.dst_endpoint;
+                    pkt->kind = p.kind;
+                    pkt->hop_count = p.hop_count;
+                    pkt->timestamp = p.timestamp;
+                    pkt->payload = std::move(p.payload);
+                    this->noc_subsys_.onNicReceive(pkt);
+                }
+                delete batch;
+                return;
+            }
+            if (auto* gd = dynamic_cast<GatingDecisionEvent*>(ev)) {
+                const uint32_t src_global =
+                    static_cast<uint32_t>(gd->src_pe) * static_cast<uint32_t>(total_neurons_) + gd->src_row;
                 std::vector<uint32_t> dpes = gd->dest_pes;
                 for (auto* core : cores_) {
                     if (!core) continue;
@@ -1805,8 +1890,11 @@ void MultiCorePE::initializeNetworkInterface() {
                     if (!hooks) continue;
                     hooks->applyGatingDecision(src_global, dpes, current_cycle_, gd->ttl_cycles);
                 }
-            });
-        }
+                delete gd;
+                return;
+            }
+            delete ev;
+        });
 
         // 注意：SST框架会自动调用SubComponent的init()和setup()方法
         // 手动调用可能导致重复初始化和时序问题，因此移除

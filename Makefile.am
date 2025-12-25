@@ -25,6 +25,7 @@ libSnnDL_la_SOURCES = \
 	api/ISpikeTransport.h \
 	api/INocTransport.h \
 	api/NocSpikeTransport.h \
+	api/IManualWindowDrive.h \
 	api/IMemoryAccess.h \
 	api/ISynapseRoute.h \
 	api/SynapseRouteBuildConfig.h \
@@ -74,8 +75,6 @@ libSnnDL_la_SOURCES = \
 	compute/SnnLearningCore.cc \
 	compute/SnnLearningCore.h \
 	compute/SnnNeuronModel.h \
-	compute/SnnWeightDiagnostics.cc \
-	compute/SnnWeightDiagnostics.h \
 	compute/SynapseManager.h \
 	services/synapse/gas/AccumulatorOps.cc \
 	services/synapse/gas/AccumulatorOps.h \
@@ -86,15 +85,21 @@ libSnnDL_la_SOURCES = \
 	services/synapse/gas/GasPhaseController.h \
 	services/noc/OptimizedInternalRing.cc \
 	services/noc/OptimizedInternalRing.h \
-	services/noc/SimpleNetworkWrapper.cc \
-	services/noc/SimpleNetworkWrapper.h \
+	components/noc/SimpleNetworkWrapper.cc \
+	components/noc/SimpleNetworkWrapper.h \
 	services/synapse/weights/SnnBcsrWeightManager.cc \
 	services/synapse/weights/SnnBcsrWeightManager.h \
-	services/noc/SnnNetworkAdapter.cc \
-	services/noc/SnnNetworkAdapter.h \
+	services/synapse/weights/SnnWeightDiagnostics.cc \
+	services/synapse/weights/SnnWeightDiagnostics.h \
+	components/noc/SnnNetworkAdapter.cc \
+	components/noc/SnnNetworkAdapter.h \
 	services/SnnProfiler.h \
 	services/synapse/route/SnnRouteProvider.cc \
 	services/synapse/route/SnnRouteProvider.h \
+	services/synapse/route/BcsrRouteBuilder.cc \
+	services/synapse/route/BcsrRouteBuilder.h \
+	services/synapse/route/StepBcsrReachability.cc \
+	services/synapse/route/StepBcsrReachability.h \
 	services/synapse/route/SynapseRouteSubsystem.cc \
 	services/synapse/route/SynapseRouteSubsystem.h \
 	services/stimulus/StepActivationSubsystem.cc \
@@ -110,9 +115,7 @@ libSnnDL_la_SOURCES = \
 	services/synapse/route/SpikeCommSubsystem.cc \
 	services/synapse/route/SpikeCommSubsystem.h \
 	services/memory/StandardMemAccess.cc \
-	services/memory/StandardMemAccess.h \
-	services/memory/StandardMemBackend.cc \
-	services/memory/StandardMemBackend.h
+	services/memory/StandardMemAccess.h
 
 #
 # Note: sources above already include GatherBufferIF / MemKCalBench / MPI files.

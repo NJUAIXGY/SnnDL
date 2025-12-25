@@ -23,6 +23,7 @@ namespace SST { namespace SnnDL {
 
 class SpikeEvent;
 class INocTransport;
+class GlobalNeuronLayout;
 
 class StepActivationSubsystem final {
 public:
@@ -65,10 +66,14 @@ public:
         uint64_t global_neuron_base = 0;
         int num_cores = 1;
         int neurons_per_core = 1;
+        // 兼容字段：仅用于诊断校验，实际口径以 layout 为准
         uint32_t neurons_per_pe_cfg = 0;
         bool sentinel_enabled = false;
         long step_diag_cap_cfg = 0;
         int step_diag_enable_cfg = 0;
+
+        // 全局 neuron_id 布局的单一真源（fail-fast：不允许为空）
+        const GlobalNeuronLayout* layout = nullptr;
 
         // NoC 抽象接口（Phase4-A1.3）：优先使用该接口进行注入/外发
         INocTransport* noc = nullptr;

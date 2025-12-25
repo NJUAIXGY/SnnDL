@@ -1,0 +1,75 @@
+// -*- c++ -*-
+//
+// NocPacketEvent:
+// - NoC 传输的通用数据包事件（payload-agnostic）
+// - 仅包含“路由头 + 不透明 payload 字节”，不携带任何 Spike/BCSR/权重语义
+//
+
+#ifndef SNNDL_NOC_PACKET_EVENT_H
+#define SNNDL_NOC_PACKET_EVENT_H
+
+#include <cstdint>
+#include <vector>
+
+#include <sst/core/event.h>
+#include <sst/core/serialization/serialize.h>
+
+namespace SST { namespace SnnDL {
+
+enum class NocPacketKind : uint16_t {
+    Unknown = 0,
+    Spike = 1,
+    Control = 2,
+    RawBytes = 3,
+};
+
+class NocPacketEvent : public SST::Event {
+public:
+    uint32_t src_node = 0;
+    uint32_t dst_node = 0;
+    uint16_t src_endpoint = 0;
+    uint16_t dst_endpoint = 0;
+    uint16_t kind = static_cast<uint16_t>(NocPacketKind::Unknown);
+    uint16_t hop_count = 0;
+    uint64_t timestamp = 0;  // 由上层定义（ns/cycle），NoC 不解释
+    std::vector<uint8_t> payload;
+
+    NocPacketEvent() = default;
+
+    NocPacketEvent(uint32_t src_node_,
+                   uint32_t dst_node_,
+                   uint16_t src_ep_,
+                   uint16_t dst_ep_,
+                   NocPacketKind kind_,
+                   uint64_t ts)
+        : SST::Event(),
+          src_node(src_node_),
+          dst_node(dst_node_),
+          src_endpoint(src_ep_),
+          dst_endpoint(dst_ep_),
+          kind(static_cast<uint16_t>(kind_)),
+          timestamp(ts)
+    {}
+
+    NocPacketKind packetKind() const { return static_cast<NocPacketKind>(kind); }
+
+    void serialize_order(SST::Core::Serialization::serializer& ser) override {
+        Event::serialize_order(ser);
+        SST_SER(src_node);
+        SST_SER(dst_node);
+        SST_SER(src_endpoint);
+        SST_SER(dst_endpoint);
+        SST_SER(kind);
+        SST_SER(hop_count);
+        SST_SER(timestamp);
+        SST_SER(payload);
+    }
+
+private:
+    ImplementSerializable(SST::SnnDL::NocPacketEvent)
+};
+
+}} // namespace SST::SnnDL
+
+#endif // SNNDL_NOC_PACKET_EVENT_H
+

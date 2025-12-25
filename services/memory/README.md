@@ -20,11 +20,8 @@
 - **注意事项**：
   - `ReadResp` 的 `data.size()` 必须覆盖请求的 `bytes`，否则会触发 `[stdmem-access-assert]` 直接 fail-fast；这用于尽早暴露地址映射/对齐/截断问题。
 
-### `StandardMemBackend.{h,cc}`（过渡/工具后端）
-- **定位**：更底层的 StandardMem pending 后端：仅提供 `sendRead/sendWrite` 与 `popPending`。
-- **说明**：
-  - 当前的 `MemRequestMeta` 中仍包含一些与 BCSR/权重诊断耦合的字段（历史包袱/过渡形态）；
-  - 长期目标是让该结构退化为“纯内存元信息”（addr/size/对齐/issue_cycle），把权重语义移动到 `services/synapse/weights` 或 `services/synapse/route` 的私有结构里。
+### Legacy（已从 Memory 域移出）
+- `services/legacy/StandardMemBackend.*`：历史 pending 后端（含权重/BCSR 语义字段），仅保留作参考；主链路禁止依赖它。
 
 ---
 
@@ -32,7 +29,7 @@
 
 - `control/SnnPESubComponent` 在 `setup/init` 时装配：
   - 创建 `StandardMemAccess`（对外提供纯 `IMemoryAccess`）；
-  - 仍可保留 `StandardMemBackend` 用于历史路径或更细粒度的 meta 跟踪（逐步收敛中）。
+  - 如需对照旧的 pending/meta 跟踪口径，请使用 `services/legacy/memory/StandardMemBackend.*`（主链路禁止依赖）。
 - `services/synapse/weights/WeightMemorySubsystem` 推荐只依赖 `api/IMemoryAccess`：
   - Memory 负责返回 bytes；
   - Weights 负责解释 bytes（例如 float 解码、rowptr/colidx/blockdata 解析）。

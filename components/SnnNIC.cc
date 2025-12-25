@@ -9,6 +9,11 @@
 #include <sst/core/serialization/serialize.h>
 #include <sstream>
 #include <fstream>
+#include <limits>
+#include <cmath>
+
+#include "NocPacketBatchEvent.h"
+#include "NocPacketEvent.h"
 
 using namespace SST;
 using namespace SST::SnnDL;
@@ -28,90 +33,14 @@ using namespace SST::Interfaces;
 std::mutex SnnNIC::s_spike_csv_mutex_;
 std::unordered_set<std::string> SnnNIC::s_spike_csv_files_;
 
-// Unify network payload types to avoid repeated class definitions in functions
 namespace {
-class NetSpikePayload : public SST::Event {
-public:
-    uint32_t src_neuron_id{};
-    uint32_t dest_neuron_id{};
-    uint64_t timestamp{};
-    double   weight{};
-    NetSpikePayload() : SST::Event() {}
-    explicit NetSpikePayload(const SST::SnnDL::SpikeEvent* spike) : SST::Event()
-    {
-        src_neuron_id  = spike->neuron_id;
-        dest_neuron_id = spike->getDestinationNeuron();
-        timestamp      = spike->timestamp;
-        weight         = spike->getWeight();
-    }
-    void serialize_order(SST::Core::Serialization::serializer& ser) override {
-        Event::serialize_order(ser);
-        SST_SER(src_neuron_id);
-        SST_SER(dest_neuron_id);
-        SST_SER(timestamp);
-        SST_SER(weight);
-    }
-    ImplementSerializable(NetSpikePayload)
-};
-
-class NetSpikeBatchPayload : public SST::Event {
-public:
-    struct PackedSpike {
-        uint32_t src_neuron_id{};
-        uint32_t dest_neuron_id{};
-        uint64_t timestamp{};
-        double   weight{};
-        void serialize_order(SST::Core::Serialization::serializer& ser) {
-            SST_SER(src_neuron_id);
-            SST_SER(dest_neuron_id);
-            SST_SER(timestamp);
-            SST_SER(weight);
-        }
-    };
-    std::vector<PackedSpike> batch;
-    uint32_t source_node{};
-    uint32_t dest_node{};
-    uint64_t batch_timestamp{};
-    void serialize_order(SST::Core::Serialization::serializer& ser) override {
-        Event::serialize_order(ser);
-        SST_SER(batch);
-        SST_SER(source_node);
-        SST_SER(dest_node);
-        SST_SER(batch_timestamp);
-    }
-    ImplementSerializable(NetSpikeBatchPayload)
-};
-
-class NetInterRankBatchPayload : public SST::Event {
-public:
-    struct PackedSpike {
-        uint32_t src_neuron_id{};
-        uint32_t dest_neuron_id{};   // 目标神经元
-        uint32_t final_dest_node{};  // 最终目标节点（rank内展开）
-        uint64_t timestamp{};
-        double   weight{};
-        void serialize_order(SST::Core::Serialization::serializer& ser) {
-            SST_SER(src_neuron_id);
-            SST_SER(dest_neuron_id);
-            SST_SER(final_dest_node);
-            SST_SER(timestamp);
-            SST_SER(weight);
-        }
-    };
-    std::vector<PackedSpike> batch;  // 属于同一目标rank的一批脉冲
-    uint32_t source_node{};
-    uint32_t gateway_node{};         // 目标rank的网关节点（本消息的目的地）
-    uint64_t batch_timestamp{};
-    void serialize_order(SST::Core::Serialization::serializer& ser) override {
-        Event::serialize_order(ser);
-        SST_SER(batch);
-        SST_SER(source_node);
-        SST_SER(gateway_node);
-        SST_SER(batch_timestamp);
-    }
-    ImplementSerializable(NetInterRankBatchPayload)
-};
-} // anonymous namespace
+constexpr uint32_t kNocPacketHeaderBytes =
+    sizeof(uint32_t) * 2 + sizeof(uint16_t) * 4 + sizeof(uint64_t);  // 24B
+constexpr uint32_t kBatchBaseHeaderBytes =
+    sizeof(uint32_t) * 2 + sizeof(uint64_t);  // 16B
+constexpr uint32_t kBatchPerPacketHeaderBytes =
+    sizeof(uint16_t) * 4 + sizeof(uint64_t);  // 16B
+} // namespace
 
 // ---- 调试辅助：打印门控状态快照 ----
 void SnnNIC::logGatingSnapshot(const char* ctx) const {
@@ -133,7 +62,7 @@ SnnNIC::SnnNIC(ComponentId_t id, Params& params)
       output(nullptr),
       network(nullptr),
       direct_link(nullptr),
-      spike_handler(nullptr),
+      receive_handler_(nullptr),
       spikes_sent_count(0),
       spikes_received_count(0),
       packets_sent_count(0),
@@ -283,58 +212,118 @@ SnnNIC::~SnnNIC()
 {
     // 让进程退出阶段由运行时回收日志对象，避免潜在的析构次序竞态
     output = nullptr;
+
+    // 清理待发送队列（所有权在 NIC）
+    while (!pending_sends_.empty()) {
+        auto& ps = pending_sends_.front();
+        delete ps.payload;
+        pending_sends_.pop();
+    }
+    // 清理批处理桶
+    for (auto& kv : batch_buckets_) {
+        for (auto* pkt : kv.second) delete pkt;
+        kv.second.clear();
+    }
+    batch_earliest_ts_.clear();
 }
 
-void SnnNIC::setSpikeHandler(SpikeHandler handler)
+void SnnNIC::setReceiveHandler(ReceiveHandler handler)
 {
-    spike_handler = handler;
-    NIC_LOG(2, "设置脉冲处理器\n");
+    receive_handler_ = std::move(handler);
+    NIC_LOG(2, "设置接收处理器\n");
 }
 
-void SnnNIC::sendSpike(SpikeEvent* spike_event)
+int SnnNIC::estimateEventBits_(const SST::Event* ev) const
 {
-    if (!spike_event) {
-        NIC_LOG(1, "发送脉冲失败：参数无效\n");
-        return;
+    if (!ev) return 0;
+    if (auto* pkt = dynamic_cast<const NocPacketEvent*>(ev)) {
+        const uint64_t bytes = kNocPacketHeaderBytes + static_cast<uint64_t>(pkt->payload.size());
+        return static_cast<int>(bytes * 8);
     }
-    uint32_t dest_node = spike_event->getDestinationNode();
-    // 直接Link模式已禁用，统一走network
-    if (use_direct_link && direct_link) {
-        SpikeEvent* network_spike = new SpikeEvent(*spike_event);
-        direct_link->send(network_spike);
-        spikes_sent_count++;
-        packets_sent_count++;
-        stat_spikes_sent->addData(1);
-        stat_packets_sent->addData(1);
-        return;
+    if (auto* batch = dynamic_cast<const NocPacketBatchEvent*>(ev)) {
+        uint64_t bytes = kBatchBaseHeaderBytes;
+        for (const auto& p : batch->packets) {
+            bytes += kBatchPerPacketHeaderBytes + static_cast<uint64_t>(p.payload.size());
+        }
+        return static_cast<int>(bytes * 8);
     }
-    // 使用网络接口
-    SimpleNetwork::Request* req = createNetworkRequest(spike_event, dest_node);
-    if (!req) return;
-    int vn_use = static_cast<int>(vn_spike_data_);
-    if (vn_use >= static_cast<int>(effective_num_vns_)) vn_use = 0;
-    req->vn = vn_use;
-    bool sent = false;
-    bool canSpace = false;
-    if (network) {
-        canSpace = network->spaceToSend(req->vn, req->size_in_bits);
-        if (canSpace) {
-            sent = network->send(req, req->vn);
+    return 256;
+}
+
+SimpleNetwork::Request* SnnNIC::createNetworkRequest_(uint32_t dest_node,
+                                                      SST::Event* payload,
+                                                      int vn,
+                                                      int size_bits)
+{
+    auto* req = new SimpleNetwork::Request();
+    req->dest = dest_node;
+    req->src = node_id;
+    req->vn = vn;
+    req->size_in_bits = size_bits;
+    req->head = true;
+    req->tail = true;
+    req->allow_adaptive = true;
+    req->givePayload(payload);
+    return req;
+}
+
+void SnnNIC::sendToNode(uint32_t dest_node, SST::Event* event)
+{
+    if (!event) return;
+
+    // 批处理仅对 NoC 包生效
+    if (enable_batching_) {
+        if (auto* pkt = dynamic_cast<NocPacketEvent*>(event)) {
+            tryBatchPacket_(dest_node, pkt);
+            return;
         }
     }
-    if (sent) {
-        stat_packets_sent->addData(1);
-        stat_spikes_sent->addData(1);
-        spikes_sent_count++;
-        // 成功发送后，NIC 接管了该脉冲的生命周期，释放本地对象
-        delete spike_event;
-        // debug print removed for production
-    } else {
-        // 无空间，进入待发送队列
-        pending_spikes.push(spike_event);
-        delete req;
-        // debug print removed for production
+
+    if (!network) {
+        delete event;
+        return;
     }
+
+    int vn_use = static_cast<int>(vn_spike_data_);
+    if (vn_use >= static_cast<int>(effective_num_vns_)) vn_use = 0;
+
+    const int bits = estimateEventBits_(event);
+    auto* req = createNetworkRequest_(dest_node, event, vn_use, bits);
+
+    bool sent = false;
+    if (network->spaceToSend(req->vn, req->size_in_bits)) {
+        sent = network->send(req, req->vn);
+    }
+
+    if (sent) {
+        packets_sent_count++;
+        stat_packets_sent->addData(1);
+
+        if (auto* pkt = dynamic_cast<NocPacketEvent*>(event)) {
+            if (pkt->packetKind() == NocPacketKind::Spike) {
+                spikes_sent_count++;
+                stat_spikes_sent->addData(1);
+
+                if (dest_node == node_id) {
+                    if (stat_spikes_local_core) stat_spikes_local_core->addData(1);
+                } else if (isNeighborNode(dest_node)) {
+                    if (stat_spikes_neighbor_node) stat_spikes_neighbor_node->addData(1);
+                } else {
+                    if (stat_spikes_remote_node) stat_spikes_remote_node->addData(1);
+                }
+            }
+            const uint64_t payload_bytes = static_cast<uint64_t>(pkt->payload.size());
+            const uint64_t total_bytes = static_cast<uint64_t>((bits + 7) / 8);
+            if (stat_payload_bytes_sent) stat_payload_bytes_sent->addData(payload_bytes);
+            if (stat_total_bytes_sent) stat_total_bytes_sent->addData(total_bytes);
+        }
+        return;
+    }
+
+    // 失败：取回 payload 并入队
+    SST::Event* payload = req->takePayload();
+    delete req;
+    pending_sends_.push(PendingSend{dest_node, payload});
 }
 
 void SnnNIC::setNodeId(uint32_t id)
@@ -355,77 +344,79 @@ std::string SnnNIC::getNetworkStatus() const
     ss << ", 接收脉冲=" << spikes_received_count;
     ss << ", 发送包=" << packets_sent_count;
     ss << ", 接收包=" << packets_received_count;
-    ss << ", 待发送=" << pending_spikes.size();
+    ss << ", 待发送=" << pending_sends_.size();
     return ss.str();
 }
 
 bool SnnNIC::handleIncoming(int vn)
 {
+    if (!network) return true;
     SimpleNetwork::Request* req = network->recv(vn);
-    if (!req) {
-        return true; // 继续处理
-    }
-    
-    packets_received_count++;  // 更新内部计数器
-    stat_packets_received->addData(1);
-    
-    NIC_LOG(3, "接收网络数据包：VN=%d，来源=%ld，目标=%ld\n",
-                   vn, req->src, req->dest);
-    // 判断payload类型
-    SST::Event* any = req->inspectPayload();
-    if (any) {
-        // 控制事件（门控等）
-        if (auto* gd = dynamic_cast<GatingDecisionEvent*>(any)) {
-            if (control_handler_) control_handler_(gd);
-        }
-        // 跨Rank代理批量：在网关节点展开并分发
-        else if (auto* ir = dynamic_cast<NetInterRankBatchPayload*>(any)) {
-            NIC_LOG(2, "IR-Recv: gateway=%u, batch=%zu\n", node_id, ir->batch.size());
-            for (auto& ps : ir->batch) {
-                auto* spike_event = new SpikeEvent(ps.src_neuron_id, ps.dest_neuron_id,
-                                                  static_cast<uint32_t>(ps.final_dest_node), (float)ps.weight, ps.timestamp);
-                if (ps.final_dest_node == node_id) {
-                    if (spike_handler) {
-                        spikes_received_count++;
-                        stat_spikes_received->addData(1);
-                        spike_handler(spike_event);
-                    } else {
-                        delete spike_event;
-                    }
-                } else {
-                    sendSpike(spike_event);
-                }
-            }
-        }
-        // 批量脉冲
-        else if (auto* batch = dynamic_cast<NetSpikeBatchPayload*>(any)) {
-            for (auto& ps : batch->batch) {
-                auto* spike_event = new SpikeEvent(ps.src_neuron_id, ps.dest_neuron_id,
-                                                  static_cast<uint32_t>(req->dest), (float)ps.weight, ps.timestamp);
-                if (spike_handler) {
-                    spikes_received_count++;
-                    stat_spikes_received->addData(1);
-                    spike_handler(spike_event);
-                } else {
-                    delete spike_event;
-                }
-            }
-        }
-        // 单条脉冲
-        else {
-            SpikeEvent* spike_event = extractSpikeEvent(req);
-            if (spike_event && spike_handler) {
-                NIC_LOG(4, "提取到脉冲事件：源神经元=%u，目标神经元=%u\n",
-                               spike_event->neuron_id, spike_event->getDestinationNeuron());
-                spikes_received_count++;
-                stat_spikes_received->addData(1);
-                spike_handler(spike_event);
-            }
-        }
-    }
-    
+    if (!req) return true;
+
+    packets_received_count++;
+    if (stat_packets_received) stat_packets_received->addData(1);
+
+    const uint32_t src_node = static_cast<uint32_t>(req->src);
+    const uint32_t dst_node = static_cast<uint32_t>(req->dest);
+
+    SST::Event* ev = req->takePayload(); // 接管 payload 生命周期
     delete req;
-    return true; // 继续处理更多数据包
+    if (!ev) return true;
+
+    auto deliverPacket = [&](NocPacketEvent* pkt) {
+        if (!pkt) return;
+        // 容错：若发送端未填 node 字段，按 Request 头补齐（不会覆盖非0值）
+        if (pkt->src_node == 0 && src_node != 0) pkt->src_node = src_node;
+        if (pkt->dst_node == 0 && dst_node != 0) pkt->dst_node = dst_node;
+
+        if (pkt->packetKind() == NocPacketKind::Spike) {
+            spikes_received_count++;
+            if (stat_spikes_received) stat_spikes_received->addData(1);
+            if (stat_msg_latency_ns) {
+                const uint64_t now_ns = getCurrentSimTimeNano();
+                if (now_ns >= pkt->timestamp) stat_msg_latency_ns->addData(now_ns - pkt->timestamp);
+            }
+        }
+
+        if (receive_handler_) {
+            receive_handler_(pkt); // handler 接管生命周期
+        } else {
+            delete pkt;
+        }
+    };
+
+    // 批量包：在 NIC 内展开为单条 NocPacketEvent，保持上层逻辑不变
+    if (auto* batch = dynamic_cast<NocPacketBatchEvent*>(ev)) {
+        for (auto& p : batch->packets) {
+            auto* pkt = new NocPacketEvent();
+            pkt->src_node = batch->src_node;
+            pkt->dst_node = batch->dst_node;
+            pkt->src_endpoint = p.src_endpoint;
+            pkt->dst_endpoint = p.dst_endpoint;
+            pkt->kind = p.kind;
+            pkt->hop_count = p.hop_count;
+            pkt->timestamp = p.timestamp;
+            pkt->payload = std::move(p.payload);
+            deliverPacket(pkt);
+        }
+        delete batch;
+        return true;
+    }
+
+    // 普通包
+    if (auto* pkt = dynamic_cast<NocPacketEvent*>(ev)) {
+        deliverPacket(pkt);
+        return true;
+    }
+
+    // 非 NoC 包事件：直接透传给 handler
+    if (receive_handler_) {
+        receive_handler_(ev);
+    } else {
+        delete ev;
+    }
+    return true;
 }
 
 bool SnnNIC::spaceAvailable(int vn)
@@ -441,35 +432,19 @@ bool SnnNIC::spaceAvailable(int vn)
                (int)network_ready_, network ? (int)network->isNetworkInitialized() : 0, (int)link_ready_);
         return true;
     }
-    // 批处理刷新
+    // 批处理刷新（阈值到达时立刻打包发送）
     if (enable_batching_ && flush_on_credit_) {
         for (auto& kv : batch_buckets_) {
-            uint32_t dest = kv.first;
+            const uint32_t dest = kv.first;
             const auto& vec = kv.second;
-            uint32_t threshold = isNeighborNode(dest) ? batch_size_local_ : batch_size_remote_;
-            if (vec.size() >= threshold) flushBatchToNode(dest);
-        }
-    }
-    // 处理待发送队列（仅在成功发送后出队；失败则保留以便后续重试）
-    while (!pending_spikes.empty() && network->spaceToSend(vn, 1)) {
-        SpikeEvent* spike = pending_spikes.front();
-        uint32_t dest_node = spike->getDestinationNode();
-        SimpleNetwork::Request* req = createNetworkRequest(spike, dest_node);
-        if (req) {
-            req->vn = vn;
-            if (network->send(req, vn)) {
-                stat_packets_sent->addData(1);
-                stat_spikes_sent->addData(1);
-                spikes_sent_count++;
-                pending_spikes.pop();
-                delete spike;
-            } else {
-                delete req;
-                // 无法发送则退出，等待下一次credit/tick再重试，保留队首
-                break;
+            const uint32_t threshold = isNeighborNode(dest) ? batch_size_local_ : batch_size_remote_;
+            if (!vec.empty() && vec.size() >= threshold) {
+                flushBatchToNode_(dest, /*is_timeout=*/false);
             }
         }
     }
+
+    flushPendingSends_();
     return true;
 }
 
@@ -477,64 +452,18 @@ void SnnNIC::finish()
 {
     // 安全收尾：避免在finish阶段进行复杂I/O或对象释放，交由进程退出回收
     // 注：不打印“最终统计”，减少退出期竞态干扰
-    // 注：不主动清空 pending_spikes，防止潜在外部持有者与析构次序问题
     if (!use_direct_link && network) network->finish();
-}
-
-SimpleNetwork::Request* SnnNIC::createNetworkRequest(SpikeEvent* spike_event, uint32_t dest_node)
-{
-    if (!spike_event) return nullptr;
-    SimpleNetwork::Request* req = new SimpleNetwork::Request();
-    req->dest = dest_node;
-    req->src = node_id;
-    req->vn = static_cast<int>(vn_spike_data_);
-    req->size_in_bits = sizeof(NetSpikePayload) * 8;
-    req->head = true;
-    req->tail = true;
-    req->allow_adaptive = true;
-    auto* payload = new NetSpikePayload(spike_event);
-    req->givePayload(payload);
-    NIC_LOG(4, "创建网络请求：源=%ld，目标=%ld，大小=%zu bits\n",
-                   req->src, req->dest, req->size_in_bits);
-    return req;
-}
-
-SpikeEvent* SnnNIC::extractSpikeEvent(SimpleNetwork::Request* req)
-{
-    if (!req || !req->inspectPayload()) return nullptr;
-    NetSpikePayload* payload = static_cast<NetSpikePayload*>(req->inspectPayload());
-    SpikeEvent* spike_event = new SpikeEvent();
-    spike_event->neuron_id = payload->src_neuron_id;
-    spike_event->setDestinationNeuron(payload->dest_neuron_id);
-    spike_event->timestamp = payload->timestamp;
-    spike_event->setWeight(payload->weight);
-    spike_event->setDestinationNode(static_cast<uint32_t>(req->dest));
-    NIC_LOG(4, "解包SpikeEvent：神经元%u -> 神经元%u\n",
-                    payload->src_neuron_id, payload->dest_neuron_id);
-    return spike_event;
 }
 
 void SnnNIC::handleDirectSpikeEvent(SST::Event* event)
 {
     if (!event) return;
-    if (auto* gd = dynamic_cast<GatingDecisionEvent*>(event)) {
-        if (control_handler_) control_handler_(gd);
-        else delete gd;
-        return;
+    // direct_link 模式已禁用；保留最小实现以避免配置误用时崩溃
+    if (receive_handler_) {
+        receive_handler_(event);
+    } else {
+        delete event;
     }
-    if (auto* spike_event = dynamic_cast<SpikeEvent*>(event)) {
-        NIC_LOG(3, "接收直接Link脉冲：源神经元=%u，目标神经元=%u\n",
-                       spike_event->neuron_id, spike_event->getDestinationNeuron());
-        if (spike_handler) {
-            spikes_received_count++;
-            packets_received_count++;
-            stat_spikes_received->addData(1);
-            stat_packets_received->addData(1);
-            spike_handler(spike_event);
-        } else { delete spike_event; }
-        return;
-    }
-    delete event;
 }
 
 // === SST lifecycle ===
@@ -582,23 +511,184 @@ bool SnnNIC::flushClockTick(SST::Cycle_t /*currentCycle*/)
 {
     // 批处理窗口刷新（轻量）
     if (enable_batching_) {
-        // 简化：遍历所有目的节点刷新
-        for (auto& kv : batch_buckets_) {
-            if (!kv.second.empty()) {
-                flushBatchToNode(kv.first);
-            }
-        }
-    }
-    if (enable_inter_rank_batching_ && nodes_per_rank_ > 0) {
-        flushInterRankAll();
+        flushAllBatches_();
     }
     return false; // 不要求持续tick
 }
 
 uint32_t SnnNIC::computeDestNode(uint32_t /*dest_neuron*/) const
 {
-    // 当前SpikeEvent已包含目标节点，若需映射请在调用前设置
+    // NoC 层不做 neuron->node 映射；由上层构造 packet/header
     return 0;
+}
+
+uint32_t SnnNIC::manhattanDistance(uint32_t src_node, uint32_t dst_node) const
+{
+    if (src_node == dst_node) return 0;
+
+    uint32_t mesh = mesh_size_;
+    if (mesh == 0 && total_nodes_ > 0) {
+        const double root = std::sqrt(static_cast<double>(total_nodes_));
+        const uint32_t side = static_cast<uint32_t>(root + 0.5);
+        if (side > 0 && side * side == total_nodes_) {
+            mesh = side;
+        }
+    }
+    if (mesh == 0) return 0;
+
+    const uint32_t src_x = src_node % mesh;
+    const uint32_t src_y = src_node / mesh;
+    const uint32_t dst_x = dst_node % mesh;
+    const uint32_t dst_y = dst_node / mesh;
+
+    const int dx = static_cast<int>(src_x) - static_cast<int>(dst_x);
+    const int dy = static_cast<int>(src_y) - static_cast<int>(dst_y);
+    return static_cast<uint32_t>(std::abs(dx) + std::abs(dy));
+}
+
+bool SnnNIC::isNeighborNode(uint32_t dest_node) const
+{
+    // 邻居定义：mesh 拓扑下 Manhattan 距离为 1（不含本地节点）
+    if (dest_node == node_id) return false;
+    return manhattanDistance(node_id, dest_node) == 1;
+}
+
+void SnnNIC::flushPendingSends_()
+{
+    if (!network) return;
+    int vn_use = static_cast<int>(vn_spike_data_);
+    if (vn_use >= static_cast<int>(effective_num_vns_)) vn_use = 0;
+
+    while (!pending_sends_.empty()) {
+        PendingSend& ps = pending_sends_.front();
+        if (!ps.payload) {
+            pending_sends_.pop();
+            continue;
+        }
+
+        // 先计算统计/大小，再把 payload 交给 Request
+        const int bits = estimateEventBits_(ps.payload);
+        const bool is_pkt = dynamic_cast<NocPacketEvent*>(ps.payload) != nullptr;
+        NocPacketKind kind = NocPacketKind::Unknown;
+        uint64_t payload_bytes = 0;
+        if (is_pkt) {
+            auto* pkt = static_cast<NocPacketEvent*>(ps.payload);
+            kind = pkt->packetKind();
+            payload_bytes = static_cast<uint64_t>(pkt->payload.size());
+        }
+        const uint64_t total_bytes = static_cast<uint64_t>((bits + 7) / 8);
+
+        auto* req = createNetworkRequest_(ps.dest_node, ps.payload, vn_use, bits);
+        bool sent = false;
+        if (network->spaceToSend(req->vn, req->size_in_bits)) {
+            sent = network->send(req, req->vn);
+        }
+        if (!sent) {
+            ps.payload = req->takePayload();
+            delete req;
+            break;
+        }
+
+        packets_sent_count++;
+        if (stat_packets_sent) stat_packets_sent->addData(1);
+
+        if (is_pkt && kind == NocPacketKind::Spike) {
+            spikes_sent_count++;
+            if (stat_spikes_sent) stat_spikes_sent->addData(1);
+            if (ps.dest_node == node_id) {
+                if (stat_spikes_local_core) stat_spikes_local_core->addData(1);
+            } else if (isNeighborNode(ps.dest_node)) {
+                if (stat_spikes_neighbor_node) stat_spikes_neighbor_node->addData(1);
+            } else {
+                if (stat_spikes_remote_node) stat_spikes_remote_node->addData(1);
+            }
+        }
+        if (is_pkt) {
+            if (stat_payload_bytes_sent) stat_payload_bytes_sent->addData(payload_bytes);
+            if (stat_total_bytes_sent) stat_total_bytes_sent->addData(total_bytes);
+        }
+
+        ps.payload = nullptr;
+        pending_sends_.pop();
+    }
+}
+
+void SnnNIC::tryBatchPacket_(uint32_t dest_node, NocPacketEvent* pkt)
+{
+    if (!pkt) return;
+    if (!network) {
+        delete pkt;
+        return;
+    }
+
+    auto& vec = batch_buckets_[dest_node];
+    vec.push_back(pkt);
+    uint64_t& earliest = batch_earliest_ts_[dest_node];
+    if (earliest == 0 || pkt->timestamp < earliest) earliest = pkt->timestamp;
+
+    const uint32_t threshold = isNeighborNode(dest_node) ? batch_size_local_ : batch_size_remote_;
+    if (threshold > 0 && vec.size() >= threshold) {
+        flushBatchToNode_(dest_node, /*is_timeout=*/false);
+    }
+}
+
+void SnnNIC::flushBatchToNode_(uint32_t dest_node, bool is_timeout)
+{
+    auto it = batch_buckets_.find(dest_node);
+    if (it == batch_buckets_.end()) return;
+    auto& vec = it->second;
+    if (vec.empty()) return;
+
+    auto* batch = new NocPacketBatchEvent();
+    batch->src_node = node_id;
+    batch->dst_node = dest_node;
+    batch->batch_timestamp = batch_earliest_ts_.count(dest_node) ? batch_earliest_ts_[dest_node] : 0;
+    batch->packets.reserve(vec.size());
+
+    uint64_t payload_sum = 0;
+    for (auto* pkt : vec) {
+        if (!pkt) continue;
+        NocPacketBatchEvent::PackedPacket pp;
+        pp.src_endpoint = pkt->src_endpoint;
+        pp.dst_endpoint = pkt->dst_endpoint;
+        pp.kind = pkt->kind;
+        pp.hop_count = pkt->hop_count;
+        pp.timestamp = pkt->timestamp;
+        pp.payload = std::move(pkt->payload);
+        payload_sum += static_cast<uint64_t>(pp.payload.size());
+        batch->packets.emplace_back(std::move(pp));
+        delete pkt;
+    }
+    vec.clear();
+    batch_earliest_ts_.erase(dest_node);
+
+    if (stat_batches_sent) stat_batches_sent->addData(1);
+    if (stat_batch_total_spikes) stat_batch_total_spikes->addData(batch->packets.size());
+    if (is_timeout) {
+        if (stat_batch_flush_timeout) stat_batch_flush_timeout->addData(1);
+    } else {
+        if (stat_batch_flush_full) stat_batch_flush_full->addData(1);
+    }
+    logSpikeMessage_(is_timeout ? "batch_timeout" : "batch_full",
+                     node_id, dest_node, 0, 0,
+                     static_cast<uint32_t>(batch->packets.size()),
+                     static_cast<uint32_t>(payload_sum));
+
+    // 作为一个事件发出（sendToNode 接管生命周期）
+    sendToNode(dest_node, batch);
+}
+
+void SnnNIC::flushAllBatches_()
+{
+    if (batch_buckets_.empty()) return;
+    std::vector<uint32_t> keys;
+    keys.reserve(batch_buckets_.size());
+    for (auto& kv : batch_buckets_) {
+        if (!kv.second.empty()) keys.push_back(kv.first);
+    }
+    for (uint32_t dest : keys) {
+        flushBatchToNode_(dest, /*is_timeout=*/true);
+    }
 }
 
 bool SnnNIC::sendControl(SST::Event* ev, uint32_t dest_node)

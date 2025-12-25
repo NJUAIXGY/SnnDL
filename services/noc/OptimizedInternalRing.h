@@ -16,16 +16,15 @@
 #include <unordered_map>
 #include <cstdint>
 
-#include "SpikeEvent.h"
+namespace SST { class Event; }
 
-namespace SST {
-namespace SnnDL {
+namespace SST { namespace SnnDL {
 
 /**
  * @brief 内部互连消息类型
  */
 enum class RingMessageType {
-    SPIKE_MESSAGE,     // 脉冲消息
+    PACKET_MESSAGE,    // 通用包消息（payload-agnostic）
     MEMORY_REQUEST,    // 内存请求  
     MEMORY_RESPONSE,   // 内存响应
     CONTROL_MESSAGE    // 控制消息
@@ -42,15 +41,15 @@ struct RingMessage {
     int priority;      // 消息优先级
     
     union {
-        SpikeEvent* spike_data;
+        SST::Event* packet;
         void* mem_request;
         void* mem_response;
         void* ctrl_data;
     } payload;
     
-    RingMessage() : type(RingMessageType::SPIKE_MESSAGE), 
+    RingMessage() : type(RingMessageType::PACKET_MESSAGE), 
                    src_unit(-1), dst_unit(-1), timestamp(0), priority(1) {
-        payload.spike_data = nullptr;
+        payload.packet = nullptr;
     }
     
     // 拷贝构造函数
@@ -423,7 +422,6 @@ private:
     const std::vector<VirtualChannel>& getVCs(const RingNode* node, RouteDirection direction) const;
 };
 
-} // namespace SnnDL
-} // namespace SST
+}} // namespace SST::SnnDL
 
 #endif // _OPTIMIZED_INTERNAL_RING_H

@@ -7,7 +7,6 @@
 
 #include <sst/core/sst_config.h>
 #include "OptimizedInternalRing.h"
-#include "SpikeEvent.h"
 
 #include <algorithm>
 #include <cmath>

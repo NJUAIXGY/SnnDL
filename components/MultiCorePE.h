@@ -34,6 +34,7 @@
 #include "SnnPEParentInterface.h"
 #include "IPeAggregation.h"
 #include "SnnCoreAPI.h"
+#include "../api/GlobalNeuronLayout.h"
 #include "noc/OptimizedInternalRing.h"
 #include "stimulus/StepActivationSubsystem.h"
 #include "noc/NocSubsystem.h"
@@ -337,6 +338,9 @@ private:
     std::string weights_file_;
     bool enable_numa_;
     bool enable_test_traffic_;
+
+    // 全局 neuron_id 布局（单一真源，供 Step/Route/NoC 等口径复用）
+    GlobalNeuronLayout global_layout_{};
     
     // 神经元参数
     float v_thresh_;

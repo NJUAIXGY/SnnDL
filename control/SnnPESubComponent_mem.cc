@@ -9,7 +9,6 @@
 #include "synapse/gas/GasCustomCmd.h"
 #include "synapse/gas/GasPhaseController.h"
 #include "IPeAggregation.h"
-#include "memory/StandardMemBackend.h"
 #include "memory/StandardMemAccess.h"
 
 #include <algorithm>
@@ -21,7 +20,6 @@
 
 using namespace SST;
 using namespace SST::SnnDL;
-using PendingMemoryRequest = MemRequestMeta;
 
 // Lightweight logging helpers (file-local). Keep consistent with other split units.
 #ifndef SNNDL_LOGPTR
@@ -46,7 +44,7 @@ bool SnnPESubComponent::applyLocalWeightUpdates_(const std::unordered_map<uint64
                                                 float learning_rate,
                                                 float weight_decay) {
     if (grads.empty()) return true;
-    if (!memory_ || !memory_ready_) return false;
+    if (!memory_ || !memory_ready_ || !stdmem_access_) return false;
     const uint32_t width = use_post_row_pre_col_ ? weights_cols_ : num_neurons_;
     const size_t bytes_per_float = sizeof(float);
     uint64_t total_writes = 0;
@@ -66,9 +64,8 @@ bool SnnPESubComponent::applyLocalWeightUpdates_(const std::unordered_map<uint64
         uint64_t addr = base_addr_ + key * bytes_per_float;
         std::vector<uint8_t> data(bytes_per_float);
         std::memcpy(data.data(), &new_w, bytes_per_float);
-        auto* w = new SST::Interfaces::StandardMem::Write(addr, data.size(), data, false);
         stats_reporter_.reportMemoryIssue(data.size(), false);
-        memory_->send(w);
+        stdmem_access_->write(addr, data, nullptr);
         total_writes++;
         weightCacheStore_(key, new_w);
     }
@@ -83,32 +80,52 @@ bool SnnPESubComponent::applyLocalWeightUpdates_(const std::unordered_map<uint64
 void SnnPESubComponent::requestWeight(uint32_t pre_neuron, uint32_t post_neuron,
                                      std::function<void(float)> callback) {
     if (use_bcsr_ && use_post_row_pre_col_) {
-        requestWeightBCSR(pre_neuron, post_neuron, callback);
+        requestWeightBCSR(pre_neuron, post_neuron, std::move(callback));
         return;
     }
-    uint32_t req_pre = 0;
-    uint32_t req_post = 0;
-    uint64_t cache_key = 0;
-    if (!weight_accessor_.resolve(pre_neuron, post_neuron, req_pre, req_post, cache_key)) {
+    if (!ensureMemoryReady_() || !stdmem_access_) {
         if (callback) callback(init_default_weight_);
         return;
     }
 
-    if (!ensureMemoryReady_()) {
-        if (callback) callback(0.5f);
+    const uint32_t width = use_post_row_pre_col_ ? weights_cols_ : num_neurons_;
+    const uint32_t row = use_post_row_pre_col_ ? post_neuron : pre_neuron;
+    const uint32_t col = use_post_row_pre_col_ ? pre_neuron : post_neuron;
+    if (width == 0 || row >= num_neurons_ || col >= width) {
+        if (callback) callback(0.0f);
         return;
     }
 
-    uint64_t req_addr = 0; size_t req_size = sizeof(float);
-    bool is_row = false; uint32_t col_start = req_post; uint32_t count_floats = 1;
-    prepareDenseRead_(req_pre, req_post, use_post_row_pre_col_ ? weights_cols_ : num_neurons_,
-                      req_addr, req_size, is_row, col_start, count_floats);
-    if (window_read_debug_) {
-        output_->verbose(CALL_INFO, 2, 0, "[diag-read] core=%d requestWeight row=%u col=%u is_row=%d col_start=%u count=%u addr=0x%llx size=%zu\n",
-                         core_id_, req_pre, req_post, (int)is_row, col_start, count_floats,
-                         (unsigned long long)req_addr, req_size);
+    const uint64_t req_addr =
+        base_addr_ + (static_cast<uint64_t>(row) * static_cast<uint64_t>(width) + static_cast<uint64_t>(col)) * sizeof(float);
+    const uint64_t issue_cycle = static_cast<uint64_t>(total_cycles_);
+
+    if (window_read_debug_ && output_) {
+        output_->verbose(CALL_INFO, 2, 0,
+            "[diag-read] core=%d requestWeight dense row=%u col=%u addr=0x%llx size=%zu\n",
+            core_id_, row, col, (unsigned long long)req_addr, sizeof(float));
     }
-    issueReadCommon_(req_addr, req_size, is_row, req_pre, col_start, count_floats, callback, cache_key);
+
+    stats_reporter_.reportMemoryIssue(sizeof(float), /*count_weight_read*/true);
+    stdmem_access_->read(req_addr, sizeof(float),
+        [this, cb = std::move(callback), issue_cycle](IMemoryAccess::RequestId, uint64_t, std::vector<uint8_t>&& data) mutable {
+            float w = 0.0f;
+            if (data.size() >= sizeof(float)) {
+                std::memcpy(&w, data.data(), sizeof(float));
+            }
+            if (readresp_zero_fallback_ && w == 0.0f) w = init_default_weight_;
+            if (cb) cb(w);
+
+            const uint64_t now = static_cast<uint64_t>(total_cycles_);
+            if (now >= issue_cycle) {
+                const uint64_t lat = now - issue_cycle;
+                accum_mem_latency_cycles_ += lat;
+                count_mem_responses_++;
+                if (auto* pe = parent_pe_cached_) {
+                    pe->accumulateMemReadLatency(lat, /*is_weight*/true);
+                }
+            }
+        });
 }
 
 void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Request* req) {
@@ -327,6 +344,24 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
         return;
     }
 
+    // Phase1-A: fail-fast only for *data-plane* read responses. Other response types may be internal
+    // (e.g., GatherBufferIF flush/write maintenance) and can be safely ignored here if untracked.
+    if (dynamic_cast<SST::Interfaces::StandardMem::ReadResp*>(req)) {
+        if (output_) {
+            output_->fatal(CALL_INFO, -1,
+                "[stdmem-untracked] node=%u core=%u type=ReadResp id=%" PRIu64 "\n",
+                static_cast<uint32_t>(node_id_),
+                static_cast<uint32_t>(core_id_),
+                static_cast<uint64_t>(req->getID()));
+        }
+        delete req;
+        return;
+    }
+    // Untracked non-ReadResp: drop.
+    delete req;
+    return;
+
+#if 0
     output_->verbose(CALL_INFO, 4, 0, "📨 核心%d收到内存响应: ID=%" PRIu64 "\n",
                     core_id_, req->getID());
     MemRequestMeta pending_req;
@@ -669,6 +704,7 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
     }
 
     delete req;
+#endif
 }
 
 void SnnPESubComponent::scheme1PrefetchSlice_(uint32_t slice_idx) {
@@ -697,77 +733,4 @@ void SnnPESubComponent::scheme1PrefetchSlice_(uint32_t slice_idx) {
         }
     }
     s1_is_issuing_prefetch_ = false;
-}
-
-// === Helpers implementations ===
-bool SnnPESubComponent::prepareDenseRead_(uint32_t row, uint32_t col, uint32_t width,
-                           uint64_t& req_addr, size_t& req_size,
-                           bool& is_row, uint32_t& col_start, uint32_t& count_floats) const {
-    const uint32_t bpf = sizeof(float);
-    // 默认先按单元素读取初始化（便于切换诊断开关）
-    req_addr = base_addr_ + (static_cast<uint64_t>(row) * width + col) * bpf;
-    req_size = sizeof(float);
-    is_row = false;
-    col_start = col;
-    count_floats = 1;
-    if (read_force_single_) {
-        return true;
-    }
-    if (merge_read_auto_) {
-        uint32_t fpl = std::max<uint32_t>(1, line_size_bytes_ / bpf);
-        size_t bytes_row = static_cast<size_t>(width) * bpf;
-        size_t bytes_cl  = static_cast<size_t>(fpl) * bpf;
-        bool choose_row = merge_read_row_ && (bytes_row <= bytes_cl);
-        if (choose_row && merge_read_row_) {
-            is_row = true;
-            col_start = 0;
-            count_floats = width;
-            req_addr = base_addr_ + static_cast<uint64_t>(row) * width * bpf;
-            req_size = static_cast<size_t>(count_floats) * bpf;
-        } else if (merge_read_cacheline_) {
-            col_start = (col / fpl) * fpl;
-            count_floats = std::min<uint32_t>(fpl, width - col_start);
-            req_addr = base_addr_ + (static_cast<uint64_t>(row) * width + col_start) * bpf;
-            req_size = static_cast<size_t>(count_floats) * bpf;
-        }
-    } else if (merge_read_row_) {
-        is_row = true;
-        col_start = 0;
-        count_floats = width;
-        req_addr = base_addr_ + static_cast<uint64_t>(row) * width * bpf;
-        req_size = static_cast<size_t>(count_floats) * bpf;
-    } else if (merge_read_cacheline_) {
-        uint32_t fpl = std::max<uint32_t>(1, line_size_bytes_ / bpf);
-        col_start = (col / fpl) * fpl;
-        count_floats = std::min<uint32_t>(fpl, width - col_start);
-        req_addr = base_addr_ + (static_cast<uint64_t>(row) * width + col_start) * bpf;
-        req_size = static_cast<size_t>(count_floats) * bpf;
-    }
-    return true;
-}
-
-void SnnPESubComponent::issueReadCommon_(uint64_t req_addr, size_t req_size,
-                          bool is_row, uint32_t row, uint32_t col_start, uint32_t count_floats,
-                          std::function<void(float)> single_cb, uint32_t single_col) {
-    PendingMemoryRequest pmr{};
-    pmr.address = req_addr;
-    pmr.size = req_size;
-    pmr.is_row = is_row;
-    pmr.pre = row;
-    pmr.post_start = col_start;
-    pmr.count_floats = count_floats;
-    pmr.has_single_cb = (single_cb != nullptr);
-    pmr.cb_post = single_col;
-    pmr.single_cb = single_cb;
-    pmr.issue_cycle = total_cycles_;
-    // Dense权重读取：视为权重区（地址位于 base_addr_ 段内）
-    pmr.is_weight = (req_addr >= base_addr_ && req_addr < weight_region_end_);
-    stats_reporter_.reportMemoryIssue(req_size, true);
-    uint64_t reqId = mem_backend_ ? mem_backend_->sendRead(req_addr, req_size, pmr) : 0;
-    if (window_read_debug_) {
-        output_->verbose(CALL_INFO, 1, 0,
-            "[diag-issue] core=%d send Read id=%" PRIu64 " addr=0x%llx size=%zu is_row=%d col_start=%u count=%u outstanding=%zu\n",
-            core_id_, reqId, (unsigned long long)req_addr, req_size, (int)is_row,
-            col_start, count_floats, pendingMemSize_());
-    }
 }

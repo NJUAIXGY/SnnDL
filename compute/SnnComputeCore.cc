@@ -90,38 +90,27 @@ void DefaultSnnComputeCore::configure(const ComputeCoreContext& ctx, const SST::
     weight_verify_samples_ = params.find<uint32_t>("weight_verify_samples", 16);
     verify_file_template_ = params.find<std::string>("verify_file_template", "");
 
-    // BCSR
-    use_bcsr_ = params.find<std::string>("index_mode", "pre_row_post_col") == "bcsr_post_row";
-    bcsr_br_ = params.find<uint32_t>("bcsr_block_rows", 16);
-    bcsr_bc_ = params.find<uint32_t>("bcsr_block_cols", 16);
-    bcsr_val_bytes_ = params.find<uint32_t>("bcsr_val_bytes", 4);
-    bcsr_idx_bytes_ = params.find<uint32_t>("bcsr_idx_bytes", 2);
-    bcsr_force_file_read_ = params.find<int>("bcsr_force_file_read", 0) != 0;
-    bcsr_row_index_cache_cap_ = params.find<uint32_t>("bcsr_row_index_cache_cap", 64);
-    bcsr_block_cache_cap_ = params.find<uint32_t>("bcsr_block_cache_cap", 256);
-    bcsr_prefetch_all_ = params.find<int>("bcsr_prefetch_all", 0) != 0;
+    // AoSoA 默认块行宽：若未显式指定，允许复用 bcsr_block_rows 作为提示以保持兼容。
+    if (aosoa_block_rows_ == 0) {
+        uint32_t hint = params.find<uint32_t>("bcsr_block_rows", 0);
+        aosoa_block_rows_ = (hint > 0) ? hint : 16;
+    }
 
-	    if (aosoa_block_rows_ == 0) {
-	        // 若启用 BCSR，则默认跟随其 block_rows；否则回退 16（与旧 SnnPESubComponent 行为一致）
-	        aosoa_block_rows_ = (use_bcsr_ && bcsr_br_ > 0) ? bcsr_br_ : 16;
-	    }
+    // 学习核心初始化（独立 LearningCore，便于后续替换算法）
+    if (!learning_core_) {
+        learning_core_ = std::make_unique<DefaultLearningCore>();
+    }
+    if (learning_core_) {
+        learning_core_->configure(ctx_.core_id, ctx_.node_id,
+                                  num_neurons_, global_neuron_base_,
+                                  weights_cols_, use_post_row_pre_col_,
+                                  v_thresh_, output_, params,
+                                  ctx.writeback_fn);
+    }
 
-	    // 学习核心初始化（独立 LearningCore，便于后续替换算法）
-	    if (!learning_core_) {
-	        learning_core_ = std::make_unique<DefaultLearningCore>();
-	    }
-	    if (learning_core_) {
-	        learning_core_->configure(ctx_.core_id, ctx_.node_id,
-	                                  num_neurons_, global_neuron_base_,
-	                                  weights_cols_, use_post_row_pre_col_,
-	                                  v_thresh_, output_, params,
-	                                  ctx.writeback_fn);
-	    }
-
-	    // 初始化状态
-	    initCoreEngineState_();
-	    initVerifyFile_();
-    prepareBcsrCaches_();
+    // 初始化状态
+    initCoreEngineState_();
+    initVerifyFile_();
 }
 
 void DefaultSnnComputeCore::initCoreEngineState_() {
@@ -185,13 +174,6 @@ void DefaultSnnComputeCore::initVerifyFile_() {
     }
 }
 
-void DefaultSnnComputeCore::prepareBcsrCaches_() {
-    bcsr_row_index_cache_.clear();
-    bcsr_row_index_lru_.clear();
-    bcsr_block_cache_.clear();
-    bcsr_block_lru_.clear();
-}
-
 void DefaultSnnComputeCore::onInit(unsigned int) {}
 void DefaultSnnComputeCore::onSetup() {}
 void DefaultSnnComputeCore::onFinish() {}
@@ -200,7 +182,6 @@ void DefaultSnnComputeCore::onClockTick(uint64_t now_cycle) {
     total_cycles_++;
     if (hasWork()) active_cycles_++;
     performWeightVerificationTick_(now_cycle);
-    performBcsrProbeTick_(now_cycle);
     if (learning_core_) learning_core_->onClockTick(now_cycle);
 }
 
@@ -599,31 +580,6 @@ void DefaultSnnComputeCore::performWeightVerificationTick_(uint64_t now_cycle) {
         if (mismatch) verify_mismatch_count_++;
     });
     verify_requested_++;
-}
-
-void DefaultSnnComputeCore::performBcsrProbeTick_(uint64_t now_cycle) {
-    if (!(verify_weights_ && use_bcsr_ && bcsr_weights_.isRowptrReady() &&
-          now_cycle >= memory_warmup_cycles_ && (loader_barrier_cycles_ == 0 || now_cycle >= loader_barrier_cycles_))) {
-        return;
-    }
-    // 诊断路径保留，简化版本：只探针第一个 block 的一个元素
-    if (verify_bcsr_done_ || verify_bcsr_inflight_) return;
-    verify_bcsr_inflight_ = true;
-    uint32_t br = (bcsr_br_>0? bcsr_br_:16);
-    uint32_t bc = (bcsr_bc_>0? bcsr_bc_:16);
-    uint32_t post_local = verify_bcsr_post_local_;
-    uint32_t pre_global = verify_bcsr_block_resolved_ ? (verify_bcsr_block_col_ * bc + verify_bcsr_intra_col_) : verify_bcsr_intra_col_;
-    if (!weight_reader_) { verify_bcsr_inflight_ = false; return; }
-    weight_reader_->requestBCSR(pre_global, post_local, [this, post_local, pre_global](float w){
-        verify_completed_++;
-        verify_sum_ += static_cast<double>(w);
-        if (std::fabs(w) > verify_epsilon_) {
-            verify_bcsr_done_ = true;
-        } else {
-            verify_bcsr_intra_col_++;
-        }
-        verify_bcsr_inflight_ = false;
-    });
 }
 
 } } // namespace SST::SnnDL

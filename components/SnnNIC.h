@@ -21,17 +21,17 @@
 #include <mutex>
 #include <unordered_set>
 #include "SnnInterface.h"
-#include "SpikeEvent.h"
-#include "GatingDecisionEvent.h"
+
+namespace SST { class Event; }
 
 namespace SST {
 namespace SnnDL {
 
 /**
- * @brief SNN网络接口控制器
+ * @brief 通用网络接口控制器（payload-agnostic）
  * 
- * 该组件实现了SnnInterface接口，作为SnnPE与merlin网络之间的适配器。
- * 它将SpikeEvent转换为网络数据包，并处理网络通信的复杂性。
+ * 该组件实现了 SnnInterface 接口，作为组件与 merlin.linkcontrol(SimpleNetwork)
+ * 之间的适配器。该层不解析 Spike/BCSR/权重语义，仅负责收发 Event。
  */
 class SnnNIC : public SnnInterface {
 public:
@@ -132,8 +132,8 @@ public:
     ~SnnNIC();
 
     // === SnnInterface 接口实现 ===
-    void setSpikeHandler(SpikeHandler handler) override;
-    void sendSpike(SpikeEvent* spike_event) override;
+    void setReceiveHandler(ReceiveHandler handler) override;
+    void sendToNode(uint32_t dest_node, SST::Event* event) override;
     void setNodeId(uint32_t node_id) override;
     uint32_t getNodeId() const override;
     std::string getNetworkStatus() const override;
@@ -152,22 +152,15 @@ public:
 
 private:
     // === 内部方法 ===
-    
-    /**
-     * @brief 将SpikeEvent打包成网络请求
-     * @param spike_event 脉冲事件
-     * @param dest_node 目标节点ID
-     * @return 网络请求对象
-     */
-    SST::Interfaces::SimpleNetwork::Request* createNetworkRequest(
-        SpikeEvent* spike_event, uint32_t dest_node);
-    
-    /**
-     * @brief 从网络请求中解包SpikeEvent
-     * @param req 网络请求
-     * @return 解包的脉冲事件（如果成功）
-     */
-    SpikeEvent* extractSpikeEvent(SST::Interfaces::SimpleNetwork::Request* req);
+    SST::Interfaces::SimpleNetwork::Request* createNetworkRequest_(uint32_t dest_node,
+                                                                   SST::Event* payload,
+                                                                   int vn,
+                                                                   int size_bits);
+    int estimateEventBits_(const SST::Event* ev) const;
+    void flushPendingSends_();
+    void tryBatchPacket_(uint32_t dest_node, class NocPacketEvent* pkt);
+    void flushBatchToNode_(uint32_t dest_node, bool is_timeout);
+    void flushAllBatches_();
 
     // === 成员变量 ===
     
@@ -200,8 +193,7 @@ private:
     bool vn_guard_warned_ = false;             ///< VN越界回退仅提示一次
     
     // 回调处理器
-    SpikeHandler spike_handler;                ///< 脉冲接收处理器
-    std::function<void(SST::Event*)> control_handler_; ///< 控制事件处理器（可选）
+    ReceiveHandler receive_handler_;           ///< 通用接收处理器（可选）
     
     // 统计计数器
     uint64_t spikes_sent_count;
@@ -236,20 +228,22 @@ private:
     Statistic<uint64_t>* stat_batch_size_max = nullptr;  ///< 最大批大小
     Statistic<uint64_t>* stat_batch_size_min = nullptr;  ///< 最小批大小
     
-    // 待发送队列（可选，用于流量控制）
-    std::queue<SpikeEvent*> pending_spikes;
+    // 待发送队列（用于流量控制 / backpressure）
+    struct PendingSend {
+        uint32_t dest_node = 0;
+        SST::Event* payload = nullptr;
+    };
+    std::queue<PendingSend> pending_sends_;
 
     // 简单批处理：按目标节点分桶
     // 旧实现：map 桶，保留以兼容；新实现：按 total_nodes_ 直接索引，减少map查找与扩容
-    std::map<uint32_t, std::vector<SpikeEvent*>> batch_buckets_;  ///< fallback: dest_node -> spikes
+    std::map<uint32_t, std::vector<class NocPacketEvent*>> batch_buckets_;  ///< dest_node -> packets
     std::map<uint32_t, uint64_t> batch_earliest_ts_;              ///< fallback: dest_node -> earliest ts
-    struct BatchBucket { std::vector<SpikeEvent*> spikes; uint64_t earliest_ts = std::numeric_limits<uint64_t>::max(); };
+    struct BatchBucket { std::vector<class NocPacketEvent*> packets; uint64_t earliest_ts = std::numeric_limits<uint64_t>::max(); };
     std::vector<BatchBucket> batch_buckets_vec_;                  ///< fast path: index by dest_node
 
     // 批处理辅助
-    void tryBatchSpike(SpikeEvent* spike);
-    void flushBatchToNode(uint32_t dest_node, bool is_timeout = false);
-    void flushAllBatches();
+    void tryBatchSpike(void*) = delete; // 禁止旧 SpikeEvent 路径误用
     bool isNeighborNode(uint32_t dest_node) const;
     uint32_t manhattanDistance(uint32_t src_node, uint32_t dst_node) const;
 
@@ -291,11 +285,8 @@ private:
     bool enable_inter_rank_batching_ = false;   ///< [禁用] 跨Rank代理聚合
     uint64_t inter_rank_batch_window_ns_ = 0;   ///< [禁用]
     uint32_t nodes_per_rank_ = 0;               ///< [禁用]
-    std::map<uint32_t, std::vector<SpikeEvent*>> ir_buckets_;     ///< dest_rank -> spikes
-    std::map<uint32_t, uint64_t> ir_earliest_ts_;                 ///< dest_rank -> earliest ts
-    void tryInterRankBatch(SpikeEvent* spike);
-    void flushInterRankTo(uint32_t dest_rank);
-    void flushInterRankAll();
+    // 注：跨Rank聚合旧实现依赖 SpikeEvent，已在通用 NoC packet 改造中移除。
+    // 若未来需要，可基于 NocPacketEvent/NocPacketBatchEvent 另行实现为独立模块。
     inline uint32_t computeRankForNode(uint32_t node) const {
         return (nodes_per_rank_ > 0) ? (node / nodes_per_rank_) : 0;
     }
@@ -329,8 +320,6 @@ private:
     static std::unordered_set<std::string> s_spike_csv_files_;
 
 public:
-    // 可选：设置控制事件处理器
-    void setControlHandler(std::function<void(SST::Event*)> handler) { control_handler_ = std::move(handler); }
     // 可选：发送控制事件到目标节点
     bool sendControl(SST::Event* ev, uint32_t dest_node);
 };

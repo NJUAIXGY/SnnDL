@@ -20,3 +20,12 @@
 - **定位**：历史的 StandardMem 权重读取 shim（实现 `IWeightReader`）。
 - **现状**：主路径已由 `services/memory/StandardMemAccess`（纯内存） + `services/synapse/weights/WeightMemorySubsystem`（权重语义）闭环承载。
 - **保留原因**：兼容旧接口/旧调试口径的参考。
+
+### `memory/StandardMemBackend.{h,cc}`
+- **定位**：历史的 StandardMem pending 跟踪后端（`sendRead/sendWrite + popPending`）。
+- **现状**：该实现携带 `MemRequestMeta`（含 BCSR/权重语义字段），已从 `services/memory/` 移出；主链路禁止依赖。
+- **保留原因**：用于对照旧 pending/回包分发逻辑与历史调试口径。
+
+### `noc/SnnNetworkAdapter.{h,cc}` / `noc/SimpleNetworkWrapper.{h,cc}`
+- **定位**：历史遗留的拓扑适配器/包装器（含 SST ELI 宏）。
+- **现状**：ELI 可加载对象的“权威位置”统一收敛在 `components/noc/`；本目录下文件仅保留作参考对照，主链路禁止依赖。

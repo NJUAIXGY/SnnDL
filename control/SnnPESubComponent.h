@@ -29,7 +29,6 @@
 #include "StageEventHub.h"
 #include "synapse/weights/WeightAccessor.h"
 #include "synapse/weights/WeightMemorySubsystem.h"
-#include "memory/StandardMemBackend.h"
 #include "IMemoryAccess.h"
 #include "ISpikeTransport.h"
 #include "ICoreControlHooks.h"
@@ -42,7 +41,7 @@ namespace SST {
 namespace SnnDL {
 
 class IPeAggregation; // PE级汇聚接口（避免依赖 MultiCorePE 具体实现）
-class GatherBufferIF;
+class IManualWindowDrive;
 class StandardMemAccess;
 struct GasOpData;
 class GasPhaseController;
@@ -422,12 +421,6 @@ private:
     // Internal helpers for robust memory access
     bool ensureLoaderReady_();
     bool ensureMemoryReady_() const { return memory_ != nullptr && memory_ready_; }
-    bool prepareDenseRead_(uint32_t row, uint32_t col, uint32_t width,
-                           uint64_t& req_addr, size_t& req_size,
-                           bool& is_row, uint32_t& col_start, uint32_t& count_floats) const;
-    void issueReadCommon_(uint64_t req_addr, size_t req_size,
-                          bool is_row, uint32_t row, uint32_t col_start, uint32_t count_floats,
-                          std::function<void(float)> single_cb, uint32_t single_col);
 
     // 方案1辅助
     inline uint32_t scheme1SliceFromPreGlobal_(uint32_t pre_g) const {
@@ -485,9 +478,8 @@ private:
     IPeAggregation* parent_pe_cached_ = nullptr;
     Output* output_;
     SST::Interfaces::StandardMem* memory_;
-    std::unique_ptr<StandardMemBackend> mem_backend_;
     std::unique_ptr<StandardMemAccess> stdmem_access_;
-    GatherBufferIF* gather_buffer_if_ = nullptr;
+    IManualWindowDrive* manual_window_drive_ = nullptr;
     bool manual_window_tick_logged_ = false;
     bool clock_tick_logged_ = false;
     SST::Link* memory_link_;
@@ -549,7 +541,7 @@ private:
     uint64_t scheme1_stage_counter_ = 0;
     bool scheme1_prefetch_issued_ = false;
     uint32_t scheme1_pending_prefetch_ = 0;    // 仍在等待的预取响应计数
-    bool s1_is_issuing_prefetch_ = false;      // 给 issueReadCommon_ 打标签用
+    bool s1_is_issuing_prefetch_ = false;      // 诊断标签：本周期是否处于 scheme1 预取发起阶段
     std::vector<std::deque<SpikeEvent*>> scheme1_slice_queues_;
     bool scheme1_queues_inited_ = false;       // 仅首次分配队列；之后跨superstep保留
     bool scheme1_first_superstep_ = true;      // 第一次superstep用于初始化current_slice_
@@ -732,8 +724,6 @@ private:
     void bcsrRowIndexPut_(uint32_t block_row, std::vector<uint32_t>& data);
     bool bcsrBlockGet_(uint32_t block_row, uint32_t block_col, std::vector<float>& out);
     void bcsrBlockPut_(uint32_t block_row, uint32_t block_col, std::vector<float>& data);
-    void bcsrPrefetchAll_();
-    void bcsrPrefetchRowBlocks_(uint32_t block_row, const std::vector<uint32_t>& cols, uint32_t row_start);
     void bcsrPopulateWeightCache_(uint32_t block_row, uint32_t block_col, const std::vector<float>& blk);
     bool loadBcsrRowptrFromFile_();
     void ensureRowptrReadyOrFatal_(const char* reason);

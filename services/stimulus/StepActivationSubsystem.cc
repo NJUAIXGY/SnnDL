@@ -18,6 +18,7 @@
 #include <sst/core/output.h>
 #include <sst/core/statapi/stataccumulator.h>
 
+#include "../../api/GlobalNeuronLayout.h"
 #include "INocTransport.h"
 #include "SpikeEvent.h"
 
@@ -48,10 +49,38 @@ void StepActivationSubsystem::configure(const Config& cfg) {
 
 void StepActivationSubsystem::bindRuntime(const Runtime& rt) {
     rt_ = rt;
-    if (rt_.neurons_per_pe_cfg == 0 && rt_.num_cores > 0 && rt_.neurons_per_core > 0) {
-        rt_.neurons_per_pe_cfg =
-            static_cast<uint32_t>(rt_.num_cores) * static_cast<uint32_t>(rt_.neurons_per_core);
+
+    if (!rt_.layout || !rt_.layout->valid()) {
+        if (rt_.log) rt_.log->fatal(CALL_INFO, -1, "StepActivationSubsystem fatal: runtime.layout 为空或无效，无法进行全局ID映射（fail-fast）\n");
+        return;
     }
+
+    const uint64_t derived_neurons_per_pe =
+        static_cast<uint64_t>(rt_.num_cores) * static_cast<uint64_t>(rt_.neurons_per_core);
+    const uint64_t layout_neurons_per_pe = rt_.layout->neuronsPerPE();
+    if (layout_neurons_per_pe != derived_neurons_per_pe) {
+        if (rt_.log) rt_.log->fatal(
+            CALL_INFO, -1,
+            "StepActivationSubsystem fatal: neurons_per_pe 口径不一致（fail-fast）：layout=%" PRIu64 " derived(num_cores*neurons_per_core)=%" PRIu64 "\n",
+            layout_neurons_per_pe, derived_neurons_per_pe);
+        return;
+    }
+    if (rt_.neurons_per_pe_cfg != 0 && static_cast<uint64_t>(rt_.neurons_per_pe_cfg) != layout_neurons_per_pe) {
+        if (rt_.log) rt_.log->fatal(
+            CALL_INFO, -1,
+            "StepActivationSubsystem fatal: neurons_per_pe_cfg(%u) 与 layout.neuronsPerPE(%" PRIu64 ") 不一致（fail-fast）\n",
+            rt_.neurons_per_pe_cfg, layout_neurons_per_pe);
+        return;
+    }
+    const uint64_t expected_base = rt_.layout->globalBaseOfNode(static_cast<uint32_t>(rt_.node_id));
+    if (rt_.global_neuron_base != expected_base) {
+        if (rt_.log) rt_.log->fatal(
+            CALL_INFO, -1,
+            "StepActivationSubsystem fatal: global_neuron_base(0x%" PRIx64 ") 与 layout.base(node=%d)=0x%" PRIx64 " 不一致（fail-fast）\n",
+            rt_.global_neuron_base, rt_.node_id, expected_base);
+        return;
+    }
+
     if (cfg_.trigger_core < -1 || cfg_.trigger_core >= rt_.num_cores) {
         STEP_LOG(1, "⚠️ step_activation_trigger_core=%d 超出范围[-1,%d)，回退到0\n",
                  cfg_.trigger_core, rt_.num_cores);
@@ -131,16 +160,17 @@ void StepActivationSubsystem::onEndScatter(uint32_t seq) {
 }
 
 int StepActivationSubsystem::determineTargetUnit_(uint32_t neuron_id) const {
-    const int64_t base = static_cast<int64_t>(rt_.global_neuron_base);
-    const int64_t local = static_cast<int64_t>(neuron_id) - base;
-    const int64_t total = static_cast<int64_t>(rt_.num_cores) * static_cast<int64_t>(rt_.neurons_per_core);
-    if (local < 0 || local >= total) return -1;
-    const int unit = (rt_.neurons_per_core > 0) ? static_cast<int>(local / rt_.neurons_per_core) : -1;
-    return (unit >= 0 && unit < rt_.num_cores) ? unit : -1;
+    if (!rt_.layout || !rt_.layout->valid()) return -1;
+    if (!rt_.layout->inGlobalRange(static_cast<uint64_t>(neuron_id))) return -1;
+    if (!rt_.layout->isLocalToNode(static_cast<uint64_t>(neuron_id), static_cast<uint32_t>(rt_.node_id))) return -1;
+    const uint32_t core = rt_.layout->coreOf(static_cast<uint64_t>(neuron_id));
+    return (core < static_cast<uint32_t>(rt_.num_cores)) ? static_cast<int>(core) : -1;
 }
 
 void StepActivationSubsystem::injectStepActivations_(uint32_t seq, uint64_t sim_time_ns) {
-    const int total_neurons = rt_.num_cores * rt_.neurons_per_core;
+    if (!rt_.layout || !rt_.layout->valid()) return;
+    const uint64_t neurons_per_pe = rt_.layout->neuronsPerPE();
+    const int total_neurons = static_cast<int>(neurons_per_pe);
     if (!cfg_.enable || cfg_.fanout == 0 || total_neurons <= 0) return;
 
     double fraction = cfg_.fraction;
@@ -150,10 +180,7 @@ void StepActivationSubsystem::injectStepActivations_(uint32_t seq, uint64_t sim_
     if (st_.invocations) st_.invocations->addData(1);
 
     const uint64_t local_total = static_cast<uint64_t>(total_neurons);
-    const uint64_t neurons_per_pe = static_cast<uint64_t>(rt_.neurons_per_pe_cfg);
-    const uint64_t max_global = (rt_.total_nodes > 0 && neurons_per_pe > 0)
-        ? static_cast<uint64_t>(rt_.total_nodes) * neurons_per_pe
-        : 0ULL;
+    const uint64_t max_global = rt_.layout->maxGlobalNeurons();
     const uint64_t diag_cap = (rt_.step_diag_cap_cfg > 0) ? static_cast<uint64_t>(rt_.step_diag_cap_cfg) : 0ULL;
     std::mt19937_64 rng(cfg_.seed ^ (static_cast<uint64_t>(seq) + (static_cast<uint64_t>(rt_.node_id) << 32)));
     std::uniform_int_distribution<uint64_t> post_dist(0, local_total - 1);
@@ -180,7 +207,7 @@ void StepActivationSubsystem::injectStepActivations_(uint32_t seq, uint64_t sim_
                 ++with_routes;
                 if (v.size() > max_routes) max_routes = static_cast<uint64_t>(v.size());
                 for (auto post : v) {
-                    uint32_t pe_of_post = (neurons_per_pe > 0) ? static_cast<uint32_t>(post / neurons_per_pe) : 0;
+                    uint32_t pe_of_post = rt_.layout->nodeOf(static_cast<uint64_t>(post));
                     if (pe_of_post == static_cast<uint32_t>(rt_.node_id)) ++local_edges; else ++remote_edges;
                 }
             }
@@ -228,8 +255,7 @@ void StepActivationSubsystem::injectStepActivations_(uint32_t seq, uint64_t sim_
                 auto* spike = new SpikeEvent(pre_global, post_global, static_cast<uint32_t>(rt_.node_id), 1.0f, sim_time_ns);
                 int dst_core = determineTargetUnit_(post_global);
                 if (dst_core >= 0) {
-                    if (rt_.noc) rt_.noc->injectLocal(dst_core, spike);
-                    else if (rt_.deliver_to_core) rt_.deliver_to_core(dst_core, spike);
+                    if (rt_.deliver_to_core) rt_.deliver_to_core(dst_core, spike);
                     else delete spike;
                     spikes_injected++;
                 } else {
@@ -279,16 +305,13 @@ void StepActivationSubsystem::injectStepActivations_(uint32_t seq, uint64_t sim_
                     auto* spike = new SpikeEvent(pre_global, post_global, static_cast<uint32_t>(rt_.node_id), 1.0f, sim_time_ns);
                     int dst_core = determineTargetUnit_(post_global);
                     if (dst_core >= 0) {
-                        if (rt_.noc) rt_.noc->injectLocal(dst_core, spike);
-                        else if (rt_.deliver_to_core) rt_.deliver_to_core(dst_core, spike);
+                        if (rt_.deliver_to_core) rt_.deliver_to_core(dst_core, spike);
                         else delete spike;
                         spikes_injected++;
                     } else {
-                        uint32_t denom = (neurons_per_pe > 0) ? static_cast<uint32_t>(neurons_per_pe) : 0u;
-                        uint32_t dest_node = (denom > 0) ? (post_global / denom) : 0u;
+                        uint32_t dest_node = rt_.layout->nodeOf(static_cast<uint64_t>(post_global));
                         spike->setDestinationNode(dest_node);
-                        if (rt_.noc) rt_.noc->sendExternal(spike);
-                        else if (rt_.send_external) rt_.send_external(spike);
+                        if (rt_.send_external) rt_.send_external(spike);
                         else delete spike;
                         spikes_injected++;
                     }

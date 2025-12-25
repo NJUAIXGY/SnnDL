@@ -8,6 +8,8 @@
 
 #include "INocTransport.h"
 #include "ISpikeTransport.h"
+#include "GlobalNeuronLayout.h"
+#include "synapse/route/SpikeNocCodec.h"
 
 namespace SST { namespace SnnDL {
 
@@ -18,16 +20,30 @@ public:
 
     void setNocTransport(INocTransport* noc) { noc_ = noc; }
     void setSourceCore(int src_core) { src_core_ = src_core; }
+    void setGlobalLayout(const GlobalNeuronLayout& layout) { layout_ = layout; }
+    void configureLayout(uint32_t total_nodes, uint32_t cores_per_pe, uint32_t neurons_per_core) {
+        layout_ = GlobalNeuronLayout(total_nodes, cores_per_pe, neurons_per_core);
+    }
 
     void send(SpikeEvent* event) override {
-        if (noc_) noc_->sendFromCore(src_core_, event);
-        else delete event;
+        if (!event) return;
+        if (!noc_ || !layout_.valid()) {
+            delete event;
+            return;
+        }
+
+        NocPacketEvent* pkt = SpikeNocCodec::encode(*event, layout_);
+        delete event;
+        if (!pkt) return;
+        // 保守：以注入端 core_id 覆盖 src_endpoint，避免上层未按 global_id 口径填充导致偏差
+        pkt->src_endpoint = static_cast<uint16_t>(src_core_);
+        noc_->sendFromCore(src_core_, pkt);
     }
 
 private:
     INocTransport* noc_ = nullptr;  // 非拥有
     int src_core_ = 0;
+    GlobalNeuronLayout layout_{};
 };
 
 }} // namespace SST::SnnDL
-

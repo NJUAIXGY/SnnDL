@@ -11,9 +11,8 @@
 #include "synapse/gas/GasCustomCmd.h"
 #include "synapse/gas/GasPhaseController.h"
 #include "IPeAggregation.h"
-#include "GatherBufferIF.h"
+#include "IManualWindowDrive.h"
 #include "synapse/weights/WeightMemorySubsystem.h"
-#include "memory/StandardMemBackend.h"
 #include "memory/StandardMemAccess.h"
 #include "ISpikeTransport.h"
 #include "synapse/route/SpikeCommSubsystem.h"
@@ -30,7 +29,6 @@
 
 using namespace SST;
 using namespace SST::SnnDL;
-using PendingMemoryRequest = MemRequestMeta;
 
 // 诊断门控改为参数化：由 enable_extended_diagnostics_ 成员控制
 
@@ -249,7 +247,7 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
       parent_(nullptr),
       output_(nullptr),
       memory_(nullptr),
-      gather_buffer_if_(nullptr),
+      manual_window_drive_(nullptr),
       memory_link_(nullptr),
       weight_cache_ops_() {
     // 构造期最早哨兵（P2：参数优先，未设置回退到环境变量，以保持兼容）。
@@ -504,6 +502,10 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     const std::string routing_mode = params.find<std::string>("routing_mode", "fixed");
     weights_template_ = params.find<std::string>("weights_template", "");
     const uint32_t total_nodes = params.find<uint32_t>("total_nodes", 16);
+    // NoC packet 编码口径：保证 NocSpikeTransport 能把 SpikeEvent 编码为 (node/core) 可路由的 NocPacketEvent
+    noc_spike_transport_.configureLayout(total_nodes,
+                                         static_cast<uint32_t>(total_cores_),
+                                         static_cast<uint32_t>(num_neurons_));
 
     // neurons_per_pe：默认按 total_cores*num_neurons 推导；但允许脚本显式覆盖（保持兼容）
     uint32_t np_from_params = params.find<uint32_t>("neurons_per_pe", 0);
@@ -693,7 +695,6 @@ void SnnPESubComponent::activityFlush_() {
 
 size_t SnnPESubComponent::pendingMemSize_() const {
     size_t n = 0;
-    if (mem_backend_) n += mem_backend_->pendingSize();
     if (stdmem_access_) n += stdmem_access_->pendingSize();
     return n;
 }
@@ -882,9 +883,6 @@ void SnnPESubComponent::init(unsigned int phase) {
             registerTimeBase("1ns"),
             new SST::Interfaces::StandardMem::Handler2<SnnPESubComponent, &SnnPESubComponent::handleMemoryResponse>(this));
         if (memory_) {
-            if (!mem_backend_) {
-                mem_backend_ = std::make_unique<StandardMemBackend>(memory_);
-            }
             if (!stdmem_access_) {
                 stdmem_access_ = std::make_unique<StandardMemAccess>(memory_, output_, node_id_, core_id_);
             }
@@ -896,15 +894,15 @@ void SnnPESubComponent::init(unsigned int phase) {
             // 若已成功加载 StandardMem 子组件，则认为内存就绪（即使未显式提供 memory_link_）
             memory_ready_ = true;
             if (gas_manual_window_drive_) {
-                gather_buffer_if_ = dynamic_cast<GatherBufferIF*>(memory_);
-                if (!gather_buffer_if_) {
+                manual_window_drive_ = dynamic_cast<IManualWindowDrive*>(memory_);
+                if (!manual_window_drive_) {
                     output_->verbose(CALL_INFO, 0, 0,
-                        "⚠️ 核心%d启用gas_manual_window_drive但memory不是GatherBufferIF，降级为自动窗口\n",
+                        "⚠️ 核心%d启用gas_manual_window_drive但memory不支持IManualWindowDrive，降级为自动窗口\n",
                         core_id_);
                     gas_manual_window_drive_ = false;
                 } else {
                     output_->verbose(CALL_INFO, 0, 0,
-                        "[diag-gas] 核心%d启用manual窗口驱动 (GatherBufferIF) gather_cycles=%" PRIu64 "\n",
+                        "[diag-gas] 核心%d启用manual窗口驱动 (IManualWindowDrive) gather_cycles=%" PRIu64 "\n",
                         core_id_, manual_gas_gather_cycles_cfg_);
                 }
             }
@@ -984,9 +982,6 @@ void SnnPESubComponent::setup() {
         }
     }
     // 确保后端已构建（init阶段可能未加载到 StandardMem）
-    if (memory_ && !mem_backend_) {
-        mem_backend_ = std::make_unique<StandardMemBackend>(memory_);
-    }
 
     // 打印映射模式与GAS端到端配置（一次性调试信息）
     {
@@ -1071,8 +1066,8 @@ bool SnnPESubComponent::clockTick(Cycle_t current_cycle) {
             new SST::SnnDL::GasOpData(SST::SnnDL::GasOp::BeginGather, /*ss*/0, /*slice*/0, /*tot*/1));
         memory_->send(begin_g);
     }
-    if (gas_enable_ && gas_window_mode_ && gas_manual_window_drive_ && gather_buffer_if_) {
-        gather_buffer_if_->manualWindowTick();
+    if (gas_enable_ && gas_window_mode_ && gas_manual_window_drive_ && manual_window_drive_) {
+        manual_window_drive_->manualWindowTick();
         manual_gas_counter_++;
         if (!manual_tick_sampled_ && manual_gas_counter_ <= manual_gas_gather_cycles_cfg_) {
             output_->verbose(CALL_INFO, 0, 0,

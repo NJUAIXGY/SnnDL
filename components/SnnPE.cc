@@ -90,9 +90,14 @@ SnnPE::SnnPE(ComponentId_t id, Params& params) : Component(id) {
         PE_LOG(1, "使用分布式SubComponent模式（接口+路由器）\n");
         
         // 配置接口
-        snn_interface->setSpikeHandler(
-            [this](SpikeEvent* spike) { this->handleInterfaceSpike(spike); }
-        );
+        snn_interface->setReceiveHandler([this](SST::Event* ev) {
+            auto* spike = dynamic_cast<SpikeEvent*>(ev);
+            if (spike) {
+                this->handleInterfaceSpike(spike); // handleInterfaceSpike 接管并释放
+            } else {
+                delete ev;
+            }
+        });
         
         // 配置路由器回调
         router->setNotifyOnReceive(
@@ -111,9 +116,14 @@ SnnPE::SnnPE(ComponentId_t id, Params& params) : Component(id) {
         PE_LOG(1, "使用SubComponent接口模式（无嵌入路由器）\n");
         
         // 配置接口
-        snn_interface->setSpikeHandler(
-            [this](SpikeEvent* spike) { this->handleInterfaceSpike(spike); }
-        );
+        snn_interface->setReceiveHandler([this](SST::Event* ev) {
+            auto* spike = dynamic_cast<SpikeEvent*>(ev);
+            if (spike) {
+                this->handleInterfaceSpike(spike);
+            } else {
+                delete ev;
+            }
+        });
         
         // Phase 4.5: 混合模式 - 保持输入Link以支持SpikeSource，仅输出使用SubComponent
         spike_input_link = configureLink("spike_input", 
@@ -367,7 +377,7 @@ bool SnnPE::clockTick(Cycle_t current_cycle) {
                 new_spike->setWeight(test_weight);
                 PE_LOG(1, "[测试流量] 周期=%" PRIu64 ": 节点%u -> 节点%u, 神经元%u, 权重=%.3f\n",
                                current_cycle, node_id, test_target_node, i % num_neurons, test_weight);
-                snn_interface->sendSpike(new_spike);
+                snn_interface->sendToNode(static_cast<uint32_t>(test_target_node), new_spike);
             }
         }
     }
@@ -839,7 +849,7 @@ void SnnPE::checkAndFireSpike(uint32_t neuron_idx) {
                 
                 if (use_interface_mode && snn_interface) {
                     // 通过网络接口发送
-                    snn_interface->sendSpike(new_spike);
+                    snn_interface->sendToNode(dest_node_id, new_spike);
                     
                 } else if (spike_output_link) {
                     // 使用传统Link发送
