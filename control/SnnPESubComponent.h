@@ -24,18 +24,11 @@
 #include "SnnProfiler.h"  // 轻量级性能分析（条件编译）
 #include "synapse/weights/SnnBcsrWeightManager.h"
 #include "ISnnComputeCore.h"
-#include "synapse/gas/AccumulatorOps.h"
-#include "synapse/weights/WeightCacheOps.h"
-#include "StageEventHub.h"
-#include "synapse/weights/WeightAccessor.h"
-#include "synapse/weights/WeightMemorySubsystem.h"
 #include "IMemoryAccess.h"
 #include "ISpikeTransport.h"
 #include "ICoreControlHooks.h"
 #include "IGasOrchestrator.h"
 #include "NocSpikeTransport.h"
-#include "synapse/route/SpikeCommSubsystem.h"
-#include "synapse/route/SynapseRouteSubsystem.h"
 
 namespace SST {
 namespace SnnDL {
@@ -43,6 +36,13 @@ namespace SnnDL {
 class IPeAggregation; // PE级汇聚接口（避免依赖 MultiCorePE 具体实现）
 class IManualWindowDrive;
 class StandardMemAccess;
+class AccumulatorOps;
+class WeightCacheOps;
+struct StageEventHub;
+struct WeightAccessor;
+class WeightMemorySubsystem;
+class SpikeCommSubsystem;
+class SynapseRouteSubsystem;
 struct GasOpData;
 class GasPhaseController;
 
@@ -248,8 +248,8 @@ private:
     INocTransport* noc_transport_ = nullptr;   // 非拥有；由父组件装配并保证生命周期
     NocSpikeTransport noc_spike_transport_{};  // 值语义适配器
     // Synapse/Route：权重驱动路由构建 + 共享缓存（Phase2）
-    SynapseRouteSubsystem synapse_route_;
-    SpikeCommSubsystem spike_comm_;
+    std::unique_ptr<SynapseRouteSubsystem> synapse_route_;
+    std::unique_ptr<SpikeCommSubsystem> spike_comm_;
     bool spike_comm_ready_ = false;
     inline void applySynapticDelta_(uint32_t idx, float dv) {
         if (compute_core_) compute_core_->applySynapticDelta(idx, dv);
@@ -307,12 +307,12 @@ private:
         void updatePendingPeak(uint32_t outstanding) const;
     };
 
-    StageEventHub stage_event_hub_;
+    std::unique_ptr<StageEventHub> stage_event_hub_;
 
     StatsReporter stats_reporter_;
     // Extracted accumulator/cache helpers (constructed in ctor)
     std::unique_ptr<AccumulatorOps> acc_ops_;
-    WeightCacheOps weight_cache_ops_;
+    std::unique_ptr<WeightCacheOps> weight_cache_ops_;
     bool bcsr_rowptr_file_fallback_enable_ = false;
     bool enable_extended_diagnostics_ = false; // 参数化诊断开关（替代环境变量 SNNDL_DIAG_ENABLE）
     // Per-window aggregation counters (PE-level flush on stage events)
@@ -356,12 +356,8 @@ private:
     uint64_t diag_spikes_stage_idle_ = 0;
     // Window-read edges/posts/pres 已下沉到 WeightMemorySubsystem（Phase A）
     // Helpers (phase‑1)
-    inline void accReset_() {
-        if (acc_ops_) acc_ops_->reset();
-    }
-    inline void accUpdate_(uint32_t post, float dv) {
-        if (acc_ops_) acc_ops_->update(post, dv);
-    }
+    void accReset_();
+    void accUpdate_(uint32_t post, float dv);
 
     // === Learning writeback hook (called by compute core) ===
     bool applyLocalWeightUpdates_(const std::unordered_map<uint64_t, float>& grads,
@@ -404,7 +400,7 @@ private:
     inline uint32_t weightMatrixWidth_() const {
         return use_post_row_pre_col_ ? weights_cols_ : num_neurons_;
     }
-    WeightAccessor weight_accessor_;
+    std::unique_ptr<WeightAccessor> weight_accessor_;
     void activityFlush_();
 
     bool clockTick(Cycle_t current_cycle);
@@ -440,36 +436,13 @@ private:
     uint64_t routeAndSendOutputs_(const std::vector<FireEvent>& fired);
     size_t pendingMemSize_() const;
     // === 窗口读计数下沉到 WeightMemorySubsystem ===
-    inline void windowStateConfigure_() {
-        if (weight_mem_subsystem_) {
-            weight_mem_subsystem_->configureWindow(window_read_budget_, max_outstanding_requests_);
-        }
-    }
-    inline void windowStateBegin_() {
-        if (weight_mem_subsystem_) {
-            weight_mem_subsystem_->beginWindow();
-        }
-    }
-    inline bool windowStateCanIssue_(uint32_t n = 1) const {
-        return weight_mem_subsystem_ ? weight_mem_subsystem_->canIssue(n) : false;
-    }
-    inline void windowStateNoteIssue_(uint32_t n = 1) {
-        if (weight_mem_subsystem_) {
-            weight_mem_subsystem_->noteIssue(n);
-            stats_reporter_.updatePendingPeak(weight_mem_subsystem_->outstanding());
-        }
-    }
-    inline void windowStateNoteComplete_(uint32_t n = 1) {
-        if (weight_mem_subsystem_) {
-            weight_mem_subsystem_->noteComplete(n);
-        }
-    }
-    inline uint32_t windowStateIssued_() const {
-        return weight_mem_subsystem_ ? weight_mem_subsystem_->issued() : 0;
-    }
-    inline uint32_t windowStateOutstanding_() const {
-        return weight_mem_subsystem_ ? weight_mem_subsystem_->outstanding() : 0;
-    }
+    void windowStateConfigure_();
+    void windowStateBegin_();
+    bool windowStateCanIssue_(uint32_t n = 1) const;
+    void windowStateNoteIssue_(uint32_t n = 1);
+    void windowStateNoteComplete_(uint32_t n = 1);
+    uint32_t windowStateIssued_() const;
+    uint32_t windowStateOutstanding_() const;
 
     // Debug/diagnostic switches (params)
     bool read_force_single_ = false; // 当为真时，强制按单元素读取（req_size=4B），用于定位对齐/切片问题
@@ -572,12 +545,8 @@ private:
     }
     void handleNeuronFire_(uint32_t neuron_idx, float v_before, float v_after);
     std::queue<SpikeEvent*> incoming_spikes_;
-    inline bool weightCacheTryGet_(uint64_t key, float& out) {
-        return weight_cache_ops_.tryGet(key, out);
-    }
-    inline void weightCacheStore_(uint64_t key, float value) {
-        weight_cache_ops_.store(key, value);
-    }
+    bool weightCacheTryGet_(uint64_t key, float& out);
+    void weightCacheStore_(uint64_t key, float value);
     bool window_read_enable_ = false;   // 严格GAS：按窗发起权重读取
     uint32_t window_read_budget_ = 1024;
     bool window_read_debug_ = false;    // 控制窗口读相关调试日志

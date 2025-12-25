@@ -10,12 +10,17 @@
 #include <fstream>
 #include "synapse/gas/GasCustomCmd.h"
 #include "synapse/gas/GasPhaseController.h"
+#include "synapse/gas/AccumulatorOps.h"
+#include "StageEventHub.h"
 #include "IPeAggregation.h"
 #include "IManualWindowDrive.h"
 #include "synapse/weights/WeightMemorySubsystem.h"
+#include "synapse/weights/WeightCacheOps.h"
+#include "synapse/weights/WeightAccessor.h"
 #include "memory/StandardMemAccess.h"
 #include "ISpikeTransport.h"
 #include "synapse/route/SpikeCommSubsystem.h"
+#include "synapse/route/SynapseRouteSubsystem.h"
 
 #include <iostream>
 #include <cmath>
@@ -248,8 +253,7 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
       output_(nullptr),
       memory_(nullptr),
       manual_window_drive_(nullptr),
-      memory_link_(nullptr),
-      weight_cache_ops_() {
+      memory_link_(nullptr) {
     // 构造期最早哨兵（P2：参数优先，未设置回退到环境变量，以保持兼容）。
     // 避免直接使用 stdout，统一走 SST Output。
     const bool kSentinelOn = [&params](){
@@ -288,7 +292,8 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     }
     enable_weight_fetch_ = params.find<int>("enable_weight_fetch", 0) != 0;
     // 现在再初始化依赖core指针的轻量结构
-    stage_event_hub_.init(this);
+    stage_event_hub_ = std::make_unique<StageEventHub>();
+    if (stage_event_hub_) stage_event_hub_->init(this);
     stats_reporter_.init(this);
     gas_ctrl_ = std::make_unique<GasPhaseController>();
     if (gas_ctrl_) {
@@ -312,11 +317,12 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
         cache_cfg.max_entries = max_cache_entries;
         cache_cfg.use_clock = use_clock_weight_cache;
         cache_cfg.disable_cache = disable_weight_cache;
-        weight_cache_ops_.configure(cache_cfg, [this]() {
+        if (!weight_cache_ops_) weight_cache_ops_ = std::make_unique<WeightCacheOps>();
+        weight_cache_ops_->configure(cache_cfg, [this]() {
             if (stat_cache_evictions_) stat_cache_evictions_->addData(1);
             count_cache_evictions_++;
         });
-        weight_cache_ops_.reserve(cache_cfg.max_entries ? cache_cfg.max_entries : 1);
+        weight_cache_ops_->reserve(cache_cfg.max_entries ? cache_cfg.max_entries : 1);
     }
     use_event_weight_fallback_ = params.find<int>("use_event_weight_fallback", 0) != 0;
     event_weight_fallback_warned_ = false;
@@ -389,7 +395,8 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     }
     if (weights_cols_ == 0) weights_cols_ = num_neurons_; // 默认沿用旧行宽
     // 配置权重索引解析器（独立于控制层实现）
-    weight_accessor_.configure(WeightAccessorConfig{
+    if (!weight_accessor_) weight_accessor_ = std::make_unique<WeightAccessor>();
+    weight_accessor_->configure(WeightAccessorConfig{
         static_cast<uint32_t>(core_id_),
         static_cast<uint64_t>(global_neuron_base_),
         static_cast<uint32_t>(num_neurons_),
@@ -563,11 +570,13 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     comm_routing.bcsr_blockdata_addr = bcsr_blockdata_addr_;
     comm_routing.bcsr_blockids_addr = bcsr_blockids_addr_;
 
-    synapse_route_.configure(comm_routing);
-    synapse_route_.configureGating(/*gating_event_mode=*/(gating_mode == "event"),
-                                   /*gating_ttl_cycles=*/gating_ttl_cycles,
-                                   /*gating_scope_inputs_only=*/(gating_scope != "all"));
-    spike_comm_.configure();
+    if (!synapse_route_) synapse_route_ = std::make_unique<SynapseRouteSubsystem>();
+    if (!spike_comm_) spike_comm_ = std::make_unique<SpikeCommSubsystem>();
+    synapse_route_->configure(comm_routing);
+    synapse_route_->configureGating(/*gating_event_mode=*/(gating_mode == "event"),
+                                    /*gating_ttl_cycles=*/gating_ttl_cycles,
+                                    /*gating_scope_inputs_only=*/(gating_scope != "all"));
+    spike_comm_->configure();
     
     // 获取权重文件路径
     weights_file_path_ = params.find<std::string>("weights_file", "");
@@ -699,6 +708,61 @@ size_t SnnPESubComponent::pendingMemSize_() const {
     return n;
 }
 
+void SnnPESubComponent::accReset_() {
+    if (acc_ops_) acc_ops_->reset();
+}
+
+void SnnPESubComponent::accUpdate_(uint32_t post, float dv) {
+    if (acc_ops_) acc_ops_->update(post, dv);
+}
+
+bool SnnPESubComponent::weightCacheTryGet_(uint64_t key, float& out) {
+    if (!weight_cache_ops_) return false;
+    return weight_cache_ops_->tryGet(key, out);
+}
+
+void SnnPESubComponent::weightCacheStore_(uint64_t key, float value) {
+    if (!weight_cache_ops_) return;
+    weight_cache_ops_->store(key, value);
+}
+
+void SnnPESubComponent::windowStateConfigure_() {
+    if (weight_mem_subsystem_) {
+        weight_mem_subsystem_->configureWindow(window_read_budget_, max_outstanding_requests_);
+    }
+}
+
+void SnnPESubComponent::windowStateBegin_() {
+    if (weight_mem_subsystem_) {
+        weight_mem_subsystem_->beginWindow();
+    }
+}
+
+bool SnnPESubComponent::windowStateCanIssue_(uint32_t n) const {
+    return weight_mem_subsystem_ ? weight_mem_subsystem_->canIssue(n) : false;
+}
+
+void SnnPESubComponent::windowStateNoteIssue_(uint32_t n) {
+    if (weight_mem_subsystem_) {
+        weight_mem_subsystem_->noteIssue(n);
+        stats_reporter_.updatePendingPeak(weight_mem_subsystem_->outstanding());
+    }
+}
+
+void SnnPESubComponent::windowStateNoteComplete_(uint32_t n) {
+    if (weight_mem_subsystem_) {
+        weight_mem_subsystem_->noteComplete(n);
+    }
+}
+
+uint32_t SnnPESubComponent::windowStateIssued_() const {
+    return weight_mem_subsystem_ ? weight_mem_subsystem_->issued() : 0;
+}
+
+uint32_t SnnPESubComponent::windowStateOutstanding_() const {
+    return weight_mem_subsystem_ ? weight_mem_subsystem_->outstanding() : 0;
+}
+
 void SnnPESubComponent::setParentInterface(SnnPEParentInterface* parent) {
     parent_ = parent;
     parent_pe_cached_ = dynamic_cast<IPeAggregation*>(parent);
@@ -709,22 +773,28 @@ void SnnPESubComponent::setParentInterface(SnnPEParentInterface* parent) {
         spike_transport_->setParent(parent_);
     }
     // 绑定通信子系统运行时依赖（路由表将在 init(phase0) 中构建/注入）
-    synapse_route_.bindRuntime(output_,
-                               static_cast<uint32_t>(node_id_),
-                               static_cast<uint32_t>(core_id_),
-                               static_cast<uint32_t>(num_neurons_),
-                               static_cast<uint32_t>(neurons_per_pe_cfg_),
-                               stat_routes_entries_);
-    synapse_route_.bindFanoutStat(stat_fanout_per_spike_);
+    if (synapse_route_) {
+        synapse_route_->bindRuntime(output_,
+                                    static_cast<uint32_t>(node_id_),
+                                    static_cast<uint32_t>(core_id_),
+                                    static_cast<uint32_t>(num_neurons_),
+                                    static_cast<uint32_t>(neurons_per_pe_cfg_),
+                                    stat_routes_entries_);
+        synapse_route_->bindFanoutStat(stat_fanout_per_spike_);
+    }
     ISpikeTransport* transport = spike_transport_.get();
     if (noc_transport_) transport = &noc_spike_transport_;
     SpikeCommRuntimeConfig rt{};
     rt.log = output_;
     rt.transport = transport;
-    rt.synapse_route = &synapse_route_;
+    rt.synapse_route = synapse_route_.get();
     rt.global_neuron_base = static_cast<uint64_t>(global_neuron_base_);
-    spike_comm_.bindRuntime(rt);
-    spike_comm_ready_ = spike_comm_.ready();
+    if (spike_comm_) {
+        spike_comm_->bindRuntime(rt);
+        spike_comm_ready_ = spike_comm_->ready();
+    } else {
+        spike_comm_ready_ = false;
+    }
 }
 
 void SnnPESubComponent::setNocTransport(INocTransport* noc) {
@@ -756,7 +826,7 @@ void SnnPESubComponent::configureComputeCore_(const Params& params) {
         // Phase A/E：窗口读集合/预算/outstanding + 读发起/响应闭环下沉到子系统（保持行为与日志口径）
         {
             WeightMemorySubsystem::OrchestratorConfig ocfg{};
-            ocfg.accessor = &weight_accessor_;
+            ocfg.accessor = weight_accessor_.get();
             ocfg.cache_try = [this](uint64_t key, float& out) -> bool {
                 if (compute_core_) return compute_core_->weightCacheTryGet(key, out);
                 return weightCacheTryGet_(key, out);
@@ -916,23 +986,29 @@ void SnnPESubComponent::init(unsigned int phase) {
 
         // 通信子系统：构建/复用路由表并配置内部 route provider
         {
-            synapse_route_.bindRuntime(output_,
-                                       static_cast<uint32_t>(node_id_),
-                                       static_cast<uint32_t>(core_id_),
-                                       static_cast<uint32_t>(num_neurons_),
-                                       static_cast<uint32_t>(neurons_per_pe_cfg_),
-                                       stat_routes_entries_);
-            synapse_route_.bindFanoutStat(stat_fanout_per_spike_);
+            if (synapse_route_) {
+                synapse_route_->bindRuntime(output_,
+                                            static_cast<uint32_t>(node_id_),
+                                            static_cast<uint32_t>(core_id_),
+                                            static_cast<uint32_t>(num_neurons_),
+                                            static_cast<uint32_t>(neurons_per_pe_cfg_),
+                                            stat_routes_entries_);
+                synapse_route_->bindFanoutStat(stat_fanout_per_spike_);
+            }
             ISpikeTransport* transport = spike_transport_.get();
             if (noc_transport_) transport = &noc_spike_transport_;
             SpikeCommRuntimeConfig rt{};
             rt.log = output_;
             rt.transport = transport;
-            rt.synapse_route = &synapse_route_;
+            rt.synapse_route = synapse_route_.get();
             rt.global_neuron_base = static_cast<uint64_t>(global_neuron_base_);
-            spike_comm_.bindRuntime(rt);
-            spike_comm_.initRouting();
-            spike_comm_ready_ = spike_comm_.ready();
+            if (spike_comm_) {
+                spike_comm_->bindRuntime(rt);
+                spike_comm_->initRouting();
+                spike_comm_ready_ = spike_comm_->ready();
+            } else {
+                spike_comm_ready_ = false;
+            }
         }
 
         // 权重验证所需的文件加载已下沉到 compute core（DefaultSnnComputeCore::initVerifyFile_）
@@ -1415,7 +1491,7 @@ void SnnPESubComponent::forceEndGather() {
 
 void SnnPESubComponent::orchestrateBeginGatherWindowSetup() {
     onStageBeginGatherCore_(curr_stage_seq_);
-    stage_event_hub_.markBeginGather(curr_stage_seq_);
+    if (stage_event_hub_) stage_event_hub_->markBeginGather(curr_stage_seq_);
 }
 
 void SnnPESubComponent::orchestratePrepareApplyWindow() {
@@ -1424,7 +1500,7 @@ void SnnPESubComponent::orchestratePrepareApplyWindow() {
 
 void SnnPESubComponent::orchestrateApplyWindowEntry() {
     onStageBeginApplyCore_(curr_stage_seq_);
-    stage_event_hub_.markBeginApply(curr_stage_seq_);
+    if (stage_event_hub_) stage_event_hub_->markBeginApply(curr_stage_seq_);
 }
 
 void SnnPESubComponent::orchestrateBeginApplyIssueFallback(bool strict_active) {
@@ -1444,7 +1520,7 @@ void SnnPESubComponent::orchestrateBeginScatterSequence() {
     onStageEndApplyCore_(curr_stage_seq_);
     onStageBeginScatterCore_(curr_stage_seq_);
     clearFiredWindowCore_();
-    stage_event_hub_.markBeginScatter(curr_stage_seq_);
+    if (stage_event_hub_) stage_event_hub_->markBeginScatter(curr_stage_seq_);
     spikes_generated_base_ = count_spikes_generated_;
     uint64_t spikes_emitted = applyAccumulatedWindowAndScatter_();
     if (spikes_emitted>0 && parent_) { if (auto* pe = parent_pe_cached_) pe->accumulateApplyScatterStats(0,0,spikes_emitted,0,0,0); }
@@ -1457,7 +1533,7 @@ void SnnPESubComponent::orchestrateEndScatterSequence() {
         if (count_spikes_generated_ >= spikes_generated_base_) delta = count_spikes_generated_ - spikes_generated_base_;
         if (delta > 0) to_emit = delta;
     }
-    stage_event_hub_.markEndScatter(curr_stage_seq_, to_emit);
+    if (stage_event_hub_) stage_event_hub_->markEndScatter(curr_stage_seq_, to_emit);
     onStageEndScatterCore_(curr_stage_seq_, to_emit);
 }
 
@@ -1546,7 +1622,9 @@ void SnnPESubComponent::handleNeuronFire_(uint32_t neuron_idx, float v_before, f
                     core_id_, neuron_idx, v_before, v_after);
 
     // 统一走通信子系统（内部封装路由/门控/事件构造与投递）
-    spike_comm_.emitNeuronFire(neuron_idx, static_cast<uint64_t>(total_cycles_));
+    if (spike_comm_) {
+        spike_comm_->emitNeuronFire(neuron_idx, static_cast<uint64_t>(total_cycles_));
+    }
 }
 
 uint64_t SnnPESubComponent::routeAndSendOutputs_(const std::vector<FireEvent>& fired) {

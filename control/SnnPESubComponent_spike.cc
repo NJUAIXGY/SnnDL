@@ -8,6 +8,8 @@
 #include <sst/core/sst_config.h>
 
 #include "SnnPESubComponent.h"
+#include "synapse/weights/WeightAccessor.h"
+#include "synapse/weights/WeightMemorySubsystem.h"
 
 #include <inttypes.h> // PRIu64
 
@@ -163,7 +165,7 @@ void SnnPESubComponent::processLocalSpike(SpikeEvent* spike_event) {
         uint32_t req_post_param = 0;
         uint64_t cache_key = 0;
         const bool allow_remap = !use_post_row_pre_col_;
-        if (weight_accessor_.resolve(pre_global, post_local, req_pre_param, req_post_param, cache_key, allow_remap)) {
+        if (weight_accessor_ && weight_accessor_->resolve(pre_global, post_local, req_pre_param, req_post_param, cache_key, allow_remap)) {
             if (use_post_row_pre_col_) {
                 recordActivePre_(pre_global);
             }

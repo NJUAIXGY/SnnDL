@@ -8,7 +8,9 @@
 #include "SnnPESubComponent.h"
 #include "synapse/gas/GasCustomCmd.h"
 #include "synapse/gas/GasPhaseController.h"
+#include "StageEventHub.h"
 #include "IPeAggregation.h"
+#include "synapse/weights/WeightMemorySubsystem.h"
 #include "memory/StandardMemAccess.h"
 
 #include <algorithm>
@@ -199,7 +201,7 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                                 posts_curr, pres_curr);
                         }
 #endif
-                stage_event_hub_.markBeginApply(curr_stage_seq_);
+                if (stage_event_hub_) stage_event_hub_->markBeginApply(curr_stage_seq_);
                 issueFallbackReadsIfNeeded_(apply_acc_enable_ && gas_window_mode_);
 #if SNNDL_DEBUG_ENABLED
                 if (window_read_debug_ && output_) {

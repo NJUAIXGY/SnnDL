@@ -1,5 +1,7 @@
 #include "SnnPESubComponent.h"
 #include "IPeAggregation.h"
+#include "synapse/weights/WeightAccessor.h"
+#include "synapse/weights/WeightMemorySubsystem.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -179,7 +181,7 @@ void SnnPESubComponent::issueFromEdges_() {
         uint32_t req_pre = 0;
         uint32_t req_post = 0;
         uint64_t cache_key = 0;
-        if (!weight_accessor_.resolve(pre_global, post_local, req_pre, req_post, cache_key)) {
+        if (!weight_accessor_ || !weight_accessor_->resolve(pre_global, post_local, req_pre, req_post, cache_key)) {
             if (window_read_debug_ && output_) {
                 output_->verbose(CALL_INFO, 0, 0,
                     "[diag-edge-resolve] core=%d window=%u bad-edge pre=%u post=%u",

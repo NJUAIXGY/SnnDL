@@ -6,6 +6,7 @@
 
 #include <sst/core/sst_config.h>
 #include "SnnPESubComponent.h"
+#include "synapse/weights/WeightMemorySubsystem.h"
 
 #include <fstream>
 #include <sstream>

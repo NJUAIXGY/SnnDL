@@ -1,4 +1,5 @@
 #include "SnnPESubComponent.h"
+#include "synapse/gas/AccumulatorOps.h"
 #include <algorithm>
 #include <cstdint>
 

@@ -8,6 +8,7 @@
 #include <sst/core/sst_config.h>
 
 #include "SnnPESubComponent.h"
+#include "synapse/route/SpikeCommSubsystem.h"
 
 #include <algorithm>
 #include <cctype>
@@ -523,5 +524,7 @@ std::string SnnPESubComponent::resolveWeightTemplate(uint32_t pe, int core) cons
 void SnnPESubComponent::applyGatingDecision(uint32_t src_global, const std::vector<uint32_t>& dest_pes,
                              uint64_t current_cycle, uint64_t ttl_cycles)
 {
-    spike_comm_.applyGatingDecision(src_global, dest_pes, current_cycle, ttl_cycles);
+    if (spike_comm_) {
+        spike_comm_->applyGatingDecision(src_global, dest_pes, current_cycle, ttl_cycles);
+    }
 }
