@@ -43,10 +43,10 @@
 ### Core 发放 → 外发/本地投递
 1) `compute/ISnnComputeCore` 产出 fire events；
 2) `control/SnnPESubComponent` 调用 `services/synapse/route/SpikeCommSubsystem`；
-3) `SpikeCommSubsystem` 通过 `api/ISpikeTransport` 发出 spike（常见实现是 `api/NocSpikeTransport`）；
-4) `NocSpikeTransport` → `INocTransport::sendFromCore(...)`；
+3) `SpikeCommSubsystem` 通过 `api/ISpikeTransport` 发出 spike（常见实现是 `services/synapse/route/SpikePacketTransport`）；
+4) `SpikePacketTransport` → `INocTransport::sendFromCore(...)`；
 5) `NocSubsystem` 根据 packet 头（`dst_node/dst_endpoint`）做本 PE 内投递或外发：
-   - 本 PE：`deliver_to_endpoint(core_id, NocPacketEvent*)`（由 `MultiCorePE` 解码为 Spike 并递送到 core）
+   - 本 PE：`deliver_to_endpoint(core_id, NocPacketEvent*)`（由 `services/synapse/route/SpikePacketBridge` 解码并递送到 core；`MultiCorePE` 仅装配回调）
    - 外部：`sendExternal(NocPacketEvent*)`（NIC 后端发送）。
 
 ### 网络输入 → 投递到目标 core

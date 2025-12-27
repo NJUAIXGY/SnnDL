@@ -53,6 +53,7 @@ GatherBufferIF::GatherBufferIF(ComponentId_t id, Params& params, TimeConverter* 
     strict_mode_ = params.find<int>("strict_mode", 1) != 0;
     double_buffer_enable_ = params.find<int>("double_buffer_enable", 1) != 0;
     window_auto_ = params.find<int>("window_auto", 0) != 0;
+    step_gate_enable_ = params.find<int>("step_gate_enable", 0) != 0;
     // Deprecate manual_window_drive: keep param for compatibility but force-disable
     (void)params.find<int>("manual_window_drive", 0);
     manual_window_drive_ = false;
@@ -169,13 +170,20 @@ void GatherBufferIF::init(unsigned int phase) {
         }
         // Always register clock for time-driven windows (manual drive deprecated)
         registerClock(clock_freq_, new Clock::Handler2<GatherBufferIF, &GatherBufferIF::clockTick>(this));
-        stage_ = Stage::Gather; stage_counter_ = 0; current_gather_id_++;
         resetWindowMetrics_();
         resetGatherAutoCounters_();
-        if (emit_stage_events_ && upstream_handler_) {
-            auto* ev = new GasOpData(GasOp::BeginGather, (uint32_t)current_gather_id_, 0, 1, false);
-            auto* cr = new StandardMem::CustomResp((StandardMem::Request::id_t)0, ev, 0, 0, 0);
-            (*upstream_handler_)(cr);
+        stage_counter_ = 0;
+        if (step_gate_enable_) {
+            // Step-level gate: 等待上层 openStep(seq) 显式打开窗口
+            stage_ = Stage::Idle;
+        } else {
+            stage_ = Stage::Gather;
+            current_gather_id_++;
+            if (emit_stage_events_ && upstream_handler_) {
+                auto* ev = new GasOpData(GasOp::BeginGather, (uint32_t)current_gather_id_, 0, 1, false);
+                auto* cr = new StandardMem::CustomResp((StandardMem::Request::id_t)0, ev, 0, 0, 0);
+                (*upstream_handler_)(cr);
+            }
         }
         sb_[gather_buf_index_].end_gather_seen = false;
     }
@@ -209,6 +217,118 @@ void GatherBufferIF::manualWindowTick() {
     return;
 }
 
+void GatherBufferIF::openStep(uint32_t seq) {
+    if (!step_gate_enable_) return;
+    if (!window_auto_) {
+        out_.fatal(CALL_INFO, -1, "GatherBufferIF fatal: openStep requires window_auto=1\n");
+        return;
+    }
+    if (seq == 0) {
+        out_.fatal(CALL_INFO, -1, "GatherBufferIF fatal: openStep(seq=0) invalid\n");
+        return;
+    }
+    if (stage_ != Stage::Idle) {
+        out_.fatal(CALL_INFO, -1,
+                   "GatherBufferIF fatal: openStep called while stage=%d (expected Idle)\n",
+                   (int)stage_);
+        return;
+    }
+    if (!inflight_down_.empty() ||
+        inflight_counts_[0] != 0 ||
+        inflight_counts_[1] != 0) {
+        out_.fatal(CALL_INFO, -1,
+                   "GatherBufferIF fatal: openStep with inflight not drained (down=%zu inflight0=%" PRIu64 " inflight1=%" PRIu64 ")\n",
+                   inflight_down_.size(),
+                   (uint64_t)inflight_counts_[0],
+                   (uint64_t)inflight_counts_[1]);
+        return;
+    }
+    if (current_gather_id_ != 0 && seq <= current_gather_id_) {
+        out_.fatal(CALL_INFO, -1,
+                   "GatherBufferIF fatal: non-monotonic openStep seq=%u current_gather_id=%" PRIu64 "\n",
+                   seq, current_gather_id_);
+        return;
+    }
+
+    // 保护：新的 gather 缓冲必须是干净的（step gate 模式下禁止跨窗预构建）
+    if (!sb_[gather_buf_index_].granules.empty() ||
+        !sb_[gather_buf_index_].required_set.empty() ||
+        !sb_[gather_buf_index_].pending_up_reads.empty() ||
+        !sb_[gather_buf_index_].staging_reads.empty()) {
+        out_.fatal(CALL_INFO, -1,
+                   "GatherBufferIF fatal: openStep expects clean gather buffer (buf=%d granules=%zu req=%zu pending_up=%zu staging=%zu)\n",
+                   gather_buf_index_,
+                   sb_[gather_buf_index_].granules.size(),
+                   sb_[gather_buf_index_].required_set.size(),
+                   sb_[gather_buf_index_].pending_up_reads.size(),
+                   sb_[gather_buf_index_].staging_reads.size());
+        return;
+    }
+
+    current_gather_id_ = seq;
+    stage_ = Stage::Gather;
+    stage_counter_ = 0;
+    resetWindowMetrics_();
+    resetGatherAutoCounters_();
+    sb_[gather_buf_index_].end_gather_seen = false;
+
+    if (emit_stage_events_ && upstream_handler_) {
+        auto* ev = new GasOpData(GasOp::BeginGather, (uint32_t)current_gather_id_, 0, 1, false);
+        auto* cr = new StandardMem::CustomResp((StandardMem::Request::id_t)0, ev, 0, 0, 0);
+        (*upstream_handler_)(cr);
+    }
+
+    // 将非Gather阶段拦截的读请求归属到本窗口并下发（与原 EndScatter->BeginGather 行为保持一致）
+	    if (!queued_non_gather_reads_.empty()) {
+	        for (auto* r : queued_non_gather_reads_) {
+	            sb_[gather_buf_index_].pending_up_reads[r->getID()] = r;
+	            uint64_t gsz = granuleSize();
+	            bool use_row = (merge_==Merge::Row) || (merge_==Merge::Auto && row_bytes_guess_ > gsz);
+	            uint64_t base = (merge_==Merge::Cacheline || (merge_==Merge::Auto && !use_row)) ? alignDown(r->pAddr, gsz)
+	                           : (use_row ? alignDown(r->pAddr, row_bytes_guess_) : r->pAddr);
+	            uint32_t sz = (merge_==Merge::None) ? r->size : (use_row ? row_bytes_guess_ : gsz);
+	            uint64_t off = (r->pAddr >= base) ? (r->pAddr - base) : 0;
+	            uint64_t need = off + (uint64_t)r->size;
+	            if (need > (uint64_t)sz) {
+	                const uint64_t align_unit = use_row ? (uint64_t)row_bytes_guess_ : gsz;
+	                const uint64_t au = (align_unit == 0) ? 64 : align_unit;
+	                const uint64_t sz_u64 = ((need + au - 1) / au) * au;
+	                if (sz_u64 > 0xffffffffull) {
+	                    out_.fatal(CALL_INFO, -1,
+	                               "GatherBufferIF fatal: openStep computed granule sz too large (seq=%u need=%" PRIu64 " align_unit=%" PRIu64 " sz_u64=%" PRIu64 ")\n",
+	                               (uint32_t)seq, (uint64_t)need, (uint64_t)au, (uint64_t)sz_u64);
+	                    return;
+	                }
+	                sz = (uint32_t)sz_u64;
+	            }
+	            uint64_t key = (base << 32) ^ (uint64_t)sz;
+	            auto& g = sb_[gather_buf_index_].granules[key];
+	            if (g.subs.empty()) {
+	                g.base = base;
+	                g.size = sz;
+	                g.window_id = current_gather_id_;
+                g.payload_bytes = 0;
+                sb_[gather_buf_index_].required_set.insert(key);
+                if (stat_coalesce_granule_size_) {
+	                    stat_coalesce_granule_size_->addData((uint64_t)sz);
+	                }
+	            }
+	            if (off + (uint64_t)r->size > (uint64_t)g.size) {
+	                out_.fatal(CALL_INFO, -1,
+	                           "GatherBufferIF fatal: openStep sub-read out of granule bounds (seq=%u merge=%d use_row=%d base=0x%lx sz=%u addr=0x%lx size=%zu off=%" PRIu64 ")\n",
+	                           (uint32_t)seq, (int)merge_, (int)use_row,
+	                           (uint64_t)base, (uint32_t)g.size, (uint64_t)r->pAddr, (size_t)r->size, (uint64_t)off);
+	                return;
+	            }
+            g.subs.push_back({r->getID(), off, (uint32_t)r->size});
+            g.payload_bytes += (uint64_t)r->size;
+            if (!g.issued) { issueGranuleBuf_(gather_buf_index_, key, g); }
+            if (stat_up_reads_) stat_up_reads_->addData(1);
+        }
+        queued_non_gather_reads_.clear();
+    }
+}
+
 void GatherBufferIF::send(Request* req) {
     // Control-plane: CustomReq
     if (auto* cr = dynamic_cast<StandardMem::CustomReq*>(req)) {
@@ -233,35 +353,55 @@ void GatherBufferIF::send(Request* req) {
                     stage_ = Stage::Gather; sb_[gather_buf_index_].end_gather_seen = false; current_gather_id_++;
                     resetGatherAutoCounters_();
                     sb_[gather_buf_index_].granules.clear(); sb_[gather_buf_index_].required_set.clear();
-                    // 将非Gather阶段缓存的读导入当前Gather窗口
-                    if (!queued_non_gather_reads_.empty()) {
-                        for (auto* r : queued_non_gather_reads_) {
-                            sb_[gather_buf_index_].pending_up_reads[r->getID()] = r;
-                            uint64_t gsz = granuleSize();
-                            bool use_row = (merge_==Merge::Row) || (merge_==Merge::Auto && row_bytes_guess_ > gsz);
-                            uint64_t base = (merge_==Merge::Cacheline || (merge_==Merge::Auto && !use_row)) ? alignDown(r->pAddr, gsz)
-                                               : (use_row ? alignDown(r->pAddr, row_bytes_guess_) : r->pAddr);
-                            uint32_t sz = (merge_==Merge::None) ? r->size : (use_row ? row_bytes_guess_ : gsz);
-                    uint64_t key = (base << 32) ^ (uint64_t)sz;
-                    auto& g = sb_[gather_buf_index_].granules[key];
-                    if (g.subs.empty()) {
-                        g.base = base;
-                        g.size = sz;
-                        g.window_id = current_gather_id_;
-                        g.payload_bytes = 0;
-                        sb_[gather_buf_index_].required_set.insert(key);
-                        if (stat_coalesce_granule_size_) {
-                            stat_coalesce_granule_size_->addData((uint64_t)sz);
-                        }
-                    }
-                    uint64_t off = (r->pAddr >= base) ? (r->pAddr - base) : 0;
-                    g.subs.push_back({r->getID(), off, (uint32_t)r->size});
-                    g.payload_bytes += (uint64_t)r->size;
-                            if (!g.issued) { issueGranuleBuf_(gather_buf_index_, key, g); }
-                            if (stat_up_reads_) stat_up_reads_->addData(1);
-                        }
-                        queued_non_gather_reads_.clear();
-                    }
+	                    // 将非Gather阶段缓存的读导入当前Gather窗口
+	                    if (!queued_non_gather_reads_.empty()) {
+	                        for (auto* r : queued_non_gather_reads_) {
+	                            sb_[gather_buf_index_].pending_up_reads[r->getID()] = r;
+	                            uint64_t gsz = granuleSize();
+	                            bool use_row = (merge_==Merge::Row) || (merge_==Merge::Auto && row_bytes_guess_ > gsz);
+	                            uint64_t base = (merge_==Merge::Cacheline || (merge_==Merge::Auto && !use_row)) ? alignDown(r->pAddr, gsz)
+	                                               : (use_row ? alignDown(r->pAddr, row_bytes_guess_) : r->pAddr);
+	                            uint32_t sz = (merge_==Merge::None) ? r->size : (use_row ? row_bytes_guess_ : gsz);
+	                            uint64_t off = (r->pAddr >= base) ? (r->pAddr - base) : 0;
+	                            uint64_t need = off + (uint64_t)r->size;
+	                            if (need > (uint64_t)sz) {
+	                                const uint64_t align_unit = use_row ? (uint64_t)row_bytes_guess_ : gsz;
+	                                const uint64_t au = (align_unit == 0) ? 64 : align_unit;
+	                                const uint64_t sz_u64 = ((need + au - 1) / au) * au;
+	                                if (sz_u64 > 0xffffffffull) {
+	                                    out_.fatal(CALL_INFO, -1,
+	                                               "GatherBufferIF fatal: manual BeginGather computed granule sz too large (need=%" PRIu64 " align_unit=%" PRIu64 " sz_u64=%" PRIu64 ")\n",
+	                                               (uint64_t)need, (uint64_t)au, (uint64_t)sz_u64);
+	                                    return;
+	                                }
+	                                sz = (uint32_t)sz_u64;
+	                            }
+	                            uint64_t key = (base << 32) ^ (uint64_t)sz;
+	                            auto& g = sb_[gather_buf_index_].granules[key];
+	                            if (g.subs.empty()) {
+	                                g.base = base;
+	                                g.size = sz;
+	                                g.window_id = current_gather_id_;
+	                                g.payload_bytes = 0;
+	                                sb_[gather_buf_index_].required_set.insert(key);
+	                                if (stat_coalesce_granule_size_) {
+	                                    stat_coalesce_granule_size_->addData((uint64_t)sz);
+	                                }
+	                            }
+	                            if (off + (uint64_t)r->size > (uint64_t)g.size) {
+	                                out_.fatal(CALL_INFO, -1,
+	                                           "GatherBufferIF fatal: manual BeginGather sub-read out of granule bounds (merge=%d use_row=%d base=0x%lx sz=%u addr=0x%lx size=%zu off=%" PRIu64 ")\n",
+	                                           (int)merge_, (int)use_row,
+	                                           (uint64_t)base, (uint32_t)g.size, (uint64_t)r->pAddr, (size_t)r->size, (uint64_t)off);
+	                                return;
+	                            }
+	                            g.subs.push_back({r->getID(), off, (uint32_t)r->size});
+	                            g.payload_bytes += (uint64_t)r->size;
+	                            if (!g.issued) { issueGranuleBuf_(gather_buf_index_, key, g); }
+	                            if (stat_up_reads_) stat_up_reads_->addData(1);
+	                        }
+	                        queued_non_gather_reads_.clear();
+	                    }
                     break;
                 case GasOp::EndGather:
                     sb_[gather_buf_index_].end_gather_seen = true; tail_wait_start_ns_ = getCurrentSimTimeNano();
@@ -293,8 +433,10 @@ void GatherBufferIF::send(Request* req) {
 
     // Data-plane
     if (auto* rd = dynamic_cast<StandardMem::Read*>(req)) {
-        // Decide whether we can treat this as gather for the next SB
-        bool can_gather_now = (stage_ == Stage::Gather) || (double_buffer_enable_ && stage_ == Stage::Apply);
+        // Apply 阶段的读属于“当前窗口的 apply_buf”，与 step_gate_enable 无关。
+        // 若在 step_gate_enable=1 时把 Apply 读拦到 queued_non_gather_reads_，
+        // 会导致 Apply/Scatter 在权重未返回时提前推进，最终出现 dv 全 0/发放归 0。
+        bool can_gather_now = (stage_ == Stage::Gather) || (stage_ == Stage::Apply);
         if (can_gather_now) {
             // 回归正确归属：Apply 阶段的读属于当前窗口，应进入 apply_buf。
             // 混入“下一窗口 gather”会导致当前窗口缺权重；但需要额外防御 pending 悬挂。
@@ -319,28 +461,48 @@ void GatherBufferIF::send(Request* req) {
                 // Stage later for gap/Lmax (and optional row-window) merging
                 sb_[tgt].staging_reads.push_back(rd);
                 sb_[tgt].staged_arrival_ns[rd->getID()] = getCurrentSimTimeNano();
-            } else {
-                uint64_t gsz = granuleSize();
-                bool use_row = (merge_==Merge::Row) || (merge_==Merge::Auto && row_bytes_guess_ > gsz);
-                uint64_t base = (merge_==Merge::Cacheline || (merge_==Merge::Auto && !use_row)) ? alignDown(rd->pAddr, gsz)
-                               : (use_row ? alignDown(rd->pAddr, row_bytes_guess_) : rd->pAddr);
-                uint32_t sz = (merge_==Merge::None) ? rd->size : (use_row ? row_bytes_guess_ : gsz);
-                uint64_t key = (base << 32) ^ (uint64_t)sz; // compact key
-                auto& g = sb_[tgt].granules[key];
-                if (g.subs.empty()) {
-                    g.base = base;
-                    g.size = sz;
-                    g.window_id = current_gather_id_;
+	            } else {
+	                uint64_t gsz = granuleSize();
+	                bool use_row = (merge_==Merge::Row) || (merge_==Merge::Auto && row_bytes_guess_ > gsz);
+	                uint64_t base = (merge_==Merge::Cacheline || (merge_==Merge::Auto && !use_row)) ? alignDown(rd->pAddr, gsz)
+	                               : (use_row ? alignDown(rd->pAddr, row_bytes_guess_) : rd->pAddr);
+	                uint32_t sz = (merge_==Merge::None) ? rd->size : (use_row ? row_bytes_guess_ : gsz);
+	                uint64_t off = (rd->pAddr >= base) ? (rd->pAddr - base) : 0;
+	                uint64_t need = off + (uint64_t)rd->size;
+	                if (need > (uint64_t)sz) {
+	                    const uint64_t align_unit = use_row ? (uint64_t)row_bytes_guess_ : gsz;
+	                    const uint64_t au = (align_unit == 0) ? 64 : align_unit;
+	                    const uint64_t sz_u64 = ((need + au - 1) / au) * au;
+	                    if (sz_u64 > 0xffffffffull) {
+	                        out_.fatal(CALL_INFO, -1,
+	                                   "GatherBufferIF fatal: computed granule sz too large (need=%" PRIu64 " align_unit=%" PRIu64 " sz_u64=%" PRIu64 ")\n",
+	                                   (uint64_t)need, (uint64_t)au, (uint64_t)sz_u64);
+	                        return;
+	                    }
+	                    sz = (uint32_t)sz_u64;
+	                }
+	                uint64_t key = (base << 32) ^ (uint64_t)sz; // compact key
+	                auto& g = sb_[tgt].granules[key];
+	                if (g.subs.empty()) {
+	                    g.base = base;
+	                    g.size = sz;
+	                    g.window_id = current_gather_id_;
                     g.payload_bytes = 0;
                     sb_[tgt].required_set.insert(key);
                     if (stat_coalesce_granule_size_) {
                         stat_coalesce_granule_size_->addData((uint64_t)sz);
-                    }
-                }
-                uint64_t off = (rd->pAddr >= base) ? (rd->pAddr - base) : 0;
-                g.subs.push_back({rd->getID(), off, (uint32_t)rd->size});
-                g.payload_bytes += (uint64_t)rd->size;
-                if (!defer_issue_until_apply_) {
+	                    }
+	                }
+	                if (off + (uint64_t)rd->size > (uint64_t)g.size) {
+	                    out_.fatal(CALL_INFO, -1,
+	                               "GatherBufferIF fatal: sub-read out of granule bounds (stage=%d buf=%d merge=%d use_row=%d base=0x%lx sz=%u addr=0x%lx size=%zu off=%" PRIu64 ")\n",
+	                               (int)stage_, tgt, (int)merge_, (int)use_row,
+	                               (uint64_t)base, (uint32_t)g.size, (uint64_t)rd->pAddr, (size_t)rd->size, (uint64_t)off);
+	                    return;
+	                }
+	                g.subs.push_back({rd->getID(), off, (uint32_t)rd->size});
+	                g.payload_bytes += (uint64_t)rd->size;
+	                if (!defer_issue_until_apply_) {
                     if (!g.issued) { issueGranuleBuf_(tgt, key, g); }
                 }
             }
@@ -688,12 +850,19 @@ void GatherBufferIF::onDownstreamResp_(Request* r) {
                         auto* cr3 = new StandardMem::CustomResp((StandardMem::Request::id_t)0, es, 0, 0, 0);
                         (*upstream_handler_)(cr3);
                     }
-                    stage_ = window_auto_ ? Stage::Gather : Stage::Idle;
-                    if (window_auto_) { sb_[gather_buf_index_].end_gather_seen = false; current_gather_id_++; }
-                    if (window_auto_ && emit_stage_events_ && upstream_handler_) {
-                        auto* bg = new GasOpData(GasOp::BeginGather, (uint32_t)current_gather_id_, 0, 1, false);
-                        auto* cr4 = new StandardMem::CustomResp((StandardMem::Request::id_t)0, bg, 0, 0, 0);
-                        (*upstream_handler_)(cr4);
+                    stage_counter_ = 0;
+                    if (window_auto_ && step_gate_enable_) {
+                        // Step-level gate：停在 Idle，等待 openStep(seq) 进入下一窗
+                        stage_ = Stage::Idle;
+                        sb_[gather_buf_index_].end_gather_seen = false;
+                    } else {
+                        stage_ = window_auto_ ? Stage::Gather : Stage::Idle;
+                        if (window_auto_) { sb_[gather_buf_index_].end_gather_seen = false; current_gather_id_++; }
+                        if (window_auto_ && emit_stage_events_ && upstream_handler_) {
+                            auto* bg = new GasOpData(GasOp::BeginGather, (uint32_t)current_gather_id_, 0, 1, false);
+                            auto* cr4 = new StandardMem::CustomResp((StandardMem::Request::id_t)0, bg, 0, 0, 0);
+                            (*upstream_handler_)(cr4);
+                        }
                     }
                 }
             }
@@ -725,11 +894,6 @@ void GatherBufferIF::maybeEnterApply_() {
     }
     flushStageCycles_(Stage::Gather, false);
     stage_ = Stage::Apply; stage_counter_ = 0; apply_pending_emit_ = true;
-    if (emit_stage_events_ && upstream_handler_) {
-        auto* ev = new GasOpData(GasOp::BeginApply, (uint32_t)current_gather_id_, 0, 1, false);
-        auto* cr = new StandardMem::CustomResp((StandardMem::Request::id_t)0, ev, 0, 0, 0);
-        (*upstream_handler_)(cr);
-    }
     // [DEBUG] 在切换前记录当前 Gather 缓冲区状态
     out_.verbose(CALL_INFO, 1, 0,
         "[diag-gbi] BEFORE switch: gather_buf=%d granules=%zu required_set=%zu pending_up_reads=%zu\n",
@@ -744,6 +908,14 @@ void GatherBufferIF::maybeEnterApply_() {
         "[diag-gbi] AFTER switch: apply_buf=%d gather_buf=%d; apply granules=%zu required_set=%zu\n",
         apply_buf_index_, gather_buf_index_, sb_[apply_buf_index_].granules.size(),
         sb_[apply_buf_index_].required_set.size());
+    // 关键：BeginApply 回调中会触发权重读发起；必须在 buffer index 切换完成后再通知上游，
+    // 否则 Apply 阶段的读会错误落到“旧 apply_buf”（下一窗口的 gather_buf），导致 req/granules 统计为 0，
+    // 进而 Apply 提前结束、WMS outstanding 悬挂，最终出现发放归 0/step_gate openStep inflight 未清空等问题。
+    if (emit_stage_events_ && upstream_handler_) {
+        auto* ev = new GasOpData(GasOp::BeginApply, (uint32_t)current_gather_id_, 0, 1, false);
+        auto* cr = new StandardMem::CustomResp((StandardMem::Request::id_t)0, ev, 0, 0, 0);
+        (*upstream_handler_)(cr);
+    }
     if (defer_issue_until_apply_) {
         // 若启用 gap/Lmax 合并，则先按 bank/row 聚合构建 granule
         if (gap_merge_enable_) buildGranulesWithGapMergeBuf_(apply_buf_index_);
@@ -1317,6 +1489,13 @@ void GatherBufferIF::ensureCapacity_(int buf, uint64_t need) {
 
 bool GatherBufferIF::clockTick(Cycle_t) {
     if (!window_auto_) return false;
+    if (step_gate_enable_ && stage_ == Stage::Idle) {
+        // step gate 模式下 Idle 表示“等待全局 START_STEP”，无需推进阶段
+        uint64_t inflight_total = (uint64_t)(inflight_counts_[0] + inflight_counts_[1]);
+        if (stat_inflight_peak_) stat_inflight_peak_->addData(inflight_total);
+        if (inflight_total > win_inflight_peak_) win_inflight_peak_ = inflight_total;
+        return false;
+    }
     if (!clock_tick_logged_) {
         if (out_.getVerboseLevel() >= 2) {
             out_.verbose(CALL_INFO, 0, 0,
@@ -1348,7 +1527,7 @@ bool GatherBufferIF::clockTick(Cycle_t) {
         }
     } else if (stage_ == Stage::Apply) {
         // 并行：在Apply阶段也推进下一窗口的Gather构建与下发
-        if (double_buffer_enable_ && defer_issue_until_apply_ && !sb_[gather_buf_index_].staging_reads.empty()) {
+        if (!step_gate_enable_ && double_buffer_enable_ && defer_issue_until_apply_ && !sb_[gather_buf_index_].staging_reads.empty()) {
             buildGranulesWithGapMergeBuf_(gather_buf_index_);
             // 直接按当前排序策略下发新窗口的granule，实现与Apply并行
             auto& gmap = sb_[gather_buf_index_].granules;
@@ -1406,42 +1585,70 @@ bool GatherBufferIF::clockTick(Cycle_t) {
                 auto* cr3 = new StandardMem::CustomResp((StandardMem::Request::id_t)0, es, 0, 0, 0);
                 (*upstream_handler_)(cr3);
             }
-            stage_ = Stage::Gather; stage_counter_ = 0; sb_[gather_buf_index_].end_gather_seen = false; current_gather_id_++;
-            if (emit_stage_events_ && upstream_handler_) {
-                auto* bg = new GasOpData(GasOp::BeginGather, (uint32_t)current_gather_id_, 0, 1, false);
-                auto* cr4 = new StandardMem::CustomResp((StandardMem::Request::id_t)0, bg, 0, 0, 0);
-                (*upstream_handler_)(cr4);
-            }
-            // 不清理 gather 缓冲，允许在 Apply 阶段已开始的下一窗口继续累积
-            // 导入非Gather缓存
-            if (!queued_non_gather_reads_.empty()) {
-                for (auto* r : queued_non_gather_reads_) {
-                    sb_[gather_buf_index_].pending_up_reads[r->getID()] = r;
-                    uint64_t gsz = granuleSize();
-                    uint64_t base = (merge_==Merge::Cacheline || merge_==Merge::Auto) ? alignDown(r->pAddr, gsz)
-                                   : (merge_==Merge::Row ? alignDown(r->pAddr, row_bytes_guess_) : r->pAddr);
-                    uint32_t sz = (merge_==Merge::None) ? r->size : (merge_==Merge::Row ? row_bytes_guess_ : gsz);
-                    uint64_t key = (base << 32) ^ (uint64_t)sz;
-                    auto& g = sb_[gather_buf_index_].granules[key];
-                    if (g.subs.empty()) {
-                        g.base = base;
-                        g.size = sz;
-                        g.window_id = current_gather_id_;
-                        g.payload_bytes = 0;
-                        sb_[gather_buf_index_].required_set.insert(key);
-                        if (stat_coalesce_granule_size_) {
-                            stat_coalesce_granule_size_->addData((uint64_t)sz);
-                        }
-                    }
-                    uint64_t off = (r->pAddr >= base) ? (r->pAddr - base) : 0;
-                    g.subs.push_back({r->getID(), off, (uint32_t)r->size});
-                    g.payload_bytes += (uint64_t)r->size;
-                    if (!g.issued) { issueGranuleBuf_(gather_buf_index_, key, g); }
-                    if (stat_up_reads_) stat_up_reads_->addData(1);
+            if (step_gate_enable_) {
+                // Step-level gate：停在 Idle，等待 openStep(seq) 进入下一窗
+                stage_ = Stage::Idle;
+                stage_counter_ = 0;
+                sb_[gather_buf_index_].end_gather_seen = false;
+            } else {
+                stage_ = Stage::Gather; stage_counter_ = 0; sb_[gather_buf_index_].end_gather_seen = false; current_gather_id_++;
+                if (emit_stage_events_ && upstream_handler_) {
+                    auto* bg = new GasOpData(GasOp::BeginGather, (uint32_t)current_gather_id_, 0, 1, false);
+                    auto* cr4 = new StandardMem::CustomResp((StandardMem::Request::id_t)0, bg, 0, 0, 0);
+                    (*upstream_handler_)(cr4);
                 }
-                queued_non_gather_reads_.clear();
-            }
-        }
+	                // 不清理 gather 缓冲，允许在 Apply 阶段已开始的下一窗口继续累积
+	                // 导入非Gather缓存
+	                if (!queued_non_gather_reads_.empty()) {
+	                    for (auto* r : queued_non_gather_reads_) {
+	                        sb_[gather_buf_index_].pending_up_reads[r->getID()] = r;
+	                        uint64_t gsz = granuleSize();
+	                        bool use_row = (merge_==Merge::Row) || (merge_==Merge::Auto && row_bytes_guess_ > gsz);
+	                        uint64_t base = (merge_==Merge::Cacheline || (merge_==Merge::Auto && !use_row)) ? alignDown(r->pAddr, gsz)
+	                                       : (use_row ? alignDown(r->pAddr, row_bytes_guess_) : r->pAddr);
+	                        uint32_t sz = (merge_==Merge::None) ? r->size : (use_row ? row_bytes_guess_ : gsz);
+	                        uint64_t off = (r->pAddr >= base) ? (r->pAddr - base) : 0;
+	                        uint64_t need = off + (uint64_t)r->size;
+	                        if (need > (uint64_t)sz) {
+	                            const uint64_t align_unit = use_row ? (uint64_t)row_bytes_guess_ : gsz;
+	                            const uint64_t au = (align_unit == 0) ? 64 : align_unit;
+	                            const uint64_t sz_u64 = ((need + au - 1) / au) * au;
+	                            if (sz_u64 > 0xffffffffull) {
+	                                out_.fatal(CALL_INFO, -1,
+	                                           "GatherBufferIF fatal: queued computed granule sz too large (need=%" PRIu64 " align_unit=%" PRIu64 " sz_u64=%" PRIu64 ")\n",
+	                                           (uint64_t)need, (uint64_t)au, (uint64_t)sz_u64);
+	                                return false;
+	                            }
+	                            sz = (uint32_t)sz_u64;
+	                        }
+	                        uint64_t key = (base << 32) ^ (uint64_t)sz;
+	                        auto& g = sb_[gather_buf_index_].granules[key];
+	                        if (g.subs.empty()) {
+	                            g.base = base;
+	                            g.size = sz;
+	                            g.window_id = current_gather_id_;
+	                            g.payload_bytes = 0;
+	                            sb_[gather_buf_index_].required_set.insert(key);
+	                            if (stat_coalesce_granule_size_) {
+	                                stat_coalesce_granule_size_->addData((uint64_t)sz);
+	                            }
+	                        }
+	                        if (off + (uint64_t)r->size > (uint64_t)g.size) {
+	                            out_.fatal(CALL_INFO, -1,
+	                                       "GatherBufferIF fatal: queued sub-read out of granule bounds (stage=%d merge=%d use_row=%d base=0x%lx sz=%u addr=0x%lx size=%zu off=%" PRIu64 ")\n",
+	                                       (int)stage_, (int)merge_, (int)use_row,
+	                                       (uint64_t)base, (uint32_t)g.size, (uint64_t)r->pAddr, (size_t)r->size, (uint64_t)off);
+	                            return false;
+	                        }
+	                        g.subs.push_back({r->getID(), off, (uint32_t)r->size});
+	                        g.payload_bytes += (uint64_t)r->size;
+	                        if (!g.issued) { issueGranuleBuf_(gather_buf_index_, key, g); }
+	                        if (stat_up_reads_) stat_up_reads_->addData(1);
+	                    }
+	                    queued_non_gather_reads_.clear();
+	                }
+	            }
+	        }
     }
     // track inflight peak (sum of both buffers)
     uint64_t inflight_total = (uint64_t)(inflight_counts_[0] + inflight_counts_[1]);

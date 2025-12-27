@@ -27,6 +27,7 @@
 #include "IMemoryAccess.h"
 #include "ISpikeTransport.h"
 #include "ICoreControlHooks.h"
+#include "IGlobalStepHooks.h"
 #include "IGasOrchestrator.h"
 #include "NocSpikeTransport.h"
 
@@ -46,7 +47,7 @@ class SynapseRouteSubsystem;
 struct GasOpData;
 class GasPhaseController;
 
-class SnnPESubComponent : public SnnCoreAPI, public ICoreControlHooks, public IGasOrchestrator {
+class SnnPESubComponent : public SnnCoreAPI, public ICoreControlHooks, public IGlobalStepHooks, public IGasOrchestrator {
 public:
     SST_ELI_REGISTER_SUBCOMPONENT(
         SnnPESubComponent,
@@ -154,6 +155,7 @@ public:
         // 严格GAS：在 BeginApply/Scatter 阶段按窗发起权重读取以填充缓存（不改变ΔV语义，由Scatter统一应用）
         {"window_read_enable", "Issue window-scoped weight reads at BeginApply/Scatter (0/1)", "0"},
         {"window_read_budget", "Max number of (pre,post) single-col reads per window", "1024"},
+        {"scatter_diag_limit", "Limit scatter diagnostic logs when window_read_debug=1 (0=disable)", "0"},
         // 安全保护：限制单窗边集合容量，防止极端随机发放导致内存增长
         {"edge_collector_max_capacity", "Max edges per window before overflow protection", "1000000"}
     )
@@ -203,6 +205,7 @@ public:
 
     virtual void setParentInterface(SnnPEParentInterface* parent);
     void setNocTransport(INocTransport* noc) override;
+    void onGlobalStepStart(uint32_t seq) override;
     virtual void init(unsigned int phase) override;
     virtual void complete(unsigned int phase) override;
     virtual void setup() override;
@@ -550,6 +553,8 @@ private:
     bool window_read_enable_ = false;   // 严格GAS：按窗发起权重读取
     uint32_t window_read_budget_ = 1024;
     bool window_read_debug_ = false;    // 控制窗口读相关调试日志
+    uint32_t scatter_diag_limit_ = 0;   // 仅在 window_read_debug=1 时生效
+    uint32_t scatter_diag_count_ = 0;
     uint32_t debug_window_log_count_ = 0;
     // Debug instrumentation
     uint32_t debug_window_idx_ = 0;

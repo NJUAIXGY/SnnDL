@@ -288,7 +288,7 @@ void WeightMemorySubsystem::requestBCSR_(uint32_t pre_global, uint32_t post_loca
         meta.count_weight_read = false;
         // 诊断：colidx 读取发起地址/跨度
         static int dbg_colidx_issue = 0;
-        if (diag_out_ && diag_node_id_ == 0 && dbg_colidx_issue < 64) {
+        if (diag_debug_ && diag_out_ && diag_node_id_ == 0 && dbg_colidx_issue < 64) {
             diag_out_->verbose(CALL_INFO, 0, 0,
                 "[diag-bcsr-colidx-issue] node=%d core=%d pre=%u post=%u block_row=%u start=%u end=%u addr=0x%llx bytes=%zu aligned=(0x%llx,%zu off=%zu) target_block_col=%u intra=(%u,%u)\n",
                 diag_node_id_, diag_core_id_, pre_global, post_local, block_row, start, end,
@@ -351,7 +351,7 @@ void WeightMemorySubsystem::requestBCSR_(uint32_t pre_global, uint32_t post_loca
     meta.count_weight_read = true;
     // 诊断：blockdata 读取发起地址/跨度
     static int dbg_block_issue = 0;
-    if (diag_out_ && diag_node_id_ == 0 && dbg_block_issue < 64) {
+    if (diag_debug_ && diag_out_ && diag_node_id_ == 0 && dbg_block_issue < 64) {
         diag_out_->verbose(CALL_INFO, 0, 0,
             "[diag-bcsr-block-issue] node=%d core=%d pre=%u post=%u block_row=%u block_col=%u gbi=%u addr=0x%llx bytes=%zu aligned=(0x%llx,%zu off=%zu) off=(%u,%u) start=%u idx_in_row=%u\n",
             diag_node_id_, diag_core_id_, pre_global, post_local, block_row, block_col, global_block_index,
@@ -671,7 +671,7 @@ void WeightMemorySubsystem::handleReadResp_(uint64_t req_id, uint64_t addr, Pend
         const size_t slice_off = meta.slice_offset;
         const size_t slice_len = meta.orig_size ? meta.orig_size : meta.size;
         const bool ok = (bytes.size() >= slice_off + slice_len) && (slice_len >= expect_bytes);
-        if (diag_out_ && diag_node_id_ == 0 && diag_core_id_ == 0) {
+        if (diag_debug_ && diag_out_ && diag_node_id_ == 0 && diag_core_id_ == 0) {
             static int dbg_block_resp = 0;
             if (dbg_block_resp < 2048) {
                 float f0 = 0.0f;

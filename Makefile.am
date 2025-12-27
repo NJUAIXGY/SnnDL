@@ -24,19 +24,23 @@ libSnnDL_la_SOURCES = \
 	api/SnnPEParentInterface.h \
 	api/ISpikeTransport.h \
 	api/INocTransport.h \
-	api/NocSpikeTransport.h \
 	api/IManualWindowDrive.h \
+	api/IGasStepGate.h \
+	api/IGlobalStepHooks.h \
 	api/IMemoryAccess.h \
 	api/ISynapseRoute.h \
 	api/SynapseRouteBuildConfig.h \
 	api/SnnWeightReader.h \
 	events/GatingDecisionEvent.h \
+	events/GasStepBarrierEvent.h \
 	events/SimpleTestEvent.cc \
 	events/SimpleTestEvent.h \
 	events/SpikeEvent.h \
 	events/SpikeEventWrapper.cc \
 	events/SpikeEventWrapper.h \
 	events/SpikePacket.h \
+	components/gas/GlobalGasStepController.cc \
+	components/gas/GlobalGasStepController.h \
 	components/GatherBufferIF.cc \
 	components/GatherBufferIF.h \
 	components/GatingPE.cc \
@@ -114,6 +118,9 @@ libSnnDL_la_SOURCES = \
 	services/synapse/weights/WeightMemorySubsystem.h \
 	services/synapse/route/SpikeCommSubsystem.cc \
 	services/synapse/route/SpikeCommSubsystem.h \
+	services/synapse/route/SpikePacketTransport.h \
+	services/synapse/route/SpikePacketBridge.cc \
+	services/synapse/route/SpikePacketBridge.h \
 	services/memory/StandardMemAccess.cc \
 	services/memory/StandardMemAccess.h
 

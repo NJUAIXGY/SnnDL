@@ -12,9 +12,10 @@
 #include "SnnNIC.h"
 #include "GatingDecisionEvent.h"
 #include "ICoreControlHooks.h"
+#include "IGlobalStepHooks.h"
 #include "NocPacketEvent.h"
 #include "NocPacketBatchEvent.h"
-#include "synapse/route/SpikeNocCodec.h"
+#include "GasStepBarrierEvent.h"
 
 #include <fstream>
 #include <sstream>
@@ -156,6 +157,9 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
     window_ns_ = window_us_ * 1000ULL; // 1us = 1000ns（组件时钟1GHz，tick≈1ns）
     diag_fire_log_ = params.find<bool>("diag_fire_log", false);
 
+    // Global Step/GAS barrier sync (Phase-step-sync)
+    global_step_sync_enable_ = params.find<bool>("global_step_sync_enable", false);
+
     // Step-level random activation injection (Phase3-B): 下沉为独立子系统（MultiCorePE 仅转发 tick/阶段事件）
     {
         StepActivationSubsystem::Config step_cfg;
@@ -205,6 +209,18 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
 
         step_activation_subsys_.bindRuntime(step_rt);
         step_activation_subsys_.initBcsrReachabilityIfEnabled();
+    }
+
+    // Phase3-C：Spike 编解码与投递 glue 下沉为 synapse/route 子系统；MultiCorePE 仅装配。
+    {
+        SpikePacketBridge::Runtime brt;
+        brt.log = output_;
+        brt.node_id = node_id_;
+        brt.num_cores = num_cores_;
+        brt.layout = &global_layout_;
+        brt.noc = &noc_subsys_;
+        brt.deliver_to_core = [this](int core_id, SpikeEvent* spike) { deliverSpikeToCore(core_id, spike); };
+        spike_packet_bridge_.bindRuntime(brt);
     }
     
     //     "🔧 多核PE配置: cores=%d, neurons_per_core=%d, total_neurons=%d, node_id=%d\n",
@@ -285,11 +301,7 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
         noc_rt.optimized_ring = nullptr;  // init 后再注入
         noc_rt.external_spike_output_link = nullptr;  // init(phase0) link configured 后再注入
         noc_rt.deliver_to_endpoint = [this](int endpoint_id, NocPacketEvent* pkt) {
-            if (!pkt) return;
-            SpikeEvent* spike = SpikeNocCodec::decode(*pkt);
-            delete pkt;
-            if (!spike) return;
-            deliverSpikeToCore(endpoint_id, spike);
+            spike_packet_bridge_.deliverPacketToEndpoint(endpoint_id, pkt);
         };
         noc_subsys_.bindRuntime(noc_rt);
     }
@@ -342,6 +354,14 @@ void MultiCorePE::init(unsigned int phase) {
             new Event::Handler2<MultiCorePE,&MultiCorePE::handleExternalSpikeEvent>(this));
         external_spike_output_link_ = configureLink("external_spike_output");
         mem_link_ = configureLink("mem_link");
+        if (global_step_sync_enable_) {
+            gas_step_ctrl_link_ = configureLink(
+                "gas_step_ctrl",
+                new Event::Handler2<MultiCorePE, &MultiCorePE::handleGasStepCtrlEvent>(this));
+            if (!gas_step_ctrl_link_) {
+                output_->fatal(CALL_INFO, -1, "❌ 配置错误：global_step_sync_enable=1 但端口 gas_step_ctrl 未连接\n");
+            }
+        }
         if (sentinel_enabled_ && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=0 links-configured\n", node_id_); }
         
         
@@ -367,11 +387,7 @@ void MultiCorePE::init(unsigned int phase) {
             noc_rt.optimized_ring = optimized_ring_;
             noc_rt.external_spike_output_link = external_spike_output_link_;
             noc_rt.deliver_to_endpoint = [this](int endpoint_id, NocPacketEvent* pkt) {
-                if (!pkt) return;
-                SpikeEvent* spike = SpikeNocCodec::decode(*pkt);
-                delete pkt;
-                if (!spike) return;
-                deliverSpikeToCore(endpoint_id, spike);
+                spike_packet_bridge_.deliverPacketToEndpoint(endpoint_id, pkt);
             };
             noc_subsys_.bindRuntime(noc_rt);
         }
@@ -468,6 +484,13 @@ void MultiCorePE::setup() {
     
     if (!controller_) {
         output_->fatal(CALL_INFO, -1, "❌ 错误: 多核控制器未初始化\n");
+    }
+
+    global_step_sync_ready_ = true;
+    if (global_step_sync_enable_ && gas_step_ctrl_link_ && !global_step_ready_sent_) {
+        auto* ev = new GasStepBarrierEvent(GasStepBarrierOp::PeReady, /*seq*/0, static_cast<uint32_t>(node_id_));
+        gas_step_ctrl_link_->send(ev);
+        global_step_ready_sent_ = true;
     }
     
     // 打印组件配置摘要
@@ -609,6 +632,12 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
                    node_id_, (uint64_t)current_cycle_, noc_subsys_.incomingQueueSize());
         }
     }
+
+    // Global Step barrier: 当收到 START_STEP(seq) 时，在时钟边界打开所有 core 的新窗口
+    if (global_step_sync_enable_ && global_step_sync_ready_ && global_step_start_pending_) {
+        beginGlobalStep_(global_step_pending_seq_);
+        global_step_start_pending_ = false;
+    }
     
     // 0a. Step 注入调度（Phase3-B 下沉为 StepActivationSubsystem）
     step_activation_subsys_.tick(static_cast<uint64_t>(current_cycle_));
@@ -623,9 +652,7 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
 		        int src_core = determineTargetUnit(static_cast<int>(src_global));
 		        int dst_core = determineTargetUnit(static_cast<int>(dst_global));
 		        if (src_core >= 0 && dst_core >= 0 && src_core != dst_core) {
-		            NocPacketEvent* pkt = SpikeNocCodec::encode(*test_spike, global_layout_);
-		            delete test_spike;
-		            if (pkt) noc_subsys_.onCoreSend(pkt);
+		            spike_packet_bridge_.sendAuto(test_spike);
 		            PE_LOG(1, "🧪 注入跨核脉冲: 核心%d->核心%d\n", src_core, dst_core);
 		            test_injected_ = true;
 		        } else {
@@ -711,16 +738,53 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
 
 void MultiCorePE::handleExternalSpikeEvent(SST::Event* ev) {
     if (!ev) return;
-    // Phase4-A1.1：优先走 NoC packet；为兼容旧输入源，保留 SpikeEvent 直投回退。
-    if (auto* pkt = dynamic_cast<NocPacketEvent*>(ev)) {
-        noc_subsys_.onExternalPortEvent(pkt);
-        return;
-    }
+    // Phase5‑5.4：外部端口事件解析收敛到 NocSubsystem；MultiCorePE 仅保留 SpikeEvent 直投回退。
     if (auto* spike = dynamic_cast<SpikeEvent*>(ev)) {
         handleExternalSpike(spike);
         return;
     }
-    delete ev;
+    noc_subsys_.onExternalPortEvent(ev);
+}
+
+void MultiCorePE::handleGasStepCtrlEvent(SST::Event* ev) {
+    if (!ev) return;
+    auto* msg = dynamic_cast<GasStepBarrierEvent*>(ev);
+    if (!msg) {
+        delete ev;
+        return;
+    }
+    if (msg->operation() == GasStepBarrierOp::StartStep) {
+        global_step_pending_seq_ = msg->seq;
+        global_step_start_pending_ = true;
+        if (sentinel_enabled_ && output_) {
+            PE_LOG(1, "[[sentinel-step-sync]] node=%d recv START_STEP seq=%u\n", node_id_, msg->seq);
+        }
+    }
+    delete msg;
+}
+
+void MultiCorePE::beginGlobalStep_(uint32_t seq) {
+    global_step_active_seq_ = seq;
+    global_step_done_sent_ = false;
+    if (global_step_done_cores_.size() != static_cast<size_t>(num_cores_)) {
+        global_step_done_cores_.assign(static_cast<size_t>(num_cores_), 0);
+    } else {
+        std::fill(global_step_done_cores_.begin(), global_step_done_cores_.end(), 0);
+    }
+
+    for (int i = 0; i < num_cores_; ++i) {
+        auto* core = cores_[i];
+        if (!core) {
+            output_->fatal(CALL_INFO, -1, "GlobalStep fatal: core%d is null\n", i);
+            return;
+        }
+        auto* hook = dynamic_cast<IGlobalStepHooks*>(core);
+        if (!hook) {
+            output_->fatal(CALL_INFO, -1, "GlobalStep fatal: core%d does not implement IGlobalStepHooks\n", i);
+            return;
+        }
+        hook->onGlobalStepStart(seq);
+    }
 }
 
 void MultiCorePE::handleExternalSpike(SpikeEvent* spike) {
@@ -740,12 +804,8 @@ void MultiCorePE::handleExternalSpike(SpikeEvent* spike) {
 
 void MultiCorePE::sendExternalSpike(SpikeEvent* spike) {
     if (!spike) return;
-    NocPacketEvent* pkt = SpikeNocCodec::encode(*spike, global_layout_);
-    delete spike;
-    if (pkt) {
-        // Phase4-A1.2：统一委托 NoC 子系统负责外发（backend选择/自环防护/统计口径）
-        noc_subsys_.sendExternal(pkt);
-    }
+    // Phase3-C：编解码/packet 化下沉到 SpikePacketBridge；NoC 仅做传输。
+    spike_packet_bridge_.sendExternal(spike);
 }
 
 int MultiCorePE::determineTargetUnit(int neuron_id) const {
@@ -905,11 +965,13 @@ void MultiCorePE::notifyStageEvent(uint32_t seq, const std::string& event, uint6
     if (event == "BeginGather") {
         if (m.bg == 0 || ts_ns < m.bg) m.bg = ts_ns;
     } else if (event == "BeginApply") {
-        if (m.ga == 0 || ts_ns < m.ga) m.ga = ts_ns;
+        // 多核窗口阶段并非严格同步：我们希望 PE 级阶段边界代表“所有核心都进入该阶段”的时刻。
+        // 因此 BeginApply/BeginScatter 取 max（最慢核心），BeginGather 取 min（最早起点）。
+        if (m.ga == 0 || ts_ns > m.ga) m.ga = ts_ns;
     } else if (event == "EndApply") {
         if (m.ea == 0 || ts_ns > m.ea) m.ea = ts_ns;
     } else if (event == "BeginScatter") {
-        if (m.bs == 0 || ts_ns < m.bs) m.bs = ts_ns;
+        if (m.bs == 0 || ts_ns > m.bs) m.bs = ts_ns;
     } else if (event == "EndScatter") {
         if (m.es == 0 || ts_ns > m.es) m.es = ts_ns;
         if (spikes_emitted > 0) {
@@ -923,6 +985,29 @@ void MultiCorePE::notifyStageEvent(uint32_t seq, const std::string& event, uint6
         step_activation_subsys_.onBeginGather(seq, ts_ns, core_id);
     } else if (event == "EndScatter") {
         step_activation_subsys_.onEndScatter(seq);
+    }
+
+    // Global Step barrier: 当本 PE 的所有 core 都完成 EndScatter(seq) 后，上报给控制器
+    if (global_step_sync_enable_ &&
+        gas_step_ctrl_link_ &&
+        !global_step_done_sent_ &&
+        event == "EndScatter" &&
+        seq == global_step_active_seq_) {
+        if (core_id >= 0 && core_id < num_cores_) {
+            global_step_done_cores_[static_cast<size_t>(core_id)] = 1;
+            bool all_done = true;
+            for (auto v : global_step_done_cores_) {
+                if (!v) { all_done = false; break; }
+            }
+            if (all_done) {
+                auto* ev = new GasStepBarrierEvent(GasStepBarrierOp::PeDone, seq, static_cast<uint32_t>(node_id_));
+                gas_step_ctrl_link_->send(ev);
+                global_step_done_sent_ = true;
+                if (sentinel_enabled_ && output_) {
+                    PE_LOG(1, "[[sentinel-step-sync]] node=%d send PE_DONE seq=%u\n", node_id_, seq);
+                }
+            }
+        }
     }
 }
 
@@ -1366,10 +1451,8 @@ void MultiCorePE::sendSpike(SpikeEvent* event) {
     PE_LOG(4, "📤 从SubComponent接收脉冲: 源神经元%d -> 目标神经元%d\n",
                     event->getSourceNeuron(), event->getDestinationNeuron());
 
-    // Phase4-A1.1：send 路径收敛到 NoC 子系统（严格通用化：SpikeEvent 在此处编码为 packet）。
-    NocPacketEvent* pkt = SpikeNocCodec::encode(*event, global_layout_);
-    delete event;
-    if (pkt) noc_subsys_.onCoreSend(pkt);
+    // Phase3-C：MultiCorePE 不直接做 Spike 编码；委托 SpikePacketBridge 生成 packet 并走 NoC。
+    spike_packet_bridge_.sendAuto(event);
 }
 
 void MultiCorePE::requestMemoryAccess(uint64_t address, size_t size, 
@@ -1859,25 +1942,9 @@ void MultiCorePE::initializeNetworkInterface() {
         // 设置通用接收回调：NoC packet 与控制面事件在此处分流
         external_nic_->setReceiveHandler([this](SST::Event* ev) {
             if (!ev) return;
-            if (auto* pkt = dynamic_cast<NocPacketEvent*>(ev)) {
-                this->noc_subsys_.onNicReceive(pkt); // NoC 接管生命周期
-                return;
-            }
-            // 容错：若底层 NIC 未展开 batch，则在此处展开为单包再入队
-            if (auto* batch = dynamic_cast<NocPacketBatchEvent*>(ev)) {
-                for (auto& p : batch->packets) {
-                    auto* pkt = new NocPacketEvent();
-                    pkt->src_node = batch->src_node;
-                    pkt->dst_node = batch->dst_node;
-                    pkt->src_endpoint = p.src_endpoint;
-                    pkt->dst_endpoint = p.dst_endpoint;
-                    pkt->kind = p.kind;
-                    pkt->hop_count = p.hop_count;
-                    pkt->timestamp = p.timestamp;
-                    pkt->payload = std::move(p.payload);
-                    this->noc_subsys_.onNicReceive(pkt);
-                }
-                delete batch;
+            // Phase5‑5.4：batch unpack/NoC 输入收敛到 NocSubsystem；MultiCorePE 仅做事件分流与装配。
+            if (dynamic_cast<NocPacketEvent*>(ev) || dynamic_cast<NocPacketBatchEvent*>(ev)) {
+                this->noc_subsys_.onNicReceiveEvent(ev);
                 return;
             }
             if (auto* gd = dynamic_cast<GatingDecisionEvent*>(ev)) {

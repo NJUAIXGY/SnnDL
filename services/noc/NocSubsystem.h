@@ -68,6 +68,7 @@ public:
     void sendExternal(NocPacketEvent* packet) override;
 
     // === Input side ===
+    void onNicReceiveEvent(SST::Event* event);
     void onNicReceive(NocPacketEvent* packet);
     void onExternalPortEvent(SST::Event* event);
     void onDirectionalLinkEvent(SST::Event* event, const std::string& direction);

@@ -59,6 +59,9 @@ public:
 	        {"verify_readback_bytes", "每次读回校验的字节数（默认64）", "64"},
 	        {"verify_colidx_start_index", "BCSR colidx 抽样起点（index，默认441，对齐现有diag）", "441"}
 	        ,
+	        {"strict_loader_done", "若启用：必须通过写后读回校验后才发布 loader_done_key（用于防止权重写入不可见导致读回全0）", "0"},
+	        {"min_raw_bcsr_chunk_bytes", "raw+BCSR 大文件的最小 chunk_size_bytes（过小会产生海量 untimed writes 并导致权重不可见/发放归零）", "4096"}
+	        ,
 	        // 运行期单点读回探针（用于确认“仿真期 timed Read”路径读到的字节是否与文件一致）
 	        {"diag_runtime_read_enable", "是否启用运行期单点读回探针(1/0，仅调试)", "0"},
 	        {"diag_runtime_read_core", "读回探针目标 core（默认0）", "0"},
@@ -217,7 +220,10 @@ private:
     uint32_t verify_readback_bytes_ = 64;
 	    uint32_t verify_colidx_start_index_ = 441;
 	    bool verify_readback_issued_ = false;
-	    bool verify_readback_done_ = false;
+    bool verify_readback_done_ = false;
+    bool strict_loader_done_ = false;
+    bool verify_failed_ = false;
+    uint32_t min_raw_bcsr_chunk_bytes_ = 4096;
 	    struct VerifyPending {
 	        uint64_t addr = 0;
 	        std::string tag;

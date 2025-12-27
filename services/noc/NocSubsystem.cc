@@ -15,6 +15,7 @@
 #include "OptimizedInternalRing.h"
 #include "SnnInterface.h"
 #include "NocPacketEvent.h"
+#include "NocPacketBatchEvent.h"
 
 namespace SST { namespace SnnDL {
 
@@ -171,6 +172,32 @@ void NocSubsystem::sendExternal(NocPacketEvent* packet) {
     sendExternalPacket_(packet);
 }
 
+void NocSubsystem::onNicReceiveEvent(SST::Event* event) {
+    if (!event) return;
+    if (auto* packet = dynamic_cast<NocPacketEvent*>(event)) {
+        onNicReceive(packet);
+        return;
+    }
+    // 容错：若底层 NIC 未展开 batch，则在此处展开为单包再入队
+    if (auto* batch = dynamic_cast<NocPacketBatchEvent*>(event)) {
+        for (auto& p : batch->packets) {
+            auto* pkt = new NocPacketEvent();
+            pkt->src_node = batch->src_node;
+            pkt->dst_node = batch->dst_node;
+            pkt->src_endpoint = p.src_endpoint;
+            pkt->dst_endpoint = p.dst_endpoint;
+            pkt->kind = p.kind;
+            pkt->hop_count = p.hop_count;
+            pkt->timestamp = p.timestamp;
+            pkt->payload = std::move(p.payload);
+            onNicReceive(pkt);
+        }
+        delete batch;
+        return;
+    }
+    delete event;
+}
+
 void NocSubsystem::onNicReceive(NocPacketEvent* packet) {
     if (!packet) return;
     if (st_.external_spikes_received) st_.external_spikes_received->addData(1);
@@ -178,6 +205,23 @@ void NocSubsystem::onNicReceive(NocPacketEvent* packet) {
 }
 
 void NocSubsystem::onExternalPortEvent(SST::Event* event) {
+    if (auto* batch = dynamic_cast<NocPacketBatchEvent*>(event)) {
+        // batch 走与单包一致的 hop/TTL 语义
+        for (auto& p : batch->packets) {
+            auto* pkt = new NocPacketEvent();
+            pkt->src_node = batch->src_node;
+            pkt->dst_node = batch->dst_node;
+            pkt->src_endpoint = p.src_endpoint;
+            pkt->dst_endpoint = p.dst_endpoint;
+            pkt->kind = p.kind;
+            pkt->hop_count = p.hop_count;
+            pkt->timestamp = p.timestamp;
+            pkt->payload = std::move(p.payload);
+            onExternalPortEvent(pkt);
+        }
+        delete batch;
+        return;
+    }
     auto* packet = dynamic_cast<NocPacketEvent*>(event);
     if (!packet) {
         delete event;
@@ -216,6 +260,22 @@ void NocSubsystem::onDirectionalLinkEvent(SST::Event* event, const std::string& 
                 packet->src_endpoint, packet->dst_endpoint,
                 packet->kind, packet->hop_count);
         onNicReceive(packet);
+        return;
+    }
+    if (auto* batch = dynamic_cast<NocPacketBatchEvent*>(event)) {
+        for (auto& p : batch->packets) {
+            auto* pkt = new NocPacketEvent();
+            pkt->src_node = batch->src_node;
+            pkt->dst_node = batch->dst_node;
+            pkt->src_endpoint = p.src_endpoint;
+            pkt->dst_endpoint = p.dst_endpoint;
+            pkt->kind = p.kind;
+            pkt->hop_count = p.hop_count;
+            pkt->timestamp = p.timestamp;
+            pkt->payload = std::move(p.payload);
+            onNicReceive(pkt);
+        }
+        delete batch;
         return;
     }
 

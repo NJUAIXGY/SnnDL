@@ -15,11 +15,12 @@
 #include <sst/core/output.h>
 #include <sst/core/interfaces/stdMem.h>
 
+#include "IGasStepGate.h"
 #include "synapse/gas/GasCustomCmd.h"
 
 namespace SST { namespace SnnDL {
 
-class GatherBufferIF : public SST::Interfaces::StandardMem {
+class GatherBufferIF : public SST::Interfaces::StandardMem, public IGasStepGate {
 public:
     SST_ELI_REGISTER_SUBCOMPONENT(
         GatherBufferIF,
@@ -54,6 +55,7 @@ public:
         {"strict_mode", "gate reads strictly to Gather phase (1=strict)", "1"},
         {"double_buffer_enable", "enable Gather/Apply overlap with SB double-buffer (0/1)", "1"},
         {"window_auto", "enable time-driven GAS windows", "0"},
+        {"step_gate_enable", "Step-level gate: only start new window on openStep() (0/1)", "0"},
         {"manual_window_drive", "deprecated (auto window always clock-driven; param kept for compatibility)", "0"},
         {"window_cycles_gather", "cycles of Gather window when window_auto=1", "0"},
         {"window_cycles_apply", "cycles to hold before emitting Apply responses", "0"},
@@ -134,6 +136,9 @@ public:
 
     // Deprecated no-op for legacy manual window drive APIs.
     void manualWindowTick();
+
+    // IGasStepGate: step-level window start (only used when step_gate_enable=1)
+    void openStep(uint32_t seq) override;
 
 private:
     // P2: 参数化门控（仅参数，不再回退env）
@@ -238,6 +243,7 @@ private:
     bool strict_mode_ = true; // 非Gather阶段是否严格拦截读（默认开）
     bool double_buffer_enable_ = true; // 允许在Apply阶段在另一SB上并行Gather
     bool window_auto_ = false;
+    bool step_gate_enable_ = false; // Step-level gate: pause after EndScatter until openStep()
     bool manual_window_drive_ = false;
     uint64_t win_cyc_gather_ = 0, win_cyc_apply_ = 0, win_cyc_scatter_ = 0;
     bool apply_auto_end_enable_ = true;

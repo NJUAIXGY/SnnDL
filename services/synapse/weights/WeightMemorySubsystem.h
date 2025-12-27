@@ -295,7 +295,7 @@ private:
                 }
                 noteIssue();
                 if (orch_.update_pending_peak) orch_.update_pending_peak(outstanding());
-                if (diag_out_) {
+                if (diag_debug_ && diag_out_) {
                     diag_out_->verbose(CALL_INFO, 0, 0,
                         "[diag-read-issue-WMS] core=%d pre=%u post=%u window=%u seq=%zu use_bcsr=1\n",
                         diag_core_id_, pre_global, post_local, diag_seq_, seq);

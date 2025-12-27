@@ -631,6 +631,16 @@ void SpikeCommSubsystem::emitNeuronFire(uint32_t neuron_idx, uint64_t now_cycle)
     emitCommon_(source_global, neuron_idx, now_cycle);
 }
 
+uint64_t SpikeCommSubsystem::emitNeuronFireBatch(const std::vector<uint32_t>& neuron_indices, uint64_t now_cycle) {
+    if (neuron_indices.empty()) return 0;
+    uint64_t emitted = 0;
+    for (uint32_t neuron_idx : neuron_indices) {
+        emitNeuronFire(neuron_idx, now_cycle);
+        emitted += 1;
+    }
+    return emitted;
+}
+
 void SpikeCommSubsystem::emitSource(uint32_t source_global, uint32_t source_local, uint64_t now_cycle) {
     emitCommon_(source_global, source_local, now_cycle);
 }

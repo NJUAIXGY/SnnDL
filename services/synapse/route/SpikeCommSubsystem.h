@@ -38,6 +38,8 @@ public:
 
     // 常规入口：compute core 报告本地 neuron_idx
     void emitNeuronFire(uint32_t neuron_idx, uint64_t now_cycle);
+    // 批量入口：控制层已收敛好 fired 集合，仅需统一下发（不引入 compute::FireEvent 依赖）
+    uint64_t emitNeuronFireBatch(const std::vector<uint32_t>& neuron_indices, uint64_t now_cycle);
     // 已知 source_global 的入口（保留扩展用途）
     void emitSource(uint32_t source_global, uint32_t source_local, uint64_t now_cycle);
 

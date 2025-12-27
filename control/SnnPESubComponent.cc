@@ -14,6 +14,7 @@
 #include "StageEventHub.h"
 #include "IPeAggregation.h"
 #include "IManualWindowDrive.h"
+#include "IGasStepGate.h"
 #include "synapse/weights/WeightMemorySubsystem.h"
 #include "synapse/weights/WeightCacheOps.h"
 #include "synapse/weights/WeightAccessor.h"
@@ -60,16 +61,11 @@ std::mutex SnnPESubComponent::s_stage_csv_mutex_;
 
 void SnnPESubComponent::appendStageEventRow_(const char* event_name, uint64_t now_ns, uint64_t spikes_emitted) {
     // 阶段事件上报（转发给 MultiCorePE 聚合落盘）：
-    // - EndScatter：所有核心都要上报（用于聚合发放数，window_spikes_pe_ 口径依赖它）。
-    // - BeginGather：需要稳定的“步起点”来触发 step random activation；不能再仅依赖 core0，
-    //   否则当 core0 在部分步缺席 BeginGather 时，会导致注入次数漂移与非确定性。
-    // - 其他阶段事件：仍由 core0 代表上报，避免多核重复噪声。
+    // 注意：GAS 窗口阶段事件在多核之间并不严格同步，某些窗口的 BeginApply/BeginScatter
+    // 可能首先出现在非 core0 上。若只允许 core0 上报，会导致 ga/bs 缺失，从而 gather/apply/scatter
+    // 统计被写成 0（p95=0）。
+    // 解决：所有核心都上报阶段边界事件，由 MultiCorePE::notifyStageEvent 做 min/max 聚合收敛。
     if (event_name == nullptr) return;
-    if (core_id_ != 0) {
-        const bool is_end_scatter = (std::strcmp(event_name, "EndScatter") == 0);
-        const bool is_begin_gather = (std::strcmp(event_name, "BeginGather") == 0);
-        if (!is_end_scatter && !is_begin_gather) return;
-    }
     std::lock_guard<std::mutex> lock(s_stage_csv_mutex_);
     // 改为通知父 PE 统一写入阶段事件（避免多核重复与多次落盘）；同时传递本窗发放数量
     if (parent_) {
@@ -362,6 +358,8 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     }
     window_read_enable_ = params.find<int>("window_read_enable", 0) != 0;
     window_read_debug_ = params.find<int>("window_read_debug", 0) != 0;
+    scatter_diag_limit_ = params.find<uint32_t>("scatter_diag_limit", 0);
+    scatter_diag_count_ = 0;
     route_summary_enable_ = params.find<int>("route_summary_enable", 0) != 0;
     if (gas_ctrl_) gas_ctrl_->setDebug(window_read_debug_, enable_extended_diagnostics_);
     window_read_budget_ = params.find<uint32_t>("window_read_budget", 1024);
@@ -801,6 +799,24 @@ void SnnPESubComponent::setNocTransport(INocTransport* noc) {
     noc_transport_ = noc;
     noc_spike_transport_.setNocTransport(noc);
     noc_spike_transport_.setSourceCore(core_id_);
+}
+
+void SnnPESubComponent::onGlobalStepStart(uint32_t seq) {
+    // 全局 Step 同步：打开 memory(GatherBufferIF) 的新窗口。
+    // 注意：这里不直接操作 GAS 状态机，而是通过 IGasStepGate 保持边界清晰。
+    if (!memory_) {
+        if (output_) output_->fatal(CALL_INFO, -1, "core=%d onGlobalStepStart(seq=%u) but memory is null\n", core_id_, seq);
+        return;
+    }
+    auto* gate = dynamic_cast<IGasStepGate*>(memory_);
+    if (!gate) {
+        if (output_) output_->fatal(
+            CALL_INFO, -1,
+            "core=%d onGlobalStepStart(seq=%u) requires memory to implement IGasStepGate (did you load GatherBufferIF with step_gate_enable=1?)\n",
+            core_id_, seq);
+        return;
+    }
+    gate->openStep(seq);
 }
 
 void SnnPESubComponent::configureComputeCore_(const Params& params) {

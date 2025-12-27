@@ -117,18 +117,7 @@ private:
     int determineTargetUnit_(uint32_t neuron_id) const;
     void injectStepActivations_(uint32_t seq, uint64_t sim_time_ns);
 
-    // BCSR reachability build helpers
-    std::string formatBcsrPath_(int pe, int core) const;
-    uint64_t alignUp_(uint64_t value, uint64_t align) const;
-    bool computeBcsrOffsets_(uint32_t n_block_rows, uint32_t total_blocks,
-                             uint64_t block_bytes,
-                             uint64_t& rowptr_offset, uint64_t& colidx_offset,
-                             uint64_t& blockdata_offset, uint64_t& blockids_offset) const;
-    bool checkBcsrOffsets_(uint64_t file_size, uint32_t n_block_rows,
-                           uint32_t total_blocks, uint64_t block_bytes,
-                           uint64_t& rowptr_offset, uint64_t& colidx_offset,
-                           uint64_t& blockdata_offset, uint64_t& blockids_offset) const;
-    bool buildRoutesFromBcsrFile_(const std::string& path, uint32_t pe_id, uint32_t core_index);
+    // BCSR reachability build（委托 synapse/route 实现，Stimulus 不自持解析逻辑）
     bool loadBcsrReachability_();
     void computeRouteRatios_() const;
 

@@ -38,6 +38,7 @@
 #include "noc/OptimizedInternalRing.h"
 #include "stimulus/StepActivationSubsystem.h"
 #include "noc/NocSubsystem.h"
+#include "synapse/route/SpikePacketBridge.h"
 
 namespace SST {
 namespace SnnDL {
@@ -139,6 +140,8 @@ public:
         {"step_activation_bcsr_stride_bytes", "BCSR per-core stride字节数", "0"},
         {"step_activation_bcsr_weight_epsilon", "判定非零连边的权重阈值", "0.0"},
         {"step_activation_log_enable", "启用步级激活BCSR路由构建日志(0/1)", "0"}
+        ,
+        {"global_step_sync_enable", "启用全局 Step/GAS barrier 同步(0/1)", "0"}
     )
 
     // 子组件槽位文档
@@ -160,6 +163,7 @@ public:
     SST_ELI_DOCUMENT_PORTS(
         {"external_spike_input",  "外部脉冲输入端口", {"SnnDL.SpikeEvent"}},
         {"external_spike_output", "外部脉冲输出端口", {"SnnDL.SpikeEvent"}},
+        {"gas_step_ctrl", "全局 Step/GAS 同步控制器端口（可选）", {"SnnDL.GasStepBarrierEvent"}},
         {"network", "网络连接端口（用于direct_link模式）", {"SnnDL.SpikeEvent", "SimpleNetwork"}},
         {"north", "北向网络连接端口（网格拓扑）", {"SnnDL.SpikeEvent"}},
         {"south", "南向网络连接端口（网格拓扑）", {"SnnDL.SpikeEvent"}},
@@ -509,6 +513,19 @@ private:
 
     // Step-level random activation injection (Phase3-B): 下沉为独立子系统
     StepActivationSubsystem step_activation_subsys_{};
+
+    // Global Step/GAS barrier sync (Phase-step-sync)
+    bool global_step_sync_enable_ = false;
+    bool global_step_sync_ready_ = false;
+    bool global_step_ready_sent_ = false;
+    SST::Link* gas_step_ctrl_link_ = nullptr;
+    bool global_step_start_pending_ = false;
+    uint32_t global_step_pending_seq_ = 0;
+    uint32_t global_step_active_seq_ = 0;
+    bool global_step_done_sent_ = false;
+    std::vector<uint8_t> global_step_done_cores_{};
+    // Spike packet bridge (Phase3-C): Spike 编解码与投递 glue 下沉到 synapse 域
+    SpikePacketBridge spike_packet_bridge_{};
     // NoC 子系统（Phase4-A1.1）：收敛 send/recv/forward + 本地投递
     NocSubsystem noc_subsys_{};
     void writeWindowCsv_();
@@ -525,6 +542,16 @@ private:
      * @brief 处理外部脉冲事件（从Link接收）
      */
     void handleExternalSpikeEvent(SST::Event* ev);
+
+    /**
+     * @brief 处理全局 Step/GAS 控制器事件（StartStep）
+     */
+    void handleGasStepCtrlEvent(SST::Event* ev);
+
+    /**
+     * @brief 在时钟边界打开所有 core 的新窗口（由 StartStep 驱动）
+     */
+    void beginGlobalStep_(uint32_t seq);
     
     /**
      * @brief 处理内部脉冲路由

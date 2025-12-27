@@ -161,6 +161,19 @@ void WeightLoader::pollVerifyReadbacks_() {
         for (size_t i = 0; i < n; ++i) {
             if (expect[i] != got[i]) mismatch++;
         }
+        const bool size_ok = got.size() == expect.size();
+        const bool ok = size_ok && (mismatch == 0);
+        if (!ok) {
+            verify_failed_ = true;
+            if (strict_loader_done_ && output_) {
+                output_->fatal(CALL_INFO, -1,
+                    "❌ WeightLoader strict_loader_done: verify_readback 失败: tag=%s addr=0x%llx got=%zu expect=%zu mismatch=%zu。"
+                    "若 got=0，可能 untimed ReadResp 不携带 data；请关闭 strict_loader_done 或改用其他验证手段。\n",
+                    it->second.tag.c_str(),
+                    (unsigned long long)it->second.addr,
+                    got.size(), expect.size(), mismatch);
+            }
+        }
         if (output_) {
             output_->verbose(CALL_INFO, 0, 0,
                 "[WL-verify-resp] tag=%s addr=0x%llx got=%zu expect=%zu mismatch=%zu head_got=[%s] head_expect=[%s]\n",
@@ -216,6 +229,19 @@ WeightLoader::WeightLoader(ComponentId_t id, Params& params)
     verify_readback_core_ = params.find<int>("verify_readback_core", 0);
     verify_readback_bytes_ = params.find<uint32_t>("verify_readback_bytes", 64);
     verify_colidx_start_index_ = params.find<uint32_t>("verify_colidx_start_index", 441);
+    strict_loader_done_ = params.find<int>("strict_loader_done", 0) != 0;
+    min_raw_bcsr_chunk_bytes_ = params.find<uint32_t>("min_raw_bcsr_chunk_bytes", 4096);
+    if (min_raw_bcsr_chunk_bytes_ != 0 && min_raw_bcsr_chunk_bytes_ < 64) {
+        min_raw_bcsr_chunk_bytes_ = 64;
+    }
+    // strict_loader_done 仅对 raw+BCSR 有意义；其他模式直接忽略，避免误伤旧用例。
+    if (strict_loader_done_ && !(raw_mode_ && bcsr_enable_)) {
+        strict_loader_done_ = false;
+    }
+    if (strict_loader_done_) {
+        // strict 模式下必须启用写后读回校验；否则 loader_done 会在“写入不可见/丢写”时误放行，导致读回全0。
+        verify_readback_enable_ = true;
+    }
     diag_runtime_read_enable_ = params.find<int>("diag_runtime_read_enable", 0) != 0;
     diag_runtime_read_core_ = params.find<int>("diag_runtime_read_core", 0);
     diag_runtime_read_offset_ = params.find<uint64_t>("diag_runtime_read_offset", 0);
@@ -289,9 +315,19 @@ void WeightLoader::init(unsigned int phase) {
         runtime_load_needed_ = false;
         loadFileOnce();
         loaded_ = true;
-        // 调试：写入后立刻在 init 阶段发起读回校验（仅用于定位；注意：StandardMem 的 untimed ReadResp 可能不携带 data）
+        // 写入后在 init/complete 阶段发起读回校验（仅用于定位；注意：StandardMem 的 untimed ReadResp 可能不携带 data）。
+        // strict_loader_done=1 时：必须校验通过后才发布 loader_done，避免“权重写入不可见→读回全0→发放归零”。
         issueVerifyReadbacks_();
-        publishLoaderDone_();
+        if (strict_loader_done_) {
+            if (!verify_readback_issued_) {
+                output_->fatal(CALL_INFO, -1,
+                    "❌ WeightLoader strict_loader_done=1 但未能发起任何 verify_readback 请求。"
+                    "请确认 per_core_files=1 且 file_template 指向可读的 *.bcsr.bin 文件（带 .meta.json），"
+                    "或关闭 strict_loader_done。\n");
+            }
+        } else {
+            publishLoaderDone_();
+        }
     }
 }
 
@@ -305,6 +341,16 @@ void WeightLoader::setup() {
     // timed_seed_* 不再触发“运行期全量写入”（避免模拟时间被 WeightLoader 吞没）。
     if (!loaded_) {
         output_->fatal(CALL_INFO, -1, "❌ WeightLoader setup 阶段检测到未完成的权重加载（expected in init）。");
+    }
+    if (strict_loader_done_) {
+        if (verify_failed_) {
+            output_->fatal(CALL_INFO, -1, "❌ WeightLoader strict_loader_done: 写后读回校验失败，拒绝发布 loader_done。\n");
+        }
+        if (!verify_readback_done_) {
+            output_->fatal(CALL_INFO, -1,
+                "❌ WeightLoader strict_loader_done: 写后读回校验未完成（可能 untimed ReadResp 不可用/未返回 data），拒绝发布 loader_done。\n");
+        }
+        publishLoaderDone_();
     }
     runtime_load_needed_ = false;
 
@@ -685,6 +731,24 @@ void WeightLoader::issueWritesRaw(int core, const std::vector<uint8_t>& data, bo
     if (data.empty()) {
         output_->verbose(CALL_INFO, 2, 0, "⚠️ 核心%d Raw写入数据为空，跳过\n", core);
         return;
+    }
+    // Guard: raw+BCSR 大文件禁止使用过小 chunk 做 untimed bulk writes。
+    // 否则将产生海量 sendUntimedData(Write)，容易出现写入不可见/丢写，最终表现为“读回全0→发放归零”。
+    if (!timed && raw_mode_ && bcsr_enable_ && min_raw_bcsr_chunk_bytes_ != 0) {
+        const size_t kLargeFileBytes = 1024 * 1024; // 1MiB
+        if (data.size() >= kLargeFileBytes && chunk_size_bytes_ < min_raw_bcsr_chunk_bytes_) {
+            const size_t chunk = std::max<size_t>(16, static_cast<size_t>(chunk_size_bytes_));
+            const size_t est_writes_per_core = (data.size() + chunk - 1) / chunk;
+            const size_t est_writes_total = est_writes_per_core * static_cast<size_t>(std::max(1, num_cores_));
+            output_->fatal(CALL_INFO, -1,
+                "❌ WeightLoader raw+BCSR: chunk_size_bytes=%u 太小（min=%u），文件=0x%zx，将导致 ~%zu writes/core (~%zu writes/PE)。"
+                "请提高 loader_chunk_bytes（推荐 65536；至少 4096），或将 min_raw_bcsr_chunk_bytes=0 关闭此保护。\n",
+                chunk_size_bytes_,
+                min_raw_bcsr_chunk_bytes_,
+                data.size(),
+                est_writes_per_core,
+                est_writes_total);
+        }
     }
     // 若配置了 per_core_stride，则要求其必须覆盖文件长度；否则权重地址映射会跨 core/PE 导致非确定性/读回垃圾值
     if (per_core_stride_ != 0 && data.size() > static_cast<size_t>(per_core_stride_)) {

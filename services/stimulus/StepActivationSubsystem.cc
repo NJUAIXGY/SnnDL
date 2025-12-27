@@ -22,6 +22,8 @@
 #include "INocTransport.h"
 #include "SpikeEvent.h"
 
+#include "synapse/route/StepBcsrReachability.h"
+
 namespace SST { namespace SnnDL {
 
 #ifndef STEP_LOG
@@ -358,6 +360,9 @@ void StepActivationSubsystem::injectStepActivations_(uint32_t seq, uint64_t sim_
     }
 }
 
+#if 0
+// Phase5‑5.3：Stimulus 不再自持 BCSR 解析/offset 推导与文件扫描逻辑。
+// 旧实现保留作对照参考（不参与编译），reachability 构建统一委托 synapse/route/StepBcsrReachability。
 std::string StepActivationSubsystem::formatBcsrPath_(int pe, int core) const {
     if (cfg_.bcsr_template.empty()) return std::string();
     std::string path = cfg_.bcsr_template;
@@ -619,6 +624,7 @@ bool StepActivationSubsystem::buildRoutesFromBcsrFile_(const std::string& path, 
     }
     return true;
 }
+#endif // 0
 
 bool StepActivationSubsystem::loadBcsrReachability_() {
     if (rt_.log && cfg_.log_enable) {
@@ -639,16 +645,42 @@ bool StepActivationSubsystem::loadBcsrReachability_() {
     const uint64_t total_pre = rt_.global_neuron_base + total_neurons;
     step_routes_.assign(static_cast<size_t>(total_pre), {});
 
-    bool success = true;
-    int pe_begin = 0, pe_end = (rt_.total_nodes > 0 ? rt_.total_nodes : 1);
-    if (cfg_.build_local_only) { pe_begin = rt_.node_id; pe_end = rt_.node_id + 1; }
-    for (int pe = pe_begin; pe < pe_end; ++pe) {
-        for (int core = 0; core < rt_.num_cores; ++core) {
-            std::string p = formatBcsrPath_(pe, core);
-            if (p.empty()) { success = false; break; }
-            if (!buildRoutesFromBcsrFile_(p, static_cast<uint32_t>(pe), static_cast<uint32_t>(core))) { success = false; break; }
+    StepBcsrReachabilityConfig rcfg{};
+    rcfg.bcsr_template = cfg_.bcsr_template;
+    rcfg.build_local_only = cfg_.build_local_only;
+    rcfg.log_enable = cfg_.log_enable;
+    rcfg.bcsr_rows_per_core = (cfg_.bcsr_rows_per_core > 0)
+        ? cfg_.bcsr_rows_per_core
+        : static_cast<uint32_t>(rt_.neurons_per_core);
+    rcfg.bcsr_br = cfg_.bcsr_br;
+    rcfg.bcsr_bc = cfg_.bcsr_bc;
+    rcfg.bcsr_idx_bytes = cfg_.bcsr_idx_bytes;
+    rcfg.bcsr_val_bytes = cfg_.bcsr_val_bytes;
+    rcfg.bcsr_rowptr_offset = cfg_.bcsr_rowptr_offset;
+    rcfg.bcsr_colidx_offset = cfg_.bcsr_colidx_offset;
+    rcfg.bcsr_blockdata_offset = cfg_.bcsr_blockdata_offset;
+    rcfg.bcsr_blockids_offset = cfg_.bcsr_blockids_offset;
+    rcfg.bcsr_weight_epsilon = cfg_.bcsr_weight_epsilon;
+
+    StepBcsrReachabilityRuntime rrt{};
+    rrt.log = rt_.log;
+    rrt.node_id = static_cast<uint32_t>(rt_.node_id);
+    rrt.total_nodes = static_cast<uint32_t>(rt_.total_nodes > 0 ? rt_.total_nodes : 1);
+    rrt.num_cores = static_cast<uint32_t>(rt_.num_cores);
+    rrt.neurons_per_core = static_cast<uint32_t>(rt_.neurons_per_core);
+    rrt.neurons_per_pe_cfg = rt_.neurons_per_pe_cfg;
+    rrt.global_neuron_base = rt_.global_neuron_base;
+
+    ISynapseRoute::RouteMap routes_map;
+    std::vector<uint32_t> pre_with_routes;
+    bool success = buildStepBcsrReachabilityRoutes(rcfg, rrt, routes_map, pre_with_routes);
+    if (success) {
+        for (auto& kv : routes_map) {
+            const uint32_t pre = kv.first;
+            if (pre < step_routes_.size()) step_routes_[pre] = std::move(kv.second);
         }
-        if (!success) break;
+        if (rt_.total_nodes == 1) pre_with_routes_ = std::move(pre_with_routes);
+        else pre_with_routes_.clear();
     }
 
     if (success) {
@@ -664,16 +696,9 @@ bool StepActivationSubsystem::loadBcsrReachability_() {
             STEP_LOG(0, "[step-activation] node=%d loadBcsrReachability success route_vectors=%zu\n",
                      rt_.node_id, step_routes_.size());
         }
-        pre_with_routes_.clear();
-        if (rt_.total_nodes == 1) {
-            pre_with_routes_.reserve(with_routes);
-            for (uint32_t pre = 0; pre < step_routes_.size(); ++pre) {
-                if (!step_routes_[pre].empty()) pre_with_routes_.push_back(pre);
-            }
-            if (rt_.log && cfg_.log_enable) {
-                STEP_LOG(1, "[step-activation] node=%d single-PE pre_with_routes_list size=%zu\n",
-                         rt_.node_id, pre_with_routes_.size());
-            }
+        if (rt_.total_nodes == 1 && rt_.log && cfg_.log_enable) {
+            STEP_LOG(1, "[step-activation] node=%d single-PE pre_with_routes_list size=%zu\n",
+                     rt_.node_id, pre_with_routes_.size());
         }
     } else {
         pre_with_routes_.clear();

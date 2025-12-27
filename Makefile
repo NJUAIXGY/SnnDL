@@ -178,7 +178,8 @@ LTLIBRARIES = $(comp_LTLIBRARIES)
 libSnnDL_la_LIBADD =
 am__dirstamp = $(am__leading_dot)dirstamp
 am_libSnnDL_la_OBJECTS = events/SimpleTestEvent.lo \
-	events/SpikeEventWrapper.lo components/GatherBufferIF.lo \
+	events/SpikeEventWrapper.lo components/gas/GlobalGasStepController.lo \
+	components/GatherBufferIF.lo \
 	components/GatingPE.lo components/MemKCalBench.lo \
 	components/MultiCorePE.lo components/SnnNIC.lo \
 	components/SnnPE.lo components/stimulus/SpikeSource.lo \
@@ -192,18 +193,26 @@ am_libSnnDL_la_OBJECTS = events/SimpleTestEvent.lo \
 	control/SnnPEApplyScatter.lo control/SnnPEOrchestrators.lo \
 	control/StageEventHub.lo compute/SnnComputeCore.lo \
 	compute/SnnCoreEngine.lo compute/SnnLearningCore.lo \
-	services/synapse/weights/SnnWeightDiagnostics.lo services/synapse/gas/AccumulatorOps.lo \
-	services/synapse/gas/GasEdgeCollector.lo services/synapse/gas/GasPhaseController.lo \
-	services/noc/OptimizedInternalRing.lo components/noc/SimpleNetworkWrapper.lo \
-	services/synapse/weights/SnnBcsrWeightManager.lo components/noc/SnnNetworkAdapter.lo \
-	services/synapse/route/SnnRouteProvider.lo services/synapse/route/BcsrRouteBuilder.lo \
-	services/synapse/route/StepBcsrReachability.lo services/synapse/route/SynapseRouteSubsystem.lo \
+	services/synapse/gas/AccumulatorOps.lo \
+	services/synapse/gas/GasEdgeCollector.lo \
+	services/synapse/gas/GasPhaseController.lo \
+	services/noc/OptimizedInternalRing.lo \
+	components/noc/SimpleNetworkWrapper.lo \
+	services/synapse/weights/SnnBcsrWeightManager.lo \
+	services/synapse/weights/SnnWeightDiagnostics.lo \
+	components/noc/SnnNetworkAdapter.lo \
+	services/synapse/route/SnnRouteProvider.lo \
+	services/synapse/route/BcsrRouteBuilder.lo \
+	services/synapse/route/StepBcsrReachability.lo \
+	services/synapse/route/SynapseRouteSubsystem.lo \
 	services/stimulus/StepActivationSubsystem.lo \
 	services/noc/NocSubsystem.lo \
-	services/synapse/weights/WeightAccessor.lo services/synapse/weights/WeightCacheOps.lo \
+	services/synapse/weights/WeightAccessor.lo \
+	services/synapse/weights/WeightCacheOps.lo \
 	services/synapse/weights/WeightMemorySubsystem.lo \
-	services/memory/StandardMemAccess.lo \
-	services/synapse/route/SpikeCommSubsystem.lo
+	services/synapse/route/SpikeCommSubsystem.lo \
+	services/synapse/route/SpikePacketBridge.lo \
+	services/memory/StandardMemAccess.lo
 libSnnDL_la_OBJECTS = $(am_libSnnDL_la_OBJECTS)
 AM_V_lt = $(am__v_lt_$(V))
 am__v_lt_ = $(am__v_lt_$(AM_DEFAULT_VERBOSITY))
@@ -232,14 +241,16 @@ am__depfiles_remade = components/$(DEPDIR)/GatherBufferIF.Plo \
 	components/$(DEPDIR)/MemKCalBench.Plo \
 	components/$(DEPDIR)/MultiCorePE.Plo \
 	components/$(DEPDIR)/SnnNIC.Plo components/$(DEPDIR)/SnnPE.Plo \
-	components/stimulus/$(DEPDIR)/SpikeSource.Plo \
 	components/$(DEPDIR)/WeightLoader.Plo \
 	components/mpi/$(DEPDIR)/MPIMultiCorePE.Plo \
 	components/mpi/$(DEPDIR)/MPITypes.Plo \
+	components/noc/$(DEPDIR)/SimpleNetworkWrapper.Plo \
+	components/noc/$(DEPDIR)/SnnNetworkAdapter.Plo \
+	components/gas/$(DEPDIR)/GlobalGasStepController.Plo \
+	components/stimulus/$(DEPDIR)/SpikeSource.Plo \
 	compute/$(DEPDIR)/SnnComputeCore.Plo \
 	compute/$(DEPDIR)/SnnCoreEngine.Plo \
 	compute/$(DEPDIR)/SnnLearningCore.Plo \
-	services/synapse/weights/$(DEPDIR)/SnnWeightDiagnostics.Plo \
 	control/$(DEPDIR)/SnnPEApplyScatter.Plo \
 	control/$(DEPDIR)/SnnPEOrchestrators.Plo \
 	control/$(DEPDIR)/SnnPESubComponent.Plo \
@@ -251,24 +262,24 @@ am__depfiles_remade = components/$(DEPDIR)/GatherBufferIF.Plo \
 	control/$(DEPDIR)/StageEventHub.Plo \
 	events/$(DEPDIR)/SimpleTestEvent.Plo \
 	events/$(DEPDIR)/SpikeEventWrapper.Plo \
+	services/memory/$(DEPDIR)/StandardMemAccess.Plo \
+	services/noc/$(DEPDIR)/NocSubsystem.Plo \
+	services/noc/$(DEPDIR)/OptimizedInternalRing.Plo \
+	services/stimulus/$(DEPDIR)/StepActivationSubsystem.Plo \
 	services/synapse/gas/$(DEPDIR)/AccumulatorOps.Plo \
 	services/synapse/gas/$(DEPDIR)/GasEdgeCollector.Plo \
 	services/synapse/gas/$(DEPDIR)/GasPhaseController.Plo \
-	services/noc/$(DEPDIR)/OptimizedInternalRing.Plo \
-	components/noc/$(DEPDIR)/SimpleNetworkWrapper.Plo \
-	services/synapse/weights/$(DEPDIR)/SnnBcsrWeightManager.Plo \
-	components/noc/$(DEPDIR)/SnnNetworkAdapter.Plo \
-	services/noc/$(DEPDIR)/NocSubsystem.Plo \
-	services/synapse/route/$(DEPDIR)/SnnRouteProvider.Plo \
 	services/synapse/route/$(DEPDIR)/BcsrRouteBuilder.Plo \
+	services/synapse/route/$(DEPDIR)/SnnRouteProvider.Plo \
+	services/synapse/route/$(DEPDIR)/SpikeCommSubsystem.Plo \
+	services/synapse/route/$(DEPDIR)/SpikePacketBridge.Plo \
 	services/synapse/route/$(DEPDIR)/StepBcsrReachability.Plo \
 	services/synapse/route/$(DEPDIR)/SynapseRouteSubsystem.Plo \
+	services/synapse/weights/$(DEPDIR)/SnnBcsrWeightManager.Plo \
+	services/synapse/weights/$(DEPDIR)/SnnWeightDiagnostics.Plo \
 	services/synapse/weights/$(DEPDIR)/WeightAccessor.Plo \
 	services/synapse/weights/$(DEPDIR)/WeightCacheOps.Plo \
-	services/synapse/weights/$(DEPDIR)/WeightMemorySubsystem.Plo \
-	services/memory/$(DEPDIR)/StandardMemAccess.Plo \
-	services/synapse/route/$(DEPDIR)/SpikeCommSubsystem.Plo \
-	services/stimulus/$(DEPDIR)/StepActivationSubsystem.Plo
+	services/synapse/weights/$(DEPDIR)/WeightMemorySubsystem.Plo
 am__mv = mv -f
 CXXCOMPILE = $(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) \
 	$(AM_CPPFLAGS) $(CPPFLAGS) $(AM_CXXFLAGS) $(CXXFLAGS)
@@ -599,19 +610,23 @@ libSnnDL_la_SOURCES = \
 	api/SnnPEParentInterface.h \
 	api/ISpikeTransport.h \
 	api/INocTransport.h \
-	api/NocSpikeTransport.h \
 	api/IManualWindowDrive.h \
+	api/IGasStepGate.h \
+	api/IGlobalStepHooks.h \
 	api/IMemoryAccess.h \
 	api/ISynapseRoute.h \
 	api/SynapseRouteBuildConfig.h \
 	api/SnnWeightReader.h \
 	events/GatingDecisionEvent.h \
+	events/GasStepBarrierEvent.h \
 	events/SimpleTestEvent.cc \
 	events/SimpleTestEvent.h \
 	events/SpikeEvent.h \
 	events/SpikeEventWrapper.cc \
 	events/SpikeEventWrapper.h \
 	events/SpikePacket.h \
+	components/gas/GlobalGasStepController.cc \
+	components/gas/GlobalGasStepController.h \
 	components/GatherBufferIF.cc \
 	components/GatherBufferIF.h \
 	components/GatingPE.cc \
@@ -689,6 +704,9 @@ libSnnDL_la_SOURCES = \
 	services/synapse/weights/WeightMemorySubsystem.h \
 	services/synapse/route/SpikeCommSubsystem.cc \
 	services/synapse/route/SpikeCommSubsystem.h \
+	services/synapse/route/SpikePacketTransport.h \
+	services/synapse/route/SpikePacketBridge.cc \
+	services/synapse/route/SpikePacketBridge.h \
 	services/memory/StandardMemAccess.cc \
 	services/memory/StandardMemAccess.h
 
@@ -793,13 +811,23 @@ components/SnnNIC.lo: components/$(am__dirstamp) \
 	components/$(DEPDIR)/$(am__dirstamp)
 components/SnnPE.lo: components/$(am__dirstamp) \
 	components/$(DEPDIR)/$(am__dirstamp)
+components/gas/$(am__dirstamp):
+	@$(MKDIR_P) components/gas
+	@: > components/gas/$(am__dirstamp)
+components/gas/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) components/gas/$(DEPDIR)
+	@: > components/gas/$(DEPDIR)/$(am__dirstamp)
+components/gas/GlobalGasStepController.lo:  \
+	components/gas/$(am__dirstamp) \
+	components/gas/$(DEPDIR)/$(am__dirstamp)
 components/stimulus/$(am__dirstamp):
 	@$(MKDIR_P) components/stimulus
 	@: > components/stimulus/$(am__dirstamp)
 components/stimulus/$(DEPDIR)/$(am__dirstamp):
 	@$(MKDIR_P) components/stimulus/$(DEPDIR)
 	@: > components/stimulus/$(DEPDIR)/$(am__dirstamp)
-components/stimulus/SpikeSource.lo: components/stimulus/$(am__dirstamp) \
+components/stimulus/SpikeSource.lo:  \
+	components/stimulus/$(am__dirstamp) \
 	components/stimulus/$(DEPDIR)/$(am__dirstamp)
 components/WeightLoader.lo: components/$(am__dirstamp) \
 	components/$(DEPDIR)/$(am__dirstamp)
@@ -849,40 +877,104 @@ compute/SnnCoreEngine.lo: compute/$(am__dirstamp) \
 	compute/$(DEPDIR)/$(am__dirstamp)
 compute/SnnLearningCore.lo: compute/$(am__dirstamp) \
 	compute/$(DEPDIR)/$(am__dirstamp)
-services/$(am__dirstamp):
-	@$(MKDIR_P) services
-	@: > services/$(am__dirstamp)
-services/$(DEPDIR)/$(am__dirstamp):
-	@$(MKDIR_P) services/$(DEPDIR)
-	@: > services/$(DEPDIR)/$(am__dirstamp)
+services/synapse/gas/$(am__dirstamp):
+	@$(MKDIR_P) services/synapse/gas
+	@: > services/synapse/gas/$(am__dirstamp)
+services/synapse/gas/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) services/synapse/gas/$(DEPDIR)
+	@: > services/synapse/gas/$(DEPDIR)/$(am__dirstamp)
+services/synapse/gas/AccumulatorOps.lo:  \
+	services/synapse/gas/$(am__dirstamp) \
+	services/synapse/gas/$(DEPDIR)/$(am__dirstamp)
+services/synapse/gas/GasEdgeCollector.lo:  \
+	services/synapse/gas/$(am__dirstamp) \
+	services/synapse/gas/$(DEPDIR)/$(am__dirstamp)
+services/synapse/gas/GasPhaseController.lo:  \
+	services/synapse/gas/$(am__dirstamp) \
+	services/synapse/gas/$(DEPDIR)/$(am__dirstamp)
+services/noc/$(am__dirstamp):
+	@$(MKDIR_P) services/noc
+	@: > services/noc/$(am__dirstamp)
+services/noc/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) services/noc/$(DEPDIR)
+	@: > services/noc/$(DEPDIR)/$(am__dirstamp)
+services/noc/OptimizedInternalRing.lo: services/noc/$(am__dirstamp) \
+	services/noc/$(DEPDIR)/$(am__dirstamp)
+components/noc/$(am__dirstamp):
+	@$(MKDIR_P) components/noc
+	@: > components/noc/$(am__dirstamp)
+components/noc/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) components/noc/$(DEPDIR)
+	@: > components/noc/$(DEPDIR)/$(am__dirstamp)
+components/noc/SimpleNetworkWrapper.lo:  \
+	components/noc/$(am__dirstamp) \
+	components/noc/$(DEPDIR)/$(am__dirstamp)
+services/synapse/weights/$(am__dirstamp):
+	@$(MKDIR_P) services/synapse/weights
+	@: > services/synapse/weights/$(am__dirstamp)
+services/synapse/weights/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) services/synapse/weights/$(DEPDIR)
+	@: > services/synapse/weights/$(DEPDIR)/$(am__dirstamp)
+services/synapse/weights/SnnBcsrWeightManager.lo:  \
+	services/synapse/weights/$(am__dirstamp) \
+	services/synapse/weights/$(DEPDIR)/$(am__dirstamp)
+services/synapse/weights/SnnWeightDiagnostics.lo:  \
+	services/synapse/weights/$(am__dirstamp) \
+	services/synapse/weights/$(DEPDIR)/$(am__dirstamp)
+components/noc/SnnNetworkAdapter.lo: components/noc/$(am__dirstamp) \
+	components/noc/$(DEPDIR)/$(am__dirstamp)
+services/synapse/route/$(am__dirstamp):
+	@$(MKDIR_P) services/synapse/route
+	@: > services/synapse/route/$(am__dirstamp)
+services/synapse/route/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) services/synapse/route/$(DEPDIR)
+	@: > services/synapse/route/$(DEPDIR)/$(am__dirstamp)
+services/synapse/route/SnnRouteProvider.lo:  \
+	services/synapse/route/$(am__dirstamp) \
+	services/synapse/route/$(DEPDIR)/$(am__dirstamp)
+services/synapse/route/BcsrRouteBuilder.lo:  \
+	services/synapse/route/$(am__dirstamp) \
+	services/synapse/route/$(DEPDIR)/$(am__dirstamp)
+services/synapse/route/StepBcsrReachability.lo:  \
+	services/synapse/route/$(am__dirstamp) \
+	services/synapse/route/$(DEPDIR)/$(am__dirstamp)
+services/synapse/route/SynapseRouteSubsystem.lo:  \
+	services/synapse/route/$(am__dirstamp) \
+	services/synapse/route/$(DEPDIR)/$(am__dirstamp)
 services/stimulus/$(am__dirstamp):
 	@$(MKDIR_P) services/stimulus
 	@: > services/stimulus/$(am__dirstamp)
 services/stimulus/$(DEPDIR)/$(am__dirstamp):
 	@$(MKDIR_P) services/stimulus/$(DEPDIR)
 	@: > services/stimulus/$(DEPDIR)/$(am__dirstamp)
-services/stimulus/StepActivationSubsystem.lo: services/stimulus/$(am__dirstamp) \
+services/stimulus/StepActivationSubsystem.lo:  \
+	services/stimulus/$(am__dirstamp) \
 	services/stimulus/$(DEPDIR)/$(am__dirstamp)
-services/AccumulatorOps.lo: services/$(am__dirstamp) \
-	services/$(DEPDIR)/$(am__dirstamp)
-services/GasEdgeCollector.lo: services/$(am__dirstamp) \
-	services/$(DEPDIR)/$(am__dirstamp)
-services/GasPhaseController.lo: services/$(am__dirstamp) \
-	services/$(DEPDIR)/$(am__dirstamp)
-services/OptimizedInternalRing.lo: services/$(am__dirstamp) \
-	services/$(DEPDIR)/$(am__dirstamp)
-services/SimpleNetworkWrapper.lo: services/$(am__dirstamp) \
-	services/$(DEPDIR)/$(am__dirstamp)
-services/SnnBcsrWeightManager.lo: services/$(am__dirstamp) \
-	services/$(DEPDIR)/$(am__dirstamp)
-services/SnnNetworkAdapter.lo: services/$(am__dirstamp) \
-	services/$(DEPDIR)/$(am__dirstamp)
-services/SnnRouteProvider.lo: services/$(am__dirstamp) \
-	services/$(DEPDIR)/$(am__dirstamp)
-services/WeightAccessor.lo: services/$(am__dirstamp) \
-	services/$(DEPDIR)/$(am__dirstamp)
-services/WeightCacheOps.lo: services/$(am__dirstamp) \
-	services/$(DEPDIR)/$(am__dirstamp)
+services/noc/NocSubsystem.lo: services/noc/$(am__dirstamp) \
+	services/noc/$(DEPDIR)/$(am__dirstamp)
+services/synapse/weights/WeightAccessor.lo:  \
+	services/synapse/weights/$(am__dirstamp) \
+	services/synapse/weights/$(DEPDIR)/$(am__dirstamp)
+services/synapse/weights/WeightCacheOps.lo:  \
+	services/synapse/weights/$(am__dirstamp) \
+	services/synapse/weights/$(DEPDIR)/$(am__dirstamp)
+services/synapse/weights/WeightMemorySubsystem.lo:  \
+	services/synapse/weights/$(am__dirstamp) \
+	services/synapse/weights/$(DEPDIR)/$(am__dirstamp)
+services/synapse/route/SpikeCommSubsystem.lo:  \
+	services/synapse/route/$(am__dirstamp) \
+	services/synapse/route/$(DEPDIR)/$(am__dirstamp)
+services/synapse/route/SpikePacketBridge.lo:  \
+	services/synapse/route/$(am__dirstamp) \
+	services/synapse/route/$(DEPDIR)/$(am__dirstamp)
+services/memory/$(am__dirstamp):
+	@$(MKDIR_P) services/memory
+	@: > services/memory/$(am__dirstamp)
+services/memory/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) services/memory/$(DEPDIR)
+	@: > services/memory/$(DEPDIR)/$(am__dirstamp)
+services/memory/StandardMemAccess.lo: services/memory/$(am__dirstamp) \
+	services/memory/$(DEPDIR)/$(am__dirstamp)
 
 libSnnDL.la: $(libSnnDL_la_OBJECTS) $(libSnnDL_la_DEPENDENCIES) $(EXTRA_libSnnDL_la_DEPENDENCIES) 
 	$(AM_V_CXXLD)$(libSnnDL_la_LINK) -rpath $(compdir) $(libSnnDL_la_OBJECTS) $(libSnnDL_la_LIBADD) $(LIBS)
@@ -893,16 +985,28 @@ mostlyclean-compile:
 	-rm -f components/*.lo
 	-rm -f components/mpi/*.$(OBJEXT)
 	-rm -f components/mpi/*.lo
+	-rm -f components/noc/*.$(OBJEXT)
+	-rm -f components/noc/*.lo
+	-rm -f components/stimulus/*.$(OBJEXT)
+	-rm -f components/stimulus/*.lo
 	-rm -f compute/*.$(OBJEXT)
 	-rm -f compute/*.lo
 	-rm -f control/*.$(OBJEXT)
 	-rm -f control/*.lo
 	-rm -f events/*.$(OBJEXT)
 	-rm -f events/*.lo
-	-rm -f services/*.$(OBJEXT)
-	-rm -f services/*.lo
+	-rm -f services/memory/*.$(OBJEXT)
+	-rm -f services/memory/*.lo
+	-rm -f services/noc/*.$(OBJEXT)
+	-rm -f services/noc/*.lo
 	-rm -f services/stimulus/*.$(OBJEXT)
 	-rm -f services/stimulus/*.lo
+	-rm -f services/synapse/gas/*.$(OBJEXT)
+	-rm -f services/synapse/gas/*.lo
+	-rm -f services/synapse/route/*.$(OBJEXT)
+	-rm -f services/synapse/route/*.lo
+	-rm -f services/synapse/weights/*.$(OBJEXT)
+	-rm -f services/synapse/weights/*.lo
 
 distclean-compile:
 	-rm -f *.tab.c
@@ -913,14 +1017,16 @@ include components/$(DEPDIR)/MemKCalBench.Plo # am--include-marker
 include components/$(DEPDIR)/MultiCorePE.Plo # am--include-marker
 include components/$(DEPDIR)/SnnNIC.Plo # am--include-marker
 include components/$(DEPDIR)/SnnPE.Plo # am--include-marker
-include components/stimulus/$(DEPDIR)/SpikeSource.Plo # am--include-marker
+include components/gas/$(DEPDIR)/GlobalGasStepController.Plo # am--include-marker
 include components/$(DEPDIR)/WeightLoader.Plo # am--include-marker
 include components/mpi/$(DEPDIR)/MPIMultiCorePE.Plo # am--include-marker
 include components/mpi/$(DEPDIR)/MPITypes.Plo # am--include-marker
+include components/noc/$(DEPDIR)/SimpleNetworkWrapper.Plo # am--include-marker
+include components/noc/$(DEPDIR)/SnnNetworkAdapter.Plo # am--include-marker
+include components/stimulus/$(DEPDIR)/SpikeSource.Plo # am--include-marker
 include compute/$(DEPDIR)/SnnComputeCore.Plo # am--include-marker
 include compute/$(DEPDIR)/SnnCoreEngine.Plo # am--include-marker
 include compute/$(DEPDIR)/SnnLearningCore.Plo # am--include-marker
-include services/synapse/weights/$(DEPDIR)/SnnWeightDiagnostics.Plo # am--include-marker
 include control/$(DEPDIR)/SnnPEApplyScatter.Plo # am--include-marker
 include control/$(DEPDIR)/SnnPEOrchestrators.Plo # am--include-marker
 include control/$(DEPDIR)/SnnPESubComponent.Plo # am--include-marker
@@ -932,24 +1038,24 @@ include control/$(DEPDIR)/SnnPESubComponent_spike.Plo # am--include-marker
 include control/$(DEPDIR)/StageEventHub.Plo # am--include-marker
 include events/$(DEPDIR)/SimpleTestEvent.Plo # am--include-marker
 include events/$(DEPDIR)/SpikeEventWrapper.Plo # am--include-marker
+include services/memory/$(DEPDIR)/StandardMemAccess.Plo # am--include-marker
+include services/noc/$(DEPDIR)/NocSubsystem.Plo # am--include-marker
+include services/noc/$(DEPDIR)/OptimizedInternalRing.Plo # am--include-marker
+include services/stimulus/$(DEPDIR)/StepActivationSubsystem.Plo # am--include-marker
 include services/synapse/gas/$(DEPDIR)/AccumulatorOps.Plo # am--include-marker
 include services/synapse/gas/$(DEPDIR)/GasEdgeCollector.Plo # am--include-marker
 include services/synapse/gas/$(DEPDIR)/GasPhaseController.Plo # am--include-marker
-include services/noc/$(DEPDIR)/OptimizedInternalRing.Plo # am--include-marker
-include components/noc/$(DEPDIR)/SimpleNetworkWrapper.Plo # am--include-marker
-include services/synapse/weights/$(DEPDIR)/SnnBcsrWeightManager.Plo # am--include-marker
-include components/noc/$(DEPDIR)/SnnNetworkAdapter.Plo # am--include-marker
-include services/noc/$(DEPDIR)/NocSubsystem.Plo # am--include-marker
-include services/synapse/route/$(DEPDIR)/SnnRouteProvider.Plo # am--include-marker
 include services/synapse/route/$(DEPDIR)/BcsrRouteBuilder.Plo # am--include-marker
+include services/synapse/route/$(DEPDIR)/SnnRouteProvider.Plo # am--include-marker
+include services/synapse/route/$(DEPDIR)/SpikeCommSubsystem.Plo # am--include-marker
+include services/synapse/route/$(DEPDIR)/SpikePacketBridge.Plo # am--include-marker
 include services/synapse/route/$(DEPDIR)/StepBcsrReachability.Plo # am--include-marker
 include services/synapse/route/$(DEPDIR)/SynapseRouteSubsystem.Plo # am--include-marker
+include services/synapse/weights/$(DEPDIR)/SnnBcsrWeightManager.Plo # am--include-marker
+include services/synapse/weights/$(DEPDIR)/SnnWeightDiagnostics.Plo # am--include-marker
 include services/synapse/weights/$(DEPDIR)/WeightAccessor.Plo # am--include-marker
 include services/synapse/weights/$(DEPDIR)/WeightCacheOps.Plo # am--include-marker
 include services/synapse/weights/$(DEPDIR)/WeightMemorySubsystem.Plo # am--include-marker
-include services/memory/$(DEPDIR)/StandardMemAccess.Plo # am--include-marker
-include services/synapse/route/$(DEPDIR)/SpikeCommSubsystem.Plo # am--include-marker
-include services/stimulus/$(DEPDIR)/StepActivationSubsystem.Plo # am--include-marker
 
 $(am__depfiles_remade):
 	@$(MKDIR_P) $(@D)
@@ -958,7 +1064,7 @@ $(am__depfiles_remade):
 am--depfiles: $(am__depfiles_remade)
 
 .cc.o:
-	$(AM_V_CXX)depbase=`echo $@ | sed 's|[^/]*$$|$(DEPDIR)/&|;s|\.o$$||'`; $(MKDIR_P) $(@D)/$(DEPDIR);\
+	$(AM_V_CXX)depbase=`echo $@ | sed 's|[^/]*$$|$(DEPDIR)/&|;s|\.o$$||'`;\
 	$(CXXCOMPILE) -MT $@ -MD -MP -MF $$depbase.Tpo -c -o $@ $< &&\
 	$(am__mv) $$depbase.Tpo $$depbase.Po
 #	$(AM_V_CXX)source='$<' object='$@' libtool=no \
@@ -974,7 +1080,7 @@ am--depfiles: $(am__depfiles_remade)
 #	$(AM_V_CXX_no)$(CXXCOMPILE) -c -o $@ `$(CYGPATH_W) '$<'`
 
 .cc.lo:
-	$(AM_V_CXX)depbase=`echo $@ | sed 's|[^/]*$$|$(DEPDIR)/&|;s|\.lo$$||'`; $(MKDIR_P) $(@D)/$(DEPDIR);\
+	$(AM_V_CXX)depbase=`echo $@ | sed 's|[^/]*$$|$(DEPDIR)/&|;s|\.lo$$||'`;\
 	$(LTCXXCOMPILE) -MT $@ -MD -MP -MF $$depbase.Tpo -c -o $@ $< &&\
 	$(am__mv) $$depbase.Tpo $$depbase.Plo
 #	$(AM_V_CXX)source='$<' object='$@' libtool=yes \
@@ -988,10 +1094,17 @@ clean-libtool:
 	-rm -rf .libs _libs
 	-rm -rf components/.libs components/_libs
 	-rm -rf components/mpi/.libs components/mpi/_libs
+	-rm -rf components/noc/.libs components/noc/_libs
+	-rm -rf components/stimulus/.libs components/stimulus/_libs
 	-rm -rf compute/.libs compute/_libs
 	-rm -rf control/.libs control/_libs
 	-rm -rf events/.libs events/_libs
-	-rm -rf services/.libs services/_libs
+	-rm -rf services/memory/.libs services/memory/_libs
+	-rm -rf services/noc/.libs services/noc/_libs
+	-rm -rf services/stimulus/.libs services/stimulus/_libs
+	-rm -rf services/synapse/gas/.libs services/synapse/gas/_libs
+	-rm -rf services/synapse/route/.libs services/synapse/route/_libs
+	-rm -rf services/synapse/weights/.libs services/synapse/weights/_libs
 snippets-local: 
 
 ID: $(am__tagged_files)
@@ -1115,16 +1228,28 @@ distclean-generic:
 	-rm -f components/$(am__dirstamp)
 	-rm -f components/mpi/$(DEPDIR)/$(am__dirstamp)
 	-rm -f components/mpi/$(am__dirstamp)
+	-rm -f components/noc/$(DEPDIR)/$(am__dirstamp)
+	-rm -f components/noc/$(am__dirstamp)
+	-rm -f components/stimulus/$(DEPDIR)/$(am__dirstamp)
+	-rm -f components/stimulus/$(am__dirstamp)
 	-rm -f compute/$(DEPDIR)/$(am__dirstamp)
 	-rm -f compute/$(am__dirstamp)
 	-rm -f control/$(DEPDIR)/$(am__dirstamp)
 	-rm -f control/$(am__dirstamp)
 	-rm -f events/$(DEPDIR)/$(am__dirstamp)
 	-rm -f events/$(am__dirstamp)
-	-rm -f services/$(DEPDIR)/$(am__dirstamp)
-	-rm -f services/$(am__dirstamp)
+	-rm -f services/memory/$(DEPDIR)/$(am__dirstamp)
+	-rm -f services/memory/$(am__dirstamp)
+	-rm -f services/noc/$(DEPDIR)/$(am__dirstamp)
+	-rm -f services/noc/$(am__dirstamp)
 	-rm -f services/stimulus/$(DEPDIR)/$(am__dirstamp)
 	-rm -f services/stimulus/$(am__dirstamp)
+	-rm -f services/synapse/gas/$(DEPDIR)/$(am__dirstamp)
+	-rm -f services/synapse/gas/$(am__dirstamp)
+	-rm -f services/synapse/route/$(DEPDIR)/$(am__dirstamp)
+	-rm -f services/synapse/route/$(am__dirstamp)
+	-rm -f services/synapse/weights/$(DEPDIR)/$(am__dirstamp)
+	-rm -f services/synapse/weights/$(am__dirstamp)
 
 maintainer-clean-generic:
 	@echo "This command is intended for maintainers to use"
@@ -1141,14 +1266,15 @@ distclean: distclean-am
 	-rm -f components/$(DEPDIR)/MultiCorePE.Plo
 	-rm -f components/$(DEPDIR)/SnnNIC.Plo
 	-rm -f components/$(DEPDIR)/SnnPE.Plo
-	-rm -f components/stimulus/$(DEPDIR)/SpikeSource.Plo
 	-rm -f components/$(DEPDIR)/WeightLoader.Plo
 	-rm -f components/mpi/$(DEPDIR)/MPIMultiCorePE.Plo
 	-rm -f components/mpi/$(DEPDIR)/MPITypes.Plo
+	-rm -f components/noc/$(DEPDIR)/SimpleNetworkWrapper.Plo
+	-rm -f components/noc/$(DEPDIR)/SnnNetworkAdapter.Plo
+	-rm -f components/stimulus/$(DEPDIR)/SpikeSource.Plo
 	-rm -f compute/$(DEPDIR)/SnnComputeCore.Plo
 	-rm -f compute/$(DEPDIR)/SnnCoreEngine.Plo
 	-rm -f compute/$(DEPDIR)/SnnLearningCore.Plo
-	-rm -f services/synapse/weights/$(DEPDIR)/SnnWeightDiagnostics.Plo
 	-rm -f control/$(DEPDIR)/SnnPEApplyScatter.Plo
 	-rm -f control/$(DEPDIR)/SnnPEOrchestrators.Plo
 	-rm -f control/$(DEPDIR)/SnnPESubComponent.Plo
@@ -1160,23 +1286,24 @@ distclean: distclean-am
 	-rm -f control/$(DEPDIR)/StageEventHub.Plo
 	-rm -f events/$(DEPDIR)/SimpleTestEvent.Plo
 	-rm -f events/$(DEPDIR)/SpikeEventWrapper.Plo
+	-rm -f services/memory/$(DEPDIR)/StandardMemAccess.Plo
+	-rm -f services/noc/$(DEPDIR)/NocSubsystem.Plo
+	-rm -f services/noc/$(DEPDIR)/OptimizedInternalRing.Plo
+	-rm -f services/stimulus/$(DEPDIR)/StepActivationSubsystem.Plo
 	-rm -f services/synapse/gas/$(DEPDIR)/AccumulatorOps.Plo
 	-rm -f services/synapse/gas/$(DEPDIR)/GasEdgeCollector.Plo
 	-rm -f services/synapse/gas/$(DEPDIR)/GasPhaseController.Plo
-	-rm -f services/noc/$(DEPDIR)/OptimizedInternalRing.Plo
-	-rm -f services/noc/$(DEPDIR)/SimpleNetworkWrapper.Plo
-	-rm -f services/synapse/weights/$(DEPDIR)/SnnBcsrWeightManager.Plo
-	-rm -f services/noc/$(DEPDIR)/SnnNetworkAdapter.Plo
-	-rm -f services/noc/$(DEPDIR)/NocSubsystem.Plo
-	-rm -f services/synapse/route/$(DEPDIR)/SnnRouteProvider.Plo
 	-rm -f services/synapse/route/$(DEPDIR)/BcsrRouteBuilder.Plo
+	-rm -f services/synapse/route/$(DEPDIR)/SnnRouteProvider.Plo
+	-rm -f services/synapse/route/$(DEPDIR)/SpikeCommSubsystem.Plo
+	-rm -f services/synapse/route/$(DEPDIR)/SpikePacketBridge.Plo
 	-rm -f services/synapse/route/$(DEPDIR)/StepBcsrReachability.Plo
 	-rm -f services/synapse/route/$(DEPDIR)/SynapseRouteSubsystem.Plo
-	-rm -f services/synapse/route/$(DEPDIR)/SpikeCommSubsystem.Plo
+	-rm -f services/synapse/weights/$(DEPDIR)/SnnBcsrWeightManager.Plo
+	-rm -f services/synapse/weights/$(DEPDIR)/SnnWeightDiagnostics.Plo
 	-rm -f services/synapse/weights/$(DEPDIR)/WeightAccessor.Plo
 	-rm -f services/synapse/weights/$(DEPDIR)/WeightCacheOps.Plo
 	-rm -f services/synapse/weights/$(DEPDIR)/WeightMemorySubsystem.Plo
-	-rm -f services/memory/$(DEPDIR)/StandardMemAccess.Plo
 	-rm -f Makefile
 distclean-am: clean-am distclean-compile distclean-generic \
 	distclean-tags
@@ -1228,14 +1355,15 @@ maintainer-clean: maintainer-clean-am
 	-rm -f components/$(DEPDIR)/MultiCorePE.Plo
 	-rm -f components/$(DEPDIR)/SnnNIC.Plo
 	-rm -f components/$(DEPDIR)/SnnPE.Plo
-	-rm -f components/stimulus/$(DEPDIR)/SpikeSource.Plo
 	-rm -f components/$(DEPDIR)/WeightLoader.Plo
 	-rm -f components/mpi/$(DEPDIR)/MPIMultiCorePE.Plo
 	-rm -f components/mpi/$(DEPDIR)/MPITypes.Plo
+	-rm -f components/noc/$(DEPDIR)/SimpleNetworkWrapper.Plo
+	-rm -f components/noc/$(DEPDIR)/SnnNetworkAdapter.Plo
+	-rm -f components/stimulus/$(DEPDIR)/SpikeSource.Plo
 	-rm -f compute/$(DEPDIR)/SnnComputeCore.Plo
 	-rm -f compute/$(DEPDIR)/SnnCoreEngine.Plo
 	-rm -f compute/$(DEPDIR)/SnnLearningCore.Plo
-	-rm -f services/synapse/weights/$(DEPDIR)/SnnWeightDiagnostics.Plo
 	-rm -f control/$(DEPDIR)/SnnPEApplyScatter.Plo
 	-rm -f control/$(DEPDIR)/SnnPEOrchestrators.Plo
 	-rm -f control/$(DEPDIR)/SnnPESubComponent.Plo
@@ -1247,23 +1375,24 @@ maintainer-clean: maintainer-clean-am
 	-rm -f control/$(DEPDIR)/StageEventHub.Plo
 	-rm -f events/$(DEPDIR)/SimpleTestEvent.Plo
 	-rm -f events/$(DEPDIR)/SpikeEventWrapper.Plo
+	-rm -f services/memory/$(DEPDIR)/StandardMemAccess.Plo
+	-rm -f services/noc/$(DEPDIR)/NocSubsystem.Plo
+	-rm -f services/noc/$(DEPDIR)/OptimizedInternalRing.Plo
+	-rm -f services/stimulus/$(DEPDIR)/StepActivationSubsystem.Plo
 	-rm -f services/synapse/gas/$(DEPDIR)/AccumulatorOps.Plo
 	-rm -f services/synapse/gas/$(DEPDIR)/GasEdgeCollector.Plo
 	-rm -f services/synapse/gas/$(DEPDIR)/GasPhaseController.Plo
-	-rm -f services/noc/$(DEPDIR)/OptimizedInternalRing.Plo
-	-rm -f services/noc/$(DEPDIR)/SimpleNetworkWrapper.Plo
-	-rm -f services/synapse/weights/$(DEPDIR)/SnnBcsrWeightManager.Plo
-	-rm -f services/noc/$(DEPDIR)/SnnNetworkAdapter.Plo
-	-rm -f services/noc/$(DEPDIR)/NocSubsystem.Plo
-	-rm -f services/synapse/route/$(DEPDIR)/SnnRouteProvider.Plo
 	-rm -f services/synapse/route/$(DEPDIR)/BcsrRouteBuilder.Plo
+	-rm -f services/synapse/route/$(DEPDIR)/SnnRouteProvider.Plo
+	-rm -f services/synapse/route/$(DEPDIR)/SpikeCommSubsystem.Plo
+	-rm -f services/synapse/route/$(DEPDIR)/SpikePacketBridge.Plo
 	-rm -f services/synapse/route/$(DEPDIR)/StepBcsrReachability.Plo
 	-rm -f services/synapse/route/$(DEPDIR)/SynapseRouteSubsystem.Plo
-	-rm -f services/synapse/route/$(DEPDIR)/SpikeCommSubsystem.Plo
+	-rm -f services/synapse/weights/$(DEPDIR)/SnnBcsrWeightManager.Plo
+	-rm -f services/synapse/weights/$(DEPDIR)/SnnWeightDiagnostics.Plo
 	-rm -f services/synapse/weights/$(DEPDIR)/WeightAccessor.Plo
 	-rm -f services/synapse/weights/$(DEPDIR)/WeightCacheOps.Plo
 	-rm -f services/synapse/weights/$(DEPDIR)/WeightMemorySubsystem.Plo
-	-rm -f services/memory/$(DEPDIR)/StandardMemAccess.Plo
 	-rm -f Makefile
 maintainer-clean-am: distclean-am maintainer-clean-generic
 

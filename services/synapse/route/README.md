@@ -32,7 +32,14 @@
   - `emitNeuronFire()`：compute core 报告 neuron_idx 后触发 fanout，并构造 `SpikeEvent` 逐条发送；
   - `applyGatingDecision()`：将 gating 决策转发给 Synapse/Route 子系统（缓存并生效）。
 - **说明**：
-  - `SpikeCommSubsystem` 通过 `api/ISpikeTransport` 发出事件；常见情况下该 transport 是 `api/NocSpikeTransport`（把 send 映射为 `INocTransport::sendFromCore`）。
+  - `SpikeCommSubsystem` 通过 `api/ISpikeTransport` 发出事件；常见情况下该 transport 是 `services/synapse/route/SpikePacketTransport`（把 SpikeEvent 编码为 packet 并映射为 `INocTransport::sendFromCore`）。
+
+### `SpikePacketBridge.{h,cc}`
+- **定位**：SpikeEvent ↔ NoC packet 的编解码与投递 glue（Phase3-C）。
+- **核心职责**：
+  - 将 `NocPacketEvent` 解码为 `SpikeEvent` 并递送到目标 core（对接 `NocSubsystem::deliver_to_endpoint` 回调）；
+  - 将 `SpikeEvent` 编码为 `NocPacketEvent` 并通过 `api/INocTransport` 发出（供 MultiCorePE/Stimulus 等装配使用）。
+- **边界收益**：`components/MultiCorePE.*` 不直接调用 `SpikeNocCodec`，只做装配与时钟调度。
 
 ---
 

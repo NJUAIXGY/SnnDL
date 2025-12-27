@@ -17,28 +17,13 @@
 
 #include <sst/core/output.h>
 
+#include "synapse/common/BcsrMeta.h"
+
 namespace SST { namespace SnnDL {
 
 namespace {
 
 constexpr uint32_t kBcsrSentinelId = 0xFFFFFFFFu;
-
-bool extractUnsigned_(const std::string& text, const char* key, uint64_t& value) {
-    auto pos = text.find(key);
-    if (pos == std::string::npos) return false;
-    pos = text.find(':', pos);
-    if (pos == std::string::npos) return false;
-    ++pos;
-    while (pos < text.size() && (std::isspace(static_cast<unsigned char>(text[pos])) || text[pos] == '"')) ++pos;
-    size_t end = pos;
-    while (end < text.size() &&
-           (std::isdigit(static_cast<unsigned char>(text[end])) || text[end] == 'x' || text[end] == 'X')) {
-        ++end;
-    }
-    if (end <= pos) return false;
-    value = std::strtoull(text.substr(pos, end - pos).c_str(), nullptr, 0);
-    return true;
-}
 
 } // namespace
 
@@ -49,23 +34,20 @@ bool parseBcsrMetaJson(const std::string& meta_path,
                        uint64_t& rowptr_off_out, uint64_t& colidx_off_out,
                        uint64_t& blockdata_off_out, uint64_t& blockids_off_out,
                        uint32_t& total_blocks_out) {
-    std::ifstream meta(meta_path);
-    if (!meta.good()) return false;
-    std::string text((std::istreambuf_iterator<char>(meta)), std::istreambuf_iterator<char>());
-    uint64_t value = 0;
-    bool ok = false;
-    if (extractUnsigned_(text, "\"rows\"", value)) { rows_out = static_cast<uint32_t>(value); ok = true; }
-    if (extractUnsigned_(text, "\"cols\"", value)) { cols_out = static_cast<uint32_t>(value); ok = true; }
-    if (extractUnsigned_(text, "\"br\"", value)) { br_out = static_cast<uint32_t>(value); ok = true; }
-    if (extractUnsigned_(text, "\"bc\"", value)) { bc_out = static_cast<uint32_t>(value); ok = true; }
-    if (extractUnsigned_(text, "\"idx_bytes\"", value)) { idx_bytes_out = static_cast<uint32_t>(value); ok = true; }
-    if (extractUnsigned_(text, "\"val_bytes\"", value)) { val_bytes_out = static_cast<uint32_t>(value); ok = true; }
-    if (extractUnsigned_(text, "\"rowptr_offset\"", value)) { rowptr_off_out = value; ok = true; }
-    if (extractUnsigned_(text, "\"colidx_offset\"", value)) { colidx_off_out = value; ok = true; }
-    if (extractUnsigned_(text, "\"blockdata_offset\"", value)) { blockdata_off_out = value; ok = true; }
-    if (extractUnsigned_(text, "\"blockids_offset\"", value)) { blockids_off_out = value; ok = true; }
-    if (extractUnsigned_(text, "\"total_blocks\"", value)) { total_blocks_out = static_cast<uint32_t>(value); ok = true; }
-    return ok;
+    BcsrMeta meta{};
+    if (!parseBcsrMetaJsonFile(meta_path, meta)) return false;
+    rows_out = meta.rows;
+    cols_out = meta.cols;
+    br_out = meta.br;
+    bc_out = meta.bc;
+    idx_bytes_out = meta.idx_bytes;
+    val_bytes_out = meta.val_bytes;
+    rowptr_off_out = meta.rowptr_offset;
+    colidx_off_out = meta.colidx_offset;
+    blockdata_off_out = meta.blockdata_offset;
+    blockids_off_out = meta.blockids_offset;
+    total_blocks_out = meta.total_blocks;
+    return true;
 }
 
 std::string resolveBcsrTemplate(const std::string& tmpl, uint32_t pe, int core) {
@@ -114,16 +96,33 @@ bool appendRoutesFromBcsrFile(const SynapseRouteBuildConfig& cfg,
     uint64_t blockdata_off = (cfg.bcsr_blockdata_addr > cfg.base_addr) ? (cfg.bcsr_blockdata_addr - cfg.base_addr) : 0;
     uint64_t blockids_off = (cfg.bcsr_blockids_addr > cfg.base_addr) ? (cfg.bcsr_blockids_addr - cfg.base_addr) : 0;
     uint32_t total_blocks = 0;
-    uint32_t meta_cols = cols;
+
+    // Phase5‑5.3：BCSR meta 口径仅用于“补齐缺省值”，不得无条件覆盖 cfg 下发的 offsets，
+    // 避免 Step reachability 与 WeightMemorySubsystem 产生 drift。
     const std::string meta_path = path + ".meta.json";
-    if (parseBcsrMetaJson(meta_path, rows, meta_cols, br, bc, idx_bytes, val_bytes,
-                          rowptr_off, colidx_off, blockdata_off, blockids_off, total_blocks)) {
-        if (meta_cols > 0) cols = meta_cols;
+    BcsrMeta meta{};
+    if (parseBcsrMetaJsonFile(meta_path, meta)) {
+        if (rows == 0 && meta.rows) rows = meta.rows;
+        if (cols == 0 && meta.cols) cols = meta.cols;
+        if (!cfg.bcsr_br && meta.br) br = meta.br;
+        if (!cfg.bcsr_bc && meta.bc) bc = meta.bc;
+        if (!cfg.bcsr_idx_bytes && meta.idx_bytes) idx_bytes = meta.idx_bytes;
+        if (!cfg.bcsr_val_bytes && meta.val_bytes) val_bytes = meta.val_bytes;
+
+        if (rowptr_off == 0) rowptr_off = meta.rowptr_offset;
+        if (colidx_off == 0) colidx_off = meta.colidx_offset;
+        if (blockdata_off == 0) blockdata_off = meta.blockdata_offset;
+        if (blockids_off == 0) blockids_off = meta.blockids_offset;
+        if (total_blocks == 0 && meta.total_blocks) total_blocks = meta.total_blocks;
     } else {
         total_blocks = 0;
     }
     if (rows == 0 || cols == 0) {
         if (out) out->verbose(CALL_INFO, 0, 0, "⚠️ BCSR路由: 元数据缺失 rows/cols %s\n", path.c_str());
+        return false;
+    }
+    if (idx_bytes != 2 && idx_bytes != 4) {
+        if (out) out->verbose(CALL_INFO, 0, 0, "⚠️ BCSR路由: idx_bytes=%u 不受支持 %s\n", idx_bytes, path.c_str());
         return false;
     }
     if (val_bytes != 4) {
@@ -141,6 +140,49 @@ bool appendRoutesFromBcsrFile(const SynapseRouteBuildConfig& cfg,
     if (!fin.good()) {
         if (out) out->verbose(CALL_INFO, 0, 0, "⚠️ BCSR路由: 无法读取 %s\n", path.c_str());
         return false;
+    }
+    // 读取前做一次 offsets/size 校验，尽早发现 meta 漂移/文件不匹配（避免静默构建空 routes）
+    fin.seekg(0, std::ios::end);
+    const std::streamoff file_size_off = fin.tellg();
+    fin.clear();
+    fin.seekg(0, std::ios::beg);
+    const uint64_t file_size = (file_size_off > 0) ? static_cast<uint64_t>(file_size_off) : 0ULL;
+    if (file_size == 0) {
+        if (out) out->verbose(CALL_INFO, 0, 0, "⚠️ BCSR路由: 文件尺寸异常 %s\n", path.c_str());
+        return false;
+    }
+    // blockids 仅作为“有效位/哨兵”使用：若文件不包含完整 blockids 区域，则将其视为 absent。
+    if (blockids_off > 0 && total_blocks > 0) {
+        const uint64_t need_blockids =
+            static_cast<uint64_t>(total_blocks) * static_cast<uint64_t>(br) * static_cast<uint64_t>(bc) * sizeof(uint32_t);
+        if (blockids_off + need_blockids > file_size) {
+            if (out) out->verbose(CALL_INFO, 1, 0,
+                                  "⚠️ BCSR路由: blockids区间超出文件，视为 absent: off=0x%llx need=%llu fsize=%llu path=%s\n",
+                                  (unsigned long long)blockids_off,
+                                  (unsigned long long)need_blockids,
+                                  (unsigned long long)file_size,
+                                  path.c_str());
+            blockids_off = 0;
+        }
+    }
+    {
+        BcsrMeta meta_for_check{};
+        meta_for_check.br = br;
+        meta_for_check.bc = bc;
+        meta_for_check.idx_bytes = idx_bytes;
+        meta_for_check.val_bytes = val_bytes;
+        meta_for_check.rowptr_offset = rowptr_off;
+        meta_for_check.colidx_offset = colidx_off;
+        meta_for_check.blockdata_offset = blockdata_off;
+        meta_for_check.blockids_offset = blockids_off;
+        meta_for_check.total_blocks = total_blocks;
+        std::string err;
+        if (!validateBcsrMetaAgainstFile(meta_for_check, file_size, rows, &err)) {
+            if (out) out->verbose(CALL_INFO, 0, 0,
+                                  "⚠️ BCSR路由: offsets/size mismatch (%s) path=%s fsize=%llu\n",
+                                  err.c_str(), path.c_str(), (unsigned long long)file_size);
+            return false;
+        }
     }
     fin.seekg(static_cast<std::streamoff>(rowptr_off), std::ios::beg);
     std::vector<uint32_t> rowptr(n_block_rows + 1, 0);
