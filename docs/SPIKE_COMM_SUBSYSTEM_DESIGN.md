@@ -116,7 +116,7 @@ private:
 
 ### 7.2 SpikeCommSubsystem（通信子系统）
 
-文件：`services/SpikeCommSubsystem.{h,cc}`（已实现）
+文件：`services/synapse/route/SpikeCommSubsystem.{h,cc}`（已实现）
 
 职责：
 - 接收控制层的“发放事件”（当前为 `FireEvent` 或 `(neuron_idx, source_global)`）
@@ -171,7 +171,7 @@ Phase B‑1（传输层抽象，无行为变化）：
 2. `SnnPESubComponent::handleNeuronFire_()` 替换为 `spike_comm_.emitNeuronFire()`。
 
 Phase D/Phase2（通信闭环 + 路由下沉）：
-1. 路由构建/共享缓存迁入 `services/SynapseRouteSubsystem`；门控缓存仍在 `services/SpikeCommSubsystem`；
+1. 路由构建/共享缓存迁入 `services/synapse/route/SynapseRouteSubsystem`；门控缓存仍在 `services/synapse/route/SpikeCommSubsystem`；
 2. 控制层仅负责配置与生命周期编排，不再持有路由表与缓存。
 
 Phase B‑2（可选增强，不影响语义）：

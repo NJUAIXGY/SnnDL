@@ -25,11 +25,20 @@
   - `invocations / pre_selected / spike_attempts / spikes_injected`；
   - `route_hits / route_misses`（当启用 BCSR reachability 路由采样时）。
 
+### `ExternalSpikeInputSubsystem.{h,cc}`
+- **定位**：外部端口 `external_spike_input` 的 SpikeEvent 直注入子系统（兼容 legacy 语义）。
+- **语义冻结（必须）**：
+  - 仅本地投递到目标 core；**不做 relay/forward**；
+  - 若 `dst_node != this.node_id` 或 `dst_neuron` 非本 PE 范围：直接丢弃。
+- **运行时绑定**（`Runtime`）：
+  - `deliver_to_core`：由 `MultiCorePE` 注入的本地投递回调（接管 spike 生命周期）。
+
 ---
 
 ## 与其他域的交互
 
 - **NoC 域**：通过 `INocTransport` 完成本地投递与外发（Stimulus 不直接操作 NIC/ring）。
+- **ExternalSpikeInputSubsystem**：不依赖 NoC（外部端口直注入语义冻结为“仅本地投递”）。
 - **Route 域**：当前 Step 的 “BCSR reachability” 解析由 Stimulus 内部实现（仅影响 post 选择）；长期可考虑与 `services/synapse/route` 共享元信息以避免口径漂移。
 - **Control/Components**：
   - `MultiCorePE` 负责把阶段事件（BeginGather/EndScatter）与 tick 转发给 Stimulus；

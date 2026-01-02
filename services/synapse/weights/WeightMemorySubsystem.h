@@ -118,6 +118,10 @@ public:
         ensureWindowTracking(orch_.num_neurons);
     }
 
+    // Phase4-Task6.4: allow workload to rebind accumulator callback without rebuilding all orchestrator config.
+    // This is used when GAS/window orchestration moves into workload=snn and accumulator state is owned there.
+    void overrideAccUpdate(AccUpdateFn fn) { orch_.acc_update = std::move(fn); }
+
     // ===== Window counters (budget/outstanding) =====
     void configureWindow(uint32_t budget, uint32_t max_outstanding) {
         window_.budget = budget;

@@ -8,9 +8,12 @@
 #include <vector>
 #include <cstring>
 #include <algorithm>
+#include <cstdlib>
 #include <inttypes.h>
 #include <cctype>
 #include <iterator>
+
+#include "WorkloadConfig.h"
 
 using namespace SST;
 using namespace SST::SnnDL;
@@ -255,6 +258,25 @@ WeightLoader::WeightLoader(ComponentId_t id, Params& params)
         (unsigned long long)base_addr_start_, (unsigned long long)per_core_stride_,
         num_cores_, rows_per_core_, cols_per_core_, fill_value_, raw_mode_ ? 1 : 0, bcsr_enable_ ? 1 : 0);
 
+    // 通用 workload（例如 stream）下禁止 WeightLoader 写入任何权重数据，
+    // 否则会覆盖通用 workload 的内存测试区域并造成误判/误崩溃。
+    {
+        std::string workload_impl = params.find<std::string>("workload_impl", "");
+        if (workload_impl.empty()) {
+            if (const char* env = workloadImplFromEnvCached()) workload_impl = env;
+        }
+        if (!workload_impl.empty() && workload_impl != "snn") {
+            enabled_ = false;
+            loaded_ = true;
+            runtime_load_needed_ = false;
+            verify_readback_enable_ = false;
+            strict_loader_done_ = false;
+            output_->verbose(CALL_INFO, 0, 0,
+                "[WL-disabled] workload_impl=%s -> skip all weight writes\n",
+                workload_impl.c_str());
+        }
+    }
+
     if (!loader_done_key_.empty()) {
         loader_done_shared_.initialize(loader_done_key_, 1, 0);
         loader_done_shared_initialized_ = true;
@@ -298,6 +320,13 @@ void WeightLoader::init(unsigned int phase) {
     // 将init相位转发给StandardMem
     if (memory_) memory_->init(phase);
 
+    if (!enabled_) {
+        if (phase == 0) {
+            publishLoaderDone_();
+        }
+        return;
+    }
+
     if (phase == 0) {
         if (output_ && verbose_ >= 2) {
             output_->verbose(CALL_INFO, 1, 0,
@@ -335,6 +364,7 @@ void WeightLoader::setup() {
     if (memory_) {
         memory_->setup();
     }
+    if (!enabled_) return;
     // output_->verbose(CALL_INFO, 1, 0, "✅ WeightLoader setup完成\n");
     
     // 统一语义：权重必须在 init 阶段完成加载并发布 loader_done；
@@ -400,6 +430,10 @@ void WeightLoader::complete(unsigned int phase) {
 }
 void WeightLoader::handleMemoryResponse(SST::Interfaces::StandardMem::Request* req) {
     if (!req) return;
+    if (!enabled_) {
+        delete req;
+        return;
+    }
 
     // 运行期单点读回探针：打印 timed ReadResp 的首字节（对齐文件预期）
     if (diag_runtime_read_enable_ && diag_runtime_read_issued_ && req->getID() == diag_runtime_read_id_) {

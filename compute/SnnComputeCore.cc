@@ -16,7 +16,9 @@ std::unique_ptr<ISnnComputeCore> createComputeCoreByName(const std::string& name
 
 ComputeCoreCapabilities DefaultSnnComputeCore::getCapabilities() const {
     ComputeCoreCapabilities caps;
-    caps.needs_weight_cache = true;
+    // Phase5.4：权重/缓存语义从 ISnnComputeCore 迁出；默认 core 不再要求控制层实现 cache 接口。
+    // 权重读取通过 ComputeCoreContext.weight_reader 注入（由 synapse/weights 提供）。
+    caps.needs_weight_cache = false;
     caps.supports_gating = true;
     caps.requires_window_scatter = false;
     caps.supports_learning = (learning_core_ != nullptr);

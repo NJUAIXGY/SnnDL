@@ -21,7 +21,7 @@
   - `ReadResp` 的 `data.size()` 必须覆盖请求的 `bytes`，否则会触发 `[stdmem-access-assert]` 直接 fail-fast；这用于尽早暴露地址映射/对齐/截断问题。
 
 ### Legacy（已从 Memory 域移出）
-- `services/legacy/StandardMemBackend.*`：历史 pending 后端（含权重/BCSR 语义字段），仅保留作参考；主链路禁止依赖它。
+- `services/legacy/memory/StandardMemBackend.*`：历史 pending 后端（含权重/BCSR 语义字段），已在 Phase5.5 清理删除；主链路统一使用 `StandardMemAccess`。
 
 ---
 
@@ -29,7 +29,7 @@
 
 - `control/SnnPESubComponent` 在 `setup/init` 时装配：
   - 创建 `StandardMemAccess`（对外提供纯 `IMemoryAccess`）；
-  - 如需对照旧的 pending/meta 跟踪口径，请使用 `services/legacy/memory/StandardMemBackend.*`（主链路禁止依赖）。
+  - 旧的 pending/meta 参考实现（`services/legacy/memory/StandardMemBackend.*`）已删除；若需要对照口径，应以 `StandardMemAccess` 的 diag/断言式诊断为准。
 - `services/synapse/weights/WeightMemorySubsystem` 推荐只依赖 `api/IMemoryAccess`：
   - Memory 负责返回 bytes；
   - Weights 负责解释 bytes（例如 float 解码、rowptr/colidx/blockdata 解析）。

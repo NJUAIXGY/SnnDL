@@ -7,6 +7,7 @@
 #include <sst/core/sst_config.h>
 #include "SnnPESubComponent.h"
 #include "synapse/weights/WeightMemorySubsystem.h"
+#include "synapse/weights/SnnBcsrWeightManager.h"
 
 #include <fstream>
 #include <sstream>
@@ -231,15 +232,15 @@ void SnnPESubComponent::bcsrPopulateWeightCache_(uint32_t block_row, uint32_t bl
 }
 
 size_t SnnPESubComponent::expectedRowptrEntries_() const {
-    return bcsr_weights_.expectedRowptrEntries(num_neurons_);
+    return bcsr_weights_->expectedRowptrEntries(num_neurons_);
 }
 
 size_t SnnPESubComponent::expectedRowptrBytes_() const {
-    return bcsr_weights_.expectedRowptrBytes(num_neurons_);
+    return bcsr_weights_->expectedRowptrBytes(num_neurons_);
 }
 
 bool SnnPESubComponent::installRowptrFromBytes_(const uint8_t* data, size_t bytes, const char* source, bool count_stats) {
-    if (!bcsr_weights_.installRowptrFromBytes(data, bytes, num_neurons_)) {
+    if (!bcsr_weights_->installRowptrFromBytes(data, bytes, num_neurons_)) {
         SNNDL_DEBUG_LOG(0,
             "[diag-bcsr] core=%u rowptr install failed source=%s bytes=%zu expect=%zu\n",
             core_id_, source ? source : "-", bytes, expectedRowptrBytes_());
@@ -250,7 +251,7 @@ bool SnnPESubComponent::installRowptrFromBytes_(const uint8_t* data, size_t byte
         bcsr_bytes_idx_ += bytes;
     }
     if (window_read_debug_ && output_) {
-        const auto& rp = bcsr_weights_.rowptrHost();
+        const auto& rp = bcsr_weights_->rowptrHost();
         output_->verbose(CALL_INFO, 0, 0,
             "[diag-bcsr] core=%u rowptr ready entries=%zu first=%u second=%u\n",
             core_id_, rp.size(),

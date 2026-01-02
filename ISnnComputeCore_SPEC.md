@@ -301,7 +301,7 @@ virtual bool fire(uint32_t idx, uint64_t now_cycles, INeuronModel* model,
 
 4. GAS 阶段：
 
-   - StageEventHub 在 Begin/End 事件中调用相应 onStage*：
+   - 控制层在窗口阶段边界调用相应 onStage*（当前由 `SnnPESubComponent::Impl` 统一记录/触发）：
 
    ```c++
    compute_core_->onStageBeginGather(seq);

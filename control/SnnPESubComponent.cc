@@ -7,26 +7,37 @@
 
 #include <sst/core/sst_config.h>
 #include "SnnPESubComponent.h"
+#include "SnnPESubComponent_impl.h"
 #include <fstream>
 #include "synapse/gas/GasCustomCmd.h"
 #include "synapse/gas/GasPhaseController.h"
 #include "synapse/gas/AccumulatorOps.h"
-#include "StageEventHub.h"
 #include "IPeAggregation.h"
 #include "IManualWindowDrive.h"
 #include "IGasStepGate.h"
+#include "ISnnComputeCore.h"
+#include "synapse/stdmem/StdMemEndpoint.h"
+#include "synapse/weights/SnnBcsrWeightManager.h"
 #include "synapse/weights/WeightMemorySubsystem.h"
 #include "synapse/weights/WeightCacheOps.h"
 #include "synapse/weights/WeightAccessor.h"
-#include "memory/StandardMemAccess.h"
 #include "ISpikeTransport.h"
+#include "NocSpikeTransport.h"
+#include "NocPacketEvent.h"
+#include "IMemoryAccess.h"
+#include "CoreWorkloadFactory.h"
+#include "ISpikeWorkload.h"
+#include "ISnnSpikeCommWorkload.h"
 #include "synapse/route/SpikeCommSubsystem.h"
 #include "synapse/route/SynapseRouteSubsystem.h"
+#include "WorkloadConfig.h"
 
 #include <iostream>
 #include <cmath>
 #include <algorithm>
+#include <cctype>
 #include <cstring>
+#include <cstdlib>
 #include <cstdint>
 #include <unordered_map>
 #include <unordered_set>
@@ -56,8 +67,80 @@ using namespace SST::SnnDL;
 #define SNNDL_DEBUG_BLOCK(stmt) do {} while(0)
 #endif
 
+void SnnPESubComponent::reportStreamMemIssueThunk_(void* ctx, size_t bytes) {
+    auto* core = static_cast<SnnPESubComponent*>(ctx);
+    if (!core) return;
+    if (core->impl_) {
+        core->impl_->reportMemoryIssue(bytes, /*count_weight_read=*/false);
+    }
+}
+
 // === 静态共享路由缓存 / 阶段事件写入锁 ===
 std::mutex SnnPESubComponent::s_stage_csv_mutex_;
+
+// === Stage event hub (Phase5.2-A1): absorbed into Impl ===
+void SnnPESubComponent::Impl::markBeginGather(uint32_t seq) {
+    if (!core) return;
+    if (gas_ctrl_) gas_ctrl_->onBeginGather(seq);
+    if (core->use_bcsr_) {
+        core->logBcsrWindowStats_("prev");
+        core->resetBcsrWindowCounters_();
+    }
+    uint64_t now = core->getCurrentSimTimeNano();
+    core->appendStageEventRow_("BeginGather", now, 0);
+    t_begin_gather = now;
+    have_begin_gather = true;
+    have_begin_apply = false;
+    have_begin_scatter = false;
+    core->window_spikes_all_ = 0;
+}
+
+void SnnPESubComponent::Impl::markBeginApply(uint32_t seq) {
+    if (!core) return;
+    if (gas_ctrl_) gas_ctrl_->onBeginApply(seq);
+    uint64_t now = core->getCurrentSimTimeNano();
+    core->appendStageEventRow_("BeginApply", now, 0);
+    t_begin_apply = now;
+    have_begin_apply = true;
+}
+
+void SnnPESubComponent::Impl::markBeginScatter(uint32_t seq) {
+    if (!core) return;
+    if (gas_ctrl_) gas_ctrl_->onBeginScatter(seq);
+    uint64_t now = core->getCurrentSimTimeNano();
+    core->appendStageEventRow_("BeginScatter", now, 0);
+    t_begin_scatter = now;
+    have_begin_scatter = true;
+}
+
+void SnnPESubComponent::Impl::markEndScatter(uint32_t seq, uint64_t spikes_emitted) {
+    if (!core) return;
+    if (gas_ctrl_) gas_ctrl_->onEndScatter(seq, spikes_emitted);
+    uint64_t now = core->getCurrentSimTimeNano();
+    core->appendStageEventRow_("EndScatter", now, spikes_emitted);
+    reportWindowSpikes(static_cast<uint32_t>(seq), spikes_emitted);
+    core->spikes_emitted_window_ = 0;
+    core->window_spikes_all_ = 0;
+    if (core->stat_gas_superstep_total_cycles_) {
+        if (have_begin_gather) {
+            uint64_t total = (now >= t_begin_gather) ? (now - t_begin_gather) : 0ULL;
+            core->stat_gas_superstep_total_cycles_->addData(total);
+        }
+        if (have_begin_gather && have_begin_apply && core->stat_gas_superstep_gather_cycles_) {
+            uint64_t g = (t_begin_apply >= t_begin_gather) ? (t_begin_apply - t_begin_gather) : 0ULL;
+            core->stat_gas_superstep_gather_cycles_->addData(g);
+        }
+        if (have_begin_apply && core->stat_gas_superstep_apply_cycles_) {
+            uint64_t a = (t_begin_scatter >= t_begin_apply) ? (t_begin_scatter - t_begin_apply) : 0ULL;
+            core->stat_gas_superstep_apply_cycles_->addData(a);
+        }
+        if (have_begin_scatter && core->stat_gas_superstep_scatter_cycles_) {
+            uint64_t s = (now >= t_begin_scatter) ? (now - t_begin_scatter) : 0ULL;
+            core->stat_gas_superstep_scatter_cycles_->addData(s);
+        }
+    }
+    have_begin_gather = have_begin_apply = have_begin_scatter = false;
+}
 
 void SnnPESubComponent::appendStageEventRow_(const char* event_name, uint64_t now_ns, uint64_t spikes_emitted) {
     // 阶段事件上报（转发给 MultiCorePE 聚合落盘）：
@@ -167,6 +250,10 @@ bool SnnPESubComponent::ensureLoaderReady_() {
     return false;
 }
 
+bool SnnPESubComponent::ensureMemoryReady_() const {
+    return stdmem_ep_ && stdmem_ep_->available() && memory_ready_;
+}
+
 void SnnPESubComponent::issueEdgeWeightFetches_() {
     const size_t prev_edges = weight_mem_subsystem_ ? weight_mem_subsystem_->edgesPrevSize() : 0;
     if (window_read_debug_ && output_) {
@@ -179,12 +266,14 @@ void SnnPESubComponent::issueEdgeWeightFetches_() {
 }
 
 void SnnPESubComponent::recordEdge_(uint32_t post_local, uint32_t pre_global) {
-    if (!(enable_weight_fetch_ && memory_ && memory_ready_)) {
+    if (!(enable_weight_fetch_ && ensureMemoryReady_())) {
         diag_edges_cond_skips_++;
         if (window_read_debug_ && !record_edge_cond_warned_) {
             output_->verbose(CALL_INFO, 0, 0,
-                "[diag-edges] recordEdge skipped enable_weight_fetch=%d memory=%s ready=%d\n",
-                enable_weight_fetch_ ? 1 : 0, memory_ ? "set" : "null", memory_ready_ ? 1 : 0);
+                "[diag-edges] recordEdge skipped enable_weight_fetch=%d stdmem_ep=%d ready=%d\n",
+                enable_weight_fetch_ ? 1 : 0,
+                (stdmem_ep_ && stdmem_ep_->available()) ? 1 : 0,
+                memory_ready_ ? 1 : 0);
             record_edge_cond_warned_ = true;
         }
         return;
@@ -247,8 +336,6 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     : SnnCoreAPI(id, params),
       parent_(nullptr),
       output_(nullptr),
-      memory_(nullptr),
-      manual_window_drive_(nullptr),
       memory_link_(nullptr) {
     // 构造期最早哨兵（P2：参数优先，未设置回退到环境变量，以保持兼容）。
     // 避免直接使用 stdout，统一走 SST Output。
@@ -270,7 +357,9 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     
     // 读取配置参数
     core_id_ = params.find<int>("core_id", 0);
-    noc_spike_transport_.setSourceCore(core_id_);
+    // Phase5.2：将实现类型改为指针持有，避免在 control 头文件中包含 synapse 实现头
+    if (!stdmem_ep_) stdmem_ep_ = std::make_unique<StdMemEndpoint>();
+    if (!bcsr_weights_) bcsr_weights_ = std::make_unique<BcsrWeightManager>();
     if (kSentinelOn && output_) {
         SNNDL_LOG(0, "[[sentinel-core-ctor]] core_ctor enter\n");
         SNNDL_LOG(0, "[[sentinel-core-ctor]] after params: core_id=%d\n", core_id_);
@@ -282,18 +371,52 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     node_id_ = params.find<uint32_t>("node_id", 0);
     verbose_ = params.find<int>("verbose", 0);
     enable_extended_diagnostics_ = params.find<int>("enable_extended_diagnostics", 0) != 0;
+    total_nodes_cfg_ = params.find<uint32_t>("total_nodes", 1);
+
+    // Phase6：workload 选择（优先 Params，其次环境变量；默认 snn 保持回归口径不变）
+    {
+        std::string w = "snn";
+        if (params.contains("workload_impl")) {
+            w = params.find<std::string>("workload_impl", "snn");
+        } else if (const char* env = workloadImplFromEnvCached()) {
+            w = std::string(env);
+        }
+        std::transform(w.begin(), w.end(), w.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (w == "stream") workload_impl_ = WorkloadImpl::Stream;
+        else workload_impl_ = WorkloadImpl::Snn;
+    }
+    // Phase4：默认也创建 `workload=snn`（暂不切换默认执行入口，仅用于后续逐步壳化迁移）。
+    // 说明：当前仅区分 stream/snn；未知值已在上方归一化为 SNN。
+    {
+        const char* name = isStreamWorkload_() ? "stream" : "snn";
+        if (!workload_) workload_ = createWorkloadByName(std::string(name));
+        if (!workload_) {
+            if (output_) {
+                output_->fatal(CALL_INFO, -1, "❌ createWorkloadByName(\"%s\") returned nullptr\n", name);
+            }
+            return;
+        }
+        workload_->configureFromParams(params);
+        spike_workload_ = dynamic_cast<ISpikeWorkload*>(workload_.get());
+        if (spike_workload_) {
+            spike_workload_->bindLegacyHost(this);
+        }
+        snn_comm_workload_ = dynamic_cast<ISnnSpikeCommWorkload*>(workload_.get());
+        gas_stage_workload_ = dynamic_cast<IGasStageSink*>(workload_.get());
+    }
     if (kSentinelOn && output_) {
         SNNDL_LOG(0, "[[sentinel-core-ctor]] after params2: node_id=%u num_neurons=%u base_addr=%" PRIu64 "\n",
                 node_id_, num_neurons_, (uint64_t)base_addr_);
     }
     enable_weight_fetch_ = params.find<int>("enable_weight_fetch", 0) != 0;
-    // 现在再初始化依赖core指针的轻量结构
-    stage_event_hub_ = std::make_unique<StageEventHub>();
-    if (stage_event_hub_) stage_event_hub_->init(this);
-    stats_reporter_.init(this);
-    gas_ctrl_ = std::make_unique<GasPhaseController>();
-    if (gas_ctrl_) {
-        gas_ctrl_->init(this, output_);
+    workload_spike_input_enable_ = params.find<int>("workload_spike_input_enable", 0) != 0;
+    // Phase5.2-A1：StageEventHub 吸收到 Impl（不再单独编译 control/StageEventHub.*）
+    if (!impl_) impl_ = std::make_unique<Impl>();
+    impl_->init(this);
+    impl_->gas_ctrl_ = std::make_unique<GasPhaseController>();
+    if (impl_->gas_ctrl_) {
+        impl_->gas_ctrl_->init(this, output_);
     }
 #if SNNDL_DEBUG_ENABLED
     if (window_read_debug_) {
@@ -361,7 +484,7 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     scatter_diag_limit_ = params.find<uint32_t>("scatter_diag_limit", 0);
     scatter_diag_count_ = 0;
     route_summary_enable_ = params.find<int>("route_summary_enable", 0) != 0;
-    if (gas_ctrl_) gas_ctrl_->setDebug(window_read_debug_, enable_extended_diagnostics_);
+    if (impl_ && impl_->gas_ctrl_) impl_->gas_ctrl_->setDebug(window_read_debug_, enable_extended_diagnostics_);
     window_read_budget_ = params.find<uint32_t>("window_read_budget", 1024);
     windowStateConfigure_();
     read_force_single_ = params.find<int>("read_force_single", 0) != 0;
@@ -430,7 +553,7 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     bcsr_colidx_addr_ = base_addr_ + bcsr_layout_.colidx_offset;
     bcsr_blockdata_addr_ = base_addr_ + bcsr_layout_.blockdata_offset;
     bcsr_blockids_addr_ = bcsr_layout_.blockids_offset ? base_addr_ + bcsr_layout_.blockids_offset : 0;
-    bcsr_weights_.configure(
+    bcsr_weights_->configure(
         bcsr_rowptr_addr,
         bcsr_colidx_addr_,
         bcsr_blockdata_addr_,
@@ -444,7 +567,7 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     acc_hwm_bytes_cfg_ = params.find<uint64_t>("acc_high_watermark_bytes", 16*1024*1024);
     acc_spill_enable_cfg_ = params.find<int>("acc_spill_enable", 1) != 0;
     stage_events_csv_ = params.find<std::string>("stage_events_csv", "");
-    if (gas_ctrl_) gas_ctrl_->setStageEventsCsv(stage_events_csv_);
+    if (impl_ && impl_->gas_ctrl_) impl_->gas_ctrl_->setStageEventsCsv(stage_events_csv_);
     // aosoa_block_rows 默认推导已转移至 compute core
     // CSR 参数已移除
     bcsr_prefetch_all_ = params.find<int>("bcsr_prefetch_all", 0) != 0;
@@ -503,14 +626,9 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
         // Stats pointers will be attached in initializeStatistics().
         acc_ops_ = std::make_unique<AccumulatorOps>(acc_cfg);
     }
-    // 路由/通信子系统参数（Phase D：路由构建+缓存闭环至 SpikeCommSubsystem）
-    const std::string routing_mode = params.find<std::string>("routing_mode", "fixed");
+
+    // Weights template is used by both synapse/weights (BCSR) and synapse/route; keep cached here.
     weights_template_ = params.find<std::string>("weights_template", "");
-    const uint32_t total_nodes = params.find<uint32_t>("total_nodes", 16);
-    // NoC packet 编码口径：保证 NocSpikeTransport 能把 SpikeEvent 编码为 (node/core) 可路由的 NocPacketEvent
-    noc_spike_transport_.configureLayout(total_nodes,
-                                         static_cast<uint32_t>(total_cores_),
-                                         static_cast<uint32_t>(num_neurons_));
 
     // neurons_per_pe：默认按 total_cores*num_neurons 推导；但允许脚本显式覆盖（保持兼容）
     uint32_t np_from_params = params.find<uint32_t>("neurons_per_pe", 0);
@@ -526,65 +644,13 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
         neurons_per_pe_cfg_ = computed_neurons_per_pe;
     }
 
-    // 读取门控事件参数（Phase3：门控缓存归入 Synapse/Route）
-    const std::string gating_mode = params.find<std::string>("gating_mode", "off");
-    const uint64_t gating_ttl_cycles = params.find<uint64_t>("gating_ttl_cycles", 1000);
-    const std::string gating_scope = params.find<std::string>("gating_scope", "inputs");
-
-    // 组装通信子系统配置（控制层不再持有路由表/缓存/层掩码解析状态）
-    SpikeCommRoutingConfig comm_routing{};
-    comm_routing.routing_weight_driven = (routing_mode == "weight_driven");
-    comm_routing.log_weight_details = log_weight_details_;
-    comm_routing.verify_routing_weights = verify_routing_weights_;
-    comm_routing.route_summary_enable = route_summary_enable_;
-    comm_routing.rows = static_cast<uint32_t>(num_neurons_);
-    comm_routing.cols = static_cast<uint32_t>(weights_cols_);
-    comm_routing.total_nodes = total_nodes;
-    comm_routing.cores_per_pe = static_cast<uint32_t>(total_cores_);
-    comm_routing.neurons_per_pe = neurons_per_pe_cfg_;
-    comm_routing.use_post_row_pre_col = use_post_row_pre_col_;
-    comm_routing.weights_template = weights_template_;
-    comm_routing.routing_epsilon = params.find<float>("routing_epsilon", 1e-8f);
-    comm_routing.routing_topk = params.find<uint32_t>("routing_topk", 0);
-    comm_routing.routing_topk_per_pe = params.find<uint32_t>("routing_topk_per_pe", 0);
-    comm_routing.route_exclude_self_pe = params.find<int>("route_exclude_self_pe", 0) != 0;
-    comm_routing.route_layers_mask = params.find<std::string>("route_layers_mask", "");
-    comm_routing.route_filter_warn = params.find<int>("route_filter_warn", 1) != 0;
-    // 映射框架集成
-    comm_routing.mapping_mode = params.find<std::string>("mapping_mode", "off");
-    comm_routing.mapping_edges_file = params.find<std::string>("mapping_edges_file", "");
-    comm_routing.mapping_csv_has_header = params.find<int>("mapping_csv_has_header", 1) != 0;
-    comm_routing.mapping_csv_separator = params.find<std::string>("mapping_csv_separator", ",");
-    comm_routing.mapping_assume_block_ids = params.find<int>("mapping_assume_block_ids", 1) != 0;
-    // BCSR 路由解析（当 weights_template 指向 .bcsr/.BCSR 时生效）
-    comm_routing.use_bcsr = use_bcsr_;
-    comm_routing.bcsr_br = bcsr_br_;
-    comm_routing.bcsr_bc = bcsr_bc_;
-    comm_routing.bcsr_idx_bytes = bcsr_idx_bytes_;
-    comm_routing.bcsr_val_bytes = bcsr_val_bytes_;
-    comm_routing.base_addr = static_cast<uint64_t>(base_addr_);
-    comm_routing.bcsr_rowptr_addr = bcsr_weights_.rowptrAddr();
-    comm_routing.bcsr_colidx_addr = bcsr_colidx_addr_;
-    comm_routing.bcsr_blockdata_addr = bcsr_blockdata_addr_;
-    comm_routing.bcsr_blockids_addr = bcsr_blockids_addr_;
-
-    if (!synapse_route_) synapse_route_ = std::make_unique<SynapseRouteSubsystem>();
-    if (!spike_comm_) spike_comm_ = std::make_unique<SpikeCommSubsystem>();
-    synapse_route_->configure(comm_routing);
-    synapse_route_->configureGating(/*gating_event_mode=*/(gating_mode == "event"),
-                                    /*gating_ttl_cycles=*/gating_ttl_cycles,
-                                    /*gating_scope_inputs_only=*/(gating_scope != "all"));
-    spike_comm_->configure();
-    
-    // 获取权重文件路径
+    // 获取权重文件路径（由 WeightLoader 负责加载；控制层仅缓存以便日志/兼容）
     weights_file_path_ = params.find<std::string>("weights_file", "");
 
-    // 学习/梯度参数已由 compute core 解析
-
-    // 参数日志改至 setup 以避免构造早期潜在问题
-    
-    // compute core 初始化（代理，保持现有行为）
-    configureComputeCore_(params);
+    if (!isStreamWorkload_()) {
+        // Phase4 Task6.1：compute core 创建/配置下沉到 workload=snn；
+        // 控制层此处仅构建 synapse/weights 的 weight reader 子系统。
+        configureWeightReaderSubsystem_(params);
 
     // 初始化输出对象（若前面已创建则不重复）
     if (!output_) {
@@ -595,7 +661,7 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
             "[diag-bcsr-base] node=%u core=%d base=0x%llx rowptr=0x%llx colidx=0x%llx blockdata=0x%llx blockids=0x%llx\n",
             node_id_, core_id_,
             (unsigned long long)base_addr_,
-            (unsigned long long)bcsr_weights_.rowptrAddr(),
+            (unsigned long long)bcsr_weights_->rowptrAddr(),
             (unsigned long long)bcsr_colidx_addr_,
             (unsigned long long)bcsr_blockdata_addr_,
             (unsigned long long)bcsr_blockids_addr_);
@@ -606,24 +672,27 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
                 "[diag-bcsr] node=%u core=%d warning: weights_template empty while BCSR enabled\n",
                 node_id_, core_id_);
         } else if (bcsr_rowptr_file_fallback_enable_ && !weights_template_.empty() &&
-                   !bcsr_weights_.isRowptrReady() && loadBcsrRowptrFromFile_()) {
+                   !bcsr_weights_->isRowptrReady() && loadBcsrRowptrFromFile_()) {
             if (window_read_debug_) {
                 output_->verbose(CALL_INFO, 0, 0,
                     "[diag-bcsr] core=%u preload rowptr entries=%zu first=%u second=%u\n",
-                    core_id_, bcsr_weights_.rowptrHost().size(),
-                    bcsr_weights_.rowptrHost().empty()?0u:bcsr_weights_.rowptrHost()[0],
-                    bcsr_weights_.rowptrHost().size()>1?bcsr_weights_.rowptrHost()[1]:0u);
+                    core_id_, bcsr_weights_->rowptrHost().size(),
+                    bcsr_weights_->rowptrHost().empty()?0u:bcsr_weights_->rowptrHost()[0],
+                    bcsr_weights_->rowptrHost().size()>1?bcsr_weights_->rowptrHost()[1]:0u);
             }
         }
     }
 
+    // 输出权重验证开关以便调试（采样/文件参数由 compute core 负责）
+    if (output_) {
+        output_->verbose(CALL_INFO, 3, 0,
+            "🔍 权重验证配置: verify_weights=%d (details in compute core)\n",
+            verify_weights_ ? 1 : 0);
+    }
+    }
+
     // output_->verbose(CALL_INFO, 1, 0, "🔧 初始化SnnPE SubComponent (核心%d, %u个神经元)\n", 
     //                 core_id_, num_neurons_);
-    
-    // 输出权重验证开关以便调试（采样/文件参数由 compute core 负责）
-    output_->verbose(CALL_INFO, 3, 0,
-        "🔍 权重验证配置: verify_weights=%d (details in compute core)\n",
-        verify_weights_ ? 1 : 0);
     
     // 神经元状态由 compute core 维护，控制层不再初始化本地副本
     // 去重发放统计位图（默认全0）
@@ -631,7 +700,6 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     
     // 初始化内存访问
     memory_link_ = nullptr;
-    memory_ = nullptr;
 
     // 学习窗口状态由 compute core 维护
 
@@ -661,6 +729,13 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     count_spikes_generated_ = 0;
     count_neurons_fired_ = 0;
     count_memory_requests_ = 0;
+    count_non_spike_packets_received_ = 0;
+    count_stream_mem_verify_pass_ = 0;
+    count_stream_mem_verify_fail_ = 0;
+    count_stream_pkt_sent_ = 0;
+    count_stream_pkt_recv_ = 0;
+    count_stream_pkt_bad_crc_ = 0;
+    count_stream_pkt_bad_magic_ = 0;
     
     // 配置时钟
     std::string clock_freq = "1GHz";
@@ -702,7 +777,9 @@ void SnnPESubComponent::activityFlush_() {
 
 size_t SnnPESubComponent::pendingMemSize_() const {
     size_t n = 0;
-    if (stdmem_access_) n += stdmem_access_->pendingSize();
+    if (stdmem_ep_ && stdmem_ep_->available()) {
+        if (auto* mem = stdmem_ep_->memoryAccess()) n += mem->pendingSize();
+    }
     return n;
 }
 
@@ -743,7 +820,7 @@ bool SnnPESubComponent::windowStateCanIssue_(uint32_t n) const {
 void SnnPESubComponent::windowStateNoteIssue_(uint32_t n) {
     if (weight_mem_subsystem_) {
         weight_mem_subsystem_->noteIssue(n);
-        stats_reporter_.updatePendingPeak(weight_mem_subsystem_->outstanding());
+        if (impl_) impl_->updatePendingPeak(weight_mem_subsystem_->outstanding());
     }
 }
 
@@ -761,54 +838,117 @@ uint32_t SnnPESubComponent::windowStateOutstanding_() const {
     return weight_mem_subsystem_ ? weight_mem_subsystem_->outstanding() : 0;
 }
 
+void SnnPESubComponent::fillStreamRuntime_(ICoreWorkload::Runtime& rt) {
+    rt.reporting.ctx = this;
+    rt.reporting.report_mem_issue = &SnnPESubComponent::reportStreamMemIssueThunk_;
+    rt.sinks.mem_verify_pass = &count_stream_mem_verify_pass_;
+    rt.sinks.mem_verify_fail = &count_stream_mem_verify_fail_;
+    rt.sinks.pkt_sent = &count_stream_pkt_sent_;
+    rt.sinks.pkt_recv = &count_stream_pkt_recv_;
+    rt.sinks.pkt_bad_crc = &count_stream_pkt_bad_crc_;
+    rt.sinks.pkt_bad_magic = &count_stream_pkt_bad_magic_;
+    rt.sinks.stat_mem_writes_issued_total = stat_stream_mem_writes_issued_total_;
+    rt.sinks.stat_mem_reads_issued_total = stat_stream_mem_reads_issued_total_;
+    rt.sinks.stat_mem_bytes_written_total = stat_stream_mem_bytes_written_total_;
+    rt.sinks.stat_mem_bytes_read_total = stat_stream_mem_bytes_read_total_;
+    rt.sinks.stat_mem_verify_pass_total = stat_stream_mem_verify_pass_total_;
+    rt.sinks.stat_mem_verify_fail_total = stat_stream_mem_verify_fail_total_;
+    rt.sinks.stat_pkt_sent_total = stat_stream_pkt_sent_total_;
+    rt.sinks.stat_pkt_recv_total = stat_stream_pkt_recv_total_;
+    rt.sinks.stat_pkt_bad_crc_total = stat_stream_pkt_bad_crc_total_;
+    rt.sinks.stat_pkt_bad_magic_total = stat_stream_pkt_bad_magic_total_;
+}
+
+uint64_t SnnPESubComponent::workloadNowNsThunk_(void* ctx) {
+    auto* self = static_cast<SnnPESubComponent*>(ctx);
+    return self ? self->getCurrentSimTimeNano() : 0;
+}
+
+void SnnPESubComponent::bindWorkloadRuntime_() {
+    if (!workload_) return;
+
+    ICoreWorkload::Runtime rt{};
+    rt.log = output_;
+    rt.node_id = static_cast<uint32_t>(node_id_);
+    rt.core_id = static_cast<uint32_t>(core_id_);
+    rt.total_nodes = total_nodes_cfg_;
+    rt.base_addr = base_addr_;
+    rt.mem = (stdmem_ep_ && stdmem_ep_->available()) ? stdmem_ep_->memoryAccess() : nullptr;
+    rt.noc = noc_transport_;
+    rt.parent_iface = parent_;
+    rt.time.ctx = this;
+    rt.time.now_ns = &SnnPESubComponent::workloadNowNsThunk_;
+    rt.sinks.spikes_received = &count_spikes_received_;
+    rt.sinks.synaptic_accesses = &count_synaptic_accesses_;
+    rt.sinks.stat_spikes_received_total = stat_spikes_received_;
+    rt.sinks.stat_synaptic_accesses_total = stat_synaptic_accesses_;
+    rt.sinks.stat_routes_entries_total = stat_routes_entries_;
+    rt.sinks.stat_fanout_per_spike_total = stat_fanout_per_spike_;
+
+    if (isStreamWorkload_()) {
+        fillStreamRuntime_(rt);
+    }
+
+    workload_->bindRuntime(rt);
+}
+
 void SnnPESubComponent::setParentInterface(SnnPEParentInterface* parent) {
     parent_ = parent;
     parent_pe_cached_ = dynamic_cast<IPeAggregation*>(parent);
     // output_->verbose(CALL_INFO, 2, 0, "🔗 核心%d设置父级接口\n", core_id_);
-    if (!spike_transport_) {
-        spike_transport_ = std::make_unique<ParentSpikeTransport>(parent_);
-    } else {
-        spike_transport_->setParent(parent_);
-    }
-    // 绑定通信子系统运行时依赖（路由表将在 init(phase0) 中构建/注入）
-    if (synapse_route_) {
-        synapse_route_->bindRuntime(output_,
-                                    static_cast<uint32_t>(node_id_),
-                                    static_cast<uint32_t>(core_id_),
-                                    static_cast<uint32_t>(num_neurons_),
-                                    static_cast<uint32_t>(neurons_per_pe_cfg_),
-                                    stat_routes_entries_);
-        synapse_route_->bindFanoutStat(stat_fanout_per_spike_);
-    }
-    ISpikeTransport* transport = spike_transport_.get();
-    if (noc_transport_) transport = &noc_spike_transport_;
-    SpikeCommRuntimeConfig rt{};
-    rt.log = output_;
-    rt.transport = transport;
-    rt.synapse_route = synapse_route_.get();
-    rt.global_neuron_base = static_cast<uint64_t>(global_neuron_base_);
-    if (spike_comm_) {
-        spike_comm_->bindRuntime(rt);
-        spike_comm_ready_ = spike_comm_->ready();
-    } else {
-        spike_comm_ready_ = false;
-    }
+    bindWorkloadRuntime_();
 }
 
 void SnnPESubComponent::setNocTransport(INocTransport* noc) {
     noc_transport_ = noc;
-    noc_spike_transport_.setNocTransport(noc);
-    noc_spike_transport_.setSourceCore(core_id_);
+    bindWorkloadRuntime_();
+}
+
+bool SnnPESubComponent::deliverPacket(NocPacketEvent* packet) {
+    // Phase6-Phase1：先打通非Spike packet入口；默认实现仅统计+丢弃，避免影响现有 SNN 行为。
+    if (!packet) return true;
+    count_non_spike_packets_received_++;
+
+    if (isStreamWorkload_() && workload_) {
+        return workload_->deliverPacket(packet);
+    }
+
+    if (enable_extended_diagnostics_ && output_) {
+        output_->verbose(
+            CALL_INFO, 1, 0,
+            "[core-packet] core=%d kind=%u payload=%zu src=%u:%u dst=%u:%u\n",
+            core_id_,
+            static_cast<unsigned>(packet->kind),
+            packet->payload.size(),
+            packet->src_node,
+            packet->src_endpoint,
+            packet->dst_node,
+            packet->dst_endpoint);
+    }
+    delete packet;
+    return true;
 }
 
 void SnnPESubComponent::onGlobalStepStart(uint32_t seq) {
-    // 全局 Step 同步：打开 memory(GatherBufferIF) 的新窗口。
-    // 注意：这里不直接操作 GAS 状态机，而是通过 IGasStepGate 保持边界清晰。
-    if (!memory_) {
-        if (output_) output_->fatal(CALL_INFO, -1, "core=%d onGlobalStepStart(seq=%u) but memory is null\n", core_id_, seq);
+    if (isStreamWorkload_()) {
+        // stream workload 不参与 SNN/GAS window 编排；
+        // 但仍需要打开 memory(GatherBufferIF) 的 step gate，否则 StandardMemAccess 会拒绝请求（write/read 返回失败）。
+        curr_stage_seq_ = seq;
+        if (stdmem_ep_ && stdmem_ep_->available()) {
+            auto* gate = stdmem_ep_->stepGate();
+            if (gate) {
+                gate->openStep(seq);
+            }
+        }
         return;
     }
-    auto* gate = dynamic_cast<IGasStepGate*>(memory_);
+    // 全局 Step 同步：打开 memory(GatherBufferIF) 的新窗口。
+    // 注意：这里不直接操作 GAS 状态机，而是通过 IGasStepGate 保持边界清晰。
+    if (!stdmem_ep_ || !stdmem_ep_->available()) {
+        if (output_) output_->fatal(CALL_INFO, -1, "core=%d onGlobalStepStart(seq=%u) but stdmem endpoint is unavailable\n", core_id_, seq);
+        return;
+    }
+    auto* gate = stdmem_ep_->stepGate();
     if (!gate) {
         if (output_) output_->fatal(
             CALL_INFO, -1,
@@ -819,19 +959,105 @@ void SnnPESubComponent::onGlobalStepStart(uint32_t seq) {
     gate->openStep(seq);
 }
 
-void SnnPESubComponent::configureComputeCore_(const Params& params) {
-    if (!compute_core_) {
-        const std::string impl = params.find<std::string>("compute_core_impl", "default");
-        compute_core_ = createComputeCoreByName(impl);
-        if (!compute_core_) {
-            if (output_) {
-                output_->verbose(CALL_INFO, 0, 0,
-                    "⚠️ 未知 compute_core_impl='%s'，回退到 default\n",
-                    impl.c_str());
+// === GAS stage/stat sink (Phase4-Task6.4) ===
+void SnnPESubComponent::onGasStageEvent(const GasStageEvent& ev) {
+    // CoreShell 保留最小镜像状态用于：
+    // - StageEventHub 统计/CSV 口径（仍由 CoreShell 汇聚写出）
+    // - activity f 等 PE 级聚合（兼容历史分析脚本）
+    // 具体窗口读编排与 scatter 事务由 workload=snn 接管（通过转发完成）。
+
+    curr_stage_seq_ = ev.superstep;
+
+    // Mirror GAS stage enum (minimal).
+    switch (ev.op) {
+        case GasOp::BeginGather:
+            gas_stage_ = GasStage::Gather;
+            // Reset per-window diagnostics in CoreShell only (no side effects).
+            record_edge_capacity_warned_ = false;
+            diag_edges_record_hits_ = 0;
+            diag_edges_stage_skips_ = 0;
+            diag_edges_cond_skips_ = 0;
+            diag_spikes_stage_gather_ = 0;
+            diag_spikes_stage_apply_ = 0;
+            diag_spikes_stage_scatter_ = 0;
+            diag_spikes_stage_idle_ = 0;
+            // Stage event bookkeeping (timing + window spikes reset) stays in CoreShell.
+            if (impl_) impl_->markBeginGather(curr_stage_seq_);
+            break;
+        case GasOp::BeginApply:
+            gas_stage_ = GasStage::Apply;
+            if (impl_) impl_->markBeginApply(curr_stage_seq_);
+            break;
+        case GasOp::EndApply:
+            gas_stage_ = GasStage::Apply; // remain until BeginScatter
+            // EndApply is still recorded for stage CSV (legacy analysis scripts).
+            appendStageEventRow_("EndApply", getCurrentSimTimeNano(), 0);
+            break;
+        case GasOp::BeginScatter:
+            gas_stage_ = GasStage::Scatter;
+            // BeginScatter timing stays in CoreShell; window spikes baseline used by EndScatter fallback.
+            spikes_generated_base_ = count_spikes_generated_;
+            if (impl_) impl_->markBeginScatter(curr_stage_seq_);
+            break;
+        case GasOp::EndScatter: {
+            gas_stage_ = GasStage::Idle;
+            uint64_t to_emit = window_spikes_all_ ? window_spikes_all_ : spikes_emitted_window_;
+            if (to_emit == 0) {
+                uint64_t delta = 0;
+                if (count_spikes_generated_ >= spikes_generated_base_) {
+                    delta = count_spikes_generated_ - spikes_generated_base_;
+                }
+                if (delta > 0) to_emit = delta;
             }
-            compute_core_ = createComputeCoreByName("default");
+            if (impl_) impl_->markEndScatter(curr_stage_seq_, to_emit);
+            break;
+        }
+        default:
+            break;
+    }
+
+    // Activity-f window tracking: keep in CoreShell (PE-level aggregation).
+    switch (ev.op) {
+        case GasOp::BeginGather:
+            activity_window_seq_ = ev.superstep;
+            activityReset_();
+            break;
+        case GasOp::BeginApply:
+        case GasOp::EndApply:
+        case GasOp::BeginScatter:
+            activityFlush_();
+            break;
+        default:
+            break;
+    }
+
+    // Forward to workload (if it implements IGasStageSink).
+    if (gas_stage_workload_) {
+        gas_stage_workload_->onGasStageEvent(ev);
+    }
+}
+
+void SnnPESubComponent::onGasStatEvent(const GasStatEvent& st) {
+    // Accumulate at PE level for CSV visibility (keep identical to legacy behavior).
+    if (parent_) {
+        if (auto* pe = parent_pe_cached_) {
+            pe->accumulateGasStatsExt(st.unique_bytes, st.unique_reads,
+                                      st.rowwin_triggers, st.rowwin_bytes,
+                                      st.bursts, st.payload_bytes,
+                                      st.window_inflight_peak, st.window_buffer_max_bytes);
         }
     }
+    // Local (per-core) copies for unique_* only (optional)
+    if (stat_gas_unique_reads_total_ && st.unique_reads) stat_gas_unique_reads_total_->addData(st.unique_reads);
+    if (stat_gas_unique_bytes_total_ && st.unique_bytes) stat_gas_unique_bytes_total_->addData(st.unique_bytes);
+
+    // Optional forward (mostly no-op for workload=snn; kept for completeness).
+    if (gas_stage_workload_) {
+        gas_stage_workload_->onGasStatEvent(st);
+    }
+}
+
+void SnnPESubComponent::configureWeightReaderSubsystem_(const Params& params) {
     // 构建权重读取子系统（Phase E：内存子系统闭环，控制层不再持有 pending/解析）
     if (!weight_reader_adapter_) {
         auto mem = std::make_unique<WeightMemorySubsystem>();
@@ -844,21 +1070,19 @@ void SnnPESubComponent::configureComputeCore_(const Params& params) {
             WeightMemorySubsystem::OrchestratorConfig ocfg{};
             ocfg.accessor = weight_accessor_.get();
             ocfg.cache_try = [this](uint64_t key, float& out) -> bool {
-                if (compute_core_) return compute_core_->weightCacheTryGet(key, out);
                 return weightCacheTryGet_(key, out);
             };
             ocfg.cache_put = [this](uint64_t key, float v) {
-                if (compute_core_) compute_core_->weightCacheStore(key, v);
-                else weightCacheStore_(key, v);
+                weightCacheStore_(key, v);
             };
             ocfg.acc_update = [this](uint32_t post_l, float dv) { accUpdate_(post_l, dv); };
             ocfg.diag_edge_weight = [this](const char* tag, uint32_t post_l, uint32_t pre_g, float w, uint32_t cnt) {
                 diagEdgeWeight_(tag, post_l, pre_g, w, cnt);
             };
-            ocfg.report_cache_access = [this](bool hit) { stats_reporter_.reportCacheAccess(hit); };
-            ocfg.update_pending_peak = [this](uint32_t ostd) { stats_reporter_.updatePendingPeak(ostd); };
+            ocfg.report_cache_access = [this](bool hit) { if (impl_) impl_->reportCacheAccess(hit); };
+            ocfg.update_pending_peak = [this](uint32_t ostd) { if (impl_) impl_->updatePendingPeak(ostd); };
             ocfg.report_mem_issue = [this](size_t bytes, bool count_weight_read) {
-                stats_reporter_.reportMemoryIssue(bytes, count_weight_read);
+                if (impl_) impl_->reportMemoryIssue(bytes, count_weight_read);
             };
             ocfg.report_mem_latency = [this](uint64_t lat_cycles, bool is_weight) {
                 accum_mem_latency_cycles_ += lat_cycles;
@@ -871,7 +1095,7 @@ void SnnPESubComponent::configureComputeCore_(const Params& params) {
                 if (scheme1_pending_prefetch_ > 0) scheme1_pending_prefetch_--;
             };
             ocfg.ensure_loader_ready = [this]() { return ensureLoaderReady_(); };
-            ocfg.bcsr_rowptr_ready = [this]() { return !use_bcsr_ || bcsr_weights_.isRowptrReady(); };
+            ocfg.bcsr_rowptr_ready = [this]() { return !use_bcsr_ || bcsr_weights_->isRowptrReady(); };
             ocfg.ensure_rowptr_ready_or_fatal = [this](const char* reason) { ensureRowptrReadyOrFatal_(reason); };
             ocfg.resume_issue_after_rowptr_ready = [this]() {
                 if (apply_acc_enable_ && gas_window_mode_ && gas_stage_ == GasStage::Apply) {
@@ -901,48 +1125,16 @@ void SnnPESubComponent::configureComputeCore_(const Params& params) {
             ocfg.node_id = node_id_;
             ocfg.core_id = static_cast<uint32_t>(core_id_);
             ocfg.weights_template = weights_template_;
-            ocfg.bcsr_mgr = &bcsr_weights_;
+            ocfg.bcsr_mgr = bcsr_weights_.get();
             mem->configureOrchestrator(std::move(ocfg));
         }
         weight_mem_subsystem_ = mem.get();
         // Phase E：BCSR 缓存容量配置下沉到 BcsrWeightManager
-        bcsr_weights_.setRowIndexCacheCapacity(bcsr_row_index_cache_cap_);
-        bcsr_weights_.setBlockCacheCapacity(bcsr_block_cache_cap_);
+        bcsr_weights_->setRowIndexCacheCapacity(bcsr_row_index_cache_cap_);
+        bcsr_weights_->setBlockCacheCapacity(bcsr_block_cache_cap_);
         windowStateConfigure_();
         if (window_read_enable_) reserveWindowContainers_();
         weight_reader_adapter_ = std::move(mem);
-    }
-    if (!compute_core_) return;
-    ComputeCoreContext ctx;
-    ctx.core_id = core_id_;
-    ctx.node_id = node_id_;
-    ctx.num_neurons = num_neurons_;
-    ctx.global_neuron_base = static_cast<uint64_t>(global_neuron_base_);
-    ctx.neurons_per_pe_cfg = neurons_per_pe_cfg_;
-    ctx.log = output_;
-    ctx.weight_reader = weight_reader_adapter_.get(); // 直接挂接适配器
-    ctx.writeback_fn = [this](const std::unordered_map<uint64_t, float>& grads,
-                              float lr, float wd) -> bool {
-        if (!memory_ || !memory_ready_) {
-            if (output_) {
-                output_->verbose(CALL_INFO, 1, 0,
-                    "⚠️ 学习: 写回启用但内存接口不可用，跳过本窗写回\n");
-            }
-            return false;
-        }
-        return applyLocalWeightUpdates_(grads, lr, wd);
-    };
-    compute_core_->configure(ctx, params);
-    compute_core_caps_ = compute_core_->getCapabilities();
-    if (window_read_debug_ && output_) {
-        output_->verbose(CALL_INFO, 1, 0,
-            "[core-cap] core=%d needs_cache=%d supports_gating=%d requires_window=%d supports_learning=%d syn_ev=%d\n",
-            core_id_,
-            compute_core_caps_.needs_weight_cache ? 1 : 0,
-            compute_core_caps_.supports_gating ? 1 : 0,
-            compute_core_caps_.requires_window_scatter ? 1 : 0,
-            compute_core_caps_.supports_learning ? 1 : 0,
-            compute_core_caps_.uses_synaptic_events ? 1 : 0);
     }
 }
 
@@ -963,93 +1155,33 @@ void SnnPESubComponent::init(unsigned int phase) {
             if (memory_link_) output_->verbose(CALL_INFO, 2, 0, "🔗 核心%d配置mem_link\n", core_id_);
         }
         
-        // 加载StandardMem接口（Python可通过槽位提供）
-        memory_ = loadUserSubComponent<SST::Interfaces::StandardMem>(
-            "memory", ComponentInfo::SHARE_NONE,
-            registerTimeBase("1ns"),
-            new SST::Interfaces::StandardMem::Handler2<SnnPESubComponent, &SnnPESubComponent::handleMemoryResponse>(this));
-        if (memory_) {
-            if (!stdmem_access_) {
-                stdmem_access_ = std::make_unique<StandardMemAccess>(memory_, output_, node_id_, core_id_);
-            }
-            // Phase1: 通过纯内存接口绑定到 WeightMemorySubsystem（语义留在子系统）。
-            if (weight_mem_subsystem_) {
-                weight_mem_subsystem_->bindMemory(stdmem_access_.get());
-            }
-            // output_->verbose(CALL_INFO, 1, 0, "✅ 核心%d加载StandardMem成功\n", core_id_);
-            // 若已成功加载 StandardMem 子组件，则认为内存就绪（即使未显式提供 memory_link_）
-            memory_ready_ = true;
-            if (gas_manual_window_drive_) {
-                manual_window_drive_ = dynamic_cast<IManualWindowDrive*>(memory_);
-                if (!manual_window_drive_) {
-                    output_->verbose(CALL_INFO, 0, 0,
-                        "⚠️ 核心%d启用gas_manual_window_drive但memory不支持IManualWindowDrive，降级为自动窗口\n",
-                        core_id_);
-                    gas_manual_window_drive_ = false;
-                } else {
-                    output_->verbose(CALL_INFO, 0, 0,
-                        "[diag-gas] 核心%d启用manual窗口驱动 (IManualWindowDrive) gather_cycles=%" PRIu64 "\n",
-                        core_id_, manual_gas_gather_cycles_cfg_);
-                }
-            }
-        } else {
-            // output_->verbose(CALL_INFO, 1, 0, "⚠️ 核心%d未加载StandardMem，将使用默认权重\n", core_id_);
-            stdmem_access_.reset();
-            if (weight_mem_subsystem_) {
-                weight_mem_subsystem_->bindMemory(nullptr);
-            }
-        }
+        initStdMemPhase0_();
 
-        // 通信子系统：构建/复用路由表并配置内部 route provider
-        {
-            if (synapse_route_) {
-                synapse_route_->bindRuntime(output_,
-                                            static_cast<uint32_t>(node_id_),
-                                            static_cast<uint32_t>(core_id_),
-                                            static_cast<uint32_t>(num_neurons_),
-                                            static_cast<uint32_t>(neurons_per_pe_cfg_),
-                                            stat_routes_entries_);
-                synapse_route_->bindFanoutStat(stat_fanout_per_spike_);
-            }
-            ISpikeTransport* transport = spike_transport_.get();
-            if (noc_transport_) transport = &noc_spike_transport_;
-            SpikeCommRuntimeConfig rt{};
-            rt.log = output_;
-            rt.transport = transport;
-            rt.synapse_route = synapse_route_.get();
-            rt.global_neuron_base = static_cast<uint64_t>(global_neuron_base_);
-            if (spike_comm_) {
-                spike_comm_->bindRuntime(rt);
-                spike_comm_->initRouting();
-                spike_comm_ready_ = spike_comm_->ready();
-            } else {
-                spike_comm_ready_ = false;
-            }
-        }
+        // Phase6/Phase4：workload runtime 绑定（平台：内存/NoC/parent；stream 额外绑定统计 sinks）。
+        // Phase4 Task6.3：route/comm 装配已迁入 workload=snn，CoreShell 不再负责通信子系统装配。
+        bindWorkloadRuntime_();
 
         // 权重验证所需的文件加载已下沉到 compute core（DefaultSnnComputeCore::initVerifyFile_）
     }
 
-    // 将 init 相位转发给 StandardMem，以建立地址映射与握手
-    if (memory_) {
-        memory_->init(phase);
-    }
+    // 将 init 相位转发给 StandardMem（通过 stdmem 端点转发）
+    stdmem_ep_->init(phase);
 
-    // 转发到 compute core（全阶段；保持与内存握手一致）
-    if (compute_core_) compute_core_->onInit(phase);
+    // Phase4 Task6.1：compute core init 下沉到 workload=snn（通过 onInitPhase 转发）。
 
     // Default weight initialization disabled, relying on WeightLoader
     if (phase == 4) {
         // 所有init阶段结束，允许后续时钟中发起访问
         memory_ready_ = true;
     }
+
+    // Phase4：将生命周期相位转发给 workload（CoreShell 统一出口）。
+    if (workload_) workload_->onInitPhase(phase);
 }
 
 void SnnPESubComponent::complete(unsigned int phase) {
     // 转发 complete 给 StandardMem：这是 memHierarchy init 握手的必要阶段（尤其当下游不是 Cache 而是 Bus/Dir）。
-    if (memory_) {
-        memory_->complete(phase);
-    }
+    stdmem_ep_->complete(phase);
 }
 
 void SnnPESubComponent::setup() {
@@ -1063,7 +1195,7 @@ void SnnPESubComponent::setup() {
         output_->fatal(CALL_INFO, -1, "❌ 错误: 核心%d没有父级接口\n", core_id_);
     }
     // 注意：此处不直接发起内存访问，避免在setup阶段 MemLink 尚未建立时触发 memHierarchy fatal
-    if (!memory_) {
+    if (!stdmem_ep_ || !stdmem_ep_->available()) {
         // output_->verbose(CALL_INFO, 1, 0, "⚠️ 核心%d未配置StandardMem，检查是否有直接权重文件\n", core_id_);
         
         // 权重将由WeightLoader组件通过内存接口加载
@@ -1087,10 +1219,16 @@ void SnnPESubComponent::setup() {
             core_id_, (uint64_t)global_neuron_base_, num_neurons_, weights_cols_);
     }
     // 配置一致性：启用窗口端到端语义时要求 window 模式的 GAS
+    if (isStreamWorkload_()) {
+        // stream workload 不依赖 GAS/Apply/Scatter，也不要求路由/权重子系统就绪。
+        if (workload_) workload_->onSetup();
+        return;
+    }
     if (apply_acc_enable_ && (!gas_enable_ || !gas_window_mode_)) {
         output_->fatal(CALL_INFO, -1, "❌ 配置错误：apply_acc_enable=1 需要 GAS 启用且 gas_window_mode=1 (window_auto)。\n");
     }
-    if (compute_core_) compute_core_->onSetup();
+    // Phase4 Task6.1：compute core setup 下沉到 workload=snn。
+    if (workload_) workload_->onSetup();
     // output_->verbose(CALL_INFO, 1, 0, "✅ SnnPE SubComponent核心%d setup完成\n", core_id_);
 }
 
@@ -1131,13 +1269,23 @@ void SnnPESubComponent::finish() {
         profiler_->export_csv(csv, 3.0);
     }
 #endif
-    if (compute_core_) compute_core_->onFinish();
+    // Phase4 Task6.1：compute core finish 下沉到 workload=snn。
+    if (workload_) workload_->onFinish();
 }
 
 bool SnnPESubComponent::clockTick(Cycle_t current_cycle) {
+    (void)current_cycle; // 统一使用内部 cycle 计数，避免不同 SST 调度口径导致漂移
     total_cycles_++;
-    if (compute_core_) compute_core_->onClockTick(static_cast<uint64_t>(total_cycles_));
-    if (weight_mem_subsystem_) weight_mem_subsystem_->onClockTick(static_cast<uint64_t>(total_cycles_));
+    if (!workload_) return false;
+    const bool did = workload_->onClockTick(static_cast<uint64_t>(total_cycles_));
+    // stream workload 的 active_cycles 由 workload 的返回值定义；SNN 仍由 legacy 链路内的 has_activity 决定。
+    if (isStreamWorkload_() && did) active_cycles_++;
+    return false;
+}
+
+bool SnnPESubComponent::legacyClockTickInternal_(Cycle_t current_cycle) {
+    (void)current_cycle;
+    // Phase4-Task6.1：compute core 的 per-tick 驱动已下沉到 workload=snn（SnnWorkload）。
     bool has_activity = false;
     if (!clock_tick_logged_ && window_read_debug_) {
         output_->verbose(CALL_INFO, 0, 0,
@@ -1154,28 +1302,34 @@ bool SnnPESubComponent::clockTick(Cycle_t current_cycle) {
     }
     // GAS: mark gather window start for this cycle (barrier-based)
     if (gas_enable_ && !gas_window_mode_ && ensureMemoryReady_()) {
-        auto *begin_g = new SST::Interfaces::StandardMem::CustomReq(
-            new SST::SnnDL::GasOpData(SST::SnnDL::GasOp::BeginGather, /*ss*/0, /*slice*/0, /*tot*/1));
-        memory_->send(begin_g);
+        stdmem_ep_->sendGasCmd(GasOp::BeginGather, /*ss*/0, /*slice*/0, /*tot*/1);
     }
-    if (gas_enable_ && gas_window_mode_ && gas_manual_window_drive_ && manual_window_drive_) {
-        manual_window_drive_->manualWindowTick();
-        manual_gas_counter_++;
-        if (!manual_tick_sampled_ && manual_gas_counter_ <= manual_gas_gather_cycles_cfg_) {
-            output_->verbose(CALL_INFO, 0, 0,
-                "[diag-gas] 核心%d manual_tick stage=%d counter=%" PRIu64 " threshold=%" PRIu64 "\n",
-                core_id_, (int)gas_stage_, manual_gas_counter_, manual_gas_gather_cycles_cfg_);
-            if (manual_gas_counter_ >= manual_gas_gather_cycles_cfg_) manual_tick_sampled_ = true;
-        }
-        if (manual_gas_counter_ >= manual_gas_gather_cycles_cfg_) {
-            auto *end_g = new SST::Interfaces::StandardMem::CustomReq(
-                new SST::SnnDL::GasOpData(SST::SnnDL::GasOp::EndGather, /*ss*/0, /*slice*/0, /*tot*/1));
-            memory_->send(end_g);
-            output_->verbose(CALL_INFO, 0, 0,
-                "[diag-gas] 核心%d手动发出 EndGather (stage=%d cnt=%" PRIu64 ")\n",
-                core_id_, (int)gas_stage_, manual_gas_counter_);
-            manual_gas_counter_ = 0;
-            manual_tick_sampled_ = false;
+    if (gas_enable_ && gas_window_mode_ && gas_manual_window_drive_) {
+        auto* drive = (stdmem_ep_ && stdmem_ep_->available()) ? stdmem_ep_->manualWindowDrive() : nullptr;
+        if (!drive) {
+            if (window_read_debug_ && output_ && !manual_window_tick_logged_) {
+                output_->verbose(CALL_INFO, 0, 0,
+                    "[diag-gas] core=%d manual window drive requested but unavailable (IManualWindowDrive not provided by stdmem)\n",
+                    core_id_);
+                manual_window_tick_logged_ = true;
+            }
+        } else {
+            drive->manualWindowTick();
+            manual_gas_counter_++;
+            if (!manual_tick_sampled_ && manual_gas_counter_ <= manual_gas_gather_cycles_cfg_) {
+                output_->verbose(CALL_INFO, 0, 0,
+                    "[diag-gas] 核心%d manual_tick stage=%d counter=%" PRIu64 " threshold=%" PRIu64 "\n",
+                    core_id_, (int)gas_stage_, manual_gas_counter_, manual_gas_gather_cycles_cfg_);
+                if (manual_gas_counter_ >= manual_gas_gather_cycles_cfg_) manual_tick_sampled_ = true;
+            }
+            if (manual_gas_counter_ >= manual_gas_gather_cycles_cfg_) {
+                stdmem_ep_->sendGasCmd(GasOp::EndGather, /*ss*/0, /*slice*/0, /*tot*/1);
+                output_->verbose(CALL_INFO, 0, 0,
+                    "[diag-gas] 核心%d手动发出 EndGather (stage=%d cnt=%" PRIu64 ")\n",
+                    core_id_, (int)gas_stage_, manual_gas_counter_);
+                manual_gas_counter_ = 0;
+                manual_tick_sampled_ = false;
+            }
         }
     }
     // 学习窗口边界由 compute core 驱动
@@ -1194,6 +1348,15 @@ bool SnnPESubComponent::clockTick(Cycle_t current_cycle) {
     //
     // 同时，为消除 MPI 多 rank 下“同一时间戳事件到达顺序抖动”导致的非确定性，
     // 对本 tick 中可处理的 spike 做确定性排序（按 timestamp/dest/src/weight 位序）。
+    if (workload_spike_input_enable_ &&
+        apply_acc_enable_ && gas_window_mode_ && window_read_enable_ && !scheme1_enable_ &&
+        !incoming_spikes_.empty()) {
+        // Phase7: strict window-read spike input is owned by workload=snn.
+        output_->fatal(CALL_INFO, -1,
+            "core=%d legacy incoming_spikes_ is non-empty under strict window-read; "
+            "this indicates an unintended fallback to legacy spike queueing.\n",
+            core_id_);
+    }
     const uint64_t now_ns = getCurrentSimTimeNano();
     std::vector<SpikeEvent*> ready_spikes;
     ready_spikes.reserve(std::min<size_t>(incoming_spikes_.size(), 256));
@@ -1320,14 +1483,14 @@ bool SnnPESubComponent::clockTick(Cycle_t current_cycle) {
     }
 
     // BCSR探针：尽力在同一窗口发起一次按边读，扫描一个块内的列，促成 1.0 样本出现（仅诊断；不影响GAS语义）
-    if (verify_weights_ && use_bcsr_ && memory_ && memory_ready_ && bcsr_weights_.isRowptrReady() &&
+    if (verify_weights_ && use_bcsr_ && ensureMemoryReady_() && bcsr_weights_->isRowptrReady() &&
         total_cycles_ >= memory_warmup_cycles_ && (loader_barrier_cycles_ == 0 || total_cycles_ >= loader_barrier_cycles_)) {
         if (!verify_bcsr_done_ && !verify_bcsr_inflight_) {
             uint32_t br = (bcsr_br_>0? bcsr_br_:16);
             uint32_t bc = (bcsr_bc_>0? bcsr_bc_:16);
             uint32_t nBlockRows = (num_neurons_ + br - 1) / br;
             if (!verify_bcsr_started_) {
-                const auto& rp = bcsr_weights_.rowptrHost();
+                const auto& rp = bcsr_weights_->rowptrHost();
                 for (uint32_t r = 0; r < nBlockRows; ++r) {
                     if (r + 1 >= rp.size()) break;
                     uint32_t start = rp[r];
@@ -1355,7 +1518,7 @@ bool SnnPESubComponent::clockTick(Cycle_t current_cycle) {
                             if (parseBcsrMeta(meta_path, rows, colsN, brM, bcM, idxB, valB, rp_off, ci_off, bd_off, id_off, totalB)) {
                                 std::ifstream fin(bin_path, std::ios::binary);
                                 if (fin.good()) {
-                                    const auto& rp = bcsr_weights_.rowptrHost();
+                                    const auto& rp = bcsr_weights_->rowptrHost();
                                     uint32_t start = (r+1 < rp.size() ? rp[r] : 0);
                                     uint32_t end   = (r+1 < rp.size() ? rp[r+1] : start);
                                     uint32_t brEff = (brM? brM : 1), bcEff = (bcM? bcM : 16);
@@ -1390,7 +1553,7 @@ bool SnnPESubComponent::clockTick(Cycle_t current_cycle) {
                 size_t block_bytes = (size_t)(bcsr_br_>0?bcsr_br_:1) * (size_t)bc_eff * (size_t)bcsr_val_bytes_;
                 uint32_t start = 0;
                 uint64_t block_addr = 0;
-                const auto& rp = bcsr_weights_.rowptrHost();
+                const auto& rp = bcsr_weights_->rowptrHost();
                 if (block_row + 1 < rp.size()) {
                     start = rp[block_row];
                     block_addr = bcsr_blockdata_addr_ + (uint64_t)(start + verify_bcsr_block_col_) * block_bytes;
@@ -1475,116 +1638,68 @@ bool SnnPESubComponent::clockTick(Cycle_t current_cycle) {
     }
 #endif // legacy verify/probe path (moved to compute core)
 
-    // window(acc) 模式下，动力学/发放由 BeginScatter 统一触发（一个 window 一次）。
-    // 这里避免在每个 clockTick 末尾重复推进导致行为漂移。
-    if (!(apply_acc_enable_ && gas_window_mode_)) {
-        // 统一在 compute core 内推进动力学并判定发放，控制层只路由输出
-        drainCoreOutputsAndRoute_(static_cast<uint64_t>(total_cycles_));
-    }
+    // Phase4-Task6.3：非 window 模式下的 “endCycle->drain->route/comm” 闭环已迁入 workload=snn（SnnWorkload::onClockTick）。
+    // 控制层仅保留 GAS/window/阶段编排等 control-plane 逻辑，避免重复推进导致行为漂移。
     
     if (has_activity) {
         active_cycles_++;
     }
     // GAS: end of gather window for this cycle; GatherBufferIF will reply upon '读齐'
     if (gas_enable_ && !gas_window_mode_ && ensureMemoryReady_()) {
-        auto *end_g = new SST::Interfaces::StandardMem::CustomReq(
-            new SST::SnnDL::GasOpData(SST::SnnDL::GasOp::EndGather, /*ss*/0, /*slice*/0, /*tot*/1));
-        memory_->send(end_g);
+        stdmem_ep_->sendGasCmd(GasOp::EndGather, /*ss*/0, /*slice*/0, /*tot*/1);
     }
 
     return false;  // 继续时钟
 }
 
-void SnnPESubComponent::forceEndGather() {
-    if (!(gas_enable_ && gas_window_mode_ && gas_manual_window_drive_ && memory_ && memory_ready_)) return;
-    auto *end_g = new SST::Interfaces::StandardMem::CustomReq(
-        new SST::SnnDL::GasOpData(SST::SnnDL::GasOp::EndGather, /*ss*/0, /*slice*/0, /*tot*/1));
-    memory_->send(end_g);
-    if (window_read_debug_ && output_) {
-        output_->verbose(CALL_INFO, 0, 0, "[diag-gas] 核心%d 手动触发 EndGather\n", core_id_);
+bool SnnPESubComponent::legacySnnOnClockTick(uint64_t now_cycle) {
+    return legacyClockTickInternal_(static_cast<Cycle_t>(now_cycle));
+}
+
+void SnnPESubComponent::legacySnnOnWeightsTick(uint64_t now_cycle) {
+    if (weight_mem_subsystem_) weight_mem_subsystem_->onClockTick(now_cycle);
+}
+
+void SnnPESubComponent::legacySnnBindComputeCore(ISnnComputeCore* core) {
+    compute_core_ = core;
+}
+
+IWeightReader* SnnPESubComponent::legacySnnGetWeightReader() {
+    if (weight_reader_adapter_) return weight_reader_adapter_.get();
+    // Phase4-Task6.2-Step2: weight reader ownership moved into workload; keep a non-owning view for legacy paths.
+    return weight_mem_subsystem_;
+}
+
+std::unique_ptr<IWeightReader> SnnPESubComponent::legacySnnTakeWeightReader() {
+    // Phase4-Task6.2-Step2: transfer ownership to workload=snn (called exactly once).
+    return std::move(weight_reader_adapter_);
+}
+
+bool SnnPESubComponent::legacySnnWriteback(const std::unordered_map<uint64_t, float>& grads,
+                                          float learning_rate,
+                                          float weight_decay) {
+    if (!ensureMemoryReady_()) {
+        if (output_) {
+            output_->verbose(CALL_INFO, 1, 0,
+                "⚠️ 学习: 写回启用但内存接口不可用，跳过本窗写回\n");
+        }
+        return false;
     }
+    return applyLocalWeightUpdates_(grads, learning_rate, weight_decay);
 }
 
-void SnnPESubComponent::orchestrateBeginGatherWindowSetup() {
-    onStageBeginGatherCore_(curr_stage_seq_);
-    if (stage_event_hub_) stage_event_hub_->markBeginGather(curr_stage_seq_);
-}
-
-void SnnPESubComponent::orchestratePrepareApplyWindow() {
-    prepareEdgeWindowForApply_();
-}
-
-void SnnPESubComponent::orchestrateApplyWindowEntry() {
-    onStageBeginApplyCore_(curr_stage_seq_);
-    if (stage_event_hub_) stage_event_hub_->markBeginApply(curr_stage_seq_);
-}
-
-void SnnPESubComponent::orchestrateBeginApplyIssueFallback(bool strict_active) {
-    issueFallbackReadsIfNeeded_(strict_active);
-}
-
-void SnnPESubComponent::orchestrateContinueIssueReads() {
-    issueFromEdges_();
-}
-
-void SnnPESubComponent::orchestrateIssueFromEdgesDirect() {
-    issueEdgeWeightFetches_();
-}
-
-void SnnPESubComponent::orchestrateBeginScatterSequence() {
-    diag_spikes_stage_apply_ = 0;
-    onStageEndApplyCore_(curr_stage_seq_);
-    onStageBeginScatterCore_(curr_stage_seq_);
-    clearFiredWindowCore_();
-    if (stage_event_hub_) stage_event_hub_->markBeginScatter(curr_stage_seq_);
-    spikes_generated_base_ = count_spikes_generated_;
-    uint64_t spikes_emitted = applyAccumulatedWindowAndScatter_();
-    if (spikes_emitted>0 && parent_) { if (auto* pe = parent_pe_cached_) pe->accumulateApplyScatterStats(0,0,spikes_emitted,0,0,0); }
-}
-
-void SnnPESubComponent::orchestrateEndScatterSequence() {
-    uint64_t to_emit = window_spikes_all_ ? window_spikes_all_ : spikes_emitted_window_;
-    if (to_emit == 0) {
-        uint64_t delta = 0;
-        if (count_spikes_generated_ >= spikes_generated_base_) delta = count_spikes_generated_ - spikes_generated_base_;
-        if (delta > 0) to_emit = delta;
-    }
-    if (stage_event_hub_) stage_event_hub_->markEndScatter(curr_stage_seq_, to_emit);
-    onStageEndScatterCore_(curr_stage_seq_, to_emit);
-}
-
-// deliverSpike 实现已拆分到 SnnPESubComponent_spike.cc（输入路径控制逻辑）
-
-void SnnPESubComponent::resetMembraneState(float v_rest_value) {
-    resetMembraneState_(v_rest_value);
-    accReset_();
-}
-
-void SnnPESubComponent::setMemoryLink(SST::Link* link) {
-    memory_link_ = link;
-    
-    // ★ 关键修正：直接使用提供的Link进行内存操作 ★
-    if (memory_link_) {
-        // output_->verbose(CALL_INFO, 2, 0, "🔗 核心%d设置内存连接成功\n", core_id_);
-        memory_ready_ = true;  // 标记内存已准备就绪
-    } else {
-        output_->verbose(CALL_INFO, 2, 0, "🔗 核心%d设置内存连接失败 (link=nullptr)\n", core_id_);
-        memory_ready_ = false;
-    }
-}
-
-bool SnnPESubComponent::hasWork() const {
+bool SnnPESubComponent::legacySnnHasWork() const {
     if (compute_core_ && compute_core_->hasWork()) return true;
     return !incoming_spikes_.empty();
 }
 
-double SnnPESubComponent::getUtilization() const {
+double SnnPESubComponent::legacySnnGetUtilization() const {
     if (compute_core_) return compute_core_->getUtilization();
     if (total_cycles_ == 0) return 0.0;
     return static_cast<double>(active_cycles_) / static_cast<double>(total_cycles_);
 }
 
-void SnnPESubComponent::getStatistics(std::map<std::string, uint64_t>& stats) const {
+void SnnPESubComponent::legacySnnGetStatistics(std::map<std::string, uint64_t>& stats) const {
     // 使用内部计数器而不是getCollectionCount()来获取正确的累计值
     if (compute_core_) {
         std::map<std::string, uint64_t> core_stats;
@@ -1611,35 +1726,150 @@ void SnnPESubComponent::getStatistics(std::map<std::string, uint64_t>& stats) co
     if (!stats.count("core_weight_cache_hits") && stat_weight_cache_hits_) stats["core_weight_cache_hits"] = stat_weight_cache_hits_->getCollectionCount();
     if (!stats.count("core_weight_cache_misses") && stat_weight_cache_misses_) stats["core_weight_cache_misses"] = stat_weight_cache_misses_->getCollectionCount();
     if (!stats.count("core_pending_reqs_peak")) stats["core_pending_reqs_peak"] = pending_reqs_peak_;
+    if (enable_extended_diagnostics_) {
+        stats["core_non_spike_packets_received"] = count_non_spike_packets_received_;
+    }
+    // 注意：stream 专用统计由 StreamWorkload 填充；这里保持为纯 SNN legacy host。
 }
 
-void SnnPESubComponent::handleNeuronFire_(uint32_t neuron_idx, float v_before, float v_after) {
-    // 学习/发放记录已由 compute core 处理
-
-    stat_neurons_fired_->addData(1);
-    stat_spikes_generated_->addData(1);
-    count_neurons_fired_++;
-    count_spikes_generated_++;
-    if (apply_acc_enable_ && gas_window_mode_) {
-        window_spikes_all_++;
+void SnnPESubComponent::forceEndGather() {
+    if (!(gas_enable_ && gas_window_mode_ && gas_manual_window_drive_ && ensureMemoryReady_())) return;
+    stdmem_ep_->sendGasCmd(GasOp::EndGather, /*ss*/0, /*slice*/0, /*tot*/1);
+    if (window_read_debug_ && output_) {
+        output_->verbose(CALL_INFO, 0, 0, "[diag-gas] 核心%d 手动触发 EndGather\n", core_id_);
     }
-    // 去重发放统计：首次发放上报到父PE聚合
-    if (neuron_idx < fired_ever_.size() && fired_ever_[neuron_idx] == 0) {
-        fired_ever_[neuron_idx] = 1;
-        if (parent_) {
+}
+
+void SnnPESubComponent::orchestrateBeginGatherWindowSetup() {
+    onStageBeginGatherCore_(curr_stage_seq_);
+    if (impl_) impl_->markBeginGather(curr_stage_seq_);
+}
+
+void SnnPESubComponent::orchestratePrepareApplyWindow() {
+    prepareEdgeWindowForApply_();
+}
+
+void SnnPESubComponent::orchestrateApplyWindowEntry() {
+    onStageBeginApplyCore_(curr_stage_seq_);
+    if (impl_) impl_->markBeginApply(curr_stage_seq_);
+}
+
+void SnnPESubComponent::orchestrateBeginApplyIssueFallback(bool strict_active) {
+    issueFallbackReadsIfNeeded_(strict_active);
+}
+
+void SnnPESubComponent::orchestrateContinueIssueReads() {
+    issueFromEdges_();
+}
+
+void SnnPESubComponent::orchestrateIssueFromEdgesDirect() {
+    issueEdgeWeightFetches_();
+}
+
+void SnnPESubComponent::orchestrateBeginScatterSequence() {
+    diag_spikes_stage_apply_ = 0;
+    onStageEndApplyCore_(curr_stage_seq_);
+    onStageBeginScatterCore_(curr_stage_seq_);
+    clearFiredWindowCore_();
+    if (impl_) impl_->markBeginScatter(curr_stage_seq_);
+    spikes_generated_base_ = count_spikes_generated_;
+    uint64_t spikes_emitted = applyAccumulatedWindowAndScatter_();
+    if (spikes_emitted>0 && parent_) { if (auto* pe = parent_pe_cached_) pe->accumulateApplyScatterStats(0,0,spikes_emitted,0,0,0); }
+}
+
+void SnnPESubComponent::orchestrateEndScatterSequence() {
+    uint64_t to_emit = window_spikes_all_ ? window_spikes_all_ : spikes_emitted_window_;
+    if (to_emit == 0) {
+        uint64_t delta = 0;
+        if (count_spikes_generated_ >= spikes_generated_base_) delta = count_spikes_generated_ - spikes_generated_base_;
+        if (delta > 0) to_emit = delta;
+    }
+    if (impl_) impl_->markEndScatter(curr_stage_seq_, to_emit);
+    onStageEndScatterCore_(curr_stage_seq_, to_emit);
+}
+
+// deliverSpike 实现已拆分到 SnnPESubComponent_spike.cc（输入路径控制逻辑）
+
+void SnnPESubComponent::resetMembraneState(float v_rest_value) {
+    resetMembraneState_(v_rest_value);
+    accReset_();
+}
+
+void SnnPESubComponent::setMemoryLink(SST::Link* link) {
+    memory_link_ = link;
+    
+    // ★ 关键修正：直接使用提供的Link进行内存操作 ★
+    if (memory_link_) {
+        // output_->verbose(CALL_INFO, 2, 0, "🔗 核心%d设置内存连接成功\n", core_id_);
+        memory_ready_ = true;  // 标记内存已准备就绪
+    } else {
+        output_->verbose(CALL_INFO, 2, 0, "🔗 核心%d设置内存连接失败 (link=nullptr)\n", core_id_);
+        memory_ready_ = false;
+    }
+}
+
+bool SnnPESubComponent::hasWork() const {
+    if (workload_) return workload_->hasWork();
+    return legacySnnHasWork();
+}
+
+double SnnPESubComponent::getUtilization() const {
+    if (workload_) return workload_->getUtilization();
+    return legacySnnGetUtilization();
+}
+
+void SnnPESubComponent::getStatistics(std::map<std::string, uint64_t>& stats) const {
+    if (workload_) {
+        workload_->getStatistics(stats);
+        return;
+    }
+    legacySnnGetStatistics(stats);
+}
+
+void SnnPESubComponent::legacySnnOnNeuronFires(const std::vector<uint32_t>& neuron_indices, uint64_t /*now_cycle*/) {
+    // Phase4-Task6.3：统计口径仍锚定在 CoreShell；workload 只负责 route/comm 事务。
+    for (uint32_t neuron_idx : neuron_indices) {
+        if (stat_neurons_fired_) stat_neurons_fired_->addData(1);
+        if (stat_spikes_generated_) stat_spikes_generated_->addData(1);
+        count_neurons_fired_++;
+        count_spikes_generated_++;
+        if (apply_acc_enable_ && gas_window_mode_) {
+            window_spikes_all_++;
+        }
+        if (neuron_idx < fired_ever_.size() && fired_ever_[neuron_idx] == 0) {
+            fired_ever_[neuron_idx] = 1;
             if (auto* pe = parent_pe_cached_) {
-                // 累加一次唯一发放
                 pe->accumulateUniqueNeuronFired(1);
             }
         }
     }
+}
 
+void SnnPESubComponent::legacySnnOnGasScatterSpikesEmitted(uint32_t /*seq*/, uint64_t spikes_emitted) {
+    // Phase4-Task6.4：scatter 事务由 workload=snn 执行；CoreShell 仅负责：
+    // - 统计/聚合口径（用于 essential_summary / mesh_stats）
+    // - EndScatter 的窗口 spikes hint
+    spikes_emitted_window_ = spikes_emitted;
+    if (spikes_emitted > 0) {
+        if (stat_gas_scatter_spikes_emitted_total_) {
+            stat_gas_scatter_spikes_emitted_total_->addData(spikes_emitted);
+        }
+        if (parent_) {
+            if (auto* pe = parent_pe_cached_) {
+                // 目前 acc_updates/posts_touched 等细项统计未迁入 workload；保持历史口径为 0（仅保留 spikes_emitted）。
+                pe->accumulateApplyScatterStats(0, 0, spikes_emitted, 0, 0, 0);
+            }
+        }
+    }
+}
+
+void SnnPESubComponent::handleNeuronFire_(uint32_t neuron_idx, float v_before, float v_after) {
+    legacySnnOnNeuronFires(std::vector<uint32_t>{neuron_idx}, static_cast<uint64_t>(total_cycles_));
     output_->verbose(CALL_INFO, 3, 0, "🔥 核心%d神经元%d发放脉冲! v_before=%.3f -> v_after=%.3f\n",
                     core_id_, neuron_idx, v_before, v_after);
-
-    // 统一走通信子系统（内部封装路由/门控/事件构造与投递）
-    if (spike_comm_) {
-        spike_comm_->emitNeuronFire(neuron_idx, static_cast<uint64_t>(total_cycles_));
+    // 发送职责已迁入 workload=snn（Phase4 Task6.3）。
+    if (snn_comm_workload_) {
+        snn_comm_workload_->emitNeuronFire(neuron_idx, static_cast<uint64_t>(total_cycles_));
     }
 }
 
@@ -1721,6 +1951,18 @@ void SnnPESubComponent::initializeStatistics() {
     // 记录单次内存请求大小与发起时的未完成请求数（Mesh 汇总使用）
     stat_mem_req_size_bytes_ = registerStatistic<uint64_t>("mem_req_size_bytes");
     stat_mem_outstanding_at_issue_ = registerStatistic<uint64_t>("mem_outstanding_at_issue");
+
+    // Phase6: stream workload stats (always registered; default no-op when workload_impl=snn)
+    stat_stream_mem_writes_issued_total_ = registerStatistic<uint64_t>("stream_mem_writes_issued_total");
+    stat_stream_mem_reads_issued_total_ = registerStatistic<uint64_t>("stream_mem_reads_issued_total");
+    stat_stream_mem_bytes_written_total_ = registerStatistic<uint64_t>("stream_mem_bytes_written_total");
+    stat_stream_mem_bytes_read_total_ = registerStatistic<uint64_t>("stream_mem_bytes_read_total");
+    stat_stream_mem_verify_pass_total_ = registerStatistic<uint64_t>("stream_mem_verify_pass_total");
+    stat_stream_mem_verify_fail_total_ = registerStatistic<uint64_t>("stream_mem_verify_fail_total");
+    stat_stream_pkt_sent_total_ = registerStatistic<uint64_t>("stream_pkt_sent_total");
+    stat_stream_pkt_recv_total_ = registerStatistic<uint64_t>("stream_pkt_recv_total");
+    stat_stream_pkt_bad_crc_total_ = registerStatistic<uint64_t>("stream_pkt_bad_crc_total");
+    stat_stream_pkt_bad_magic_total_ = registerStatistic<uint64_t>("stream_pkt_bad_magic_total");
     
     // Attach stats hooks to accumulator module now that they are registered.
     if (acc_ops_) {

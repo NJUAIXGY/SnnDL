@@ -6,19 +6,9 @@
 #include <sst/core/interfaces/stdMem.h>
 #include <string>
 
-namespace SST { namespace SnnDL {
+#include "GasOps.h"
 
-// GAS control opcodes
-enum class GasOp : uint8_t {
-    BeginGather = 1,
-    EndGather   = 2,
-    BeginApply  = 3,
-    EndApply    = 4,
-    BeginScatter= 5,
-    EndScatter  = 6,
-    FlushSRAM   = 7,
-    SetSlice    = 8,
-};
+namespace SST { namespace SnnDL {
 
 // CustomData payload carried inside StandardMem::CustomReq/Resp
 struct GasOpData : public SST::Interfaces::StandardMem::CustomData {

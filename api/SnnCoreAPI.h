@@ -11,11 +11,12 @@
 #include <sst/core/link.h>
 #include <map>
 
-#include "SpikeEvent.h"
-#include "SnnPEParentInterface.h"
-
 namespace SST {
 namespace SnnDL {
+
+class SpikeEvent;
+class NocPacketEvent;
+class SnnPEParentInterface;
 
 class SnnCoreAPI : public SST::SubComponent {
 public:
@@ -34,6 +35,9 @@ public:
 
     // 业务接口
     virtual void deliverSpike(SpikeEvent* spike) = 0;
+    // 通用 NoC packet 输入（非 Spike 语义）：默认不处理，由上层回收 packet 内存。
+    // 返回 true 表示本 core 接管 packet 生命周期；返回 false 表示未处理、由调用方负责 delete。
+    virtual bool deliverPacket(NocPacketEvent* /*packet*/) { return false; }
     virtual void getStatistics(std::map<std::string, uint64_t>& stats) const = 0;
     virtual bool hasWork() const = 0;
     virtual double getUtilization() const = 0;

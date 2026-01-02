@@ -5,7 +5,9 @@
 
 #include "NocSubsystem.h"
 
+#include <algorithm>
 #include <cinttypes>
+#include <vector>
 
 #include <sst/core/event.h>
 #include <sst/core/link.h>
@@ -18,6 +20,20 @@
 #include "NocPacketBatchEvent.h"
 
 namespace SST { namespace SnnDL {
+
+#if __cplusplus >= 201703L
+namespace {
+static inline uint64_t fnv1a64_(const std::vector<uint8_t>& bytes) {
+    // Deterministic tie-breaker for same-timestamp packets under -n multi-thread.
+    uint64_t h = 1469598103934665603ULL;
+    for (uint8_t b : bytes) {
+        h ^= static_cast<uint64_t>(b);
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+} // namespace
+#endif
 
 #ifndef NOC_LOG
 #define NOC_LOG(lvl, ...) do { if (rt_.log && cfg_.log_enable) rt_.log->verbose(CALL_INFO, (lvl), 0, __VA_ARGS__); } while(0)
@@ -284,9 +300,36 @@ void NocSubsystem::onDirectionalLinkEvent(SST::Event* event, const std::string& 
 }
 
 void NocSubsystem::drainIncomingQueue(uint64_t /*current_cycle*/) {
+    if (incoming_queue_.empty()) return;
+
+    std::vector<NocPacketEvent*> packets;
+    packets.reserve(incoming_queue_.size());
     while (!incoming_queue_.empty()) {
-        NocPacketEvent* packet = incoming_queue_.front();
+        packets.push_back(incoming_queue_.front());
         incoming_queue_.pop();
+    }
+
+    if (packets.size() > 1) {
+        std::sort(packets.begin(), packets.end(), [](const NocPacketEvent* a, const NocPacketEvent* b) {
+            if (a == b) return false;
+            if (!a) return true;
+            if (!b) return false;
+            if (a->timestamp != b->timestamp) return a->timestamp < b->timestamp;
+            if (a->src_node != b->src_node) return a->src_node < b->src_node;
+            if (a->src_endpoint != b->src_endpoint) return a->src_endpoint < b->src_endpoint;
+            if (a->dst_node != b->dst_node) return a->dst_node < b->dst_node;
+            if (a->dst_endpoint != b->dst_endpoint) return a->dst_endpoint < b->dst_endpoint;
+            if (a->kind != b->kind) return a->kind < b->kind;
+            if (a->hop_count != b->hop_count) return a->hop_count < b->hop_count;
+            if (a->payload.size() != b->payload.size()) return a->payload.size() < b->payload.size();
+            const uint64_t ha = fnv1a64_(a->payload);
+            const uint64_t hb = fnv1a64_(b->payload);
+            return ha < hb;
+        });
+    }
+
+    for (auto* packet : packets) {
+        if (!packet) continue;
 
         const bool is_local = (static_cast<int>(packet->dst_node) == rt_.node_id);
 

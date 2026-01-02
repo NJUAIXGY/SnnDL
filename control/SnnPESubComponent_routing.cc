@@ -8,7 +8,8 @@
 #include <sst/core/sst_config.h>
 
 #include "SnnPESubComponent.h"
-#include "synapse/route/SpikeCommSubsystem.h"
+#include "api/ISnnSpikeCommWorkload.h"
+#include "synapse/weights/SnnBcsrWeightManager.h"
 
 #include <algorithm>
 #include <cctype>
@@ -391,7 +392,7 @@ bool SnnPESubComponent::appendRoutesFromBcsrFile(const std::string& path, uint32
     uint32_t bc = bcsr_bc_ ? bcsr_bc_ : 16;
     uint32_t idx_bytes = bcsr_idx_bytes_ ? bcsr_idx_bytes_ : 2;
     uint32_t val_bytes = bcsr_val_bytes_ ? bcsr_val_bytes_ : 4;
-    uint64_t rowptr_off = (bcsr_weights_.rowptrAddr() > base_addr_) ? (bcsr_weights_.rowptrAddr() - base_addr_) : 0;
+    uint64_t rowptr_off = (bcsr_weights_->rowptrAddr() > base_addr_) ? (bcsr_weights_->rowptrAddr() - base_addr_) : 0;
     uint64_t colidx_off = (bcsr_colidx_addr_ > base_addr_) ? (bcsr_colidx_addr_ - base_addr_) : 0;
     uint64_t blockdata_off = (bcsr_blockdata_addr_ > base_addr_) ? (bcsr_blockdata_addr_ - base_addr_) : 0;
     uint64_t blockids_off = (bcsr_blockids_addr_ > base_addr_) ? (bcsr_blockids_addr_ - base_addr_) : 0;
@@ -524,7 +525,8 @@ std::string SnnPESubComponent::resolveWeightTemplate(uint32_t pe, int core) cons
 void SnnPESubComponent::applyGatingDecision(uint32_t src_global, const std::vector<uint32_t>& dest_pes,
                              uint64_t current_cycle, uint64_t ttl_cycles)
 {
-    if (spike_comm_) {
-        spike_comm_->applyGatingDecision(src_global, dest_pes, current_cycle, ttl_cycles);
+    // Phase4-Task6.3：门控决策的应用下沉到 workload=snn（synapse/route）。
+    if (snn_comm_workload_) {
+        snn_comm_workload_->applyGatingDecision(src_global, dest_pes, current_cycle, ttl_cycles);
     }
 }

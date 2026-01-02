@@ -1,15 +1,17 @@
 // -*- c++ -*-
 //
-// SnnPESubComponent_mem.cc: StandardMem request/response tracking and dense read/write
-// helpers extracted from SnnPESubComponent.cc. Behavior preserved; only file split.
+// SnnPESubComponent_mem.cc: StandardMem glue + dense read/write helpers for SnnPESubComponent.
 //
 
 #include <sst/core/sst_config.h>
+#include <sst/core/componentInfo.h>
+#include <sst/core/interfaces/stdMem.h>
 #include "SnnPESubComponent.h"
-#include "synapse/gas/GasCustomCmd.h"
-#include "synapse/gas/GasPhaseController.h"
-#include "StageEventHub.h"
+#include "SnnPESubComponent_impl.h"
 #include "IPeAggregation.h"
+#include "IManualWindowDrive.h"
+#include "synapse/stdmem/StdMemEndpoint.h"
+#include "synapse/weights/SnnBcsrWeightManager.h"
 #include "synapse/weights/WeightMemorySubsystem.h"
 #include "memory/StandardMemAccess.h"
 
@@ -22,6 +24,10 @@
 
 using namespace SST;
 using namespace SST::SnnDL;
+
+template <>
+void SnnPESubComponent::handleMemoryResponse<SST::Interfaces::StandardMem::Request>(
+    SST::Interfaces::StandardMem::Request* req);
 
 // Lightweight logging helpers (file-local). Keep consistent with other split units.
 #ifndef SNNDL_LOGPTR
@@ -41,12 +47,68 @@ using namespace SST::SnnDL;
 #define SNNDL_DEBUG_BLOCK(stmt) do {} while(0)
 #endif
 
+void SnnPESubComponent::initStdMemPhase0_() {
+    // 加载 StandardMem 接口（Python 可通过槽位提供）。
+    // 注意：该逻辑放在 synapse/stdmem 域，避免 control/*.cc 出现 StandardMem::。
+    auto* stdmem = loadUserSubComponent<SST::Interfaces::StandardMem>(
+        "memory", ComponentInfo::SHARE_NONE,
+        registerTimeBase("1ns"),
+        new SST::Interfaces::StandardMem::Handler2<SnnPESubComponent,
+                                                   &SnnPESubComponent::handleMemoryResponse<SST::Interfaces::StandardMem::Request>>(this));
+
+    // bind endpoint for control-plane sends (Begin/EndGather etc.)
+    // Phase6：stream workload 需要“纯内存语义”，强制设置 non-cacheable（同时保留 env fallback 兼容路径）。
+    {
+        StdMemEndpoint::Config cfg{};
+        cfg.force_noncacheable = isStreamWorkload_();
+        stdmem_ep_->configure(cfg);
+    }
+    StdMemEndpoint::Runtime rt{};
+    rt.log = output_;
+    rt.node_id = static_cast<uint32_t>(node_id_);
+    rt.core_id = static_cast<uint32_t>(core_id_);
+    // Phase4-Task6.4: GAS stage/stat events are dispatched via StdMemEndpoint to CoreShell (IGasStageSink).
+    rt.gas_stage_sink = this;
+    rt.now_cycle = [this]() { return static_cast<uint64_t>(total_cycles_); };
+    rt.before_data_plane_dispatch = [this](uint64_t now_cycle) {
+        if (weight_mem_subsystem_) weight_mem_subsystem_->setNowCycle(now_cycle);
+    };
+    stdmem_ep_->bindRuntime(rt);
+    stdmem_ep_->bindStdMem(stdmem);
+
+    if (stdmem_ep_ && stdmem_ep_->available()) {
+        // 若已成功加载 StandardMem 子组件，则认为内存就绪（即使未显式提供 memory_link_）
+        memory_ready_ = true;
+        if (gas_manual_window_drive_) {
+            auto* drive = stdmem_ep_->manualWindowDrive();
+            if (!drive) {
+                if (output_) {
+                    output_->verbose(CALL_INFO, 0, 0,
+                        "⚠️ 核心%d启用gas_manual_window_drive但memory不支持IManualWindowDrive，降级为自动窗口\n",
+                        core_id_);
+                }
+                gas_manual_window_drive_ = false;
+            } else {
+                if (output_) {
+                    output_->verbose(CALL_INFO, 0, 0,
+                        "[diag-gas] 核心%d启用manual窗口驱动 (IManualWindowDrive) gather_cycles=%" PRIu64 "\n",
+                        core_id_, manual_gas_gather_cycles_cfg_);
+                }
+            }
+        }
+    } else {
+        memory_ready_ = false;
+    }
+}
+
 // === Learning writeback (called by compute core) ===
 bool SnnPESubComponent::applyLocalWeightUpdates_(const std::unordered_map<uint64_t, float>& grads,
                                                 float learning_rate,
                                                 float weight_decay) {
     if (grads.empty()) return true;
-    if (!memory_ || !memory_ready_ || !stdmem_access_) return false;
+    if (!ensureMemoryReady_()) return false;
+    auto* mem = stdmem_ep_ ? stdmem_ep_->memoryAccess() : nullptr;
+    if (!mem) return false;
     const uint32_t width = use_post_row_pre_col_ ? weights_cols_ : num_neurons_;
     const size_t bytes_per_float = sizeof(float);
     uint64_t total_writes = 0;
@@ -63,13 +125,13 @@ bool SnnPESubComponent::applyLocalWeightUpdates_(const std::unordered_map<uint64
         if (weight_decay != 0.0f) {
             new_w -= weight_decay * old_w;
         }
-        uint64_t addr = base_addr_ + key * bytes_per_float;
-        std::vector<uint8_t> data(bytes_per_float);
-        std::memcpy(data.data(), &new_w, bytes_per_float);
-        stats_reporter_.reportMemoryIssue(data.size(), false);
-        stdmem_access_->write(addr, data, nullptr);
-        total_writes++;
-        weightCacheStore_(key, new_w);
+	        uint64_t addr = base_addr_ + key * bytes_per_float;
+	        std::vector<uint8_t> data(bytes_per_float);
+	        std::memcpy(data.data(), &new_w, bytes_per_float);
+	        if (impl_) impl_->reportMemoryIssue(data.size(), false);
+	        mem->write(addr, data, nullptr);
+	        total_writes++;
+	        weightCacheStore_(key, new_w);
     }
     if (output_) {
         output_->verbose(CALL_INFO, 1, 0,
@@ -85,7 +147,8 @@ void SnnPESubComponent::requestWeight(uint32_t pre_neuron, uint32_t post_neuron,
         requestWeightBCSR(pre_neuron, post_neuron, std::move(callback));
         return;
     }
-    if (!ensureMemoryReady_() || !stdmem_access_) {
+    auto* mem = stdmem_ep_ ? stdmem_ep_->memoryAccess() : nullptr;
+    if (!ensureMemoryReady_() || !mem) {
         if (callback) callback(init_default_weight_);
         return;
     }
@@ -108,9 +171,9 @@ void SnnPESubComponent::requestWeight(uint32_t pre_neuron, uint32_t post_neuron,
             core_id_, row, col, (unsigned long long)req_addr, sizeof(float));
     }
 
-    stats_reporter_.reportMemoryIssue(sizeof(float), /*count_weight_read*/true);
-    stdmem_access_->read(req_addr, sizeof(float),
-        [this, cb = std::move(callback), issue_cycle](IMemoryAccess::RequestId, uint64_t, std::vector<uint8_t>&& data) mutable {
+	    if (impl_) impl_->reportMemoryIssue(sizeof(float), /*count_weight_read*/true);
+	    mem->read(req_addr, sizeof(float),
+	        [this, cb = std::move(callback), issue_cycle](IMemoryAccess::RequestId, uint64_t, std::vector<uint8_t>&& data) mutable {
             float w = 0.0f;
             if (data.size() >= sizeof(float)) {
                 std::memcpy(&w, data.data(), sizeof(float));
@@ -130,236 +193,18 @@ void SnnPESubComponent::requestWeight(uint32_t pre_neuron, uint32_t post_neuron,
         });
 }
 
-void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Request* req) {
+template <>
+void SnnPESubComponent::handleMemoryResponse<SST::Interfaces::StandardMem::Request>(SST::Interfaces::StandardMem::Request* req) {
 #ifdef SNNDL_ENABLE_PROFILING
     if (profiler_enabled_) { SNNDL_PROFILE_FUNCTION(profiler_); }
 #endif
-    // 轻量哨兵：进入/退出标记（限量输出，便于定位崩溃前最后一步）
-    static uint32_t s_sentinel_enter = 0;
-    if (window_read_debug_ && s_sentinel_enter < 64) {
-        const char* t = "req";
-        if (dynamic_cast<SST::Interfaces::StandardMem::ReadResp*>(req)) t = "ReadResp";
-        else if (dynamic_cast<SST::Interfaces::StandardMem::CustomResp*>(req)) t = "CustomResp";
-        output_->verbose(CALL_INFO, 0, 0, "[sentinel] core=%d enter handleMemoryResponse type=%s id=%" PRIu64 "\n",
-                         core_id_, t, static_cast<uint64_t>(req ? req->getID() : 0));
-        ++s_sentinel_enter;
-    }
-    // Capture GAS upstream stat updates or stage events
-    if (auto* cust = dynamic_cast<SST::Interfaces::StandardMem::CustomResp*>(req)) {
-        auto& data = cust->getData();
-        if (auto* op = dynamic_cast<GasOpData*>(&data)) {
-            // Stage event handling (Phase‑1): requires apply_acc_enable_
-            if (apply_acc_enable_) {
-                switch (op->op) {
-                    case GasOp::BeginGather:
-                        gas_stage_ = GasStage::Gather; curr_stage_seq_ = op->superstep; accReset_();
-                        if (window_read_debug_) {
-                            const size_t edges_curr = weight_mem_subsystem_ ? weight_mem_subsystem_->edgesCurrSize() : 0;
-                            const size_t edges_prev = weight_mem_subsystem_ ? weight_mem_subsystem_->edgesPrevSize() : 0;
-                            output_->verbose(CALL_INFO, 0, 0,
-                                "[diag-edges] BeginGather seq=%u edges_curr=%zu edges_prev=%zu\n",
-                                curr_stage_seq_, edges_curr, edges_prev);
-                        }
-                        if (window_read_debug_) {
-                        const size_t posts_prev = weight_mem_subsystem_ ? weight_mem_subsystem_->postsPrevSize() : 0;
-                        const size_t pres_prev  = weight_mem_subsystem_ ? weight_mem_subsystem_->presPrevSize() : 0;
-                        const size_t posts_curr = weight_mem_subsystem_ ? weight_mem_subsystem_->postsCurrSize() : 0;
-                        const size_t pres_curr  = weight_mem_subsystem_ ? weight_mem_subsystem_->presCurrSize() : 0;
-                        SNNDL_DEBUG_LOG(1, "[diag-stage] BeginGather window=%" PRIu64 " stage=%d posts_prev=%zu active_prev=%zu posts_curr=%zu active_curr=%zu qsize=%zu\n",
-                            (uint64_t)op->superstep, static_cast<int>(gas_stage_),
-                            posts_prev, pres_prev,
-                            posts_curr, pres_curr, incoming_spikes_.size());
-                        }
-                        // reset per-window counters
-                        {
-                        orchestrateBeginGatherWindowSetup();
-                        // 新窗开始：复位容量告警 + 迁移 window-read 集合
-                        record_edge_capacity_warned_ = false;
-                        if (weight_mem_subsystem_) {
-                            weight_mem_subsystem_->beginGatherWindow(window_read_enable_, num_neurons_);
-                        }
-                        }
-                        acc_updates_count_ = 0; acc_posts_touched_count_ = 0;
-                        diag_edges_record_hits_ = 0; diag_edges_stage_skips_ = 0; diag_edges_cond_skips_ = 0;
-                        diag_spikes_stage_gather_ = diag_spikes_stage_apply_ = diag_spikes_stage_scatter_ = 0;
-                        diag_spikes_stage_idle_ = 0;
-                        acc_spill_records_count_ = 0; acc_spilled_bytes_sum_ = 0; acc_hwm_bytes_max_ = 0;
-                        break;
-                    case GasOp::BeginApply:
-                        gas_stage_ = GasStage::Apply; curr_stage_seq_ = op->superstep; // start accepting accum
-                        if (gas_ctrl_) { gas_ctrl_->beginApplyFullSequence(apply_acc_enable_ && gas_window_mode_); }
-                        else { orchestratePrepareApplyWindow(); orchestrateApplyWindowEntry(); orchestrateBeginApplyIssueFallback(apply_acc_enable_ && gas_window_mode_); }
-#if SNNDL_DEBUG_ENABLED
-                        if (window_read_debug_) {
-                            const size_t posts_prev = weight_mem_subsystem_ ? weight_mem_subsystem_->postsPrevSize() : 0;
-                            const size_t pres_prev  = weight_mem_subsystem_ ? weight_mem_subsystem_->presPrevSize() : 0;
-                            const size_t posts_curr = weight_mem_subsystem_ ? weight_mem_subsystem_->postsCurrSize() : 0;
-                            const size_t pres_curr  = weight_mem_subsystem_ ? weight_mem_subsystem_->presCurrSize() : 0;
-                            SNNDL_DEBUG_LOG(1, "[diag-stage] BeginApply window=%" PRIu64 " stage=%d posts_prev=%zu active_prev=%zu posts_curr=%zu active_curr=%zu\n",
-                                (uint64_t)op->superstep, static_cast<int>(gas_stage_),
-                                posts_prev, pres_prev,
-                                posts_curr, pres_curr);
-                        }
-#endif
-                if (stage_event_hub_) stage_event_hub_->markBeginApply(curr_stage_seq_);
-                issueFallbackReadsIfNeeded_(apply_acc_enable_ && gas_window_mode_);
-#if SNNDL_DEBUG_ENABLED
-                if (window_read_debug_ && output_) {
-                    output_->verbose(CALL_INFO, 1, 0,
-                        "[diag-edges-summary] core=%u window=%u recorded=%" PRIu64 " stage_skip=%" PRIu64 " cond_skip=%" PRIu64 " edges_prev=%zu\n",
-                        core_id_, curr_stage_seq_, diag_edges_record_hits_, diag_edges_stage_skips_, diag_edges_cond_skips_,
-                        weight_mem_subsystem_ ? weight_mem_subsystem_->edgesPrevSize() : 0);
-                    output_->verbose(CALL_INFO, 1, 0,
-                        "[diag-spike-stage] core=%u window=%u gather=%" PRIu64 " apply=%" PRIu64 " scatter=%" PRIu64 " idle=%" PRIu64 "\n",
-                        core_id_, curr_stage_seq_, diag_spikes_stage_gather_, diag_spikes_stage_apply_,
-                        diag_spikes_stage_scatter_, diag_spikes_stage_idle_);
-                }
-#endif
-                diag_spikes_stage_gather_ = 0;
-                break;
-                    case GasOp::EndApply:
-                        gas_stage_ = GasStage::Apply; // remain until BeginScatter
-                        stats_reporter_.reportApplyScatter(
-                            acc_updates_count_, acc_posts_touched_count_, 0,
-                            acc_hwm_bytes_max_, acc_spill_records_count_, acc_spilled_bytes_sum_);
-                        appendStageEventRow_("EndApply", getCurrentSimTimeNano(), 0);
-                        break;
-                    case GasOp::BeginScatter:
-                        gas_stage_ = GasStage::Scatter; // apply accumulated deltas deterministically
-#if SNNDL_DEBUG_ENABLED
-                        if (window_read_debug_ && output_) {
-                            SNNDL_DEBUG_LOG(1, "[diag-stage] BeginScatter window=%" PRIu64 " stage=%d\n",
-                                (uint64_t)op->superstep, static_cast<int>(gas_stage_));
-                            output_->verbose(CALL_INFO, 1, 0,
-                                "[diag-spike-stage] core=%u window=%u (apply) gather=%" PRIu64 " apply=%" PRIu64 " scatter=%" PRIu64 " idle=%" PRIu64 "\n",
-                                core_id_, curr_stage_seq_, diag_spikes_stage_gather_, diag_spikes_stage_apply_,
-                                diag_spikes_stage_scatter_, diag_spikes_stage_idle_);
-                        }
-#endif
-                        if (gas_ctrl_) { gas_ctrl_->beginScatterSequence(); }
-                        else { orchestrateBeginScatterSequence(); }
-                        // Scheme-C (debug aid): print per-window delta summary for diagnostics.
-                        // Helps verify that Apply phase indeed accumulated into this window.
-                        // We intentionally use a low verbosity so it shows up when users enable logs.
-#if SNNDL_DEBUG_ENABLED
-                        if (window_read_debug_ && output_) {
-                            // Use updates/posts as主要口径，避免因 acc_delta_ 已在溢写合并前为空而误判
-                            output_->verbose(CALL_INFO, 1, 0,
-                                "[GAS][Delta] core=%u seq=%u updates=%" PRIu64 ", posts=%" PRIu64 ", hwm_bytes=%" PRIu64 ", spill_records=%" PRIu64 ", spilled_bytes=%" PRIu64 "\n",
-                                core_id_, curr_stage_seq_, acc_updates_count_, acc_posts_touched_count_,
-                                acc_hwm_bytes_max_, acc_spill_records_count_, acc_spilled_bytes_sum_);
-                            output_->verbose(CALL_INFO, 1, 0,
-                                "[GAS][Delta][sum] core=%u seq=%u dv_sum=%.6f nonzero_updates=%" PRIu64 "\n",
-                                core_id_, curr_stage_seq_, diag_dv_sum_window_, diag_dv_updates_nonzero_);
-                        }
-#endif
-                        // BeginScatter 的累加应用/发放已由 orchestrateBeginScatterSequence()
-                        // 与 applyAccumulatedWindowAndScatter_ 完成，避免重复执行。
-                        break;
-                    case GasOp::EndScatter:
-                        gas_stage_ = GasStage::Idle;
-                        {
-                            uint64_t to_emit = window_spikes_all_ ? window_spikes_all_ : spikes_emitted_window_;
-                            if (to_emit == 0) {
-                                uint64_t delta = 0;
-                                if (count_spikes_generated_ >= spikes_generated_base_) {
-                                    delta = count_spikes_generated_ - spikes_generated_base_;
-                                }
-                                if (delta > 0) to_emit = delta;
-                            }
-                            // 诊断：当两种口径均非零但不一致时，提示一次（不改变行为）
-#if SNNDL_DEBUG_ENABLED
-                            if (window_read_debug_ && window_spikes_all_ > 0 && spikes_emitted_window_ > 0 &&
-                                window_spikes_all_ != spikes_emitted_window_) {
-                                output_->verbose(CALL_INFO, 0, 0,
-                                    "[diag-window] ⚠️ inconsistent spikes: all=%" PRIu64 " vs emitted=%" PRIu64 " (seq=%u)\n",
-                                    window_spikes_all_, spikes_emitted_window_, curr_stage_seq_);
-                            }
-#endif
-                            if (window_read_debug_ && output_) {
-                                output_->verbose(CALL_INFO, 1, 0,
-                                    "[diag-spike-stage] core=%u window=%u (scatter) gather=%" PRIu64 " apply=%" PRIu64 " scatter=%" PRIu64 " idle=%" PRIu64 "\n",
-                                    core_id_, curr_stage_seq_, diag_spikes_stage_gather_, diag_spikes_stage_apply_,
-                                    diag_spikes_stage_scatter_, diag_spikes_stage_idle_);
-                            }
-                            if (gas_ctrl_) { gas_ctrl_->endScatterSequence(); }
-                            else { orchestrateEndScatterSequence(); }
-                        }
-                        break;
-                    default: break;
-                }
-            }
-            // Unconditional: activity f window tracking (independent of apply_acc_enable_)
-            switch (op->op) {
-                case GasOp::BeginGather:
-                    activity_window_seq_ = op->superstep;
-                    activityReset_();
-                    break;
-                case GasOp::BeginApply:
-                    // 上一Gather窗口结束，计算其活跃度
-                    activityFlush_();
-                    break;
-                case GasOp::EndApply:
-                case GasOp::BeginScatter:
-                    // flush activity for the finished window
-                    activityFlush_();
-                    break;
-                default: break;
-            }
-            delete req; return;
-        }
-        if (auto* stat = dynamic_cast<GasStatData*>(&data)) {
-            // Accumulate at PE level to ensure CSV visibility
-            if (window_read_debug_ && output_) output_->verbose(CALL_INFO, 2, 0,
-                "[GAS] stat recv: reads=%" PRIu64 ", bytes=%" PRIu64 ", rwt=%" PRIu64 ", rwb=%" PRIu64 ", bursts=%" PRIu64 ", payload=%" PRIu64 "\n",
-                (uint64_t)stat->unique_reads, (uint64_t)stat->unique_bytes,
-                (uint64_t)stat->rowwin_triggers, (uint64_t)stat->rowwin_bytes,
-                (uint64_t)stat->bursts, (uint64_t)stat->payload_bytes);
-            if (parent_) {
-                if (auto* pe = parent_pe_cached_) {
-                    pe->accumulateGasStatsExt(stat->unique_bytes, stat->unique_reads,
-                                              stat->rowwin_triggers, stat->rowwin_bytes,
-                                              stat->bursts, stat->payload_bytes,
-                                              stat->window_inflight_peak, stat->window_buffer_max_bytes);
-                }
-            }
-            if ((stat->window_inflight_peak || stat->window_buffer_max_bytes) && window_read_debug_ && output_) {
-                output_->verbose(CALL_INFO, 2, 0,
-                    "[GAS] window metrics: inflight_peak=%" PRIu64 ", buffer_peak=%" PRIu64 "\n",
-                    (uint64_t)stat->window_inflight_peak, (uint64_t)stat->window_buffer_max_bytes);
-            }
-            // Local (per-core) copies for unique_* only (optional)
-            if (stat_gas_unique_reads_total_ && stat->unique_reads) stat_gas_unique_reads_total_->addData(stat->unique_reads);
-            if (stat_gas_unique_bytes_total_ && stat->unique_bytes) stat_gas_unique_bytes_total_->addData(stat->unique_bytes);
-            delete req; return;
-        }
-        // Unknown CustomResp: drop through to delete
-    }
-    if (!req) return;
-
-    // Phase E/Phase1: data-plane StandardMem responses should first be dispatched by StandardMemAccess.
-    // Control layer keeps only CustomResp (GAS control-plane) processing above.
-    if (weight_mem_subsystem_) {
-        weight_mem_subsystem_->setNowCycle(static_cast<uint64_t>(total_cycles_));
-    }
-    if (stdmem_access_ && stdmem_access_->handleMemoryResponse(req)) {
+    // Phase4-Task6.4: StdMemEndpoint 统一分发：
+    // - GAS 控制面（CustomResp）→ IGasStageSink（CoreShell），再转发到 workload=snn
+    // - 数据面（ReadResp/WriteResp）→ StandardMemAccess（纯内存语义）
+    if (stdmem_ep_ && stdmem_ep_->available()) {
+        stdmem_ep_->handleResponseOpaque(req);
         return;
     }
-
-    // Phase1-A: fail-fast only for *data-plane* read responses. Other response types may be internal
-    // (e.g., GatherBufferIF flush/write maintenance) and can be safely ignored here if untracked.
-    if (dynamic_cast<SST::Interfaces::StandardMem::ReadResp*>(req)) {
-        if (output_) {
-            output_->fatal(CALL_INFO, -1,
-                "[stdmem-untracked] node=%u core=%u type=ReadResp id=%" PRIu64 "\n",
-                static_cast<uint32_t>(node_id_),
-                static_cast<uint32_t>(core_id_),
-                static_cast<uint64_t>(req->getID()));
-        }
-        delete req;
-        return;
-    }
-    // Untracked non-ReadResp: drop.
     delete req;
     return;
 
@@ -397,7 +242,7 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
 
     auto finalize_rowptr_ready = [&]() {
         if (window_read_debug_ && output_) {
-            const auto& rp = bcsr_weights_.rowptrHost();
+            const auto& rp = bcsr_weights_->rowptrHost();
             output_->verbose(CALL_INFO, 0, 0,
                 "[diag-bcsr] core=%u rowptr ready entries=%zu first=%u second=%u\n",
                 core_id_, rp.size(),
@@ -426,7 +271,7 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
             bytes.size());
     }
     if (pending_req.bcsr_kind == 1) {
-        bcsr_weights_.setRowptrReadPending(false);
+        bcsr_weights_->setRowptrReadPending(false);
     }
     if (readResp && !readResp->data.empty()) {
         const std::vector<uint8_t>& bytes = readResp->data;
@@ -483,14 +328,14 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                             uint64_t addr = bcsr_blockdata_addr_ + (uint64_t)global_block_index * block_bytes;
                             PendingMemoryRequest pm{};
                             pm.address = addr; pm.size = block_bytes; pm.issue_cycle = total_cycles_;
-                            pm.is_weight = true; // BCSR 块数据属于权重
-                            pm.bcsr_kind = 3; pm.bcsr_block_row = pending_req.bcsr_block_row; pm.bcsr_target_block_col = pending_req.bcsr_target_block_col;
-                            pm.bcsr_intra_row = pending_req.bcsr_intra_row; pm.bcsr_intra_col = pending_req.bcsr_intra_col;
-                            pm.bcsr_row_start = start; pm.bcsr_idx_in_row = idx_in_row; pm.bcsr_global_block_index = global_block_index;
-                            pm.has_single_cb = pending_req.has_single_cb; pm.single_cb = pending_req.single_cb;
-                            stats_reporter_.reportMemoryIssue(block_bytes, true);
-                            if (mem_backend_) mem_backend_->sendRead(addr, block_bytes, pm);
-                            bcsr_count_block_misses_++;
+	                            pm.is_weight = true; // BCSR 块数据属于权重
+	                            pm.bcsr_kind = 3; pm.bcsr_block_row = pending_req.bcsr_block_row; pm.bcsr_target_block_col = pending_req.bcsr_target_block_col;
+	                            pm.bcsr_intra_row = pending_req.bcsr_intra_row; pm.bcsr_intra_col = pending_req.bcsr_intra_col;
+	                            pm.bcsr_row_start = start; pm.bcsr_idx_in_row = idx_in_row; pm.bcsr_global_block_index = global_block_index;
+	                            pm.has_single_cb = pending_req.has_single_cb; pm.single_cb = pending_req.single_cb;
+	                            if (impl_) impl_->reportMemoryIssue(block_bytes, true);
+	                            if (mem_backend_) mem_backend_->sendRead(addr, block_bytes, pm);
+	                            bcsr_count_block_misses_++;
                         }
                     }
                 }
@@ -667,7 +512,8 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
             windowStateNoteComplete_();
         }
         // Apply 窗口内的补发：在收到 ReadResp 后，若预算/并发未满则继续发起下一批
-        if (!(apply_acc_enable_ && gas_window_mode_) && window_read_enable_ && gas_stage_ == GasStage::Apply && enable_weight_fetch_ && memory_ && memory_ready_) {
+        if (!(apply_acc_enable_ && gas_window_mode_) && window_read_enable_ && gas_stage_ == GasStage::Apply &&
+            enable_weight_fetch_ && ensureMemoryReady_()) {
             // 允许使用当前窗作为补发来源（当 prev 为空但 curr 非空时）
             if (!weight_mem_subsystem_) {
                 // 子系统缺失时跳过补发
@@ -689,10 +535,10 @@ void SnnPESubComponent::handleMemoryResponse(SST::Interfaces::StandardMem::Reque
                         uint32_t arg0 = use_post_row_pre_col_ ? pre_g : post_l;
                         uint32_t arg1 = use_post_row_pre_col_ ? post_l : pre_g;
                         const uint64_t key = (uint64_t)post_l * (uint64_t)width_refill + (use_post_row_pre_col_ ? (uint64_t)pre_g : (uint64_t)post_l);
-                        stats_reporter_.reportCacheAccess(false);
-                        windowStateNoteIssue_();
-                        requestWeight(arg0, arg1, [this, key](float w){
-                            weightCacheStore_(key, w);
+	                        if (impl_) impl_->reportCacheAccess(false);
+	                        windowStateNoteIssue_();
+	                        requestWeight(arg0, arg1, [this, key](float w){
+	                            weightCacheStore_(key, w);
                             windowStateNoteComplete_();
                         });
                         if (!windowStateCanIssue_()) break;

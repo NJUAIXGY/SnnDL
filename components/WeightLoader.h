@@ -30,13 +30,14 @@ public:
         COMPONENT_CATEGORY_UNCATEGORIZED
     )
 
-    SST_ELI_DOCUMENT_PARAMS(
-	        {"verbose", "日志详细级别", "0"},
-        {"weight_file", "兼容旧参数：单文件路径(若提供将优先生效)", ""},
-        {"base_addr_start", "core0权重矩阵的起始地址", "0"},
-        {"per_core_stride", "相邻核心权重矩阵在内存中的地址跨度(字节)", "0"},
-        {"num_cores", "核心数", "1"},
-        {"neurons_per_core", "每核神经元数(形成 NxN 权重矩阵)", "64"},
+	    SST_ELI_DOCUMENT_PARAMS(
+		        {"verbose", "日志详细级别", "0"},
+	        {"workload_impl", "工作负载实现: snn/stream/...", ""},
+	        {"weight_file", "兼容旧参数：单文件路径(若提供将优先生效)", ""},
+	        {"base_addr_start", "core0权重矩阵的起始地址", "0"},
+	        {"per_core_stride", "相邻核心权重矩阵在内存中的地址跨度(字节)", "0"},
+	        {"num_cores", "核心数", "1"},
+	        {"neurons_per_core", "每核神经元数(形成 NxN 权重矩阵)", "64"},
         {"rows_per_core", "每核权重矩阵的行数(默认等于neurons_per_core)", "0"},
         {"cols_per_core", "每核权重矩阵的列数(默认等于neurons_per_core)", "0"},
         {"fill_value", "当无文件可用时使用的填充值(float)", "0.5"},
@@ -115,13 +116,17 @@ private:
     bool loadPerCoreFiles(const std::string& tmpl, const std::string& fmt);
     bool loadPerCoreFilesRuntime(const std::string& tmpl, const std::string& fmt);
 
-    SST::Output* output_;
-    SST::Interfaces::StandardMem* memory_;
+	    SST::Output* output_;
+	    SST::Interfaces::StandardMem* memory_;
 
-    int verbose_;
-    std::string weight_file_;
-    uint64_t base_addr_start_;
-    uint64_t per_core_stride_;
+	    // 若处于非 SNN 的通用 workload（例如 stream），WeightLoader 必须完全静默，
+	    // 否则会污染/覆盖通用 workload 的内存测试区域并造成误判。
+	    bool enabled_ = true;
+
+	    int verbose_;
+	    std::string weight_file_;
+	    uint64_t base_addr_start_;
+	    uint64_t per_core_stride_;
     int num_cores_;
     uint32_t neurons_per_core_;
     // 新增：显式行列配置，默认退回到neurons_per_core_（保持兼容）

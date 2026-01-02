@@ -11,21 +11,22 @@
 
 ## 目录结构与组件职责
 
-### `ReadOrchestrator.{h,cc}`
+### `control/StageEventHub.{h,cc}`（已迁入 legacy）
+- **定位**：历史的 GAS 阶段事件调度与统计汇报助手（BeginGather/BeginApply/BeginScatter/EndScatter）。
+- **现状**：已在 Phase5.2-A1 被吸收进 `control/SnnPESubComponent_impl.h` 的 `SnnPESubComponent::Impl`；旧实现迁入 `services/legacy/control/StageEventHub.*` 仅用于对照参考（不参与主链路构建）。
+
+### `ReadOrchestrator.{h,cc}`（已删除）
 - **定位**：历史窗口读发起编排器（window-read issue logic）。
-- **现状**：已被主路径回收/替代（主路径由 `services/synapse/weights/WeightMemorySubsystem` 闭环承载，并在控制层 orchestrator 中完成窗口读编排）。
-- **保留原因**：作为“issueFromEdges/issueFromSets/fallback” 逻辑的参考实现与对照。
+- **删除原因**：主链路已由 `services/synapse/weights/WeightMemorySubsystem` 闭环承载窗口读编排；保留会造成重复实现与“可复活依赖”的风险。
 
-### `StandardMemWeightReader.{h,cc}`
+### `StandardMemWeightReader.{h,cc}`（已删除）
 - **定位**：历史的 StandardMem 权重读取 shim（实现 `IWeightReader`）。
-- **现状**：主路径已由 `services/memory/StandardMemAccess`（纯内存） + `services/synapse/weights/WeightMemorySubsystem`（权重语义）闭环承载。
-- **保留原因**：兼容旧接口/旧调试口径的参考。
+- **删除原因**：主链路已由 `services/memory/StandardMemAccess`（纯内存） + `services/synapse/weights/WeightMemorySubsystem`（权重语义）闭环承载；禁止再走旧权重读路径。
 
-### `memory/StandardMemBackend.{h,cc}`
+### `memory/StandardMemBackend.{h,cc}`（已删除）
 - **定位**：历史的 StandardMem pending 跟踪后端（`sendRead/sendWrite + popPending`）。
-- **现状**：该实现携带 `MemRequestMeta`（含 BCSR/权重语义字段），已从 `services/memory/` 移出；主链路禁止依赖。
-- **保留原因**：用于对照旧 pending/回包分发逻辑与历史调试口径。
+- **删除原因**：该实现携带 `MemRequestMeta`（含 BCSR/权重语义字段），与“Memory 绝对去语义化”边界冲突；主链路禁止依赖并已由 `services/memory/StandardMemAccess` 取代。
 
 ### `noc/SnnNetworkAdapter.{h,cc}` / `noc/SimpleNetworkWrapper.{h,cc}`
-- **定位**：历史遗留的拓扑适配器/包装器（含 SST ELI 宏）。
-- **现状**：ELI 可加载对象的“权威位置”统一收敛在 `components/noc/`；本目录下文件仅保留作参考对照，主链路禁止依赖。
+- **定位**：历史遗留的拓扑适配器/包装器（早期含 SST ELI 宏）。
+- **现状**：已删除（2025-12-28），ELI 可加载对象的“权威位置”统一收敛在 `components/noc/`；避免 services/legacy 下继续保留“可加载”幻象与重复实现。

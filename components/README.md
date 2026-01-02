@@ -31,6 +31,8 @@
 
 - `components/stimulus/`：Stimulus 域的注入型组件（例如 `SpikeSource`）。
 - `components/mpi/`：MPI 扩展相关组件与类型（可选编译）。
+- `components/noc/`：ELI 可加载的 NoC/拓扑适配组件（高级/实验性用途，默认推荐 `SnnNIC`）。
+- `components/gas/`：全局 Step/GAS 同步组件（Mesh barrier 控制面）。
 
 ## 依赖边界（建议）
 

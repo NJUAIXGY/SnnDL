@@ -8,6 +8,9 @@
 #include <sst/core/sst_config.h>
 
 #include "SnnPESubComponent.h"
+#include "SnnPESubComponent_impl.h"
+#include "ISpikeWorkload.h"
+#include "SpikeEvent.h"
 #include "synapse/weights/WeightAccessor.h"
 #include "synapse/weights/WeightMemorySubsystem.h"
 
@@ -34,6 +37,56 @@ using namespace SST::SnnDL;
 
 void SnnPESubComponent::deliverSpike(SpikeEvent* spike) {
     if (!spike) return;
+    // Phase6：stream workload 不处理 Spike 语义（保持边界清晰：stream=纯通信+纯内存验证）。
+    if (isStreamWorkload_()) {
+        delete spike;
+        return;
+    }
+    if (!spike_workload_) {
+        if (output_) {
+            output_->fatal(CALL_INFO, -1,
+                "core=%d deliverSpike requires workload implementing ISpikeWorkload (workload_impl=snn)\n",
+                core_id_);
+        }
+        delete spike;
+        return;
+    }
+    // 统计/聚合仍锚定在 CoreShell：activity f 需要在 BeginGather/BeginApply 阶段做 PE 级汇聚。
+    // window_read_enable=1 时按“到达本核的 spike”记录 active_pre（与 legacy deliverSpike 行为一致）。
+    if (window_read_enable_) {
+        uint32_t dest = spike->getDestinationNeuron();
+        uint32_t post_local = dest;
+        bool post_local_valid = true;
+        if (dest >= num_neurons_) {
+            if (dest >= global_neuron_base_ && dest < global_neuron_base_ + num_neurons_) {
+                post_local = static_cast<uint32_t>(dest - global_neuron_base_);
+            } else {
+                post_local_valid = false;
+            }
+        }
+        if (post_local_valid && post_local < num_neurons_) {
+            recordActivePre_(spike->getSourceNeuron());
+        }
+    }
+    spike_workload_->deliverSpike(spike);
+}
+
+void SnnPESubComponent::legacySnnDeliverSpike(SpikeEvent* spike) {
+    if (!spike) return;
+    // Phase7: strict window-read spike input has moved into workload=snn.
+    // If this triggers, it indicates an unintended fallback to legacy control-plane queueing.
+    if (workload_spike_input_enable_ &&
+        apply_acc_enable_ && gas_window_mode_ && window_read_enable_ && !scheme1_enable_) {
+        if (output_) {
+            output_->fatal(
+                CALL_INFO, -1,
+                "core=%d legacySnnDeliverSpike called under strict window-read (apply_acc_enable=1, gas_window_mode=1, window_read_enable=1). "
+                "Spike input should be handled by workload=snn.\n",
+                core_id_);
+        }
+        delete spike;
+        return;
+    }
     onSpikeDeliveredCore_(spike);
 
     spike->clearLocalCache();
@@ -151,7 +204,7 @@ void SnnPESubComponent::processLocalSpike(SpikeEvent* spike_event) {
     float weight = 0.0f;
     bool have_mem_weight = false;
     const bool logDetail = log_weight_details_ || enable_detailed_map_log_;
-    if (enable_weight_fetch_ && memory_ && memory_ready_) {
+    if (enable_weight_fetch_ && ensureMemoryReady_()) {
         uint32_t pre_global = spike_event->getSourceNeuron();
         uint32_t post_global = spike_event->getDestinationNeuron();
         uint32_t post_local = target_neuron;
@@ -170,12 +223,12 @@ void SnnPESubComponent::processLocalSpike(SpikeEvent* spike_event) {
                 recordActivePre_(pre_global);
             }
             float cached = 0.0f;
-            if (weightCacheTryGet_(cache_key, cached)) {
-                weight = cached;
-                if (readresp_zero_fallback_ && weight == 0.0f) weight = init_default_weight_;
-                have_mem_weight = true;
-                stats_reporter_.reportCacheAccess(true);
-                if (logDetail && !first_cache_hit_logged_) {
+	            if (weightCacheTryGet_(cache_key, cached)) {
+	                weight = cached;
+	                if (readresp_zero_fallback_ && weight == 0.0f) weight = init_default_weight_;
+	                have_mem_weight = true;
+	                if (impl_) impl_->reportCacheAccess(true);
+	                if (logDetail && !first_cache_hit_logged_) {
                     if (use_post_row_pre_col_) {
                         SNNDL_LOG(2, "🟢 首次命中(全网): row(post_l)=%u, col(pre_g)=%u, key=%" PRIu64 ", weight=%.3f\n",
                             post_local, pre_global, cache_key, weight);
@@ -188,11 +241,11 @@ void SnnPESubComponent::processLocalSpike(SpikeEvent* spike_event) {
                     }
                     first_cache_hit_logged_ = true;
                 }
-            } else if (!window_read_enable_ && pendingMemSize_() < static_cast<size_t>(max_outstanding_requests_)) {
-                stats_reporter_.reportCacheAccess(false);
-                requestWeight(req_pre_param, req_post_param, [this, cache_key](float w){
-                    weightCacheStore_(cache_key, w);
-                });
+	            } else if (!window_read_enable_ && pendingMemSize_() < static_cast<size_t>(max_outstanding_requests_)) {
+	                if (impl_) impl_->reportCacheAccess(false);
+	                requestWeight(req_pre_param, req_post_param, [this, cache_key](float w){
+	                    weightCacheStore_(cache_key, w);
+	                });
                 if (logDetail && !first_cache_miss_logged_) {
                     if (use_post_row_pre_col_) {
                         SNNDL_LOG(2, "🟡 首次未命中并发起读(全网): row(post_l)=%u, col(pre_g)=%u, key=%" PRIu64 "\n",
@@ -206,10 +259,10 @@ void SnnPESubComponent::processLocalSpike(SpikeEvent* spike_event) {
                     }
                     first_cache_miss_logged_ = true;
                 }
-            } else if (window_read_enable_) {
-                stats_reporter_.reportCacheAccess(false);
-            }
-        } else {
+	            } else if (window_read_enable_) {
+	                if (impl_) impl_->reportCacheAccess(false);
+	            }
+	        } else {
 #if SNNDL_DEBUG_ENABLED
             if (window_read_debug_) {
                 SNNDL_DEBUG_LOG(0, "[diag-edge-resolve] core=%d skipped pre=%u post=%u (resolve失败)\n",
@@ -221,8 +274,11 @@ void SnnPESubComponent::processLocalSpike(SpikeEvent* spike_event) {
 #ifdef SNNDL_ENABLE_DEBUG_LOG
         if (window_read_debug_) {
             output_->verbose(CALL_INFO, 0, 0,
-                "[diag-edge-gate] core=%d skip recordEdge: ewf=%d mem=%s ready=%d stage=%d\n",
-                core_id_, enable_weight_fetch_ ? 1 : 0, memory_ ? "set" : "null", memory_ready_ ? 1 : 0, (int)gas_stage_);
+                "[diag-edge-gate] core=%d skip recordEdge: ewf=%d stdmem_ep=%d ready=%d stage=%d\n",
+                core_id_, enable_weight_fetch_ ? 1 : 0,
+                (stdmem_ep_ && stdmem_ep_->available()) ? 1 : 0,
+                memory_ready_ ? 1 : 0,
+                (int)gas_stage_);
         }
 #endif
     }

@@ -14,6 +14,10 @@
   - 详见：`services/synapse/route/README.md`
 - `services/synapse/gas/`：GAS 窗口与累加辅助子系统（edge 收集、累加器、CustomCmd/统计载体）
   - 详见：`services/synapse/gas/README.md`
+- `services/synapse/common/`：Synapse 域公共工具（BCSR `.meta.json` 解析与校验等口径）
+  - 详见：`services/synapse/common/README.md`
+- `services/synapse/stdmem/`：StandardMem 胶水层（隔离 `StandardMem::*`，避免污染 `control/`）
+  - 详见：`services/synapse/stdmem/README.md`
 
 ---
 
@@ -22,4 +26,3 @@
 - `synapse/*` **可以依赖**：`api/`、`events/`、少量 SST 基础类型、以及 `services/memory`（通过 `api/IMemoryAccess`）。
 - `synapse/*` **不应依赖**：`services/noc` 的具体实现（应通过 `api/ISpikeTransport` / `api/INocTransport` 交互）。
 - `services/memory` **不出现**：权重/突触/路由语义；它只负责“地址→字节块”。
-

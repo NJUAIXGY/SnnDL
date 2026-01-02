@@ -60,9 +60,10 @@
 
 - **内存事务仍分散**：`StandardMem` 请求派发、pending 跟踪、合并策略、BCSR 读取路径等仍主要散落在 `control/*_mem.cc`、`control/*_bcsr.cc` 与若干辅助模块中。
 - **通信事务仍分散**：路由构建与发送路径仍部分存在于控制层，导致控制层难以保持“通用壳”定位。
-- **Compute Core 接口仍含“内存语义”能力**：
-  - `ISnnComputeCore` 目前包含 `requestWeight/resolveWeightKey/weightCacheTryGet...` 等方法；
-  - 这在“通用 compute core”语义上并不干净（内存系统应通过 `IWeightReader` 注入）。
+- **Compute Core 接口收敛仍需保持一致性**：
+  - 已在 Phase5.4 完成主接口收敛：`ISnnComputeCore` 不再包含 `requestWeight/resolveWeightKey/weightCacheTryGet...`；
+  - 若某 compute 需要权重/缓存语义，改为实现可选扩展接口 `compute/IWeightAwareComputeCore`；
+  - 主链路依赖 `ComputeCoreContext.weight_reader (IWeightReader)` 注入，避免接口层暴露内存语义。
 
 ## 3. 目标架构（最终形态）
 
@@ -96,7 +97,7 @@ compute/* (IComputeCore impls)      services/* (Memory/Comm subsystems)
 - 事务编排：
   - 调用 Memory Subsystem 发起/推进内存事务（预算/outstanding/窗口读等）。
   - 调用 Comm Subsystem 将 compute core 的输出事件路由/发送。
-- 统计汇总与向父组件汇报（通过 hooks/StatsReporter）。
+- 统计汇总与向父组件汇报（通过控制层内部 hooks：`SnnPESubComponent::Impl::report*`）。
 
 **SnnPESubComponent 不负责**
 
@@ -120,28 +121,28 @@ compute/* (IComputeCore impls)      services/* (Memory/Comm subsystems)
   - `drainOutputs`
   - `onStageBegin*/onStageEnd*`
   - `shouldAcceptSynapticInput`（控制层在“记录边/发起权重读/累加ΔV”前复用核心门控，避免窥探动力学状态）
-- **兼容接口（逐步收敛/下线）**
-  - `requestWeight/resolveWeightKey/weightCacheTryGet/weightCacheStore`
-  - 最终目标：Compute Core 仅依赖 `ComputeCoreContext.weight_reader (IWeightReader)`，不在接口层重复暴露内存语义。
+- **可选扩展接口（仅当 compute 需要权重语义时实现）**
+  - `IWeightAwareComputeCore`：`requestWeight/requestWeightBCSR/resolveWeightKey/weightCacheTryGet/weightCacheStore`
+  - 推荐：Compute Core 主实现仅依赖 `ComputeCoreContext.weight_reader (IWeightReader)`，扩展接口只用于 legacy/特殊范式兼容。
 
 ### 4.2 Memory Subsystem（内存访问完整体系）
 
-#### 4.2.1 IMemoryBackend（后端：可替换 StandardMem）
+#### 4.2.1 IMemoryAccess（后端：可替换 StandardMem）
 
-建议新增 `api/IMemoryBackend`（或放在 `services/memory/` 并仅通过前置声明暴露）：
+当前主链路使用 `api/IMemoryAccess`（纯 addr→bytes）作为跨域唯一入口：
 
 - 语义：只做**按地址读写 + 回调**，不关心权重 key/BCSR/cache。
-- 典型实现：`StandardMemBackend`（内部持有 `SST::Interfaces::StandardMem*` 与 request-id/pending 跟踪）。
+- 典型实现：`services/memory/StandardMemAccess`（内部持有 `SST::Interfaces::StandardMem*` 与 pending 跟踪）。
 
 #### 4.2.2 WeightMemorySubsystem（语义服务：实现 IWeightReader）
 
-建议新增 `services/memory/WeightMemorySubsystem`（或先放在 `services/` 根目录，再拆子目录）：
+主链路实现位于 `services/synapse/weights/WeightMemorySubsystem`：
 
 - 内部组合（现有模块复用）：
   - `WeightAccessor`：key/地址解析、index_mode/weights_cols
   - `WeightCacheOps`：LRU/clock 缓存（已内聚）
   - `SnnBcsrWeightManager`：BCSR rowptr/colidx/block 管理（可选开启）
-  - `IMemoryBackend`：StandardMem 后端
+  - `IMemoryAccess`：纯内存后端（StandardMemAccess）
 - 对外提供：
   - `IWeightReader*`：注入 compute core（`ComputeCoreContext.weight_reader`）
   - Control 侧窗口接口（建议）：
@@ -151,7 +152,7 @@ compute/* (IComputeCore impls)      services/* (Memory/Comm subsystems)
 
 #### 4.2.3 Hooks 与统计（控制层不窥探内部状态）
 
-建议 Memory Subsystem 提供 hooks，用于复用现有 `StatsReporter`：
+建议 Memory Subsystem 提供 hooks，以复用控制层的统计上报接口（`SnnPESubComponent::Impl::report*`）：
 
 - `onIssue(bytes, inflight, is_weight)`
 - `onCacheAccess(hit)`
@@ -169,10 +170,10 @@ compute/* (IComputeCore impls)      services/* (Memory/Comm subsystems)
 
 #### 4.3.2 SpikeCommSubsystem（语义服务：路由/封包/发送）
 
-建议新增 `services/comm/SpikeCommSubsystem`：
+主链路实现位于 `services/synapse/route/SpikeCommSubsystem`：
 
 - 内部组合：
-  - `SnnRouteProvider` 与 route table（含共享缓存）
+  - `SynapseRouteSubsystem`（route table / fanout / gating）
   - `ISpikeTransport`
   - （可选）门控缓存应用（如果希望“外发过滤”也收敛到通信体系）
 - 对外提供：
@@ -208,7 +209,7 @@ compute/* (IComputeCore impls)      services/* (Memory/Comm subsystems)
 
 ### 5.3 内存响应路径（StandardMem）
 
-- `StandardMemBackend` 负责：
+- `services/memory/StandardMemAccess` 负责：
   - request-id 分配、pending map、回调分发；
   - 合并读/按行读等“物理策略”（可选上移到 WeightMemorySubsystem，但建议后端至少负责 pending/回调）。
 - WeightMemorySubsystem 负责：
@@ -220,10 +221,10 @@ compute/* (IComputeCore impls)      services/* (Memory/Comm subsystems)
 
 ### Phase A：内存子系统对象化（先形成“独立完整体系”）
 
-1. 引入 `IMemoryBackend` 与 `StandardMemBackend`：
-   - 从 `control/*_mem.cc` 搬迁 pending map、req id、回调派发代码到 backend。
+1. 引入 `IMemoryAccess` 与 `services/memory/StandardMemAccess`：
+   - 从控制层搬迁 pending map、req id、回调派发代码到纯内存访问层（addr→bytes）。
 2. 引入 `WeightMemorySubsystem`：
-   - 组合 `WeightAccessor/WeightCacheOps/BcsrWeightManager/StandardMemBackend`；
+   - 组合 `WeightAccessor/WeightCacheOps/BcsrWeightManager/IMemoryAccess`；
    - 对 compute core 暴露 `IWeightReader`；
    - 对 control 暴露窗口边界与窗口读发起入口。
 3. 控制层改为持有 `std::unique_ptr<WeightMemorySubsystem>`：
@@ -239,7 +240,7 @@ compute/* (IComputeCore impls)      services/* (Memory/Comm subsystems)
 
 ### Phase C：Compute Core 接口收敛为“范式无关”
 
-1. 将 `ISnnComputeCore` 中 weight/cache 相关方法降级为 legacy（capabilities 控制是否调用）。
+1. 将 `ISnnComputeCore` 中 weight/cache 相关方法迁出为可选扩展接口（例如 `IWeightAwareComputeCore`），避免 compute 被接口绑架。
 2. 控制层与 compute core 统一只通过 `IWeightReader` 与 Memory Subsystem 交互。
 3. 最终可引入 `IComputeCore`（保留 `ISnnComputeCore` type alias 兼容）以支持非 SNN 范式命名。
 
@@ -263,11 +264,10 @@ compute/* (IComputeCore impls)      services/* (Memory/Comm subsystems)
 
 ## 9. 下一步行动清单（建议）
 
-- [ ] 定义 `IMemoryBackend` 接口与 `StandardMemBackend` 位置（推荐：`services/memory/`）
-- [ ] 定义 `WeightMemorySubsystem` 的公开 API（实现 `IWeightReader` + 窗口接口）
-- [ ] 从 `control/SnnPESubComponent_mem.cc` 迁出 pending/req-id/回调派发到 backend
+- [x] 定义 `IMemoryAccess` 接口与 `services/memory/StandardMemAccess` 位置（纯 addr→bytes）
+- [x] 定义并落地 `services/synapse/weights/WeightMemorySubsystem`（实现 `IWeightReader` + 窗口接口）
+- [x] 从 control 迁出 StandardMem 回包与 pending/req-id/回调派发到 `StandardMemAccess`/stdmem endpoint
 - [ ] 将“窗口读集合/边记录/发起读编排”从 control 迁入 Memory Subsystem（控制层仅发窗口边界与 record 请求）
 - [ ] 定义 `ISpikeTransport` 与 `SpikeCommSubsystem`（路由/发送闭环）
 - [ ] 将输出路由从 control 迁入 Comm Subsystem
 - [ ] Phase-by-phase 编译安装 + 10us/100us 回归验证
-

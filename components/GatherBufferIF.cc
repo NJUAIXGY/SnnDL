@@ -433,6 +433,11 @@ void GatherBufferIF::send(Request* req) {
 
     // Data-plane
     if (auto* rd = dynamic_cast<StandardMem::Read*>(req)) {
+        // Noncacheable reads bypass Gather/Apply coalescing & SRAM cache (universal workload support).
+        if (rd->getNoncacheable()) {
+            backend_->send(req);
+            return;
+        }
         // Apply 阶段的读属于“当前窗口的 apply_buf”，与 step_gate_enable 无关。
         // 若在 step_gate_enable=1 时把 Apply 读拦到 queued_non_gather_reads_，
         // 会导致 Apply/Scatter 在权重未返回时提前推进，最终出现 dv 全 0/发放归 0。
@@ -602,6 +607,16 @@ void GatherBufferIF::onDownstreamResp_(Request* r) {
     // Only expecting ReadResp for now
     if (auto* rr = dynamic_cast<StandardMem::ReadResp*>(r)) {
         auto it = inflight_down_.find(rr->getID());
+        // Pass-through ReadResp (i.e., requests not issued by GatherBufferIF) must be forwarded upstream.
+        // Otherwise upstream pending maps (e.g., StandardMemAccess) will never see the response and may deadlock.
+        if (it == inflight_down_.end()) {
+            if (upstream_handler_) {
+                (*upstream_handler_)(r);
+            } else {
+                delete r;
+            }
+            return;
+        }
         if (diagEnabled_(1)) {
             uint64_t key_dbg = (it != inflight_down_.end()) ? it->second.key : 0;
             int buf_dbg = (it != inflight_down_.end()) ? it->second.buf : -1;

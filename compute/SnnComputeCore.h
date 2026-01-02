@@ -18,12 +18,13 @@
 #include "SnnWeightReader.h"
 #include "SnnCoreEngine.h"
 #include "SnnLearningCore.h"
+#include "IWeightAwareComputeCore.h"
 #include "ISnnComputeCore.h"
 
 namespace SST { namespace SnnDL {
 
 // 默认核心实现：封装现有 SnnPESubComponent 内的计算逻辑
-class DefaultSnnComputeCore final : public ISnnComputeCore {
+class DefaultSnnComputeCore final : public ISnnComputeCore, public IWeightAwareComputeCore {
 public:
     DefaultSnnComputeCore() = default;
     ~DefaultSnnComputeCore() override = default;
@@ -60,16 +61,16 @@ public:
               float& v_before, float& v_after) override;
     bool wasFiredThisWindow(uint32_t idx) const override;
     void markFiredThisWindow(uint32_t idx) override;
-    // 权重读取：供控制层委托
+    // IWeightAwareComputeCore (可选扩展接口；默认实现转发到 weight_reader)
     bool requestWeight(uint32_t pre, uint32_t post,
-                       const std::function<void(float)>& cb);
+                       const std::function<void(float)>& cb) override;
     bool requestWeightBCSR(uint32_t pre, uint32_t post,
-                           const std::function<void(float)>& cb);
-    bool weightCacheTryGet(uint64_t key, float& out) const;
-    void weightCacheStore(uint64_t key, float v);
+                           const std::function<void(float)>& cb) override;
+    bool weightCacheTryGet(uint64_t key, float& out) const override;
+    void weightCacheStore(uint64_t key, float v) override;
     bool resolveWeightKey(uint32_t pre_global, uint32_t post_local,
                           uint32_t& req_pre, uint32_t& req_post,
-                          uint64_t& cache_key) const;
+                          uint64_t& cache_key) const override;
 private:
     // 注入上下文
     ComputeCoreContext ctx_;

@@ -8,6 +8,8 @@
 
 #include <inttypes.h>
 
+#include "WorkloadConfig.h"
+
 namespace SST { namespace SnnDL {
 
 IMemoryAccess::RequestId
@@ -17,7 +19,12 @@ StandardMemAccess::read(uint64_t addr, size_t bytes, ReadCallback cb) {
         return 0;
     }
     auto* req = new SST::Interfaces::StandardMem::Read(addr, bytes);
-    const auto id = static_cast<uint64_t>(req->getID());
+    if (force_noncacheable_ || isStreamWorkloadEnv()) {
+        req->setNoncacheable();
+    }
+    // StandardMem::Request::id_t 可能为 0；IMemoryAccess 约定 0 为“失败/无效”。
+    // 因此对外暴露的 RequestId 做 +1 偏移，保证成功请求永不返回 0。
+    const auto id = static_cast<uint64_t>(req->getID()) + 1;
     PendingEntry pe{};
     pe.address = addr;
     pe.bytes = bytes;
@@ -36,7 +43,10 @@ StandardMemAccess::write(uint64_t addr, const std::vector<uint8_t>& data, WriteC
     }
     auto* req = new SST::Interfaces::StandardMem::Write(addr, static_cast<uint64_t>(data.size()),
                                                         data, /*posted*/false);
-    const auto id = static_cast<uint64_t>(req->getID());
+    if (force_noncacheable_ || isStreamWorkloadEnv()) {
+        req->setNoncacheable();
+    }
+    const auto id = static_cast<uint64_t>(req->getID()) + 1;
     PendingEntry pe{};
     pe.address = addr;
     pe.bytes = data.size();
@@ -49,7 +59,7 @@ StandardMemAccess::write(uint64_t addr, const std::vector<uint8_t>& data, WriteC
 
 bool StandardMemAccess::handleMemoryResponse(SST::Interfaces::StandardMem::Request* req) {
     if (!req) return true;
-    const uint64_t id = static_cast<uint64_t>(req->getID());
+    const uint64_t id = static_cast<uint64_t>(req->getID()) + 1;
     auto it = pending_.find(id);
     if (it == pending_.end()) {
         return false;

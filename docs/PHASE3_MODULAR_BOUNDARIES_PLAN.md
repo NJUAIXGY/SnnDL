@@ -24,8 +24,9 @@ This document is intentionally actionable and regression-driven.
 
 ### 0.2 仍未达标（下一步必须收敛的“硬缺口”）
 
-1) **Compute 接口仍携带权重/缓存语义**（可插拔性被接口绑架）  
-   - `compute/ISnnComputeCore.h` 中存在 `requestWeightBCSR/weightCacheTryGet/resolveWeightKey...` 一类接口。
+1) **Compute 接口携带权重/缓存语义（历史问题，已收敛）**（可插拔性会被接口绑架）  
+   - 已在 Phase5.4 完成收敛：`compute/ISnnComputeCore.h` 不再包含 `requestWeightBCSR/weightCacheTryGet/resolveWeightKey...`；
+   - 权重/缓存语义迁移到可选扩展接口：`compute/IWeightAwareComputeCore.h`（仅当某 compute 需要时实现）。
 2) **Control 头文件仍强耦合实现细节**（边界不够“硬”）  
    - `control/SnnPESubComponent.h` 直接 include 多个 `services/synapse/**` 实现头以及 `stdMem.h`，导致编译依赖扩散与模块复用困难。
 3) **MultiCorePE 仍承担过多 glue**  
@@ -84,6 +85,8 @@ This document is intentionally actionable and regression-driven.
 ### Phase3-A：Compute 接口去权重语义（可插拔的第一刀）
 
 **目标**：让“替换 compute core”不需要实现权重缓存/BCSR/地址映射等事务。
+
+**状态**：已在 Phase5.4 完成落地（`ISnnComputeCore` 主接口去权重语义 + `IWeightAwareComputeCore` 可选扩展接口）。
 
 **推荐做法（最安全、最增量）**
 
@@ -157,4 +160,3 @@ This document is intentionally actionable and regression-driven.
 - `control/SnnPESubComponent.h` 不再 include `stdMem.h` 与 synapse 实现头（编译边界硬化）。
 - `MultiCorePE` 变成纯装配/调度壳（编解码与分发细节下沉）。
 - mesh 100us 回归通过并稳定；`essential_summary_mesh.json` 关键字段量级合理且不出现 0。
-

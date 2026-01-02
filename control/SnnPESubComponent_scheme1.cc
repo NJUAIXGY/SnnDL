@@ -8,6 +8,7 @@
 #include <sst/core/sst_config.h>
 
 #include "SnnPESubComponent.h"
+#include "SpikeEvent.h"
 
 #include <algorithm>
 
@@ -102,4 +103,3 @@ bool SnnPESubComponent::scheme1Tick_() {
 
     return true; // 默认不落入旧路径
 }
-

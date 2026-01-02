@@ -1,7 +1,9 @@
 #include "SnnPESubComponent.h"
+#include "SnnPESubComponent_impl.h"
 #include "IPeAggregation.h"
 #include "synapse/weights/WeightAccessor.h"
 #include "synapse/weights/WeightMemorySubsystem.h"
+#include "synapse/weights/SnnBcsrWeightManager.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -9,8 +11,8 @@
 
 using namespace SST::SnnDL;
 
-// ==== StatsReporter ====
-void SnnPESubComponent::StatsReporter::reportMemoryIssue(size_t bytes, bool count_weight_read) const {
+// ==== Statistics reporter (Phase5.4: moved into Impl) ====
+void SnnPESubComponent::Impl::reportMemoryIssue(size_t bytes, bool count_weight_read) const {
     if (!core) return;
     const uint64_t inflight = static_cast<uint64_t>(core->pendingMemSize_()) + 1ULL;
     if (auto* pe = core->parent_pe_cached_) {
@@ -29,7 +31,7 @@ void SnnPESubComponent::StatsReporter::reportMemoryIssue(size_t bytes, bool coun
     }
 }
 
-void SnnPESubComponent::StatsReporter::reportApplyScatter(uint64_t acc_updates, uint64_t posts_touched,
+void SnnPESubComponent::Impl::reportApplyScatter(uint64_t acc_updates, uint64_t posts_touched,
                                 uint64_t spikes_emitted, uint64_t hwm_bytes,
                                 uint64_t spill_records, uint64_t spilled_bytes) const {
     if (!core) return;
@@ -39,14 +41,14 @@ void SnnPESubComponent::StatsReporter::reportApplyScatter(uint64_t acc_updates, 
     }
 }
 
-void SnnPESubComponent::StatsReporter::reportWindowSpikes(uint32_t seq, uint64_t spikes_emitted) const {
+void SnnPESubComponent::Impl::reportWindowSpikes(uint32_t seq, uint64_t spikes_emitted) const {
     if (!core || spikes_emitted == 0) return;
     if (auto* pe = core->parent_pe_cached_) {
         pe->accumulateWindowSpikes(seq, spikes_emitted);
     }
 }
 
-void SnnPESubComponent::StatsReporter::reportCacheAccess(bool hit) const {
+void SnnPESubComponent::Impl::reportCacheAccess(bool hit) const {
     if (!core) return;
     if (hit) {
         if (core->stat_weight_cache_hits_) core->stat_weight_cache_hits_->addData(1);
@@ -57,7 +59,7 @@ void SnnPESubComponent::StatsReporter::reportCacheAccess(bool hit) const {
     }
 }
 
-void SnnPESubComponent::StatsReporter::updatePendingPeak(uint32_t outstanding) const {
+void SnnPESubComponent::Impl::updatePendingPeak(uint32_t outstanding) const {
     if (!core) return;
     if (outstanding > core->pending_reqs_peak_) {
         core->pending_reqs_peak_ = outstanding;
@@ -92,7 +94,7 @@ void SnnPESubComponent::issueFromEdges_() {
         }
         return;
     }
-    if (use_bcsr_ && !bcsr_weights_.isRowptrReady()) {
+    if (use_bcsr_ && !bcsr_weights_->isRowptrReady()) {
         if (window_read_debug_ && output_) {
             output_->verbose(CALL_INFO, 0, 0,
                 "[diag-window-read] BeginApply: core=%u window=%u defer edge issue (BCSR rowptr not ready)\n",
@@ -128,7 +130,7 @@ void SnnPESubComponent::issueFromEdges_() {
                 uint32_t intra_col = (bc? (pre_global % bc) : 0);
                 float resolved = 0.0f;
                 do {
-                    const auto& rowptr = bcsr_weights_.rowptrHost();
+                    const auto& rowptr = bcsr_weights_->rowptrHost();
                     if (block_row + 1 > rowptr.size()) break;
                     uint32_t start = rowptr[block_row];
                     uint32_t end   = (block_row + 1 < rowptr.size() ? rowptr[block_row+1] : start);
@@ -232,7 +234,7 @@ void SnnPESubComponent::issueFromSets_(
 }
 
 void SnnPESubComponent::issueFallbackReadsIfNeeded_(bool strict_gas_active) {
-    if (!window_read_enable_ || !enable_weight_fetch_ || !memory_ || !memory_ready_) return;
+    if (!window_read_enable_ || !enable_weight_fetch_ || !ensureMemoryReady_()) return;
     if (!weight_mem_subsystem_) return;
     bool need_sets = false;
     if (strict_gas_active) {

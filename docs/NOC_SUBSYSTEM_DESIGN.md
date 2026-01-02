@@ -16,10 +16,10 @@
 ```
 ComputeCore::drainOutputs
   -> control/SnnPESubComponent
-    -> services/SpikeCommSubsystem (fanout 已下沉至 Synapse/Route)
+    -> services/synapse/route/SpikeCommSubsystem (fanout 已下沉至 Synapse/Route)
       -> api/ISpikeTransport (NocSpikeTransport)
         -> api/INocTransport
-          -> services/NocSubsystem
+          -> services/noc/NocSubsystem
              -> 本地投递 / ring 路由 / NIC 外发
 ```
 
@@ -61,7 +61,7 @@ ComputeCore::drainOutputs
 为降低风险，Phase4-A1 采用两段式：
 
 ### 3.1 Phase4-A1.1（适配器/编排层）——已完成
-- `services/NocSubsystem.{h,cc}` 先以编排层形式落地：统一收敛输入侧，并在输出侧做“目的地判定 + 分流策略”。
+- `services/noc/NocSubsystem.{h,cc}` 先以编排层形式落地：统一收敛输入侧，并在输出侧做“目的地判定 + 分流策略”。
 - MultiCorePE 变薄：其 `sendSpike/handleExternalSpike*/link handlers` 只做转发到 `NocSubsystem`（冻结行为与统计口径）。
 
 优点：改动可控、行为不变风险低、可快速通过 100us 回归。
@@ -75,7 +75,7 @@ ComputeCore::drainOutputs
 
 ### 3.3 Phase4-A1.3（接口化：INocTransport）——已完成
 - 新增 `api/INocTransport.h` 冻结 NoC 调用面：`sendFromCore` / `injectLocal` / `sendExternal`。
-- `services/NocSubsystem` 实现 `INocTransport`，成为 Control/Step 的唯一 NoC 依赖入口。
+- `services/noc/NocSubsystem` 实现 `INocTransport`，成为 Control/Step 的唯一 NoC 依赖入口。
 - Control/Step 接入：
 - `api/NocSpikeTransport.h`：将 `SpikeCommSubsystem` 的 `ISpikeTransport` 落到 `INocTransport::sendFromCore(src_core, ev)`。
   - `services/stimulus/StepActivationSubsystem`：注入/外发优先走 `INocTransport`。
@@ -91,7 +91,7 @@ ComputeCore::drainOutputs
 - `injectLocal(int dst_core, SpikeEvent*)`：本 PE 内本地直达注入（不走 ring；用于 Step/控制面）。
 - `sendExternal(SpikeEvent*)`：跨 PE 外发（计入 `external_spikes_sent`）。
 
-`services/NocSubsystem` 关键入口：
+`services/noc/NocSubsystem` 关键入口：
 - `configure(cfg)`：仅保存配置（如 hop 限制/自环策略/verbose 门控）
 - `bindRuntime(rt)`：注入后端与回调（Output/NIC/ring/links/parent hooks）
 - `onCoreSend(SpikeEvent* ev)`：来自 compute 输出（ParentSpikeTransport → parent->sendSpike）

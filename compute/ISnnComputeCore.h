@@ -120,16 +120,6 @@ public:
     // 窗口门控（供控制层同步镜像）：core 维护 fired_this_window_，控制层可复用
     virtual bool wasFiredThisWindow(uint32_t idx) const = 0;
     virtual void markFiredThisWindow(uint32_t idx) = 0;
-    // 权重访问抽象：允许控制层通过 core 访问权重与缓存
-    virtual bool requestWeight(uint32_t pre, uint32_t post,
-                               const std::function<void(float)>& cb) = 0;
-    virtual bool requestWeightBCSR(uint32_t pre, uint32_t post,
-                                   const std::function<void(float)>& cb) = 0;
-    virtual bool weightCacheTryGet(uint64_t key, float& out) const = 0;
-    virtual void weightCacheStore(uint64_t key, float v) = 0;
-    virtual bool resolveWeightKey(uint32_t pre_global, uint32_t post_local,
-                                  uint32_t& req_pre, uint32_t& req_post,
-                                  uint64_t& cache_key) const = 0;
 };
 
 // 工厂：按名称创建 compute core（默认返回 DefaultSnnComputeCore）
@@ -139,4 +129,3 @@ std::unique_ptr<ISnnComputeCore> createComputeCoreByName(const std::string& name
 }} // namespace SST::SnnDL
 
 #endif // SST_ELEMENTS_SNNDL_ISNNCOMPUTECORE_H
-

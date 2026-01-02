@@ -1,4 +1,5 @@
 #include "SnnPESubComponent.h"
+#include "api/ISnnSpikeCommWorkload.h"
 #include "synapse/gas/AccumulatorOps.h"
 #include <algorithm>
 #include <cinttypes>
@@ -73,7 +74,18 @@ uint64_t SnnPESubComponent::applyAccumulatedWindowAndScatter_() {
     compute_core_->endCycle(static_cast<uint64_t>(total_cycles_));
     std::vector<FireEvent> fired;
     compute_core_->drainOutputs(fired, true);
-    spikes_emitted += routeAndSendOutputs_(fired);
+    if (!fired.empty()) {
+        std::vector<uint32_t> neuron_indices;
+        neuron_indices.reserve(fired.size());
+        for (const auto& ev : fired) neuron_indices.push_back(ev.neuron_idx);
+
+        // 统计口径保留在 CoreShell；发送闭环由 workload=snn 负责。
+        legacySnnOnNeuronFires(neuron_indices, static_cast<uint64_t>(total_cycles_));
+        if (snn_comm_workload_) {
+            (void)snn_comm_workload_->emitNeuronFireBatch(neuron_indices, static_cast<uint64_t>(total_cycles_));
+        }
+        spikes_emitted += neuron_indices.size();
+    }
 
     if (acc_ops_) acc_ops_->reset();
     spikes_emitted_window_ = spikes_emitted;

@@ -2,7 +2,6 @@
 #define _H_SST_SNN_PE_SUBCOMPONENT
 
 #include <sst/core/subcomponent.h>
-#include <sst/core/interfaces/stdMem.h>
 #include <sst/core/link.h>
 #include <sst/core/output.h>
 #include <sst/core/shared/sharedArray.h>
@@ -18,36 +17,45 @@
 #include <utility>
 #include <string>
 #include <vector>
-#include "SpikeEvent.h"
-#include "SnnPEParentInterface.h"
 #include "SnnCoreAPI.h"
 #include "SnnProfiler.h"  // 轻量级性能分析（条件编译）
-#include "synapse/weights/SnnBcsrWeightManager.h"
 #include "ISnnComputeCore.h"
-#include "IMemoryAccess.h"
-#include "ISpikeTransport.h"
+#include "ICoreWorkload.h"
 #include "ICoreControlHooks.h"
 #include "IGlobalStepHooks.h"
 #include "IGasOrchestrator.h"
-#include "NocSpikeTransport.h"
+#include "IGasStageSink.h"
+#include "ILegacySnnWorkloadHost.h"
 
-namespace SST {
-namespace SnnDL {
+namespace SST { namespace SnnDL {
+
+class SpikeEvent;
+class SnnPEParentInterface;
+class ParentSpikeTransport;
+class NocSpikeTransport;
+class BcsrWeightManager;
+class StdMemEndpoint;
+class ISnnSpikeCommWorkload;
+class IGasStageSink;
 
 class IPeAggregation; // PE级汇聚接口（避免依赖 MultiCorePE 具体实现）
 class IManualWindowDrive;
-class StandardMemAccess;
 class AccumulatorOps;
 class WeightCacheOps;
-struct StageEventHub;
 struct WeightAccessor;
 class WeightMemorySubsystem;
 class SpikeCommSubsystem;
-class SynapseRouteSubsystem;
-struct GasOpData;
-class GasPhaseController;
+	class SynapseRouteSubsystem;
+	struct GasOpData;
+	class ICoreWorkload;
+    class ISpikeWorkload;
 
-class SnnPESubComponent : public SnnCoreAPI, public ICoreControlHooks, public IGlobalStepHooks, public IGasOrchestrator {
+class SnnPESubComponent : public SnnCoreAPI,
+                          public ICoreControlHooks,
+                          public IGlobalStepHooks,
+                          public IGasOrchestrator,
+                          public IGasStageSink,
+                          public ILegacySnnWorkloadHost {
 public:
     SST_ELI_REGISTER_SUBCOMPONENT(
         SnnPESubComponent,
@@ -61,6 +69,19 @@ public:
     SST_ELI_DOCUMENT_PARAMS(
         {"core_id", "ID of the core", ""},
         {"compute_core_impl", "Compute core implementation name (default/snn)", "default"},
+        // Phase6：通用 workload（默认仍为 SNN；stream 用于通信+内存 read-after-write 验证负载）
+        {"workload_impl", "Workload implementation: snn (default) or stream", "snn"},
+        {"stream_mem_enable", "Enable stream memory read/write verify (0/1)", "1"},
+        {"stream_mem_period_cycles", "Issue one stream write per N cycles (0=as fast as possible)", "100"},
+        {"stream_mem_region_bytes", "Stream memory region size in bytes (0=disable mem)", "4096"},
+        {"stream_mem_req_bytes", "Stream memory request size in bytes", "64"},
+        {"stream_mem_stride_bytes", "Stream memory stride in bytes", "64"},
+        {"stream_mem_max_outstanding", "Max outstanding stream mem requests (write+read)", "16"},
+        {"stream_comm_enable", "Enable stream RawBytes NoC traffic (0/1)", "1"},
+        {"stream_comm_period_cycles", "Send one stream packet per N cycles (0=disable)", "1000"},
+        {"stream_comm_payload_bytes", "RawBytes payload bytes (excluding header)", "64"},
+        {"stream_strict", "Fail-fast on any stream verify error (0/1)", "1"},
+        {"stream_seed", "Base seed for stream pattern generation (uint64)", "0"},
         {"total_cores", "Total number of cores in the PE", "8"},
         {"global_neuron_base", "Global base ID for neurons in this core", "0"},
         {"num_neurons", "Number of neurons in this core", "64"},
@@ -197,7 +218,18 @@ public:
         {"gas_acc_spilled_bytes_total", "溢写到增量日志的有效字节数（payload）", "bytes", 1}
         ,
         {"weight_read_requests", "Number of weight read requests issued by core", "requests", 1},
-        {"gas_edge_overflow", "Number of times per-window edge collector hit capacity and stopped recording", "events", 1}
+        {"gas_edge_overflow", "Number of times per-window edge collector hit capacity and stopped recording", "events", 1},
+        // Phase6：stream workload 统计（默认不影响 SNN；仅在 workload_impl=stream 时有意义）
+        {"stream_mem_writes_issued_total", "Stream workload: total writes issued", "requests", 1},
+        {"stream_mem_reads_issued_total", "Stream workload: total reads issued", "requests", 1},
+        {"stream_mem_bytes_written_total", "Stream workload: bytes written (issued)", "bytes", 1},
+        {"stream_mem_bytes_read_total", "Stream workload: bytes read (issued)", "bytes", 1},
+        {"stream_mem_verify_pass_total", "Stream workload: verify pass count", "count", 1},
+        {"stream_mem_verify_fail_total", "Stream workload: verify fail count", "count", 1},
+        {"stream_pkt_sent_total", "Stream workload: RawBytes packets sent", "packets", 1},
+        {"stream_pkt_recv_total", "Stream workload: RawBytes packets received", "packets", 1},
+        {"stream_pkt_bad_crc_total", "Stream workload: packets with bad CRC", "packets", 1},
+        {"stream_pkt_bad_magic_total", "Stream workload: packets with bad magic/version", "packets", 1}
     )
 
     SnnPESubComponent(SST::ComponentId_t id, SST::Params& params);
@@ -212,6 +244,7 @@ public:
     virtual void finish() override;
 
     virtual void deliverSpike(SpikeEvent* spike) override;
+    virtual bool deliverPacket(NocPacketEvent* packet) override;
     virtual bool hasWork() const override;
     virtual double getUtilization() const override;
     virtual void getStatistics(std::map<std::string, uint64_t>& stats) const override;
@@ -231,29 +264,48 @@ public:
     void orchestrateBeginScatterSequence() override;
     void orchestrateEndScatterSequence() override;
 
-private:
-    // Helper modules extracted to standalone files; keep private access via friends.
-    friend struct StageEventHub;
-    friend struct WeightAccessor;
+    // Phase4-Task5: legacy host entrypoints used by workload=snn during cutover.
+    bool legacySnnOnClockTick(uint64_t now_cycle) override;
+	    void legacySnnOnWeightsTick(uint64_t now_cycle) override;
+	    void legacySnnDeliverSpike(SpikeEvent* spike) override;
+	    void legacySnnBindComputeCore(ISnnComputeCore* core) override;
+	    IWeightReader* legacySnnGetWeightReader() override;
+	    std::unique_ptr<IWeightReader> legacySnnTakeWeightReader() override;
+	    bool legacySnnWriteback(const std::unordered_map<uint64_t, float>& grads,
+	                            float learning_rate,
+	                            float weight_decay) override;
+	    bool legacySnnHasWork() const override;
+	    double legacySnnGetUtilization() const override;
+	    void legacySnnGetStatistics(std::map<std::string, uint64_t>& stats) const override;
+	    void legacySnnOnNeuronFires(const std::vector<uint32_t>& neuron_indices, uint64_t now_cycle) override;
+        void legacySnnOnGasScatterSpikesEmitted(uint32_t seq, uint64_t spikes_emitted) override;
+
+	private:
+	    // Helper modules extracted to standalone files; keep private access via friends.
+	    friend struct WeightAccessor;
+	    struct Impl;
+	    std::unique_ptr<Impl> impl_;
+
+	    // Phase4 Task6.3: unify workload runtime binding points (init / parent / noc).
+	    void bindWorkloadRuntime_();
+	    void fillStreamRuntime_(ICoreWorkload::Runtime& rt);
+        static uint64_t workloadNowNsThunk_(void* ctx);
 
     // 学习/梯度/误差相关状态已下沉到 compute core（SnnComputeCore）
 
-    // Compute core（动力学/发放/学习），默认内置；保持兼容旧路径
-    std::unique_ptr<ISnnComputeCore> compute_core_;
-    ComputeCoreCapabilities compute_core_caps_{};
-    // 权重读取适配器：将控制层的 requestWeight/cache 接口包装给 compute core
-    std::unique_ptr<IWeightReader> weight_reader_adapter_;
-    // 直接引用 WeightMemorySubsystem 以便管理窗口预算/并发计数（控制层不再持有本地计数）。
-    WeightMemorySubsystem* weight_mem_subsystem_ = nullptr;
-    // 通信子系统：封装 Spike 事件构造与传输
-    std::unique_ptr<ParentSpikeTransport> spike_transport_;
-    // NoC 传输注入（Phase4-A1.3）：优先走 NoC 接口，避免依赖 MultiCorePE 的 send/forward 细节
-    INocTransport* noc_transport_ = nullptr;   // 非拥有；由父组件装配并保证生命周期
-    NocSpikeTransport noc_spike_transport_{};  // 值语义适配器
-    // Synapse/Route：权重驱动路由构建 + 共享缓存（Phase2）
-    std::unique_ptr<SynapseRouteSubsystem> synapse_route_;
-    std::unique_ptr<SpikeCommSubsystem> spike_comm_;
-    bool spike_comm_ready_ = false;
+    // Compute core（动力学/发放/学习）：Phase4 Task6.1 起由 workload=snn 持有并在 init/setup 期间注入。
+    // 这里仅保留 non-owning view 以兼容 legacy 控制链路（后续 Task6.x 将逐步下沉到 workload）。
+    ISnnComputeCore* compute_core_ = nullptr;
+	    // 权重读取适配器：将控制层的 requestWeight/cache 接口包装给 compute core
+	    std::unique_ptr<IWeightReader> weight_reader_adapter_;
+	    // 直接引用 WeightMemorySubsystem 以便管理窗口预算/并发计数（控制层不再持有本地计数）。
+	    WeightMemorySubsystem* weight_mem_subsystem_ = nullptr;
+	    // NoC 传输注入（Phase4-A1.3）：优先走 NoC 接口，避免依赖 MultiCorePE 的 send/forward 细节
+	    INocTransport* noc_transport_ = nullptr;   // 非拥有；由父组件装配并保证生命周期
+	    // SNN comm workload (Phase4 Task6.3): route/comm 迁入 workload=snn 后的窄接口视图（non-owning）
+	    ISnnSpikeCommWorkload* snn_comm_workload_ = nullptr;
+        // Phase4 Task6.4: GAS/window stage events forwarded to workload=snn (non-owning, optional).
+        IGasStageSink* gas_stage_workload_ = nullptr;
     inline void applySynapticDelta_(uint32_t idx, float dv) {
         if (compute_core_) compute_core_->applySynapticDelta(idx, dv);
     }
@@ -281,9 +333,9 @@ private:
     inline void onSpikeDeliveredCore_(SpikeEvent* spike) {
         if (compute_core_) compute_core_->onSpikeDelivered(spike);
     }
-    inline void onSynapticEventCore_(const SynapticEvent& ev) {
-        if (compute_core_) compute_core_->onSynapticEvent(ev);
-    }
+	    inline void onSynapticEventCore_(const SynapticEvent& ev) {
+	        if (compute_core_) compute_core_->onSynapticEvent(ev);
+	    }
 
     // === GAS Apply/Scatter Phase‑1 ===
     bool apply_acc_enable_ = false;           // gate for end-to-end semantics
@@ -293,29 +345,13 @@ private:
     bool acc_spill_enable_cfg_ = true;
     bool acc_dense_enable_cfg_ = false;
     bool acc_shadow_verify_enable_cfg_ = false;
-    std::string stage_events_csv_;
-    enum class GasStage { Idle=0, Gather=1, Apply=2, Scatter=3 };
-    GasStage gas_stage_ = GasStage::Idle;
-    uint32_t curr_stage_seq_ = 0;             // gather/apply/scatter sequence id
-    // GAS superstep timing (ns ~= cycles@1GHz)
-    struct StatsReporter {
-        SnnPESubComponent* core = nullptr;
-        void init(SnnPESubComponent* owner) { core = owner; }
-        void reportMemoryIssue(size_t bytes, bool count_weight_read) const;
-        void reportApplyScatter(uint64_t acc_updates, uint64_t posts_touched,
-                                uint64_t spikes_emitted, uint64_t hwm_bytes,
-                                uint64_t spill_records, uint64_t spilled_bytes) const;
-        void reportWindowSpikes(uint32_t seq, uint64_t spikes_emitted) const;
-        void reportCacheAccess(bool hit) const;
-        void updatePendingPeak(uint32_t outstanding) const;
-    };
-
-    std::unique_ptr<StageEventHub> stage_event_hub_;
-
-    StatsReporter stats_reporter_;
-    // Extracted accumulator/cache helpers (constructed in ctor)
-    std::unique_ptr<AccumulatorOps> acc_ops_;
-    std::unique_ptr<WeightCacheOps> weight_cache_ops_;
+	    std::string stage_events_csv_;
+	    enum class GasStage { Idle=0, Gather=1, Apply=2, Scatter=3 };
+	    GasStage gas_stage_ = GasStage::Idle;
+	    uint32_t curr_stage_seq_ = 0;             // gather/apply/scatter sequence id
+	    // Extracted accumulator/cache helpers (constructed in ctor)
+	    std::unique_ptr<AccumulatorOps> acc_ops_;
+	    std::unique_ptr<WeightCacheOps> weight_cache_ops_;
     bool bcsr_rowptr_file_fallback_enable_ = false;
     bool enable_extended_diagnostics_ = false; // 参数化诊断开关（替代环境变量 SNNDL_DIAG_ENABLE）
     // Per-window aggregation counters (PE-level flush on stage events)
@@ -324,13 +360,13 @@ private:
     uint64_t acc_spill_records_count_ = 0;
     uint64_t acc_spilled_bytes_sum_ = 0;
     uint64_t acc_hwm_bytes_max_ = 0;
-    // Stats pointers
+	    // Stats pointers
     Statistic<uint64_t>* stat_gas_apply_acc_updates_total_ = nullptr;
     Statistic<uint64_t>* stat_gas_acc_posts_touched_total_ = nullptr;
     Statistic<uint64_t>* stat_gas_scatter_spikes_emitted_total_ = nullptr;
     Statistic<uint64_t>* stat_gas_acc_hwm_bytes_total_ = nullptr;
     Statistic<uint64_t>* stat_gas_acc_spill_records_total_ = nullptr;
-    Statistic<uint64_t>* stat_gas_acc_spilled_bytes_total_ = nullptr;
+	    Statistic<uint64_t>* stat_gas_acc_spilled_bytes_total_ = nullptr;
     // GAS superstep duration statistics (cycles)
     Statistic<uint64_t>* stat_gas_superstep_gather_cycles_  = nullptr;
     Statistic<uint64_t>* stat_gas_superstep_apply_cycles_   = nullptr;
@@ -407,11 +443,12 @@ private:
     void activityFlush_();
 
     bool clockTick(Cycle_t current_cycle);
-    void handleMemoryResponse(SST::Interfaces::StandardMem::Request* req);
+    bool legacyClockTickInternal_(Cycle_t current_cycle);
     void initializeStatistics();
     uint64_t applyAccumulatedWindowAndScatter_();
-    void configureComputeCore_(const Params& params);
+    void configureWeightReaderSubsystem_(const Params& params);
     void processLocalSpike(SpikeEvent* spike_event);
+    size_t drainReadySpikes_(uint64_t now_ns);
     void requestWeight(uint32_t pre_neuron, uint32_t post_neuron, std::function<void(float)> callback);
     bool loadTextWeights(const std::string& weights_file_path);
     bool loadCSRRowptrFromFile_();
@@ -419,7 +456,11 @@ private:
     void reserveWindowContainers_();
     // Internal helpers for robust memory access
     bool ensureLoaderReady_();
-    bool ensureMemoryReady_() const { return memory_ != nullptr && memory_ready_; }
+    bool ensureMemoryReady_() const;
+    void initStdMemPhase0_();
+    // Handle StandardMem responses via template specialization defined out-of-line (keeps StandardMem types out of headers; Phase5.3).
+    template <class StdMemRequestT>
+    void handleMemoryResponse(StdMemRequestT* req);
 
     // 方案1辅助
     inline uint32_t scheme1SliceFromPreGlobal_(uint32_t pre_g) const {
@@ -450,12 +491,23 @@ private:
     // Debug/diagnostic switches (params)
     bool read_force_single_ = false; // 当为真时，强制按单元素读取（req_size=4B），用于定位对齐/切片问题
 
+	    // === Phase6: Workload selection ===
+	    enum class WorkloadImpl : uint8_t { Snn = 0, Stream = 1 };
+	    WorkloadImpl workload_impl_ = WorkloadImpl::Snn;
+	    inline bool isStreamWorkload_() const { return workload_impl_ == WorkloadImpl::Stream; }
+
+	    // Phase6.3：workload 插件（Phase6/Phase3）；当前仅 stream 通过工厂创建，SNN 保持原快路径。
+	    std::unique_ptr<ICoreWorkload> workload_;
+        // Phase4（方案 B）：仅 SNN workload 需要 SpikeEvent 语义；在初始化阶段缓存指针，热路径避免 RTTI。
+        ISpikeWorkload* spike_workload_ = nullptr; // non-owning; points into workload_
+        // Phase7 (opt-in): allow migrating strict window-read spike input into workload=snn.
+        bool workload_spike_input_enable_ = false;
+	    static void reportStreamMemIssueThunk_(void* ctx, size_t bytes);
+
     SnnPEParentInterface* parent_;
     IPeAggregation* parent_pe_cached_ = nullptr;
     Output* output_;
-    SST::Interfaces::StandardMem* memory_;
-    std::unique_ptr<StandardMemAccess> stdmem_access_;
-    IManualWindowDrive* manual_window_drive_ = nullptr;
+    std::unique_ptr<StdMemEndpoint> stdmem_ep_;
     bool manual_window_tick_logged_ = false;
     bool clock_tick_logged_ = false;
     SST::Link* memory_link_;
@@ -466,6 +518,7 @@ private:
     uint32_t num_neurons_;
     uint64_t base_addr_;
     uint32_t node_id_;
+    uint32_t total_nodes_cfg_ = 1;
     int verbose_;
     // 路由/目的节点计算所需：每个PE的神经元数（与 num_neurons_ 不同，后者为本core行数）
     uint32_t neurons_per_pe_cfg_ = 0;
@@ -604,6 +657,13 @@ private:
     uint64_t count_spikes_generated_;
     uint64_t count_neurons_fired_;
     uint64_t count_memory_requests_;
+    uint64_t count_non_spike_packets_received_ = 0;
+    uint64_t count_stream_mem_verify_pass_ = 0;
+    uint64_t count_stream_mem_verify_fail_ = 0;
+    uint64_t count_stream_pkt_sent_ = 0;
+    uint64_t count_stream_pkt_recv_ = 0;
+    uint64_t count_stream_pkt_bad_crc_ = 0;
+    uint64_t count_stream_pkt_bad_magic_ = 0;
     // 内部计数：用于收尾摘要打印（不依赖SST统计聚合）
     uint64_t count_cache_hits_ = 0;
     uint64_t count_cache_misses_ = 0;
@@ -627,6 +687,18 @@ private:
     Statistic<uint64_t>* stat_mem_read_latency_cycles_state_ = nullptr;
     Statistic<uint64_t>* stat_mem_req_size_bytes_ = nullptr;
     Statistic<uint64_t>* stat_mem_outstanding_at_issue_ = nullptr;
+
+    // === Phase6: Stream workload statistics (per-core) ===
+    Statistic<uint64_t>* stat_stream_mem_writes_issued_total_ = nullptr;
+    Statistic<uint64_t>* stat_stream_mem_reads_issued_total_ = nullptr;
+    Statistic<uint64_t>* stat_stream_mem_bytes_written_total_ = nullptr;
+    Statistic<uint64_t>* stat_stream_mem_bytes_read_total_ = nullptr;
+    Statistic<uint64_t>* stat_stream_mem_verify_pass_total_ = nullptr;
+    Statistic<uint64_t>* stat_stream_mem_verify_fail_total_ = nullptr;
+    Statistic<uint64_t>* stat_stream_pkt_sent_total_ = nullptr;
+    Statistic<uint64_t>* stat_stream_pkt_recv_total_ = nullptr;
+    Statistic<uint64_t>* stat_stream_pkt_bad_crc_total_ = nullptr;
+    Statistic<uint64_t>* stat_stream_pkt_bad_magic_total_ = nullptr;
 
     // Dense 权重区域上界（用于区域分组）；BCSR 通过 bcsr_kind 判别
     uint64_t weight_region_end_ = 0; // [base_addr_, weight_region_end_) 视为权重区（dense）
@@ -664,7 +736,7 @@ private:
     bool bcsr_weight_guard_enable_ = true;
     float bcsr_weight_abs_max_ = 10.0f;
     uint64_t bcsr_bad_weight_count_ = 0;
-    BcsrWeightManager bcsr_weights_;
+    std::unique_ptr<BcsrWeightManager> bcsr_weights_;
 
     uint32_t bcsr_row_index_cache_cap_ = 64; // 行索引段缓存容量（行数）
     uint32_t bcsr_block_cache_cap_ = 256;    // 数据块缓存容量（块数）
@@ -689,11 +761,8 @@ private:
     bool bcsr_prefetch_all_ = true;
     bool bcsr_prefetch_issued_ = false;
 
-    // GAS 阶段控制：mirror-only controller（cp4'）
-    std::unique_ptr<GasPhaseController> gas_ctrl_;
-
-    // BCSR 辅助
-    void requestWeightBCSR(uint32_t pre_global, uint32_t post_local, std::function<void(float)> cb);
+	    // BCSR 辅助
+	    void requestWeightBCSR(uint32_t pre_global, uint32_t post_local, std::function<void(float)> cb);
     bool bcsrRowIndexGet_(uint32_t block_row, std::vector<uint32_t>& out);
     void bcsrRowIndexPut_(uint32_t block_row, std::vector<uint32_t>& data);
     bool bcsrBlockGet_(uint32_t block_row, uint32_t block_col, std::vector<float>& out);
@@ -741,6 +810,10 @@ private:
     void resetBcsrWindowCounters_();
 
 public:
+    // IGasStageSink (StdMemEndpoint -> CoreShell): stage/stat events are forwarded to workload=snn.
+    void onGasStageEvent(const GasStageEvent& ev) override;
+    void onGasStatEvent(const GasStatEvent& st) override;
+
     // 应用门控决策（由父级MultiCorePE调用）
     void applyGatingDecision(uint32_t src_global, const std::vector<uint32_t>& dest_pes,
                              uint64_t current_cycle, uint64_t ttl_cycles) override;

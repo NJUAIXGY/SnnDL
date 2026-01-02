@@ -1,6 +1,10 @@
 // -*- c++ -*-
 //
 // StageEventHub: GAS阶段事件调度与统计汇报助手
+//
+// ⚠️ Legacy reference only (Phase5.2-A1):
+// 已被吸收进 `control/SnnPESubComponent_impl.h` 的 `SnnPESubComponent::Impl`。
+// 本文件仅为历史对照保留，不参与主链路构建。
 
 #include "StageEventHub.h"
 #include "SnnPESubComponent.h"

@@ -4,6 +4,9 @@
 
 核心设计目标：**组件层只做装配与调度，事务下沉到子系统；compute core 可替换；边界清晰可回归。**
 
+推荐总览入口（先看这个更容易读懂整体）：
+- `docs/SNNDL_HIERARCHY_AND_WORKFLOW.md`
+
 ---
 
 ## 快速构建与安装（修改生效必须 install）

@@ -16,6 +16,7 @@
 #include "NocPacketEvent.h"
 #include "NocPacketBatchEvent.h"
 #include "GasStepBarrierEvent.h"
+#include "WorkloadConfig.h"
 
 #include <fstream>
 #include <sstream>
@@ -188,6 +189,25 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
         step_cfg.build_local_only = params.find<bool>("step_activation_build_local_only", true);
         step_cfg.bcsr_align = params.find<uint64_t>("step_activation_bcsr_align", 64);
 
+        // 通用 workload（例如 stream）下必须禁用 Step/Synapse 语义注入，否则会污染纯通信/纯内存负载。
+        // 选择来源：优先 Params.workload_impl，其次环境变量 SNNDL_WORKLOAD_IMPL（保持脚本不改的兼容路径）。
+        {
+            std::string w = params.find<std::string>("workload_impl", "");
+            if (w.empty()) {
+                if (const char* env = workloadImplFromEnvCached()) w = std::string(env);
+            }
+            std::transform(w.begin(), w.end(), w.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (w == "stream") {
+                step_cfg.enable = false;
+                step_cfg.fraction = 0.0;
+                step_cfg.fanout = 0;
+                step_cfg.period_cycles = 0;
+                step_cfg.use_bcsr_routes = false;
+                step_cfg.bcsr_template.clear();
+            }
+        }
+
         step_activation_subsys_.configure(step_cfg);
 
         StepActivationSubsystem::Runtime step_rt;
@@ -209,6 +229,19 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
 
         step_activation_subsys_.bindRuntime(step_rt);
         step_activation_subsys_.initBcsrReachabilityIfEnabled();
+    }
+
+    // 外部端口 SpikeEvent 直注入（仅本地投递）：收敛为 Stimulus 子系统，MultiCorePE 仅装配/转发。
+    {
+        ExternalSpikeInputSubsystem::Runtime ex_rt;
+        ex_rt.log = output_;
+        ex_rt.node_id = node_id_;
+        ex_rt.global_neuron_base = global_neuron_base_;
+        ex_rt.num_cores = num_cores_;
+        ex_rt.neurons_per_core = neurons_per_core_;
+        ex_rt.total_neurons = total_neurons_;
+        ex_rt.deliver_to_core = [this](int core_id, SpikeEvent* spike) { deliverSpikeToCore(core_id, spike); };
+        external_spike_input_subsys_.bindRuntime(ex_rt);
     }
 
     // Phase3-C：Spike 编解码与投递 glue 下沉为 synapse/route 子系统；MultiCorePE 仅装配。
@@ -301,7 +334,7 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
         noc_rt.optimized_ring = nullptr;  // init 后再注入
         noc_rt.external_spike_output_link = nullptr;  // init(phase0) link configured 后再注入
         noc_rt.deliver_to_endpoint = [this](int endpoint_id, NocPacketEvent* pkt) {
-            spike_packet_bridge_.deliverPacketToEndpoint(endpoint_id, pkt);
+            deliverPacketToEndpoint_(endpoint_id, pkt);
         };
         noc_subsys_.bindRuntime(noc_rt);
     }
@@ -323,12 +356,6 @@ MultiCorePE::~MultiCorePE() {
     delete controller_;
     // 避免析构次序竞态：不手动delete日志对象
     output_ = nullptr;
-    
-    // 清理挂起的内存请求
-    for (auto& pair : pending_memory_requests_) {
-        delete pair.second;
-    }
-    pending_memory_requests_.clear();
 }
 
 void MultiCorePE::init(unsigned int phase) {
@@ -387,7 +414,7 @@ void MultiCorePE::init(unsigned int phase) {
             noc_rt.optimized_ring = optimized_ring_;
             noc_rt.external_spike_output_link = external_spike_output_link_;
             noc_rt.deliver_to_endpoint = [this](int endpoint_id, NocPacketEvent* pkt) {
-                spike_packet_bridge_.deliverPacketToEndpoint(endpoint_id, pkt);
+                deliverPacketToEndpoint_(endpoint_id, pkt);
             };
             noc_subsys_.bindRuntime(noc_rt);
         }
@@ -738,7 +765,7 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
 
 void MultiCorePE::handleExternalSpikeEvent(SST::Event* ev) {
     if (!ev) return;
-    // Phase5‑5.4：外部端口事件解析收敛到 NocSubsystem；MultiCorePE 仅保留 SpikeEvent 直投回退。
+    // 外部端口事件解析：NocPacketEvent 走 NoC；SpikeEvent 走 Stimulus 的直注入（仅本地投递，语义冻结）。
     if (auto* spike = dynamic_cast<SpikeEvent*>(ev)) {
         handleExternalSpike(spike);
         return;
@@ -788,18 +815,7 @@ void MultiCorePE::beginGlobalStep_(uint32_t seq) {
 }
 
 void MultiCorePE::handleExternalSpike(SpikeEvent* spike) {
-    if (!spike) return;
-    // 仅处理发往本节点的脉冲；其它情况视为无效输入直接丢弃（relay 由 NoC packet 路径负责）。
-    if (spike->getDestinationNode() != static_cast<uint32_t>(node_id_)) {
-        delete spike;
-        return;
-    }
-    const int dst_core = determineTargetUnit(static_cast<int>(spike->getDestinationNeuron()));
-    if (dst_core >= 0) {
-        deliverSpikeToCore(dst_core, spike);
-    } else {
-        delete spike;
-    }
+    external_spike_input_subsys_.onSpike(spike);
 }
 
 void MultiCorePE::sendExternalSpike(SpikeEvent* spike) {
@@ -1416,33 +1432,6 @@ int MultiCoreController::findMostLoadedCore() const {
     return most_loaded;
 }
 
-// ===== 内存响应处理 =====
-
-void MultiCorePE::handleMemoryResponse(SST::Interfaces::StandardMem::Request* resp) {
-    if (!resp) return;
-    
-    PE_LOG(4, "📨 收到内存响应: ID=%" PRIu64 "\n", 
-                    resp->getID());
-    
-    // 查找对应的挂起请求
-    auto it = pending_memory_requests_.find(resp->getID());
-    if (it != pending_memory_requests_.end()) {
-        SpikeEvent* original_spike = it->second;
-        pending_memory_requests_.erase(it);
-        
-        // 处理原始脉冲事件
-        if (original_spike) {
-            handleExternalSpike(original_spike);
-        }
-        
-        stat_memory_requests_->addData(1);
-    } else {
-        PE_LOG(2, "⚠️ 未找到对应的挂起内存请求: ID=%" PRIu64 "\n", resp->getID());
-    }
-    
-    delete resp;
-}
-
 // ===== SnnPEParentInterface 实现 =====
 
 void MultiCorePE::sendSpike(SpikeEvent* event) {
@@ -1457,14 +1446,12 @@ void MultiCorePE::sendSpike(SpikeEvent* event) {
 
 void MultiCorePE::requestMemoryAccess(uint64_t address, size_t size, 
                                     std::function<void(const void*)> callback) {
-    // TODO: 在Phase 2中实现内存访问
-    PE_LOG(4, "📨 接收内存访问请求: 地址=0x%lx, 大小=%zu\n", address, size);
-    
-    // 暂时提供一个虚拟的响应
-    static float dummy_data = 0.5f;
-    if (callback) {
-        callback(&dummy_data);
-    }
+    (void)callback;
+    output_->fatal(
+        CALL_INFO, -1,
+        "MultiCorePE fatal: requestMemoryAccess 已废弃/禁止使用（避免引入权重语义耦合）。"
+        "请改走 services/memory/StandardMemAccess + services/synapse/weights 事务链路；addr=0x%" PRIx64 " size=%zu\n",
+        static_cast<uint64_t>(address), size);
 }
 
 void MultiCorePE::deliverSpikeToCore(int core_id, SpikeEvent* spike) {
@@ -1496,6 +1483,34 @@ void MultiCorePE::deliverSpikeToCore(int core_id, SpikeEvent* spike) {
 
     PE_LOG(4, "📨 向核心%d递送脉冲: 神经元%d\n", 
                     core_id, spike->getDestinationNeuron());
+}
+
+void MultiCorePE::deliverPacketToEndpoint_(int endpoint_id, NocPacketEvent* pkt) {
+    if (!pkt) return;
+    if (pkt->packetKind() == NocPacketKind::Spike) {
+        spike_packet_bridge_.deliverPacketToEndpoint(endpoint_id, pkt);
+        return;
+    }
+
+    if (endpoint_id < 0 || endpoint_id >= num_cores_) {
+        PE_LOG(2, "⚠️ 无效 endpoint_id=%d，丢弃 packet(kind=%u)\n",
+               endpoint_id, static_cast<unsigned>(pkt->kind));
+        delete pkt;
+        return;
+    }
+    if (!cores_[endpoint_id]) {
+        PE_LOG(2, "⚠️ endpoint(core)=%d 未配置，丢弃 packet(kind=%u)\n",
+               endpoint_id, static_cast<unsigned>(pkt->kind));
+        delete pkt;
+        return;
+    }
+
+    const bool taken = cores_[endpoint_id]->deliverPacket(pkt);
+    if (!taken) {
+        PE_LOG(2, "⚠️ core=%d 未处理 packet(kind=%u)，已回收\n",
+               endpoint_id, static_cast<unsigned>(pkt->kind));
+        delete pkt;
+    }
 }
 
 void MultiCorePE::resetAllCoreMembranes() {

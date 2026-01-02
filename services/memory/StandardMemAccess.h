@@ -27,6 +27,9 @@ public:
                                int core_id)
         : mem_(mem), out_(out), node_id_(node_id), core_id_(core_id) {}
 
+    // Memory semantic only: force all requests to be non-cacheable (e.g., streaming workload).
+    void setForceNoncacheable(bool v) { force_noncacheable_ = v; }
+
     RequestId read(uint64_t addr, size_t bytes, ReadCallback cb) override;
     RequestId write(uint64_t addr, const std::vector<uint8_t>& data, WriteCallback cb) override;
     size_t pendingSize() const override { return pending_.size(); }
@@ -47,8 +50,8 @@ private:
     SST::Output* out_ = nullptr;
     int node_id_ = -1;
     int core_id_ = -1;
+    bool force_noncacheable_ = false;
     std::unordered_map<uint64_t, PendingEntry> pending_;
 };
 
 }} // namespace SST::SnnDL
-

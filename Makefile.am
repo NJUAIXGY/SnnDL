@@ -25,9 +25,17 @@ libSnnDL_la_SOURCES = \
 	api/ISpikeTransport.h \
 	api/INocTransport.h \
 	api/IManualWindowDrive.h \
+	api/GasOps.h \
+	api/IGasCmdSender.h \
+	api/IGasStageSink.h \
 	api/IGasStepGate.h \
 	api/IGlobalStepHooks.h \
 	api/IMemoryAccess.h \
+	api/ICoreWorkload.h \
+	api/ISpikeWorkload.h \
+	api/ILegacySnnWorkloadHost.h \
+	api/WorkloadConfig.h \
+	api/CoreWorkloadFactory.h \
 	api/ISynapseRoute.h \
 	api/SynapseRouteBuildConfig.h \
 	api/SnnWeightReader.h \
@@ -63,21 +71,20 @@ libSnnDL_la_SOURCES = \
 	components/mpi/MPITypes.h \
 	control/SnnPESubComponent.cc \
 	control/SnnPESubComponent.h \
+	control/SnnPESubComponent_impl.h \
 	control/SnnPESubComponent_bcsr.cc \
-	control/SnnPESubComponent_mem.cc \
 	control/SnnPESubComponent_routing.cc \
 	control/SnnPESubComponent_scheme1.cc \
 	control/SnnPESubComponent_spike.cc \
 	control/SnnPEApplyScatter.cc \
 	control/SnnPEOrchestrators.cc \
-	control/StageEventHub.cc \
-	control/StageEventHub.h \
 	compute/SnnComputeCore.cc \
 	compute/SnnComputeCore.h \
 	compute/SnnCoreEngine.cc \
 	compute/SnnCoreEngine.h \
 	compute/SnnLearningCore.cc \
 	compute/SnnLearningCore.h \
+	compute/IWeightAwareComputeCore.h \
 	compute/SnnNeuronModel.h \
 	compute/SynapseManager.h \
 	services/synapse/gas/AccumulatorOps.cc \
@@ -87,6 +94,9 @@ libSnnDL_la_SOURCES = \
 	services/synapse/gas/GasEdgeCollector.h \
 	services/synapse/gas/GasPhaseController.cc \
 	services/synapse/gas/GasPhaseController.h \
+	services/synapse/stdmem/StdMemEndpoint.cc \
+	services/synapse/stdmem/StdMemEndpoint.h \
+	services/synapse/stdmem/SnnPESubComponent_mem.cc \
 	services/noc/OptimizedInternalRing.cc \
 	services/noc/OptimizedInternalRing.h \
 	components/noc/SimpleNetworkWrapper.cc \
@@ -108,6 +118,8 @@ libSnnDL_la_SOURCES = \
 	services/synapse/route/SynapseRouteSubsystem.h \
 	services/stimulus/StepActivationSubsystem.cc \
 	services/stimulus/StepActivationSubsystem.h \
+	services/stimulus/ExternalSpikeInputSubsystem.cc \
+	services/stimulus/ExternalSpikeInputSubsystem.h \
 	services/noc/NocSubsystem.cc \
 	services/noc/NocSubsystem.h \
 	services/synapse/weights/WeightAccessor.cc \
@@ -121,6 +133,11 @@ libSnnDL_la_SOURCES = \
 	services/synapse/route/SpikePacketTransport.h \
 	services/synapse/route/SpikePacketBridge.cc \
 	services/synapse/route/SpikePacketBridge.h \
+	services/workload/CoreWorkloadFactory.cc \
+	services/workload/snn/SnnWorkload.cc \
+	services/workload/snn/SnnWorkload.h \
+	services/workload/stream/StreamWorkload.cc \
+	services/workload/stream/StreamWorkload.h \
 	services/memory/StandardMemAccess.cc \
 	services/memory/StandardMemAccess.h
 
@@ -135,3 +152,7 @@ libSnnDL_la_LDFLAGS = -module -avoid-version
 # libSnnDL_la_LDFLAGS += $(MPI_LDFLAGS)
 # libSnnDL_la_LIBADD = $(MPI_LIBS)
 # endif
+
+.PHONY: test-compile
+test-compile:
+	$(CXXCOMPILE) -c $(srcdir)/tests/test_includes.cc -o tests/test_includes.o

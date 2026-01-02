@@ -29,13 +29,13 @@
 #include <limits>
 
 #include "SpikeEvent.h"
-#include "SpikeEventWrapper.h"
 #include "SnnInterface.h"
 #include "SnnPEParentInterface.h"
 #include "IPeAggregation.h"
 #include "SnnCoreAPI.h"
 #include "../api/GlobalNeuronLayout.h"
 #include "noc/OptimizedInternalRing.h"
+#include "stimulus/ExternalSpikeInputSubsystem.h"
 #include "stimulus/StepActivationSubsystem.h"
 #include "noc/NocSubsystem.h"
 #include "synapse/route/SpikePacketBridge.h"
@@ -46,6 +46,7 @@ namespace SnnDL {
 // 前置声明
 class MultiCoreController;
 class SnnNetworkAdapter;
+class NocPacketEvent;
 
 // RingMessage和RingMessageType现在定义在OptimizedInternalRing.h中
 
@@ -467,9 +468,6 @@ private:
     SST::Link* west_link_;
     SST::Link* network_link_;
     
-    // 内部数据结构
-    std::unordered_map<uint64_t, SpikeEvent*> pending_memory_requests_;
-    
     // 时钟计数器和测试流量
     uint64_t current_cycle_;
     uint64_t test_cycle_counter_;
@@ -510,6 +508,9 @@ private:
         }
         return w;
     }
+
+    // 外部端口 SpikeEvent 直注入（语义：仅本地投递；Stimulus 域）
+    ExternalSpikeInputSubsystem external_spike_input_subsys_{};
 
     // Step-level random activation injection (Phase3-B): 下沉为独立子系统
     StepActivationSubsystem step_activation_subsys_{};
@@ -557,11 +558,6 @@ private:
      * @brief 处理内部脉冲路由
      */
     /**
-     * @brief 处理内存响应
-     */
-    void handleMemoryResponse(SST::Interfaces::StandardMem::Request* resp);
-    
-    /**
      * @brief 加载和分布权重
      */
     void loadAndDistributeWeights();
@@ -585,6 +581,10 @@ private:
      * @brief 向指定核心递送脉冲
      */
     void deliverSpikeToCore(int core_id, SpikeEvent* spike);
+    /**
+     * @brief 将NoC packet按kind分流并投递到指定endpoint/core
+     */
+    void deliverPacketToEndpoint_(int endpoint_id, NocPacketEvent* pkt);
     void resetAllCoreMembranes();
     
     // === 网络端口事件处理器 ===

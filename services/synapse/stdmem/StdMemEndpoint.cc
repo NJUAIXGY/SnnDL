@@ -1,0 +1,150 @@
+// -*- c++ -*-
+//
+// StdMemEndpoint.cc: StandardMem glue implementation (synapse 域)
+//
+
+#include <sst/core/sst_config.h>
+
+#include "synapse/stdmem/StdMemEndpoint.h"
+
+#include <sst/core/interfaces/stdMem.h>
+#include <sst/core/output.h>
+
+#include "IGasStageSink.h"
+#include "IGasStepGate.h"
+#include "IManualWindowDrive.h"
+#include "memory/StandardMemAccess.h"
+#include "synapse/gas/GasCustomCmd.h"
+
+#include <inttypes.h>
+
+namespace SST { namespace SnnDL {
+
+struct StdMemEndpoint::Impl {
+    SST::Interfaces::StandardMem* stdmem = nullptr;  // non-owning; created by SST factory
+    std::unique_ptr<StandardMemAccess> stdmem_access;
+};
+
+StdMemEndpoint::StdMemEndpoint() : impl_(std::make_unique<Impl>()) {}
+StdMemEndpoint::~StdMemEndpoint() = default;
+
+void StdMemEndpoint::configure(const Config& cfg) { cfg_ = cfg; }
+
+void StdMemEndpoint::bindRuntime(const Runtime& rt) {
+    rt_ = rt;
+}
+
+void StdMemEndpoint::bindStdMem(SST::SubComponent* stdmem_subcomp) {
+    // Reset previous bindings
+    mem_access_ = nullptr;
+    step_gate_ = nullptr;
+    manual_drive_ = nullptr;
+    if (impl_) {
+        impl_->stdmem = nullptr;
+        impl_->stdmem_access.reset();
+    }
+
+    if (!impl_) return;
+    if (!stdmem_subcomp) return;
+
+    impl_->stdmem = dynamic_cast<SST::Interfaces::StandardMem*>(stdmem_subcomp);
+    if (!impl_->stdmem) return;
+
+    impl_->stdmem_access =
+        std::make_unique<StandardMemAccess>(impl_->stdmem, rt_.log, (int)rt_.node_id, (int)rt_.core_id);
+    impl_->stdmem_access->setForceNoncacheable(cfg_.force_noncacheable);
+    mem_access_ = impl_->stdmem_access.get();
+
+    // Optional: query GAS step gate and manual window driver from downstream StandardMem front-end.
+    step_gate_ = dynamic_cast<IGasStepGate*>(impl_->stdmem);
+    manual_drive_ = dynamic_cast<IManualWindowDrive*>(impl_->stdmem);
+}
+
+void StdMemEndpoint::init(unsigned int phase) {
+    if (impl_ && impl_->stdmem) {
+        impl_->stdmem->init(phase);
+    }
+}
+
+void StdMemEndpoint::complete(unsigned int phase) {
+    if (impl_ && impl_->stdmem) {
+        impl_->stdmem->complete(phase);
+    }
+}
+
+void StdMemEndpoint::sendGasCmd(GasOp op,
+                                uint32_t superstep,
+                                uint32_t slice,
+                                uint32_t total_slices,
+                                bool flag) {
+    if (!impl_ || !impl_->stdmem) return;
+    auto* req = new SST::Interfaces::StandardMem::CustomReq(new GasOpData(op, superstep, slice, total_slices, flag));
+    impl_->stdmem->send(req);
+}
+
+void StdMemEndpoint::handleResponseOpaque(void* req) {
+    auto* stdmem_req = reinterpret_cast<SST::Interfaces::StandardMem::Request*>(req);
+    if (!stdmem_req) return;
+
+    // === Control-plane CustomResp (GAS stage/stat) ===
+    if (auto* cust = dynamic_cast<SST::Interfaces::StandardMem::CustomResp*>(stdmem_req)) {
+        auto& data = cust->getData();
+        if (auto* op = dynamic_cast<GasOpData*>(&data)) {
+            if (rt_.gas_stage_sink) {
+                GasStageEvent ev{};
+                ev.op = op->op;
+                ev.superstep = op->superstep;
+                ev.slice = op->slice;
+                ev.total_slices = op->total_slices;
+                ev.flag = op->flag;
+                rt_.gas_stage_sink->onGasStageEvent(ev);
+            }
+            delete stdmem_req;
+            return;
+        }
+        if (auto* st = dynamic_cast<GasStatData*>(&data)) {
+            if (rt_.gas_stage_sink) {
+                GasStatEvent sev{};
+                sev.unique_reads = st->unique_reads;
+                sev.unique_bytes = st->unique_bytes;
+                sev.rowwin_triggers = st->rowwin_triggers;
+                sev.rowwin_bytes = st->rowwin_bytes;
+                sev.bursts = st->bursts;
+                sev.payload_bytes = st->payload_bytes;
+                sev.window_inflight_peak = st->window_inflight_peak;
+                sev.window_buffer_max_bytes = st->window_buffer_max_bytes;
+                rt_.gas_stage_sink->onGasStatEvent(sev);
+            }
+            delete stdmem_req;
+            return;
+        }
+        // Unknown CustomResp: fall-through to delete
+    }
+
+    // === Data-plane Read/Write responses ===
+    uint64_t now_cycle = 0;
+    if (rt_.now_cycle) now_cycle = rt_.now_cycle();
+    if (rt_.before_data_plane_dispatch) rt_.before_data_plane_dispatch(now_cycle);
+
+    if (impl_ && impl_->stdmem_access && impl_->stdmem_access->handleMemoryResponse(stdmem_req)) {
+        // handled and deleted
+        return;
+    }
+
+    // Fail-fast for untracked ReadResp (preserve previous control behavior).
+    if (dynamic_cast<SST::Interfaces::StandardMem::ReadResp*>(stdmem_req)) {
+        if (rt_.log) {
+            rt_.log->fatal(CALL_INFO, -1,
+                           "[stdmem-untracked] node=%u core=%u type=ReadResp id=%" PRIu64 "\n",
+                           static_cast<uint32_t>(rt_.node_id),
+                           static_cast<uint32_t>(rt_.core_id),
+                           static_cast<uint64_t>(stdmem_req->getID()));
+        }
+        delete stdmem_req;
+        return;
+    }
+
+    delete stdmem_req;
+}
+
+}} // namespace SST::SnnDL
