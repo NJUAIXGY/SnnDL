@@ -224,6 +224,8 @@ bool StreamWorkload::onClockTick(uint64_t now_cycle) {
                 memory_requests_++;
                 if (rt_.sinks.stat_mem_writes_issued_total) rt_.sinks.stat_mem_writes_issued_total->addData(1);
                 if (rt_.sinks.stat_mem_bytes_written_total) rt_.sinks.stat_mem_bytes_written_total->addData(data.size());
+                stream_mem_writes_issued_total_ += 1;
+                stream_mem_bytes_written_total_ += static_cast<uint64_t>(data.size());
 
                 const auto w_id = rt_.mem->write(
                     addr, data,
@@ -247,6 +249,8 @@ bool StreamWorkload::onClockTick(uint64_t now_cycle) {
                         memory_requests_++;
                         if (rt_.sinks.stat_mem_reads_issued_total) rt_.sinks.stat_mem_reads_issued_total->addData(1);
                         if (rt_.sinks.stat_mem_bytes_read_total) rt_.sinks.stat_mem_bytes_read_total->addData(req_bytes);
+                        stream_mem_reads_issued_total_ += 1;
+                        stream_mem_bytes_read_total_ += static_cast<uint64_t>(req_bytes);
 
                         const auto r_id = rt_.mem->read(
                             addr, req_bytes,
@@ -384,6 +388,10 @@ void StreamWorkload::getStatistics(std::map<std::string, uint64_t>& stats) const
 
     stats["stream_mem_verify_pass_total"] = rt_.sinks.mem_verify_pass ? *rt_.sinks.mem_verify_pass : 0;
     stats["stream_mem_verify_fail_total"] = rt_.sinks.mem_verify_fail ? *rt_.sinks.mem_verify_fail : 0;
+    stats["stream_mem_writes_issued_total"] = stream_mem_writes_issued_total_;
+    stats["stream_mem_reads_issued_total"] = stream_mem_reads_issued_total_;
+    stats["stream_mem_bytes_written_total"] = stream_mem_bytes_written_total_;
+    stats["stream_mem_bytes_read_total"] = stream_mem_bytes_read_total_;
     stats["stream_pkt_sent_total"] = rt_.sinks.pkt_sent ? *rt_.sinks.pkt_sent : 0;
     stats["stream_pkt_recv_total"] = rt_.sinks.pkt_recv ? *rt_.sinks.pkt_recv : 0;
     stats["stream_pkt_bad_crc_total"] = rt_.sinks.pkt_bad_crc ? *rt_.sinks.pkt_bad_crc : 0;

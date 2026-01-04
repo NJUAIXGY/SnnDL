@@ -1,6 +1,6 @@
 # compute/（可替换计算核心层）
 
-本目录存放 **可插拔 compute core 接口与默认 SNN 核心实现**。目标是让 SnnDL 支持未来“替换核心计算范式”，而无需改动控制壳（`control/SnnPESubComponent`）。
+本目录存放 **可插拔 compute core 接口与默认 SNN 核心实现**。目标是让 SnnDL 支持未来“替换核心计算范式”，而无需改动平台壳（CoreShell：`control/SnnPESubComponent`）。
 
 ## 职责
 

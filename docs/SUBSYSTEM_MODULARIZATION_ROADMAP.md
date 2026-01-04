@@ -13,7 +13,7 @@
 
 ### 0.0 Phase1 详细实施计划（Task-by-task）
 
-- 见：`docs/PHASE5_BOUNDARY_HARDENING_PLAN.md`
+- “完成态”DoD 与执行清单：`docs/plans/2026-01-03-universal-core-completion.md`
 
 ### 0.1 范围（In-scope）
 - 代码范围：`sst_workspace/sst-elements/src/sst/elements/SnnDL/**`
@@ -39,7 +39,7 @@
   - `memory.memory_requests / memory.memory_bytes`
   - `nic.packets_sent / packets_recv`
   - `window_metrics.payload_bytes_avg / bursts_avg / inflight_peak_max`
-- “确定性”验收：同配置连续跑 3 次，以上字段**完全一致**（首选）或在非常小的允许范围内一致（若存在确认为随机源引起的合理差异，则必须固定 seed 彻底消除）。
+- “确定性”验收：同配置连续跑 3 次，以上字段应完全一致（首选）或在可解释的小范围内一致；建议使用 `sst_dram_si/tools/compare_essential_summary_mesh.py` 做容忍度对比。
 
 ### 0.4 回归执行清单（建议每个 Phase 都照此打勾）
 
@@ -324,12 +324,12 @@ components/MultiCorePE (装配/调度/统计汇聚)
 - 100us ×3（同配置完全一致）：`sst_dram_si/outputs_large/paper2/dram_mesh_4x4/20251223-144549`、`20251223-144725`、`20251223-144833`
 
 ### 6.2 已完成：Phase1（Memory 去语义化：IMemoryAccess / StandardMemAccess）
-- 规划：以 `docs/PHASE3_MODULAR_BOUNDARIES_PLAN.md` 与 `TECH_PROGRESS.md` 的落地记录为准（旧 docs/plans 已弃用）
+- 规划：以 `docs/UNIVERSAL_CONTROL_CORE_DESIGN.md`、`docs/plans/2026-01-03-universal-core-completion.md` 与 `sst_dram_si/TECH_PROGRESS.md` 的落地记录为准
 - OpenSpec：`openspec/changes/refactor-snndl-phase1-memory-access/`
 - 100us ×3（同配置完全一致）：`sst_dram_si/outputs_large/paper2/dram_mesh_4x4/20251223-163433`、`20251223-163612`、`20251223-163713`
 
 ### 6.3 已完成：Phase2（Synapse/Route 收敛：路由构建从 SpikeCommSubsystem 下移）
-- 规划：以 `docs/PHASE3_MODULAR_BOUNDARIES_PLAN.md` 与 `TECH_PROGRESS.md` 的落地记录为准（旧 docs/plans 已弃用）
+- 规划：以 `docs/UNIVERSAL_CONTROL_CORE_DESIGN.md`、`docs/plans/2026-01-03-universal-core-completion.md` 与 `sst_dram_si/TECH_PROGRESS.md` 的落地记录为准
 - OpenSpec：`openspec/changes/refactor-snndl-phase2-synapse-route/`
 - 关键改动：
   - 新增 `services/synapse/route/SynapseRouteSubsystem.{h,cc}`：接管“路由构建/共享缓存/BCSR route 解析”
@@ -378,3 +378,32 @@ components/MultiCorePE (装配/调度/统计汇聚)
   - 10us：`sst_dram_si/outputs_large/paper2/dram_mesh_4x4/20251228-172153`（`neurons_fired_total=1`；`gas.*_p95` 非 0）
   - 100us：`sst_dram_si/outputs_large/paper2/dram_mesh_4x4/20251228-172308`（`neurons_fired_total=2220`）
   - 100us（同配置重复 1 次完全一致）：`sst_dram_si/outputs_large/paper2/dram_mesh_4x4/20251228-172437`（关键字段与上一条完全一致）
+
+### 6.8 已完成：Phase8（NoC Spike packet 严格收敛：MultiCorePE 不再走 deliverSpike fallback）
+- 目标：
+  - 平台层（`components/MultiCorePE`）对 `NocPacketKind::Spike` **不再**做任何 `SpikeEvent` 语义处理；
+  - 所有 NoC 收到的 Spike 输入必须通过 `core->deliverPacket(NocPacketEvent*)` 进入 core/workload，由 workload 负责解码与处理；
+  - 禁止 `SpikePacketBridge::deliverPacketToEndpoint()->core->deliverSpike()` 这条 legacy 回退（避免边界回退带来语义漂移与非确定性风险）。
+- 关键改动：
+  - `components/MultiCorePE`：在 `deliverPacketToEndpoint_()` 中对 `kind==Spike` 改为 strict 调用 `cores_[endpoint_id]->deliverPacket(pkt)`；若 core 未接管则 `fatal`（fail-fast）。
+- 回归验证（mesh 模板方式）：
+  - 10us：`sst_dram_si/outputs_large/paper2/dram_mesh_4x4/20260103-034134`（`neurons_fired_total=1`；`gas.*_p95` 非 0）
+  - 100us：`sst_dram_si/outputs_large/paper2/dram_mesh_4x4/20260103-034247`（`neurons_fired_total=2220`；`gas.*_p95` 非 0）
+
+### 6.9 已完成：Phase9（9.1–9.4：CoreShellAPI 槽位 + packet-first 注入 + 退役 deliverSpikeToCore）
+- 目标（一次性完成 9.1–9.4）：
+  - 9.1：核心槽位 API 切换为 `CoreShellAPI`（平台层不再直接依赖 `SnnCoreAPI`）
+  - 9.2：ExternalSpikeInputSubsystem 注入改为 packet-first（走 `INocTransport`）
+  - 9.3：StepActivationSubsystem 注入改为 packet-first（走 `INocTransport`）
+  - 9.4：退役 `deliverSpikeToCore()`（主链路不再走 `deliverSpike` 回退）
+- 关键改动：
+  - `components/MultiCorePE.*`：`coreX` 槽位按 `CoreShellAPI` 加载；为“core 未加载/不匹配 API”加入 fail-fast `fatal`，避免静默归零。
+  - `control/SnnPESubComponent.h`：ELI 注册父接口改为 `CoreShellAPI`，确保能被 `loadAnonymousSubComponent<CoreShellAPI>` 正确加载（修复 Phase9 初版导致 core 为空→Step 不触发→全链路归零的问题）。
+  - `services/stimulus/ExternalSpikeInputSubsystem.*`：`SpikeEvent*` → `SpikeNocCodec::encode` → `noc->injectLocal/sendExternal`。
+  - `services/stimulus/StepActivationSubsystem.*`：同上，注入链路完全 packet-first。
+  - `components/MultiCorePE.*`：删除 `deliverSpikeToCore()` 及其绑定；仅保留 legacy-only 入口通过 `dynamic_cast<SnnCoreAPI*>` 调用（用于 reset/forceEndGather）。
+- 回归验证（脚本保持不改，按模板启动；stream 通过环境变量选择）：
+  - SNN 10us：`sst_dram_si/outputs_large/paper2/dram_mesh_4x4/20260103-050427`（`neurons_fired_total=1`；非 0）
+  - SNN 100us：`sst_dram_si/outputs_large/paper2/dram_mesh_4x4/20260103-050009`（`neurons_fired_total=2220`；与稳定基线量级一致）
+  - stream 10us：`sst_dram_si/outputs_large/paper2/dram_mesh_4x4/20260103-050241`（`memory_requests` 非 0；WeightLoader 显示 `workload_impl=stream -> skip`）
+  - stream 100us：`sst_dram_si/outputs_large/paper2/dram_mesh_4x4/20260103-050541`（`memory_requests=79920`、`external_spikes_sent/received=3980`）

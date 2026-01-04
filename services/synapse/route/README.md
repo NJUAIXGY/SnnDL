@@ -37,7 +37,7 @@
 ### `SpikePacketBridge.{h,cc}`
 - **定位**：SpikeEvent ↔ NoC packet 的编解码与投递 glue（Phase3-C）。
 - **核心职责**：
-  - 将 `NocPacketEvent` 解码为 `SpikeEvent` 并递送到目标 core（对接 `NocSubsystem::deliver_to_endpoint` 回调）；
+  - 将 `NocPacketEvent` 解码为 `SpikeEvent` 并以 packet-first 方式递送到目标 CoreShell/workload（对接 `NocSubsystem::deliver_to_endpoint` 回调）；
   - 将 `SpikeEvent` 编码为 `NocPacketEvent` 并通过 `api/INocTransport` 发出（供 MultiCorePE/Stimulus 等装配使用）。
 - **边界收益**：`components/MultiCorePE.*` 不直接调用 `SpikeNocCodec`，只做装配与时钟调度。
 
@@ -45,8 +45,8 @@
 
 ## 与其他域的交互（典型数据流）
 
-1) `compute/ISnnComputeCore` 产出 fire events；
-2) `control/SnnPESubComponent` 调用 `SpikeCommSubsystem::emitNeuronFire()`；
+1) `workload=snn` 内部装配的 `compute/ISnnComputeCore` 产出 fire events；
+2) `workload=snn` 调用 `SpikeCommSubsystem::emitNeuronFire()`；
 3) `SpikeCommSubsystem` 调用 `ISynapseRoute::computeFanout()` 得到目的集合；
 4) `SpikeCommSubsystem` 构造 `events/SpikeEvent` 并调用 `ISpikeTransport::send(...)`；
 5) `ISpikeTransport` 的具体实现（通常由 NoC 域承载）完成实际发送与本地投递。

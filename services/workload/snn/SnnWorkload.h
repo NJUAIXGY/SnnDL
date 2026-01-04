@@ -14,10 +14,11 @@
 #include <string>
 #include <vector>
 
-#include "ILegacySnnWorkloadHost.h"
 #include "IGasStageSink.h"
 #include "ISpikeWorkload.h"
 #include "ISnnSpikeCommWorkload.h"
+
+namespace SST { namespace Shared { template <typename T> class SharedArray; } }
 
 namespace SST { class Output; class Params; }
 
@@ -28,10 +29,12 @@ class NocPacketEvent;
 class ISnnComputeCore;
 class IWeightReader;
 class WeightMemorySubsystem;
+class WeightCacheOps;
+class BcsrWeightManager;
+struct WeightAccessor;
 class AccumulatorOps;
 class SynapseRouteSubsystem;
 class SpikeCommSubsystem;
-class ParentSpikeTransport;
 class NocSpikeTransport;
 struct SynapseRouteBuildConfig;
 
@@ -42,7 +45,6 @@ public:
 
     void configureFromParams(const SST::Params& params) override;
     void bindRuntime(const Runtime& rt) override;
-    void bindLegacyHost(ILegacySnnWorkloadHost* host) override { legacy_host_ = host; }
 
     bool onClockTick(uint64_t now_cycle) override;
     bool deliverPacket(NocPacketEvent* packet) override;
@@ -79,19 +81,22 @@ private:
     uint32_t remapPreGlobalModulo_(uint32_t pre_global) const;
     uint32_t mapPreGlobalToLocal_(uint32_t pre_global) const;
 
+    bool ensureLoaderReady_();
     void ensureWeightReaderOwned_();
     void ensureComputeCoreConfigured_();
     void ensureSpikeCommConfigured_();
     bool windowScatterModeActive_() const;
 
     Runtime rt_{};
-    ILegacySnnWorkloadHost* legacy_host_ = nullptr; // non-owning (Phase4-Task5 transitional)
 
     // Phase4-Task6.2-Step2: weight reader/subsystem ownership moved from CoreShell into workload=snn.
     std::unique_ptr<IWeightReader> weight_reader_;
     WeightMemorySubsystem* weight_mem_subsystem_ = nullptr; // non-owning view into weight_reader_ (if it is WMS)
+    std::unique_ptr<WeightCacheOps> weight_cache_ops_;
+    std::unique_ptr<WeightAccessor> weight_accessor_;
+    std::unique_ptr<BcsrWeightManager> bcsr_mgr_;
 
-    // Compute core moved from CoreShell (Phase4 Task6.1). Still bridged via legacy host for now.
+    // Compute core owned by workload=snn.
     std::unique_ptr<ISnnComputeCore> compute_core_;
     std::string compute_core_impl_ = "default";
     uint32_t num_neurons_ = 0;
@@ -104,6 +109,7 @@ private:
     bool window_read_debug_ = false;
     bool scheme1_enable_ = false;
     bool use_post_row_pre_col_ = false;
+    bool use_bcsr_ = false;
     bool workload_spike_input_enable_ = false;
     uint64_t now_cycle_cached_ = 0;
     GasStage gas_stage_ = GasStage::Idle;
@@ -119,6 +125,14 @@ private:
     // Phase4-Task6.4: window accumulator moved into workload (acc_update callback rebound in WMS).
     std::unique_ptr<AccumulatorOps> acc_ops_;
     uint64_t last_scatter_spikes_emitted_ = 0;
+    uint64_t total_scatter_spikes_emitted_ = 0;
+
+    // WeightLoader barrier (shared signal)
+    std::string loader_done_key_;
+    bool wait_for_loader_done_ = false;
+    bool loader_ready_latched_ = false;
+    bool loader_ready_logged_ = false;
+    std::unique_ptr<SST::Shared::SharedArray<int>> loader_done_shared_;
 
     // Keep a local copy of params for compute_core_->configure().
     std::unique_ptr<SST::Params> params_;
@@ -127,7 +141,6 @@ private:
     // Phase4-Task6.3: route/comm owned by workload=snn.
     std::unique_ptr<SynapseRouteSubsystem> synapse_route_;
     std::unique_ptr<SpikeCommSubsystem> spike_comm_;
-    std::unique_ptr<ParentSpikeTransport> parent_spike_transport_;
     std::unique_ptr<NocSpikeTransport> noc_spike_transport_;
     bool spike_comm_configured_ = false;
 };

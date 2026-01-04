@@ -75,6 +75,29 @@ void SnnPESubComponent::reportStreamMemIssueThunk_(void* ctx, size_t bytes) {
     }
 }
 
+void SnnPESubComponent::reportSnnMemIssueThunk_(void* ctx, size_t bytes) {
+    auto* core = static_cast<SnnPESubComponent*>(ctx);
+    if (!core) return;
+    if (core->impl_) {
+        core->impl_->reportMemoryIssue(bytes, /*count_weight_read=*/true);
+    }
+}
+
+void SnnPESubComponent::reportApplyScatterThunk_(void* ctx,
+                                                 uint64_t acc_updates,
+                                                 uint64_t posts_touched,
+                                                 uint64_t spikes_emitted,
+                                                 uint64_t hwm_bytes,
+                                                 uint64_t spill_records,
+                                                 uint64_t spilled_bytes) {
+    auto* core = static_cast<SnnPESubComponent*>(ctx);
+    if (!core) return;
+    if (core->impl_) {
+        core->impl_->reportApplyScatter(acc_updates, posts_touched, spikes_emitted,
+                                        hwm_bytes, spill_records, spilled_bytes);
+    }
+}
+
 // === 静态共享路由缓存 / 阶段事件写入锁 ===
 std::mutex SnnPESubComponent::s_stage_csv_mutex_;
 
@@ -151,10 +174,8 @@ void SnnPESubComponent::appendStageEventRow_(const char* event_name, uint64_t no
     if (event_name == nullptr) return;
     std::lock_guard<std::mutex> lock(s_stage_csv_mutex_);
     // 改为通知父 PE 统一写入阶段事件（避免多核重复与多次落盘）；同时传递本窗发放数量
-    if (parent_) {
-        if (auto* pe = parent_pe_cached_) {
-            pe->notifyStageEvent(static_cast<uint32_t>(curr_stage_seq_), std::string(event_name), now_ns, spikes_emitted, core_id_);
-        }
+    if (auto* pe = parent_pe_cached_) {
+        pe->notifyStageEvent(static_cast<uint32_t>(curr_stage_seq_), std::string(event_name), now_ns, spikes_emitted, core_id_);
     }
 }
 
@@ -334,7 +355,6 @@ void SnnPESubComponent::recordEdge_(uint32_t post_local, uint32_t pre_global) {
 
 SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     : SnnCoreAPI(id, params),
-      parent_(nullptr),
       output_(nullptr),
       memory_link_(nullptr) {
     // 构造期最早哨兵（P2：参数优先，未设置回退到环境变量，以保持兼容）。
@@ -399,9 +419,6 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
         }
         workload_->configureFromParams(params);
         spike_workload_ = dynamic_cast<ISpikeWorkload*>(workload_.get());
-        if (spike_workload_) {
-            spike_workload_->bindLegacyHost(this);
-        }
         snn_comm_workload_ = dynamic_cast<ISnnSpikeCommWorkload*>(workload_.get());
         gas_stage_workload_ = dynamic_cast<IGasStageSink*>(workload_.get());
     }
@@ -766,7 +783,7 @@ SnnPESubComponent::~SnnPESubComponent() {
 // === Activity f (per-window active axons ratio) ===
 void SnnPESubComponent::activityFlush_() {
     if (!activity_stats_enable_) return;
-    if (!parent_) return;
+    if (!parent_pe_cached_) return;
     if (weights_cols_ == 0) return;
     double f = (double)activity_pre_set_.size() / (double)weights_cols_;
     if (auto* pe = parent_pe_cached_) {
@@ -875,13 +892,22 @@ void SnnPESubComponent::bindWorkloadRuntime_() {
     rt.base_addr = base_addr_;
     rt.mem = (stdmem_ep_ && stdmem_ep_->available()) ? stdmem_ep_->memoryAccess() : nullptr;
     rt.noc = noc_transport_;
-    rt.parent_iface = parent_;
     rt.time.ctx = this;
     rt.time.now_ns = &SnnPESubComponent::workloadNowNsThunk_;
+    rt.reporting.ctx = this;
+    rt.reporting.report_mem_issue = &SnnPESubComponent::reportSnnMemIssueThunk_;
+    rt.reporting.report_apply_scatter = &SnnPESubComponent::reportApplyScatterThunk_;
     rt.sinks.spikes_received = &count_spikes_received_;
+    rt.sinks.spikes_generated = &count_spikes_generated_;
+    rt.sinks.neurons_fired = &count_neurons_fired_;
     rt.sinks.synaptic_accesses = &count_synaptic_accesses_;
+    rt.sinks.window_spikes_all = &window_spikes_all_;
+    rt.sinks.spikes_emitted_window = &spikes_emitted_window_;
     rt.sinks.stat_spikes_received_total = stat_spikes_received_;
+    rt.sinks.stat_spikes_generated_total = stat_spikes_generated_;
+    rt.sinks.stat_neurons_fired_total = stat_neurons_fired_;
     rt.sinks.stat_synaptic_accesses_total = stat_synaptic_accesses_;
+    rt.sinks.stat_gas_scatter_spikes_emitted_total = stat_gas_scatter_spikes_emitted_total_;
     rt.sinks.stat_routes_entries_total = stat_routes_entries_;
     rt.sinks.stat_fanout_per_spike_total = stat_fanout_per_spike_;
 
@@ -892,9 +918,8 @@ void SnnPESubComponent::bindWorkloadRuntime_() {
     workload_->bindRuntime(rt);
 }
 
-void SnnPESubComponent::setParentInterface(SnnPEParentInterface* parent) {
-    parent_ = parent;
-    parent_pe_cached_ = dynamic_cast<IPeAggregation*>(parent);
+void SnnPESubComponent::setParentInterface(IPeAggregation* parent) {
+    parent_pe_cached_ = parent;
     // output_->verbose(CALL_INFO, 2, 0, "🔗 核心%d设置父级接口\n", core_id_);
     bindWorkloadRuntime_();
 }
@@ -905,11 +930,9 @@ void SnnPESubComponent::setNocTransport(INocTransport* noc) {
 }
 
 bool SnnPESubComponent::deliverPacket(NocPacketEvent* packet) {
-    // Phase6-Phase1：先打通非Spike packet入口；默认实现仅统计+丢弃，避免影响现有 SNN 行为。
     if (!packet) return true;
-    count_non_spike_packets_received_++;
-
-    if (isStreamWorkload_() && workload_) {
+    // Phase7（B）：平台侧不再调用 deliverSpike；所有输入（含 Spike）统一以 packet 形式进入 workload。
+    if (workload_) {
         return workload_->deliverPacket(packet);
     }
 
@@ -1039,13 +1062,11 @@ void SnnPESubComponent::onGasStageEvent(const GasStageEvent& ev) {
 
 void SnnPESubComponent::onGasStatEvent(const GasStatEvent& st) {
     // Accumulate at PE level for CSV visibility (keep identical to legacy behavior).
-    if (parent_) {
-        if (auto* pe = parent_pe_cached_) {
-            pe->accumulateGasStatsExt(st.unique_bytes, st.unique_reads,
-                                      st.rowwin_triggers, st.rowwin_bytes,
-                                      st.bursts, st.payload_bytes,
-                                      st.window_inflight_peak, st.window_buffer_max_bytes);
-        }
+    if (auto* pe = parent_pe_cached_) {
+        pe->accumulateGasStatsExt(st.unique_bytes, st.unique_reads,
+                                  st.rowwin_triggers, st.rowwin_bytes,
+                                  st.bursts, st.payload_bytes,
+                                  st.window_inflight_peak, st.window_buffer_max_bytes);
     }
     // Local (per-core) copies for unique_* only (optional)
     if (stat_gas_unique_reads_total_ && st.unique_reads) stat_gas_unique_reads_total_->addData(st.unique_reads);
@@ -1191,7 +1212,7 @@ void SnnPESubComponent::setup() {
     //     init_default_weight_, use_event_weight_fallback_, merge_read_row_, merge_read_cacheline_, line_size_bytes_, base_addr_, num_neurons_);
     
     // 验证组件状态
-    if (!parent_) {
+    if (!parent_pe_cached_) {
         output_->fatal(CALL_INFO, -1, "❌ 错误: 核心%d没有父级接口\n", core_id_);
     }
     // 注意：此处不直接发起内存访问，避免在setup阶段 MemLink 尚未建立时触发 memHierarchy fatal
@@ -1278,8 +1299,8 @@ bool SnnPESubComponent::clockTick(Cycle_t current_cycle) {
     total_cycles_++;
     if (!workload_) return false;
     const bool did = workload_->onClockTick(static_cast<uint64_t>(total_cycles_));
-    // stream workload 的 active_cycles 由 workload 的返回值定义；SNN 仍由 legacy 链路内的 has_activity 决定。
-    if (isStreamWorkload_() && did) active_cycles_++;
+    // Phase10: active_cycles 由 workload 的返回值定义（SNN/stream 一致）。
+    if (did) active_cycles_++;
     return false;
 }
 
@@ -1774,7 +1795,9 @@ void SnnPESubComponent::orchestrateBeginScatterSequence() {
     if (impl_) impl_->markBeginScatter(curr_stage_seq_);
     spikes_generated_base_ = count_spikes_generated_;
     uint64_t spikes_emitted = applyAccumulatedWindowAndScatter_();
-    if (spikes_emitted>0 && parent_) { if (auto* pe = parent_pe_cached_) pe->accumulateApplyScatterStats(0,0,spikes_emitted,0,0,0); }
+    if (spikes_emitted > 0) {
+        if (auto* pe = parent_pe_cached_) pe->accumulateApplyScatterStats(0, 0, spikes_emitted, 0, 0, 0);
+    }
 }
 
 void SnnPESubComponent::orchestrateEndScatterSequence() {
@@ -1854,11 +1877,9 @@ void SnnPESubComponent::legacySnnOnGasScatterSpikesEmitted(uint32_t /*seq*/, uin
         if (stat_gas_scatter_spikes_emitted_total_) {
             stat_gas_scatter_spikes_emitted_total_->addData(spikes_emitted);
         }
-        if (parent_) {
-            if (auto* pe = parent_pe_cached_) {
-                // 目前 acc_updates/posts_touched 等细项统计未迁入 workload；保持历史口径为 0（仅保留 spikes_emitted）。
-                pe->accumulateApplyScatterStats(0, 0, spikes_emitted, 0, 0, 0);
-            }
+        if (auto* pe = parent_pe_cached_) {
+            // 目前 acc_updates/posts_touched 等细项统计未迁入 workload；保持历史口径为 0（仅保留 spikes_emitted）。
+            pe->accumulateApplyScatterStats(0, 0, spikes_emitted, 0, 0, 0);
         }
     }
 }

@@ -44,9 +44,10 @@ SnnDL/
 ├── api/            # 跨层稳定接口（窄抽象：IMemoryAccess/INocTransport/ISnnComputeCore...）
 ├── events/         # 事件与 payload（SpikeEvent/NocPacketEvent/GatingDecision...）
 ├── components/     # SST 可加载组件装配壳（ELI 注册对象：MultiCorePE/GatherBufferIF/SnnNIC...）
-├── control/        # 通用控制壳（GAS 编排/事务调度/统计汇聚；不含动力学）
+├── control/        # CoreShell（平台壳：time/packet/stat；不含业务状态机）
 ├── compute/        # 可替换 compute core（动力学/学习/模型；不触碰 StandardMem/NoC）
 ├── services/       # 事务子系统（memory/noc/synapse/stimulus/legacy）
+│   └── workload/   # Workload 插件（snn/stream/...）：业务主链路闭环
 ├── docs/           # 设计/路线图/阶段性方案（包含本文）
 └── tests/          # include/边界自检
 ```
@@ -57,12 +58,13 @@ SnnDL/
 
 ```
 components/* (装配壳：端口/clock/stat/后端句柄)
-  └─ control/* (通用控制壳：GAS 编排 + 调用子系统)
-      ├─ compute/* (可替换动力学：ISnnComputeCore)
-      ├─ services/synapse/* (突触语义：weights/route/gas)
-      ├─ services/noc/* (传输：NocPacketEvent)
-      ├─ services/memory/* (纯内存：addr→bytes)
-      └─ services/stimulus/* (刺激：Step/外部输入时基)
+  └─ control/* (CoreShell：time/packet/stat)
+      └─ services/workload/* (业务主链路：snn/stream/...)
+          ├─ compute/* (可替换动力学：ISnnComputeCore；仅 snn 使用)
+          ├─ services/synapse/* (突触语义：weights/route/gas；仅 snn 使用)
+          ├─ services/stimulus/* (刺激：Step/外部输入；仅 snn 使用)
+          ├─ services/noc/* (传输：NocPacketEvent；平台面)
+          └─ services/memory/* (纯内存：addr→bytes；平台面)
 api/* (窄接口)  ← 以上所有层均可依赖
 events/* (payload) ← components/services/control 传递数据时使用
 ```
@@ -70,12 +72,13 @@ events/* (payload) ← components/services/control 传递数据时使用
 ### 1.3 “每一层到底负责什么”（职责视角）
 
 - **components/**：SST 组件装配壳（端口/Link/Clock/init/setup/finish/stat），尽量不写算法事务。
-- **control/**：通用控制壳（GAS 窗口编排、请求节流、统计汇聚、把 compute 输出交给 route 发送）；不包含动力学。
+- **control/**：CoreShell（平台壳：时钟驱动、packet 递送、统计汇聚）；不包含业务状态机。
 - **compute/**：动力学与发放判定（可替换 compute core；可替换 neuron model）；不直接依赖 StandardMem/NoC。
 - **services/memory/**：纯 `addr+size ↔ bytes`（pending/回包分发/断言式诊断）；不出现 weight/synapse/bcsr/route 语义。
 - **services/synapse/**：突触语义闭环（weights/BCSR/缓存/ΔV + route/fanout/gating + GAS 辅助结构）。
 - **services/noc/**：纯传输（send/recv/forward/本地投递 + ring tick）；payload 为 `NocPacketEvent`，不解析 Spike 语义。
 - **services/stimulus/**：刺激域（何时注入/注入哪些源）；通过 NoC/Route 完成投递与外发。
+- **services/workload/**：业务主链路（snn/stream/...）；负责把 compute/synapse/stimulus 组合成可运行闭环。
 
 ---
 
@@ -86,7 +89,7 @@ events/* (payload) ← components/services/control 传递数据时使用
 ### 2.1 Compute（计算层）
 - **接口**：`compute/ISnnComputeCore.h`
 - **实现**：`compute/DefaultSnnComputeCore`（`compute/SnnComputeCore.{h,cc}`）
-- **调用者**：`control/SnnPESubComponent`（在收敛点调用 `endCycle()`，并用 `drainOutputs()` 拉取输出）
+- **调用者**：`services/workload/snn/SnnWorkload`（在收敛点调用 `endCycle()`，并用 `drainOutputs()` 拉取输出）
 
 关键交互点（约定）：
 - 输入：`onSpikeDelivered(SpikeEvent*)`、`applySynapticDelta(post_local, dv)`
@@ -190,9 +193,9 @@ events/* (payload) ← components/services/control 传递数据时使用
 
 ### 4.1 推荐的“最小回归”节奏
 
-- 先跑 `10us`：不崩溃 + 指标非 0（尤其 `neurons_fired_total`、`gas.*_p95`）
-- 再跑 `100us`：看稳定性
-- 同配置重复跑一次 `100us`：关键字段完全一致（确定性）
+- 先跑 `10us`：不崩溃 + `gas.windows` 数量级合理（10us 允许 `neurons_fired_total=0`）
+- 再跑 `100us`：`neurons_fired_total` 与 `gas.*_p95` 不应异常归零，用于稳定性回归
+- 同配置重复跑一次 `100us`：允许轻微漂移（建议用 `sst_dram_si/tools/compare_essential_summary_mesh.py` 做容忍度对比）
 
 ### 4.2 输出文件怎么看
 
@@ -222,7 +225,7 @@ events/* (payload) ← components/services/control 传递数据时使用
 1) 在 `compute/` 新增实现类：`class XxxComputeCore : public ISnnComputeCore`
 2) 在 `compute/createComputeCoreByName()` 注册名称（例如 `compute_core_impl=xxx`）
 3) 在模板/脚本里设置 `compute_core_impl=xxx`
-4) 必跑回归：`10us → 100us → 100us(重复)`，关键字段完全一致
+4) 必跑回归：`10us → 100us → 100us(重复)`（SNN 允许轻微漂移时建议用 `sst_dram_si/tools/compare_essential_summary_mesh.py` 做容忍度对比）
 
 ### 5.2 新增 neuron model
 
@@ -235,7 +238,4 @@ events/* (payload) ← components/services/control 传递数据时使用
 
 - 全局路线图：`docs/SUBSYSTEM_MODULARIZATION_ROADMAP.md`
 - 通用控制壳设计：`docs/UNIVERSAL_CONTROL_CORE_DESIGN.md`
-- Phase5 边界硬化：`docs/PHASE5_BOUNDARY_HARDENING_PLAN.md`
-- NoC 子系统：`docs/NOC_SUBSYSTEM_DESIGN.md`
-- Spike 通信子系统：`docs/SPIKE_COMM_SUBSYSTEM_DESIGN.md`
-
+- 完成态 DoD：`docs/plans/2026-01-03-universal-core-completion.md`

@@ -1298,6 +1298,15 @@ void GatherBufferIF::emitApplyResponsesBuf_(int buf) {
 
         // 发回所有 sub-reads
         for (auto& s : g.subs) {
+            // 防御性：如果 upstream 已不再跟踪该 up_id（例如重复 sub、已提前回包），则不要再发回 ReadResp，
+            // 否则会导致上游 StandardMemAccess 出现 untracked ReadResp（非确定性/潜在崩溃）。
+            auto itup = S.pending_up_reads.find(s.up_id);
+            if (itup == S.pending_up_reads.end()) {
+                out_.verbose(CALL_INFO, 1, 0,
+                    "[diag-gbi] skip respond: missing pending_up_reads up_id=%" PRIu64 " key=0x%lx off=%u size=%u buf=%d\n",
+                    (uint64_t)s.up_id, (unsigned long)key, (unsigned)s.offset, (unsigned)s.size, buf);
+                continue;
+            }
             // 使用 up_id 构造响应，避免依赖上游 Read* 指针的生命周期
             auto* resp = new StandardMem::ReadResp(
                 s.up_id,
@@ -1356,17 +1365,10 @@ void GatherBufferIF::emitApplyResponsesBuf_(int buf) {
             if (upstream_handler_) (*upstream_handler_)(resp);
             // 注意：上游StandardMem::Read的所有权由上游组件管理。
             // 这里不再delete上游请求指针，仅从追踪表移除，避免重复释放导致的崩溃。
-            auto itup = S.pending_up_reads.find(s.up_id);
-            if (itup != S.pending_up_reads.end()) {
-                S.pending_up_reads.erase(itup);
-                out_.verbose(CALL_INFO, 1, 0,
-                    "[diag-gbi] pending erase up_id=%" PRIu64 " remaining=%zu\n",
-                    (uint64_t)s.up_id, (size_t)S.pending_up_reads.size());
-            } else {
-                out_.verbose(CALL_INFO, 1, 0,
-                    "[diag-gbi] pending MISS up_id=%" PRIu64 "\n",
-                    (uint64_t)s.up_id);
-            }
+            S.pending_up_reads.erase(itup);
+            out_.verbose(CALL_INFO, 1, 0,
+                "[diag-gbi] pending erase up_id=%" PRIu64 " remaining=%zu\n",
+                (uint64_t)s.up_id, (size_t)S.pending_up_reads.size());
         }
 
         // 标记此 granule 为已完成（可以清空）

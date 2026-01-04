@@ -40,5 +40,5 @@
 ## 与其他域的交互
 
 - `components/GatherBufferIF` 使用 `GasCustomCmd` 发送阶段事件/统计到 PE；
-- `control/SnnPESubComponent` 使用 `GasEdgeCollector` 与 `AccumulatorOps` 承载窗口边与累加状态；
+- `workload=snn` 使用 `GasEdgeCollector` 与 `AccumulatorOps` 承载窗口边与累加状态（CoreShell 不应持有业务状态机）；
 - `services/synapse/weights/WeightMemorySubsystem` 读取 `GasEdgeCollector` 的 prev 边集合，在 Apply 阶段发起窗口读并更新累加器。

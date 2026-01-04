@@ -16,6 +16,8 @@
   - 详见：`services/synapse/README.md`
 - `services/stimulus/`：Stimulus 刺激/注入域（Step 注入/外部刺激）  
   - 详见：`services/stimulus/README.md`
+- `services/workload/`：Workload 插件域（`snn`/`stream` 等），承载业务状态机与执行主链路  
+  - 详见：`services/workload/README.md`
 - `services/legacy/`：历史遗留/参考实现（默认不参与主链路构建）  
   - 详见：`services/legacy/README.md`
 

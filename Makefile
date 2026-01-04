@@ -615,6 +615,7 @@ compdir = $(pkglibdir)
 comp_LTLIBRARIES = libSnnDL.la
 libSnnDL_la_SOURCES = \
 	api/SnnCoreAPI.h \
+	api/CoreShellAPI.h \
 	api/SnnInterface.h \
 	api/SnnPEParentInterface.h \
 	api/ISpikeTransport.h \
@@ -625,10 +626,10 @@ libSnnDL_la_SOURCES = \
 	api/IGasStageSink.h \
 	api/IGasStepGate.h \
 	api/IGlobalStepHooks.h \
+	api/ICoreMemoryLink.h \
 	api/IMemoryAccess.h \
 	api/ICoreWorkload.h \
 	api/ISpikeWorkload.h \
-	api/ILegacySnnWorkloadHost.h \
 	api/WorkloadConfig.h \
 	api/CoreWorkloadFactory.h \
 	api/ISynapseRoute.h \

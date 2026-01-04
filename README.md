@@ -1,8 +1,8 @@
 # SnnDL（SST Element：Spiking Neural Network / Deep Learning）
 
-本目录是 `sst-elements` 中的 **SnnDL 元素库源码**，用于在 SST 中模拟多核 Processing Element（PE）上的脉冲神经网络（SNN）工作负载，并支撑 DRAM/NoC/窗口化（GAS）等系统级实验。
+本目录是 `sst-elements` 中的 **SnnDL 元素库源码**，用于在 SST 中模拟多核 Processing Element（PE）上的工作负载：默认提供 SNN（Spike/GAS/BCSR/Step）链路，同时也支持以 **packet-first** 方式加载非 SNN workload（例如通信+内存 streaming 校验）。
 
-核心设计目标：**组件层只做装配与调度，事务下沉到子系统；compute core 可替换；边界清晰可回归。**
+核心设计目标：**平台核（NoC/Mem/CoreShell）通用可复用；业务语义（SNN/Step/GAS/BCSR/Stream）作为可插拔 workload/子系统加载；边界清晰、可回归、fail-fast。**
 
 推荐总览入口（先看这个更容易读懂整体）：
 - `docs/SNNDL_HIERARCHY_AND_WORKFLOW.md`
@@ -31,6 +31,15 @@ export MESH_SIM_TIME="100us"
 ./tools/run_mesh_with_time.sh
 ```
 
+切换到 `workload=stream`（不涉及 Spike/GAS/权重/BCSR，仅做 packet-first 通信 + 内存 read-after-write 校验）：
+
+```bash
+cd "sst_dram_si"
+export SNNDL_WORKLOAD_IMPL="stream"
+export MESH_SIM_TIME="100us"
+./tools/run_mesh_with_time.sh
+```
+
 输出目录通常位于：
 - `sst_dram_si/outputs_large/paper2/dram_mesh_4x4/YYYYMMDD-HHMMSS/`
   - `essential_summary_mesh.json`：关键指标摘要（用于 100us 回归判定）。
@@ -46,13 +55,14 @@ SnnDL/
 ├── api/            # 跨层稳定接口（窄抽象）
 ├── events/         # 事件与数据载体（Spike/Gating 等）
 ├── components/     # SST 组件装配壳（ELI 注册对象）
-├── control/        # 控制/编排壳（GAS/内存/路由调度，不含动力学）
+├── control/        # 通用 CoreShell（只做装配/分发/统计汇聚；业务逻辑在 workload）
 ├── compute/        # 可替换 compute core（神经动力学/学习/验证）
 ├── services/       # 可复用事务子系统（按子域拆分）
 │   ├── noc/        # NoC 传输域（send/recv/forward/本地投递）
 │   ├── memory/     # 纯内存访问域（地址→字节块）
 │   ├── synapse/    # 突触语义域（weights/route/gas 事务闭环）
 │   ├── stimulus/   # Stimulus 域（Step 注入/外部刺激）
+│   ├── workload/   # Workload 插件域（snn/stream 等）
 │   └── legacy/     # 历史遗留/参考实现（默认不进主链路）
 ├── docs/           # 设计与阶段性方案文档
 └── tests/          # include 自检等轻量测试
@@ -63,8 +73,9 @@ SnnDL/
 ## 关键边界（控制 / 计算 / 路由 / 内存 / 权重）
 
 - `components/`：SST 对接与装配壳（端口、Link、Clock、Stat、生命周期）；尽量不写算法事务。
-- `control/`：控制/编排壳（窗口/GAS、内存请求编排、统计汇聚）；**不包含神经动力学**。
-- `compute/`：神经动力学与学习等计算逻辑（`ISnnComputeCore`）；**不直接触碰 StandardMem/NoC**。
+- `control/`：通用 CoreShell（时钟驱动、packet 递送、统计汇聚）；**不包含 SNN 业务状态机**。
+- `services/workload/`：workload 插件（例如 `snn`/`stream`）；承载业务状态机与事务编排。
+- `compute/`：神经动力学与学习等计算逻辑（`ISnnComputeCore`）；**不直接触碰 StandardMem/NoC**（通过 `IWeightReader`/workload 注入）。
 - `services/noc/`：纯传输（send/recv/forward/本地投递）；**不做 fanout/权重语义**。
 - `services/memory/`：纯地址/字节访问；**不出现权重/突触/路由语义**。
 - `services/synapse/`：权重语义/路由与 fanout/GAS 辅助（weights/route/gas 事务闭环）。

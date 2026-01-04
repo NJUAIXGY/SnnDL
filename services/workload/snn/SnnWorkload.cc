@@ -7,33 +7,35 @@
 #include "SpikeEvent.h"
 #include "SnnWeightReader.h"
 #include "synapse/gas/AccumulatorOps.h"
+#include "synapse/weights/WeightAccessor.h"
+#include "synapse/weights/WeightCacheOps.h"
+#include "synapse/weights/SnnBcsrWeightManager.h"
 #include "synapse/weights/WeightMemorySubsystem.h"
 #include "synapse/route/SynapseRouteSubsystem.h"
 #include "synapse/route/SpikeCommSubsystem.h"
+#include "synapse/route/SpikeNocCodec.h"
 #include "SynapseRouteBuildConfig.h"
 #include "ISpikeTransport.h"
 #include "NocSpikeTransport.h"
 
 #include <sst/core/output.h>
 #include <sst/core/params.h>
+#include <sst/core/shared/sharedArray.h>
+#include <sst/core/statapi/stataccumulator.h>
 
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <inttypes.h>
 #include <utility>
 
 namespace SST { namespace SnnDL {
 
 namespace {
 
-[[noreturn]] void fatal_missing_legacy_host_(SST::Output* log, const char* what) {
-    if (log) {
-        log->fatal(CALL_INFO, -1,
-                   "SnnWorkload requires legacy_host_ during Phase4-Task5 cutover (%s)\n",
-                   what ? what : "missing");
-    }
-    // Fallback: if log is null, aborting is still preferable to silent corruption.
-    std::abort();
+inline void addCountStat_(SST::Statistics::Statistic<uint64_t>* st, uint64_t n) {
+    if (!st || n == 0) return;
+    for (uint64_t i = 0; i < n; ++i) st->addData(1);
 }
 
 } // namespace
@@ -59,12 +61,22 @@ void SnnWorkload::configureFromParams(const SST::Params& params) {
     window_read_enable_ = params.find<int>("window_read_enable", 0) != 0;
     window_read_debug_ = params.find<int>("window_read_debug", 0) != 0;
     scheme1_enable_ = params.find<int>("scheme1_enable", 0) != 0;
-    workload_spike_input_enable_ = params.find<int>("workload_spike_input_enable", 0) != 0;
     const std::string index_mode_str = params.find<std::string>("index_mode", "pre_row_post_col");
     use_post_row_pre_col_ =
         (index_mode_str == "post_row_pre_col") ||
         (index_mode_str == "bcsr_post_row") ||
         (index_mode_str == "csr_post_row");
+    use_bcsr_ = (index_mode_str == "bcsr_post_row");
+
+    // Phase10: strict window-read path is now the default when workload=snn runs GAS/window mode.
+    // (Opt-in param still supported for experimentation.)
+    const int wsi = params.find<int>("workload_spike_input_enable", -1);
+    if (wsi >= 0) {
+        workload_spike_input_enable_ = (wsi != 0);
+    } else {
+        workload_spike_input_enable_ =
+            (apply_acc_enable_ && gas_window_mode_ && window_read_enable_ && !scheme1_enable_);
+    }
 
     enable_weight_fetch_ = params.find<int>("enable_weight_fetch", 0) != 0;
     edge_collector_max_capacity_ = static_cast<size_t>(params.find<uint64_t>("edge_collector_max_capacity", 1'000'000));
@@ -77,6 +89,18 @@ void SnnWorkload::configureFromParams(const SST::Params& params) {
     const uint32_t computed_neurons_per_pe = cores_per_pe * num_neurons_;
     const uint32_t np_from_params = params.find<uint32_t>("neurons_per_pe", 0);
     neurons_per_pe_cfg_ = (np_from_params > 0) ? np_from_params : computed_neurons_per_pe;
+
+    // WeightLoader barrier (shared signal): allow memory readers to defer until loader is done.
+    loader_done_key_ = params.find<std::string>("loader_done_key", "");
+    wait_for_loader_done_ = !loader_done_key_.empty();
+    loader_ready_latched_ = false;
+    loader_ready_logged_ = false;
+    if (wait_for_loader_done_) {
+        loader_done_shared_ = std::make_unique<SST::Shared::SharedArray<int>>();
+        loader_done_shared_->initialize(loader_done_key_, 1, 0);
+    } else {
+        loader_done_shared_.reset();
+    }
 }
 
 void SnnWorkload::bindRuntime(const Runtime& rt) {
@@ -96,18 +120,18 @@ void SnnWorkload::bindRuntime(const Runtime& rt) {
     }
     if (spike_comm_) {
         ISpikeTransport* transport = nullptr;
-        if (rt_.noc) {
-            if (!noc_spike_transport_) noc_spike_transport_ = std::make_unique<NocSpikeTransport>();
-            noc_spike_transport_->setNocTransport(rt_.noc);
-            noc_spike_transport_->setSourceCore(static_cast<int>(rt_.core_id));
-            const uint32_t cores_per_pe = params_ ? params_->find<uint32_t>("total_cores", 1) : 1;
-            noc_spike_transport_->configureLayout(total_nodes_cfg_, cores_per_pe, num_neurons_);
-            transport = noc_spike_transport_.get();
-        } else {
-            if (!parent_spike_transport_) parent_spike_transport_ = std::make_unique<ParentSpikeTransport>(rt_.parent_iface);
-            else parent_spike_transport_->setParent(rt_.parent_iface);
-            transport = parent_spike_transport_.get();
+        // Strict universal-kernel boundary: workload=snn must route via INocTransport (NocPacketEvent),
+        // not via legacy parent->sendSpike(SpikeEvent*) path.
+        if (!rt_.noc) {
+            if (rt_.log) rt_.log->fatal(CALL_INFO, -1, "SnnWorkload requires Runtime.noc (INocTransport) for spike comm\n");
+            std::abort();
         }
+        if (!noc_spike_transport_) noc_spike_transport_ = std::make_unique<NocSpikeTransport>();
+        noc_spike_transport_->setNocTransport(rt_.noc);
+        noc_spike_transport_->setSourceCore(static_cast<int>(rt_.core_id));
+        const uint32_t cores_per_pe = params_ ? params_->find<uint32_t>("total_cores", 1) : 1;
+        noc_spike_transport_->configureLayout(total_nodes_cfg_, cores_per_pe, num_neurons_);
+        transport = noc_spike_transport_.get();
         SpikeCommRuntimeConfig crt{};
         crt.log = rt_.log;
         crt.transport = transport;
@@ -144,44 +168,178 @@ uint32_t SnnWorkload::mapPreGlobalToLocal_(uint32_t pre_global) const {
     return remapPreGlobalModulo_(pre_global);
 }
 
+bool SnnWorkload::ensureLoaderReady_() {
+    if (!wait_for_loader_done_) return true;
+    if (loader_ready_latched_) return true;
+    if (!loader_done_shared_) return true;
+    if (loader_done_shared_->size() == 0) return false;
+    const int ready = loader_done_shared_->mutex_read(0);
+    if (ready != 0) {
+        loader_ready_latched_ = true;
+        if (window_read_debug_ && !loader_ready_logged_ && rt_.log) {
+            rt_.log->verbose(CALL_INFO, 0, 0,
+                             "[diag-loader] workload=snn core=%u weights_ready at cycle=%" PRIu64 "\n",
+                             static_cast<uint32_t>(rt_.core_id),
+                             static_cast<uint64_t>(now_cycle_cached_));
+        }
+        loader_ready_logged_ = true;
+        return true;
+    }
+    return false;
+}
+
 void SnnWorkload::ensureWeightReaderOwned_() {
     if (weight_reader_) return;
-    if (!legacy_host_) {
-        fatal_missing_legacy_host_(rt_.log, "bindLegacyHost missing (take weight reader)");
-    }
 
-    weight_reader_ = legacy_host_->legacySnnTakeWeightReader();
-    if (!weight_reader_) {
-        if (rt_.log) {
-            rt_.log->fatal(CALL_INFO, -1,
-                           "SnnWorkload failed to take weight reader from legacy host (legacySnnTakeWeightReader returned nullptr)\n");
-        }
+    if (!params_) {
+        if (rt_.log) rt_.log->fatal(CALL_INFO, -1, "SnnWorkload missing cached Params (configureFromParams not called?)\n");
         std::abort();
     }
 
-    weight_mem_subsystem_ = dynamic_cast<WeightMemorySubsystem*>(weight_reader_.get());
-    if (weight_mem_subsystem_) {
-        weight_mem_subsystem_->bindMemory(rt_.mem);
-        // Phase4-Task6.4: window accumulator moved into workload=snn; rebind WMS acc_update callback.
-        if (apply_acc_enable_ && gas_window_mode_) {
-            if (!acc_ops_) {
-                const bool dense_enable = params_ ? (params_->find<int>("apply_dense_acc_enable", 1) != 0) : true;
-                const bool shadow_verify_enable =
-                    dense_enable && (params_ ? (params_->find<int>("acc_shadow_verify_enable", 0) != 0) : false);
-                AccumulatorOpsConfig acc_cfg{};
-                acc_cfg.num_neurons = num_neurons_;
-                acc_cfg.dense_enable = dense_enable;
-                acc_cfg.spill_enable = params_ ? (params_->find<int>("acc_spill_enable", 1) != 0) : true;
-                acc_cfg.high_watermark_bytes =
-                    params_ ? params_->find<uint64_t>("acc_high_watermark_bytes", 16 * 1024 * 1024)
-                            : (16 * 1024 * 1024);
-                acc_cfg.shadow_verify_enable = shadow_verify_enable;
-                acc_cfg.window_read_debug = window_read_debug_;
-                acc_cfg.core_id = static_cast<int>(rt_.core_id);
-                acc_cfg.verbose = rt_.log ? rt_.log->getVerboseLevel() : 0;
-                acc_cfg.out = rt_.log;
-                acc_ops_ = std::make_unique<AccumulatorOps>(acc_cfg);
-            }
+    // === Build local cache/weight accessor/BCSR manager (workload-owned) ===
+    const uint32_t max_cache_entries = params_->find<uint32_t>("max_cache_entries", 65536);
+    const bool use_clock_weight_cache = params_->find<int>("use_clock_weight_cache", 0) != 0;
+    const bool disable_weight_cache = params_->find<int>("disable_weight_cache", 0) != 0;
+
+    if (!weight_cache_ops_) weight_cache_ops_ = std::make_unique<WeightCacheOps>();
+    {
+        WeightCacheOps::Config cache_cfg{};
+        cache_cfg.max_entries = max_cache_entries;
+        cache_cfg.use_clock = use_clock_weight_cache;
+        cache_cfg.disable_cache = disable_weight_cache;
+        weight_cache_ops_->configure(cache_cfg, /*on_evict*/[](){});
+        weight_cache_ops_->reserve(cache_cfg.max_entries ? cache_cfg.max_entries : 1);
+    }
+
+    if (!weight_accessor_) weight_accessor_ = std::make_unique<WeightAccessor>();
+    uint32_t weights_cols = params_->find<uint32_t>("weights_cols", 0);
+    if (weights_cols == 0) weights_cols = num_neurons_;
+    weight_accessor_->configure(WeightAccessorConfig{
+        static_cast<uint32_t>(rt_.core_id),
+        static_cast<uint64_t>(global_neuron_base_),
+        static_cast<uint32_t>(num_neurons_),
+        static_cast<uint32_t>(weights_cols),
+        use_post_row_pre_col_
+    });
+
+    if (!bcsr_mgr_) bcsr_mgr_ = std::make_unique<BcsrWeightManager>();
+    if (use_bcsr_) {
+        const uint64_t base_addr = params_->find<uint64_t>("base_addr", 0);
+        const uint64_t rp_off = params_->find<uint64_t>("bcsr_rowptr_offset", 0);
+        const uint64_t ci_off = params_->find<uint64_t>("bcsr_colidx_offset", 0);
+        const uint64_t bd_off = params_->find<uint64_t>("bcsr_blockdata_offset", 0);
+        const uint64_t id_off = params_->find<uint64_t>("bcsr_blockids_offset", 0);
+        const uint32_t br = params_->find<uint32_t>("bcsr_block_rows", 16);
+        const uint32_t bc = params_->find<uint32_t>("bcsr_block_cols", 16);
+        const uint32_t idxb = params_->find<uint32_t>("bcsr_idx_bytes", 2);
+        const uint32_t valb = params_->find<uint32_t>("bcsr_val_bytes", 4);
+        const uint64_t rowptr_addr = base_addr + rp_off;
+        const uint64_t colidx_addr = base_addr + ci_off;
+        const uint64_t blockdata_addr = base_addr + bd_off;
+        const uint64_t blockids_addr = id_off ? (base_addr + id_off) : 0;
+        bcsr_mgr_->configure(rowptr_addr, colidx_addr, blockdata_addr, blockids_addr, br, bc, idxb, valb);
+        bcsr_mgr_->setRowIndexCacheCapacity(params_->find<uint32_t>("bcsr_row_index_cache_cap", 64));
+        bcsr_mgr_->setBlockCacheCapacity(params_->find<uint32_t>("bcsr_block_cache_cap", 256));
+    }
+
+    // === Build WeightMemorySubsystem ===
+    auto wms = std::make_unique<WeightMemorySubsystem>();
+    wms->configure(
+        [this](uint64_t key, float& out) -> bool {
+            return weight_cache_ops_ ? weight_cache_ops_->tryGet(key, out) : false;
+        },
+        [this](uint64_t key, float v) {
+            if (weight_cache_ops_) weight_cache_ops_->store(key, v);
+        });
+
+    const uint64_t base_addr = params_->find<uint64_t>("base_addr", 0);
+    const uint64_t weight_region_end =
+        base_addr + static_cast<uint64_t>(num_neurons_) * static_cast<uint64_t>(weights_cols) * sizeof(float);
+
+    WeightMemorySubsystem::OrchestratorConfig ocfg{};
+    ocfg.accessor = weight_accessor_.get();
+    ocfg.cache_try = [this](uint64_t key, float& out) -> bool {
+        return weight_cache_ops_ ? weight_cache_ops_->tryGet(key, out) : false;
+    };
+    ocfg.cache_put = [this](uint64_t key, float v) {
+        if (weight_cache_ops_) weight_cache_ops_->store(key, v);
+    };
+    ocfg.acc_update = [this](uint32_t post_local, float dv) {
+        if (acc_ops_) acc_ops_->update(post_local, dv);
+    };
+    ocfg.report_mem_issue = [this](size_t bytes, bool /*count_weight_read*/) {
+        if (rt_.reporting.report_mem_issue) rt_.reporting.report_mem_issue(rt_.reporting.ctx, bytes);
+    };
+    ocfg.ensure_loader_ready = [this]() { return ensureLoaderReady_(); };
+    ocfg.bcsr_rowptr_ready = [this]() { return !use_bcsr_ || (bcsr_mgr_ && bcsr_mgr_->isRowptrReady()); };
+    ocfg.ensure_rowptr_ready_or_fatal = [this](const char* reason) {
+        if (rt_.log) {
+            rt_.log->fatal(CALL_INFO, -1,
+                           "SnnWorkload fatal: BCSR rowptr not ready (%s) node=%u core=%u\n",
+                           reason ? reason : "unknown",
+                           static_cast<uint32_t>(rt_.node_id),
+                           static_cast<uint32_t>(rt_.core_id));
+        }
+        std::abort();
+    };
+    ocfg.resume_issue_after_rowptr_ready = [this]() {
+        if (apply_acc_enable_ && gas_window_mode_ && gas_stage_ == GasStage::Apply && weight_mem_subsystem_) {
+            weight_mem_subsystem_->issueFromEdges();
+        }
+    };
+    ocfg.use_bcsr = use_bcsr_;
+    ocfg.bcsr_prefetch_all = params_->find<int>("bcsr_prefetch_all", 0) != 0;
+    ocfg.bcsr_force_file_read = params_->find<int>("bcsr_force_file_read", 0) != 0;
+    ocfg.bcsr_weight_guard_enable = params_->find<int>("bcsr_weight_guard_enable", 1) != 0;
+    ocfg.bcsr_weight_abs_max = params_->find<float>("bcsr_weight_abs_max", 10.0f);
+    ocfg.readresp_zero_fallback = params_->find<int>("readresp_zero_fallback", 0) != 0;
+    ocfg.init_default_weight = params_->find<float>("init_default_weight", 0.5f);
+    ocfg.num_neurons = num_neurons_;
+    ocfg.weights_cols = weights_cols;
+    ocfg.use_post_row_pre_col = use_post_row_pre_col_;
+    ocfg.base_addr = base_addr;
+    ocfg.weight_region_end = weight_region_end;
+    ocfg.read_force_single = params_->find<int>("read_force_single", 0) != 0;
+    ocfg.merge_read_cacheline = params_->find<int>("merge_read_cacheline", 1) != 0;
+    ocfg.merge_read_row = params_->find<int>("merge_read_row", 0) != 0;
+    ocfg.merge_read_auto = params_->find<int>("merge_read_auto", 0) != 0;
+    ocfg.line_size_bytes = params_->find<uint32_t>("line_size_bytes", 64);
+    ocfg.memory_warmup_cycles = params_->find<uint64_t>("memory_warmup_cycles", 0);
+    ocfg.loader_barrier_cycles = params_->find<uint64_t>("loader_barrier_cycles", 0);
+    ocfg.node_id = rt_.node_id;
+    ocfg.core_id = rt_.core_id;
+    ocfg.weights_template = params_->find<std::string>("weights_template", "");
+    ocfg.bcsr_mgr = bcsr_mgr_.get();
+    wms->configureOrchestrator(std::move(ocfg));
+
+    const uint32_t window_read_budget = params_->find<uint32_t>("window_read_budget", 1024);
+    const uint32_t max_outstanding = params_->find<uint32_t>("max_outstanding_requests", 16);
+    wms->configureWindow(window_read_budget, max_outstanding);
+    if (window_read_enable_) wms->reserveWindowContainers(num_neurons_);
+
+    wms->bindMemory(rt_.mem);
+    weight_mem_subsystem_ = wms.get();
+    weight_reader_ = std::move(wms);
+
+    // Phase4-Task6.4: window accumulator moved into workload=snn; bind WMS acc_update callback.
+    if (apply_acc_enable_ && gas_window_mode_) {
+        if (!acc_ops_) {
+            const bool dense_enable = params_->find<int>("apply_dense_acc_enable", 1) != 0;
+            const bool shadow_verify_enable =
+                dense_enable && (params_->find<int>("acc_shadow_verify_enable", 0) != 0);
+            AccumulatorOpsConfig acc_cfg{};
+            acc_cfg.num_neurons = num_neurons_;
+            acc_cfg.dense_enable = dense_enable;
+            acc_cfg.spill_enable = params_->find<int>("acc_spill_enable", 1) != 0;
+            acc_cfg.high_watermark_bytes = params_->find<uint64_t>("acc_high_watermark_bytes", 16 * 1024 * 1024);
+            acc_cfg.shadow_verify_enable = shadow_verify_enable;
+            acc_cfg.window_read_debug = window_read_debug_;
+            acc_cfg.core_id = static_cast<int>(rt_.core_id);
+            acc_cfg.verbose = rt_.log ? rt_.log->getVerboseLevel() : 0;
+            acc_cfg.out = rt_.log;
+            acc_ops_ = std::make_unique<AccumulatorOps>(acc_cfg);
+        }
+        if (weight_mem_subsystem_) {
             weight_mem_subsystem_->overrideAccUpdate([this](uint32_t post_local, float dv) {
                 if (acc_ops_) acc_ops_->update(post_local, dv);
             });
@@ -191,9 +349,6 @@ void SnnWorkload::ensureWeightReaderOwned_() {
 
 void SnnWorkload::ensureComputeCoreConfigured_() {
     if (compute_configured_) return;
-    if (!legacy_host_) {
-        fatal_missing_legacy_host_(rt_.log, "bindLegacyHost missing (compute configure)");
-    }
     if (!params_) {
         if (rt_.log) {
             rt_.log->fatal(CALL_INFO, -1,
@@ -216,8 +371,6 @@ void SnnWorkload::ensureComputeCoreConfigured_() {
             if (rt_.log) rt_.log->fatal(CALL_INFO, -1, "createComputeCoreByName failed for both impl and default\n");
             std::abort();
         }
-        // Expose compute core view to legacy host (non-owning) so existing control-plane code keeps working.
-        legacy_host_->legacySnnBindComputeCore(compute_core_.get());
     }
 
     ComputeCoreContext ctx;
@@ -229,11 +382,8 @@ void SnnWorkload::ensureComputeCoreConfigured_() {
     ctx.log = rt_.log;
     ensureWeightReaderOwned_();
     ctx.weight_reader = weight_reader_.get();
-    ctx.writeback_fn = [this](const std::unordered_map<uint64_t, float>& grads,
-                              float lr,
-                              float wd) -> bool {
-        return legacy_host_ ? legacy_host_->legacySnnWriteback(grads, lr, wd) : false;
-    };
+    // Phase10: legacy host removed. Learning writeback is optional; keep disabled unless a future workload hook is added.
+    ctx.writeback_fn = [](const std::unordered_map<uint64_t, float>&, float, float) -> bool { return false; };
     compute_core_->configure(ctx, *params_);
     compute_configured_ = true;
 }
@@ -323,19 +473,17 @@ void SnnWorkload::ensureSpikeCommConfigured_() {
                                 rt_.sinks.stat_routes_entries_total);
     synapse_route_->bindFanoutStat(rt_.sinks.stat_fanout_per_spike_total);
 
-    // Choose transport backend: prefer NoC, fallback to parent interface.
-    ISpikeTransport* transport = nullptr;
-    if (rt_.noc) {
-        if (!noc_spike_transport_) noc_spike_transport_ = std::make_unique<NocSpikeTransport>();
-        noc_spike_transport_->setNocTransport(rt_.noc);
-        noc_spike_transport_->setSourceCore(static_cast<int>(rt_.core_id));
-        noc_spike_transport_->configureLayout(total_nodes_cfg_, cfg.cores_per_pe, num_neurons_);
-        transport = noc_spike_transport_.get();
-    } else {
-        if (!parent_spike_transport_) parent_spike_transport_ = std::make_unique<ParentSpikeTransport>(rt_.parent_iface);
-        else parent_spike_transport_->setParent(rt_.parent_iface);
-        transport = parent_spike_transport_.get();
+    // Strict universal-kernel boundary: workload=snn must route via INocTransport (NocPacketEvent),
+    // not via legacy parent->sendSpike(SpikeEvent*) path.
+    if (!rt_.noc) {
+        if (rt_.log) rt_.log->fatal(CALL_INFO, -1, "SnnWorkload requires Runtime.noc (INocTransport) for spike comm\n");
+        std::abort();
     }
+    if (!noc_spike_transport_) noc_spike_transport_ = std::make_unique<NocSpikeTransport>();
+    noc_spike_transport_->setNocTransport(rt_.noc);
+    noc_spike_transport_->setSourceCore(static_cast<int>(rt_.core_id));
+    noc_spike_transport_->configureLayout(total_nodes_cfg_, cfg.cores_per_pe, num_neurons_);
+    ISpikeTransport* transport = noc_spike_transport_.get();
 
     spike_comm_->configure();
     SpikeCommRuntimeConfig crt{};
@@ -351,11 +499,8 @@ void SnnWorkload::ensureSpikeCommConfigured_() {
 
 bool SnnWorkload::onClockTick(uint64_t now_cycle) {
     now_cycle_cached_ = now_cycle;
-    if (!legacy_host_) {
-        fatal_missing_legacy_host_(rt_.log, "bindLegacyHost missing");
-    }
-    // Phase4-Task6.1：compute core 的 per-tick 驱动下沉到 workload=snn，
-    // CoreShell 仅保留 non-owning view 以兼容 legacy 控制链路。
+    bool did = false;
+    // Phase4-Task6.1：compute core 的 per-tick 驱动下沉到 workload=snn。
     ensureComputeCoreConfigured_();
     if (compute_core_) {
         compute_core_->onClockTick(now_cycle);
@@ -365,15 +510,12 @@ bool SnnWorkload::onClockTick(uint64_t now_cycle) {
         weight_mem_subsystem_->onClockTick(now_cycle);
     }
 
-    // Phase4-Task6.3: control-plane 仍由 legacy host 驱动（GAS/window/阶段事件等）。
-    const bool did_legacy = legacy_host_->legacySnnOnClockTick(now_cycle);
-
-    // Phase7-Task1: strict window-read spike queue processing moved into workload=snn.
-    // NOTE: This path is currently opt-in via Params to avoid reintroducing non-determinism.
+    // Phase7-Task1/Phase10: strict window-read spike queue processing moved into workload=snn.
     bool did_spike = false;
     if (workload_spike_input_enable_ && isWindowWorkload_() && window_read_enable_ && !scheme1_enable_) {
         did_spike = processReadySpikes_(nowNs_());
     }
+    did = did || did_spike;
 
     // Phase4-Task6.3: 非 window 模式下的 “endCycle->drain->route/comm” 闭环迁入 workload。
     if (!windowScatterModeActive_() && compute_core_) {
@@ -381,22 +523,42 @@ bool SnnWorkload::onClockTick(uint64_t now_cycle) {
         std::vector<FireEvent> fired;
         compute_core_->drainOutputs(fired, /*clear=*/true);
         if (!fired.empty()) {
+            const uint64_t fired_cnt = static_cast<uint64_t>(fired.size());
+            if (rt_.sinks.neurons_fired) (*rt_.sinks.neurons_fired) += fired_cnt;
+            if (rt_.sinks.spikes_generated) (*rt_.sinks.spikes_generated) += fired_cnt;
+            addCountStat_(rt_.sinks.stat_neurons_fired_total, fired_cnt);
+            addCountStat_(rt_.sinks.stat_spikes_generated_total, fired_cnt);
             std::vector<uint32_t> neuron_indices;
             neuron_indices.reserve(fired.size());
             for (const auto& ev : fired) neuron_indices.push_back(ev.neuron_idx);
-            legacy_host_->legacySnnOnNeuronFires(neuron_indices, now_cycle);
             ensureSpikeCommConfigured_();
             (void)emitNeuronFireBatch(neuron_indices, now_cycle);
-            return true;
+            did = true;
         }
     }
 
-    return did_legacy || did_spike;
+    return did;
 }
 
-bool SnnWorkload::deliverPacket(NocPacketEvent* /*packet*/) {
-    // Task3: 未接管非 spike packet；保持由 CoreShell 处理。
-    return false;
+bool SnnWorkload::deliverPacket(NocPacketEvent* packet) {
+    // CoreShell 统一以 packet 输入；Spike 的解码/语义处理完全由 workload 承担。
+    // NOTE: packet ownership is transferred to this function (it will always delete packet).
+    if (!packet) return true;
+
+    const auto kind = packet->packetKind();
+    if (kind != NocPacketKind::Spike) {
+        // 非 Spike packet 由其它 workload 或上层消费；SNN workload 默认丢弃以避免语义漂移。
+        delete packet;
+        return true;
+    }
+
+    SpikeEvent* spike = SpikeNocCodec::decode(*packet);
+    delete packet;
+    if (!spike) return true;
+
+    // Reuse the existing spike entrypoint (keeps strict window-read migration gates + legacy fallback).
+    deliverSpike(spike);
+    return true;
 }
 
 bool SnnWorkload::processReadySpikes_(uint64_t now_ns) {
@@ -516,23 +678,7 @@ void SnnWorkload::processLocalSpike_(SpikeEvent* spike_event) {
 
 void SnnWorkload::deliverSpike(SpikeEvent* spike) {
     if (!spike) return;
-    if (!legacy_host_) {
-        fatal_missing_legacy_host_(rt_.log, "bindLegacyHost missing");
-        delete spike;
-        return;
-    }
-
-    // Phase7-Task1: migrate strict window-read spike input into workload=snn.
-    // Keep legacy path for non-window modes and scheme1 to avoid behavior drift.
-    const bool migrate =
-        workload_spike_input_enable_ && isWindowWorkload_() && window_read_enable_ && !scheme1_enable_;
-    if (!migrate) {
-        legacy_host_->legacySnnDeliverSpike(spike);
-        return;
-    }
-
     ensureComputeCoreConfigured_();
-    ensureWeightReaderOwned_();
 
     if (rt_.sinks.spikes_received) (*rt_.sinks.spikes_received)++;
     if (rt_.sinks.stat_spikes_received_total) rt_.sinks.stat_spikes_received_total->addData(1);
@@ -541,62 +687,134 @@ void SnnWorkload::deliverSpike(SpikeEvent* spike) {
     spike->setTimestamp(nowNs_());
     if (compute_core_) compute_core_->onSpikeDelivered(spike);
 
-    // Cache post/pre local indices (used by strict window-read path).
-    if (window_read_enable_) {
-        const uint32_t dest = spike->getDestinationNeuron();
-        uint32_t post_local = dest;
-        bool post_local_valid = true;
-        if (dest >= num_neurons_) {
-            const uint64_t g = static_cast<uint64_t>(dest);
-            if (g >= global_neuron_base_ && g < global_neuron_base_ + static_cast<uint64_t>(num_neurons_)) {
-                post_local = static_cast<uint32_t>(g - global_neuron_base_);
-            } else {
-                post_local_valid = false;
-            }
+    // Resolve post-local (legacy compatible).
+    const uint32_t dest = spike->getDestinationNeuron();
+    uint32_t post_local = dest;
+    bool post_local_valid = true;
+    if (dest >= num_neurons_) {
+        const uint64_t g = static_cast<uint64_t>(dest);
+        if (g >= global_neuron_base_ && g < global_neuron_base_ + static_cast<uint64_t>(num_neurons_)) {
+            post_local = static_cast<uint32_t>(g - global_neuron_base_);
+        } else {
+            post_local_valid = false;
         }
-        if (post_local_valid) {
-            spike->setCachedPostLocal(post_local);
-        }
-        if (!use_post_row_pre_col_) {
-            // For legacy index_mode=pre_row_post_col, cache pre_local mapping.
-            // (Best-effort: strict window-read uses pre_global in edge keys.)
-            spike->setCachedPreLocal(mapPreGlobalToLocal_(spike->getSourceNeuron()));
-        }
+    }
+    if (!post_local_valid || post_local >= num_neurons_) {
+        delete spike;
+        return;
+    }
 
-        // Critical: update window touch sets immediately (before per-tick filtering), so BeginApply sees non-empty sets.
-        if (weight_mem_subsystem_ && post_local_valid && post_local < num_neurons_) {
-            weight_mem_subsystem_->noteWindowTouch(post_local, spike->getSourceNeuron(), num_neurons_);
+    // Compute core gating (kept consistent with legacy: reject before recording any edge/access).
+    if (apply_acc_enable_ && compute_core_) {
+        if (!compute_core_->shouldAcceptSynapticInput(post_local, now_cycle_cached_)) {
+            delete spike;
+            return;
         }
     }
 
-    incoming_spikes_.push(spike);
+    // Window/GAS mode: record touches + edges immediately (do NOT defer to per-tick queue),
+    // so BeginApply can issue reads deterministically even for same-cycle arrivals.
+    if (workload_spike_input_enable_ && isWindowWorkload_() && window_read_enable_ && !scheme1_enable_) {
+        ensureWeightReaderOwned_();
+        if (weight_mem_subsystem_) {
+            // Maintain window sets immediately.
+            weight_mem_subsystem_->noteWindowTouch(post_local, spike->getSourceNeuron(), num_neurons_);
+
+            // Record edge for BeginApply issueFromEdges().
+            if (enable_weight_fetch_ && rt_.mem) {
+                bool stage_ok = false;
+                switch (gas_stage_) {
+                    case GasStage::Gather:
+                        stage_ok = true;
+                        break;
+                    case GasStage::Apply:
+                        stage_ok = record_edge_apply_enable_;
+                        break;
+                    case GasStage::Idle:
+                        stage_ok = record_edge_idle_enable_;
+                        break;
+                    case GasStage::Scatter:
+                        stage_ok = record_edge_scatter_enable_;
+                        break;
+                    default:
+                        stage_ok = false;
+                        break;
+                }
+                if (stage_ok) {
+                    const size_t curr_edges = weight_mem_subsystem_->edgesCurrSize();
+                    if (curr_edges < edge_collector_max_capacity_) {
+                        weight_mem_subsystem_->recordEdge(post_local, spike->getSourceNeuron());
+                    }
+                }
+            }
+        }
+
+        if (rt_.sinks.synaptic_accesses) (*rt_.sinks.synaptic_accesses)++;
+        if (rt_.sinks.stat_synaptic_accesses_total) rt_.sinks.stat_synaptic_accesses_total->addData(1);
+        delete spike;
+        return;
+    }
+
+    // Non-window path: best-effort single-synapse apply.
+    if (compute_core_) {
+        const uint32_t pre_global = spike->getSourceNeuron();
+        if (enable_weight_fetch_) {
+            ensureWeightReaderOwned_();
+            IWeightReader* wr = weight_reader_.get();
+            if (wr) {
+                // Weight fetch is async; apply when resolved.
+                wr->requestDense(pre_global, post_local, [this, pre_global, post_local](float w) {
+                    if (!compute_core_) return;
+                    SynapticEvent ev;
+                    ev.post_local = post_local;
+                    ev.pre_global = pre_global;
+                    ev.weight = w;
+                    compute_core_->onSynapticEvent(ev);
+                    if (rt_.sinks.synaptic_accesses) (*rt_.sinks.synaptic_accesses)++;
+                    if (rt_.sinks.stat_synaptic_accesses_total) rt_.sinks.stat_synaptic_accesses_total->addData(1);
+                });
+                delete spike;
+                return;
+            }
+        }
+
+        SynapticEvent ev;
+        ev.post_local = post_local;
+        ev.pre_global = pre_global;
+        ev.weight = static_cast<float>(spike->getWeight());
+        compute_core_->onSynapticEvent(ev);
+        if (rt_.sinks.synaptic_accesses) (*rt_.sinks.synaptic_accesses)++;
+        if (rt_.sinks.stat_synaptic_accesses_total) rt_.sinks.stat_synaptic_accesses_total->addData(1);
+    }
+
+    delete spike;
 }
 
 bool SnnWorkload::hasWork() const {
-    if (!legacy_host_) {
-        fatal_missing_legacy_host_(rt_.log, "bindLegacyHost missing (hasWork)");
-    }
     if (!incoming_spikes_.empty()) return true;
+    if (weight_mem_subsystem_ && weight_mem_subsystem_->pendingSize() > 0) return true;
     if (compute_core_ && compute_core_->hasWork()) return true;
-    return legacy_host_->legacySnnHasWork();
+    return false;
 }
 
 double SnnWorkload::getUtilization() const {
-    if (!legacy_host_) {
-        fatal_missing_legacy_host_(rt_.log, "bindLegacyHost missing (getUtilization)");
-    }
-    return legacy_host_->legacySnnGetUtilization();
+    if (compute_core_) return compute_core_->getUtilization();
+    return 0.0;
 }
 
 void SnnWorkload::getStatistics(std::map<std::string, uint64_t>& stats) const {
-    if (!legacy_host_) {
-        fatal_missing_legacy_host_(rt_.log, "bindLegacyHost missing (getStatistics)");
-    }
-    legacy_host_->legacySnnGetStatistics(stats);
+    const uint64_t spikes_received = rt_.sinks.spikes_received ? *rt_.sinks.spikes_received : 0;
+    const uint64_t spikes_generated = rt_.sinks.spikes_generated ? *rt_.sinks.spikes_generated : 0;
+    const uint64_t neurons_fired = rt_.sinks.neurons_fired ? *rt_.sinks.neurons_fired : 0;
+    const uint64_t syn_accesses = rt_.sinks.synaptic_accesses ? *rt_.sinks.synaptic_accesses : 0;
+    stats["spikes_received"] = spikes_received;
+    stats["spikes_generated"] = spikes_generated;
+    stats["neurons_fired"] = neurons_fired;
+    stats["synaptic_accesses"] = syn_accesses;
+    stats["gas_scatter_spikes_emitted_total"] = total_scatter_spikes_emitted_;
 }
 
 void SnnWorkload::onInitPhase(unsigned phase) {
-    if (!legacy_host_) return;
     // Ensure compute core is configured before init() phases are forwarded.
     ensureComputeCoreConfigured_();
     if (compute_core_) {
@@ -609,13 +827,11 @@ void SnnWorkload::onInitPhase(unsigned phase) {
 }
 
 void SnnWorkload::onSetup() {
-    if (!legacy_host_) return;
     ensureComputeCoreConfigured_();
     if (compute_core_) compute_core_->onSetup();
 }
 
 void SnnWorkload::onFinish() {
-    if (!legacy_host_) return;
     if (compute_core_) compute_core_->onFinish();
 }
 
@@ -647,9 +863,6 @@ bool SnnWorkload::ready() const {
 void SnnWorkload::onGasStageEvent(const GasStageEvent& ev) {
     // Phase4-Task6.4: 仅在窗口端到端语义下接管（apply_acc_enable + gas_window_mode）。
     if (!(apply_acc_enable_ && gas_window_mode_)) return;
-    if (!legacy_host_) {
-        fatal_missing_legacy_host_(rt_.log, "bindLegacyHost missing (onGasStageEvent)");
-    }
 
     ensureComputeCoreConfigured_();
     ensureSpikeCommConfigured_();
@@ -706,15 +919,34 @@ void SnnWorkload::onGasStageEvent(const GasStageEvent& ev) {
                     neuron_indices.reserve(fired.size());
                     for (const auto& fe : fired) neuron_indices.push_back(fe.neuron_idx);
 
-                    legacy_host_->legacySnnOnNeuronFires(neuron_indices, now_cycle_cached_);
                     const uint64_t emitted = emitNeuronFireBatch(neuron_indices, now_cycle_cached_);
                     last_scatter_spikes_emitted_ = emitted ? emitted : neuron_indices.size();
+
+                    const uint64_t fired_cnt = static_cast<uint64_t>(neuron_indices.size());
+                    if (rt_.sinks.neurons_fired) (*rt_.sinks.neurons_fired) += fired_cnt;
+                    if (rt_.sinks.spikes_generated) (*rt_.sinks.spikes_generated) += fired_cnt;
+                    addCountStat_(rt_.sinks.stat_neurons_fired_total, fired_cnt);
+                    addCountStat_(rt_.sinks.stat_spikes_generated_total, fired_cnt);
                 }
             }
             if (acc_ops_) acc_ops_->reset();
 
-            // Report scatter spikes to CoreShell for per-window aggregation/stats.
-            legacy_host_->legacySnnOnGasScatterSpikesEmitted(ev.superstep, last_scatter_spikes_emitted_);
+            // Report scatter spikes for per-window aggregation/stats.
+            if (rt_.sinks.spikes_emitted_window) (*rt_.sinks.spikes_emitted_window) = last_scatter_spikes_emitted_;
+            if (rt_.sinks.window_spikes_all) (*rt_.sinks.window_spikes_all) += last_scatter_spikes_emitted_;
+            total_scatter_spikes_emitted_ += last_scatter_spikes_emitted_;
+            if (rt_.sinks.stat_gas_scatter_spikes_emitted_total && last_scatter_spikes_emitted_ > 0) {
+                rt_.sinks.stat_gas_scatter_spikes_emitted_total->addData(last_scatter_spikes_emitted_);
+            }
+            if (rt_.reporting.report_apply_scatter) {
+                rt_.reporting.report_apply_scatter(rt_.reporting.ctx,
+                                                   /*acc_updates=*/0,
+                                                   /*posts_touched=*/0,
+                                                   /*spikes_emitted=*/last_scatter_spikes_emitted_,
+                                                   /*hwm_bytes=*/0,
+                                                   /*spill_records=*/0,
+                                                   /*spilled_bytes=*/0);
+            }
             break;
         }
         case GasOp::EndScatter:

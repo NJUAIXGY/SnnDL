@@ -19,6 +19,7 @@
   - `handleMemoryResponse(req*)`：用于把 StandardMem 回包分发到对应回调（并释放请求对象）。
 - **注意事项**：
   - `ReadResp` 的 `data.size()` 必须覆盖请求的 `bytes`，否则会触发 `[stdmem-access-assert]` 直接 fail-fast；这用于尽早暴露地址映射/对齐/截断问题。
+  - 回包匹配默认以 `RequestId` 为准；若上游/后端导致 `resp_id` 不匹配，允许在 **无歧义** 情况下按 `(addr,size)` 唯一回退匹配（若歧义将 fail-fast）。
 
 ### Legacy（已从 Memory 域移出）
 - `services/legacy/memory/StandardMemBackend.*`：历史 pending 后端（含权重/BCSR 语义字段），已在 Phase5.5 清理删除；主链路统一使用 `StandardMemAccess`。
@@ -27,7 +28,7 @@
 
 ## 与其他域的交互（典型用法）
 
-- `control/SnnPESubComponent` 在 `setup/init` 时装配：
+- CoreShell（`control/SnnPESubComponent`）在 `setup/init` 时装配：
   - 创建 `StandardMemAccess`（对外提供纯 `IMemoryAccess`）；
   - 旧的 pending/meta 参考实现（`services/legacy/memory/StandardMemBackend.*`）已删除；若需要对照口径，应以 `StandardMemAccess` 的 diag/断言式诊断为准。
 - `services/synapse/weights/WeightMemorySubsystem` 推荐只依赖 `api/IMemoryAccess`：

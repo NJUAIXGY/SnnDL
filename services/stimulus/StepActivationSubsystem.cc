@@ -20,9 +20,11 @@
 
 #include "../../api/GlobalNeuronLayout.h"
 #include "INocTransport.h"
+#include "NocPacketEvent.h"
 #include "SpikeEvent.h"
 
 #include "synapse/route/StepBcsrReachability.h"
+#include "synapse/route/SpikeNocCodec.h"
 
 namespace SST { namespace SnnDL {
 
@@ -174,6 +176,10 @@ void StepActivationSubsystem::injectStepActivations_(uint32_t seq, uint64_t sim_
     const uint64_t neurons_per_pe = rt_.layout->neuronsPerPE();
     const int total_neurons = static_cast<int>(neurons_per_pe);
     if (!cfg_.enable || cfg_.fanout == 0 || total_neurons <= 0) return;
+    if (!rt_.noc) {
+        if (rt_.log) rt_.log->fatal(CALL_INFO, -1, "StepActivationSubsystem fatal: runtime.noc is null while step is enabled\n");
+        return;
+    }
 
     double fraction = cfg_.fraction;
     if (fraction <= 0.0) return;
@@ -254,15 +260,29 @@ void StepActivationSubsystem::injectStepActivations_(uint32_t seq, uint64_t sim_
                 }
                 route_hits++;
 
-                auto* spike = new SpikeEvent(pre_global, post_global, static_cast<uint32_t>(rt_.node_id), 1.0f, sim_time_ns);
-                int dst_core = determineTargetUnit_(post_global);
-                if (dst_core >= 0) {
-                    if (rt_.deliver_to_core) rt_.deliver_to_core(dst_core, spike);
-                    else delete spike;
-                    spikes_injected++;
-                } else {
-                    delete spike;
+                if (!rt_.layout->inGlobalRange(static_cast<uint64_t>(post_global))) {
                     ++local_drops;
+                    continue;
+                }
+                const uint32_t dest_node = rt_.layout->nodeOf(static_cast<uint64_t>(post_global));
+                SpikeEvent spike(pre_global, post_global, dest_node, 1.0f, sim_time_ns);
+                NocPacketEvent* pkt = SpikeNocCodec::encode(spike, *rt_.layout);
+                if (!pkt) {
+                    ++local_drops;
+                    continue;
+                }
+                if (dest_node == static_cast<uint32_t>(rt_.node_id)) {
+                    const int dst_core = determineTargetUnit_(post_global);
+                    if (dst_core >= 0) {
+                        rt_.noc->injectLocal(dst_core, pkt);
+                        spikes_injected++;
+                    } else {
+                        delete pkt;
+                        ++local_drops;
+                    }
+                } else {
+                    rt_.noc->sendExternal(pkt);
+                    spikes_injected++;
                 }
                 if (diag_cap && spikes_injected >= diag_cap) { diag_cap_hit = true; break; }
             }
@@ -304,17 +324,28 @@ void StepActivationSubsystem::injectStepActivations_(uint32_t seq, uint64_t sim_
                         }
                     }
 
-                    auto* spike = new SpikeEvent(pre_global, post_global, static_cast<uint32_t>(rt_.node_id), 1.0f, sim_time_ns);
-                    int dst_core = determineTargetUnit_(post_global);
-                    if (dst_core >= 0) {
-                        if (rt_.deliver_to_core) rt_.deliver_to_core(dst_core, spike);
-                        else delete spike;
-                        spikes_injected++;
+                    if (!rt_.layout->inGlobalRange(static_cast<uint64_t>(post_global))) {
+                        ++local_drops;
+                        continue;
+                    }
+                    const uint32_t dest_node = rt_.layout->nodeOf(static_cast<uint64_t>(post_global));
+                    SpikeEvent spike(pre_global, post_global, dest_node, 1.0f, sim_time_ns);
+                    NocPacketEvent* pkt = SpikeNocCodec::encode(spike, *rt_.layout);
+                    if (!pkt) {
+                        ++local_drops;
+                        continue;
+                    }
+                    if (dest_node == static_cast<uint32_t>(rt_.node_id)) {
+                        const int dst_core = determineTargetUnit_(post_global);
+                        if (dst_core >= 0) {
+                            rt_.noc->injectLocal(dst_core, pkt);
+                            spikes_injected++;
+                        } else {
+                            delete pkt;
+                            ++local_drops;
+                        }
                     } else {
-                        uint32_t dest_node = rt_.layout->nodeOf(static_cast<uint64_t>(post_global));
-                        spike->setDestinationNode(dest_node);
-                        if (rt_.send_external) rt_.send_external(spike);
-                        else delete spike;
+                        rt_.noc->sendExternal(pkt);
                         spikes_injected++;
                     }
                     if (diag_cap && spikes_injected >= diag_cap) { diag_cap_hit = true; break; }

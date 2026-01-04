@@ -27,16 +27,22 @@ namespace SST { namespace SnnDL {
 class IMemoryAccess;
 class INocTransport;
 class NocPacketEvent;
-class SnnPEParentInterface;
 
 class ICoreWorkload {
 public:
     struct Sinks {
         // Common core-level counters/stats (owned by CoreShell)
         uint64_t* spikes_received = nullptr;
+        uint64_t* spikes_generated = nullptr;
+        uint64_t* neurons_fired = nullptr;
         uint64_t* synaptic_accesses = nullptr;
+        uint64_t* window_spikes_all = nullptr;
+        uint64_t* spikes_emitted_window = nullptr;
         SST::Statistics::Statistic<uint64_t>* stat_spikes_received_total = nullptr;
+        SST::Statistics::Statistic<uint64_t>* stat_spikes_generated_total = nullptr;
+        SST::Statistics::Statistic<uint64_t>* stat_neurons_fired_total = nullptr;
         SST::Statistics::Statistic<uint64_t>* stat_synaptic_accesses_total = nullptr;
+        SST::Statistics::Statistic<uint64_t>* stat_gas_scatter_spikes_emitted_total = nullptr;
 
         // Optional: raw counters for aggregation (owned by CoreShell)
         uint64_t* mem_verify_pass = nullptr;
@@ -68,6 +74,14 @@ public:
         // Optional: report to host aggregation (e.g., memory_requests/bytes)
         void* ctx = nullptr;
         void (*report_mem_issue)(void* ctx, size_t bytes) = nullptr;
+        // Optional: GAS/window apply+scatter aggregation (workload-level; core aggregates to PE-level stats).
+        void (*report_apply_scatter)(void* ctx,
+                                     uint64_t acc_updates,
+                                     uint64_t posts_touched,
+                                     uint64_t spikes_emitted,
+                                     uint64_t hwm_bytes,
+                                     uint64_t spill_records,
+                                     uint64_t spilled_bytes) = nullptr;
     };
 
     struct TimeSource {
@@ -84,8 +98,6 @@ public:
 
         IMemoryAccess* mem = nullptr;
         INocTransport* noc = nullptr;
-        // Optional: parent interface for fallback transports (mainly used by workload=snn).
-        SnnPEParentInterface* parent_iface = nullptr;
 
         TimeSource time{};
         Sinks sinks{};

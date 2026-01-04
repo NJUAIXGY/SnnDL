@@ -96,6 +96,12 @@ private:
     uint64_t total_cycles_ = 0;
     uint64_t active_cycles_ = 0;
     uint64_t memory_requests_ = 0;
+
+    // Stream counters exported via getStatistics() (so MultiCorePE can aggregate them to mesh_stats.csv).
+    uint64_t stream_mem_writes_issued_total_ = 0;
+    uint64_t stream_mem_reads_issued_total_ = 0;
+    uint64_t stream_mem_bytes_written_total_ = 0;
+    uint64_t stream_mem_bytes_read_total_ = 0;
 };
 
 }} // namespace SST::SnnDL

@@ -36,5 +36,4 @@
 ## 依赖与交互
 
 - **依赖**：`events/GasStepBarrierEvent.h`（barrier 事件载体）
-- **典型装配**：由 mesh 模板在系统层创建一个 controller，并把每个 PE 的 `pe_linkX` 接到 controller 的 `pe_linkX`。
-
+- **典型装配**：整张 mesh **只创建 1 个** controller，并把每个 PE 的 `pe_linkX` 接到 controller 的 `pe_linkX`（它是全局共享的同步器，而不是 per-node）。

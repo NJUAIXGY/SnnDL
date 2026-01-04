@@ -32,7 +32,7 @@
 #include "SnnInterface.h"
 #include "SnnPEParentInterface.h"
 #include "IPeAggregation.h"
-#include "SnnCoreAPI.h"
+#include "CoreShellAPI.h"
 #include "../api/GlobalNeuronLayout.h"
 #include "noc/OptimizedInternalRing.h"
 #include "stimulus/ExternalSpikeInputSubsystem.h"
@@ -60,10 +60,32 @@ struct ProcessingUnitState {
     bool is_active;
     uint64_t spikes_processed;
     uint64_t neurons_fired;
+    // Stream workload counters (pulled from core->getStatistics map)
+    uint64_t stream_mem_writes_issued_total;
+    uint64_t stream_mem_reads_issued_total;
+    uint64_t stream_mem_bytes_written_total;
+    uint64_t stream_mem_bytes_read_total;
+    uint64_t stream_mem_verify_pass_total;
+    uint64_t stream_mem_verify_fail_total;
+    uint64_t stream_pkt_sent_total;
+    uint64_t stream_pkt_recv_total;
+    uint64_t stream_pkt_bad_crc_total;
+    uint64_t stream_pkt_bad_magic_total;
     double utilization;
     
     ProcessingUnitState() : unit_id(-1), neuron_id_start(0), neuron_count(0), 
-                           is_active(false), spikes_processed(0), neurons_fired(0), utilization(0.0) {}
+                           is_active(false), spikes_processed(0), neurons_fired(0),
+                           stream_mem_writes_issued_total(0),
+                           stream_mem_reads_issued_total(0),
+                           stream_mem_bytes_written_total(0),
+                           stream_mem_bytes_read_total(0),
+                           stream_mem_verify_pass_total(0),
+                           stream_mem_verify_fail_total(0),
+                           stream_pkt_sent_total(0),
+                           stream_pkt_recv_total(0),
+                           stream_pkt_bad_crc_total(0),
+                           stream_pkt_bad_magic_total(0),
+                           utilization(0.0) {}
 };
 
 /**
@@ -147,14 +169,14 @@ public:
 
     // 子组件槽位文档
     SST_ELI_DOCUMENT_SUBCOMPONENT_SLOTS(
-        {"core0", "SnnPE计算核心0", "SST::SnnDL::SnnCoreAPI"},
-        {"core1", "SnnPE计算核心1", "SST::SnnDL::SnnCoreAPI"},
-        {"core2", "SnnPE计算核心2", "SST::SnnDL::SnnCoreAPI"},
-        {"core3", "SnnPE计算核心3", "SST::SnnDL::SnnCoreAPI"},
-        {"core4", "SnnPE计算核心4", "SST::SnnDL::SnnCoreAPI"},
-        {"core5", "SnnPE计算核心5", "SST::SnnDL::SnnCoreAPI"},
-        {"core6", "SnnPE计算核心6", "SST::SnnDL::SnnCoreAPI"},
-        {"core7", "SnnPE计算核心7", "SST::SnnDL::SnnCoreAPI"},
+        {"core0", "CoreShell 子核心0", "SST::SnnDL::CoreShellAPI"},
+        {"core1", "CoreShell 子核心1", "SST::SnnDL::CoreShellAPI"},
+        {"core2", "CoreShell 子核心2", "SST::SnnDL::CoreShellAPI"},
+        {"core3", "CoreShell 子核心3", "SST::SnnDL::CoreShellAPI"},
+        {"core4", "CoreShell 子核心4", "SST::SnnDL::CoreShellAPI"},
+        {"core5", "CoreShell 子核心5", "SST::SnnDL::CoreShellAPI"},
+        {"core6", "CoreShell 子核心6", "SST::SnnDL::CoreShellAPI"},
+        {"core7", "CoreShell 子核心7", "SST::SnnDL::CoreShellAPI"},
         {"l2_cache", "共享L2缓存", "SST::MemHierarchy::Cache"},
         {"memory_interface", "内存接口", "SST::Interfaces::StandardMem"},
         {"external_nic", "外部网络接口", "SST::SnnDL::SnnInterface"}
@@ -190,12 +212,23 @@ public:
         {"memory_requests", "内存请求数", "requests", 1},
         {"avg_core_utilization", "平均核心利用率", "percentage", 1},
         {"total_neurons_fired", "总神经元发放数", "neurons", 1},
-        {"unique_neurons_fired_total", "至少发放一次的不同神经元数（总）", "neurons", 1},
-        {"external_spikes_sent", "发送的外部脉冲数", "spikes", 1},
-        {"external_spikes_received", "接收的外部脉冲数", "spikes", 1},
-        {"mem_read_latency_cycles", "端到端内存读延迟（cycles）", "cycles", 1},
-        {"mem_read_latency_cycles_weights", "权重访问读延迟（cycles）", "cycles", 1},
-        {"mem_read_latency_cycles_state", "非权重访问读延迟（cycles）", "cycles", 1},
+	        {"unique_neurons_fired_total", "至少发放一次的不同神经元数（总）", "neurons", 1},
+	        {"external_spikes_sent", "发送的外部脉冲数", "spikes", 1},
+	        {"external_spikes_received", "接收的外部脉冲数", "spikes", 1},
+	        // Stream workload（PE聚合，供 essential_summary_mesh 汇总）
+	        {"stream_mem_writes_issued_total", "Stream workload: total writes issued（PE聚合）", "requests", 1},
+	        {"stream_mem_reads_issued_total", "Stream workload: total reads issued（PE聚合）", "requests", 1},
+	        {"stream_mem_bytes_written_total", "Stream workload: bytes written（issued, PE聚合）", "bytes", 1},
+	        {"stream_mem_bytes_read_total", "Stream workload: bytes read（issued, PE聚合）", "bytes", 1},
+	        {"stream_mem_verify_pass_total", "Stream workload: read-after-write 校验通过次数（PE聚合）", "count", 1},
+	        {"stream_mem_verify_fail_total", "Stream workload: read-after-write 校验失败次数（PE聚合）", "count", 1},
+	        {"stream_pkt_sent_total", "Stream workload: raw-bytes packets sent（PE聚合）", "packets", 1},
+	        {"stream_pkt_recv_total", "Stream workload: raw-bytes packets received（PE聚合）", "packets", 1},
+	        {"stream_pkt_bad_crc_total", "Stream workload: bad CRC packets（PE聚合）", "packets", 1},
+	        {"stream_pkt_bad_magic_total", "Stream workload: bad magic packets（PE聚合）", "packets", 1},
+	        {"mem_read_latency_cycles", "端到端内存读延迟（cycles）", "cycles", 1},
+	        {"mem_read_latency_cycles_weights", "权重访问读延迟（cycles）", "cycles", 1},
+	        {"mem_read_latency_cycles_state", "非权重访问读延迟（cycles）", "cycles", 1},
         {"mem_req_size_bytes", "发起时请求大小（bytes）", "bytes", 1},
         {"gas_unique_reads_total", "GAS 下游唯一合并读事务数（总）", "reads", 1},
         {"gas_unique_bytes_total", "GAS 下游唯一合并读覆盖字节（总）", "bytes", 1},
@@ -421,9 +454,29 @@ private:
     Statistic<uint64_t>* stat_step_activation_pre_selected_ = nullptr;
     Statistic<uint64_t>* stat_step_activation_spike_attempts_ = nullptr;
     Statistic<uint64_t>* stat_step_activation_spikes_injected_ = nullptr;
-    Statistic<uint64_t>* stat_step_activation_route_hits_ = nullptr;
-    Statistic<uint64_t>* stat_step_activation_route_misses_ = nullptr;
-    Statistic<uint64_t>* stat_step_activation_local_drops_ = nullptr;
+	    Statistic<uint64_t>* stat_step_activation_route_hits_ = nullptr;
+	    Statistic<uint64_t>* stat_step_activation_route_misses_ = nullptr;
+	    Statistic<uint64_t>* stat_step_activation_local_drops_ = nullptr;
+	    Statistic<uint64_t>* stat_stream_mem_verify_fail_total_ = nullptr;
+	    Statistic<uint64_t>* stat_stream_mem_writes_issued_total_ = nullptr;
+	    Statistic<uint64_t>* stat_stream_mem_reads_issued_total_ = nullptr;
+	    Statistic<uint64_t>* stat_stream_mem_bytes_written_total_ = nullptr;
+	    Statistic<uint64_t>* stat_stream_mem_bytes_read_total_ = nullptr;
+	    Statistic<uint64_t>* stat_stream_mem_verify_pass_total_ = nullptr;
+	    Statistic<uint64_t>* stat_stream_pkt_sent_total_ = nullptr;
+	    Statistic<uint64_t>* stat_stream_pkt_recv_total_ = nullptr;
+	    Statistic<uint64_t>* stat_stream_pkt_bad_crc_total_ = nullptr;
+	    Statistic<uint64_t>* stat_stream_pkt_bad_magic_total_ = nullptr;
+	    std::vector<uint64_t> stream_mem_verify_fail_last_;
+	    std::vector<uint64_t> stream_mem_verify_pass_last_;
+	    std::vector<uint64_t> stream_mem_writes_issued_last_;
+	    std::vector<uint64_t> stream_mem_reads_issued_last_;
+	    std::vector<uint64_t> stream_mem_bytes_written_last_;
+	    std::vector<uint64_t> stream_mem_bytes_read_last_;
+	    std::vector<uint64_t> stream_pkt_sent_last_;
+	    std::vector<uint64_t> stream_pkt_recv_last_;
+	    std::vector<uint64_t> stream_pkt_bad_crc_last_;
+	    std::vector<uint64_t> stream_pkt_bad_magic_last_;
 
     // 本地统计：仅在环形跨核投递成功时累加
     uint64_t inter_core_messages_count_ = 0;
@@ -444,7 +497,7 @@ private:
     bool test_injected_ = false;
     
     // 子组件
-    std::vector<SnnCoreAPI*> cores_;
+    std::vector<CoreShellAPI*> cores_;
     SST::Interfaces::StandardMem* l2_cache_;
     SST::Interfaces::StandardMem* memory_interface_;
     SST::SnnDL::SnnInterface* external_nic_;
@@ -580,7 +633,6 @@ private:
     /**
      * @brief 向指定核心递送脉冲
      */
-    void deliverSpikeToCore(int core_id, SpikeEvent* spike);
     /**
      * @brief 将NoC packet按kind分流并投递到指定endpoint/core
      */

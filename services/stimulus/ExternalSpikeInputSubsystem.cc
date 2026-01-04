@@ -9,7 +9,11 @@
 
 #include <sst/core/output.h>
 
+#include "GlobalNeuronLayout.h"
+#include "INocTransport.h"
+#include "NocPacketEvent.h"
 #include "SpikeEvent.h"
+#include "synapse/route/SpikeNocCodec.h"
 
 namespace SST { namespace SnnDL {
 
@@ -18,6 +22,12 @@ namespace SST { namespace SnnDL {
 #endif
 
 int ExternalSpikeInputSubsystem::determineTargetUnit_(uint32_t global_neuron_id) const {
+    if (rt_.layout && rt_.layout->valid()) {
+        const uint64_t gid = static_cast<uint64_t>(global_neuron_id);
+        if (!rt_.layout->isLocalToNode(gid, static_cast<uint32_t>(rt_.node_id))) return -1;
+        const uint32_t core = rt_.layout->coreOf(gid);
+        return (core < static_cast<uint32_t>(rt_.num_cores)) ? static_cast<int>(core) : -1;
+    }
     if (rt_.num_cores <= 0 || rt_.neurons_per_core <= 0 || rt_.total_neurons <= 0) return -1;
 
     const int64_t local_neuron_id =
@@ -31,6 +41,11 @@ int ExternalSpikeInputSubsystem::determineTargetUnit_(uint32_t global_neuron_id)
 
 void ExternalSpikeInputSubsystem::onSpike(SpikeEvent* spike) {
     if (!spike) return;
+
+    if (!rt_.noc || !rt_.layout || !rt_.layout->valid()) {
+        delete spike;
+        return;
+    }
 
     const uint32_t dst_node = spike->getDestinationNode();
     if (dst_node != static_cast<uint32_t>(rt_.node_id)) {
@@ -46,12 +61,10 @@ void ExternalSpikeInputSubsystem::onSpike(SpikeEvent* spike) {
         return;
     }
 
-    if (!rt_.deliver_to_core) {
-        delete spike;
-        return;
-    }
-    rt_.deliver_to_core(dst_core, spike);
+    NocPacketEvent* pkt = SpikeNocCodec::encode(*spike, *rt_.layout);
+    delete spike;
+    if (!pkt) return;
+    rt_.noc->injectLocal(dst_core, pkt);
 }
 
 }} // namespace SST::SnnDL
-

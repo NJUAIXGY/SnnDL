@@ -17,11 +17,11 @@
   - 提供 BCSR 读路径的安全护栏（例如 abs-max guard、rowptr-ready gate、fallback 策略等）。
 - **关键装配面**：
   - `bindMemory(IMemoryAccess*)`：绑定纯内存访问（地址→字节）；
-  - `configureOrchestrator(OrchestratorConfig)`：由控制层注入“发起读/写、cache、累加、诊断、统计”等回调与配置。
+  - `configureOrchestrator(OrchestratorConfig)`：由 `workload=snn` 注入“发起读/写、cache、累加、诊断、统计”等回调与配置。
 - **典型调用节奏**：
   - BeginGather：`beginGatherWindow(...)` 迁移/清空窗口集合；
   - BeginApply：`beginApplyWindow(...)` + `flipEdgesForApply(...)`，然后 `issueFromEdges()`；
-  - ReadResp：由控制层把 bytes 交给 Weights 语义层解析并回调 `acc_update` 等。
+  - ReadResp：由 `workload=snn` 把 bytes 交给 Weights 语义层解析并回调 `acc_update` 等。
 
 ### `SnnBcsrWeightManager.{h,cc}`
 - **定位**：BCSR 元数据与缓存管理器（`BcsrWeightManager`）。

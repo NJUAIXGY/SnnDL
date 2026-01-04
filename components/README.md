@@ -10,8 +10,9 @@
 ## 主要内容
 
 - `MultiCorePE.{h,cc}`
-  - 处理单元（PE）顶层组件：挂接多个 `SnnCoreAPI` 子核心（通常是 `control/SnnPESubComponent`）。
-  - 负责统计汇聚、阶段事件聚合、内部 ring 互连等。
+  - 处理单元（PE）顶层组件：挂接多个 **CoreShell** 子核（接口：`api/CoreShellAPI.h`，默认实现：`control/SnnPESubComponent`）。
+  - 负责装配并驱动平台面子系统（NoC/Mem/Stimulus），以及对 PE 内多 core 的统计汇聚（写出到 `mesh_stats.csv`）。
+  - 支持可插拔 workload：通过参数 `workload_impl` 或环境变量 `SNNDL_WORKLOAD_IMPL` 选择（默认 `snn`）。
 - `SnnNIC.{h,cc}`
   - NIC 组件：对接 `SimpleNetwork`（如 merlin.linkcontrol），发送/接收 Spike 与门控事件。
 - `WeightLoader.{h,cc}`
@@ -37,7 +38,10 @@
 ## 依赖边界（建议）
 
 - `components/` 可以依赖 `api/`、`events/`、`control/`、`services/`、`compute/`。
-- 避免把动力学/算法细节写进组件层：应下沉到 `compute/`。
+- 避免把业务语义写进组件层：
+  - 动力学/学习应下沉到 `compute/`；
+  - SNN/Step/GAS/BCSR 等事务应下沉到 `services/workload/snn` 与 `services/synapse/*`；
+  - NoC/Mem 在组件层只做“装配与调度壳”。
 
 ## 扩展指南
 

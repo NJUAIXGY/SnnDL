@@ -11,15 +11,12 @@
 
 namespace SST { namespace SnnDL {
 
-class ILegacySnnWorkloadHost;
 class SpikeEvent;
 
 class ISpikeWorkload : public ICoreWorkload {
 public:
     ~ISpikeWorkload() override = default;
     virtual void deliverSpike(SpikeEvent* spike) = 0;
-    // Phase4-Task5: transitional hook for entrypoint cutover (default no-op).
-    virtual void bindLegacyHost(ILegacySnnWorkloadHost* /*host*/) {}
 };
 
 }} // namespace SST::SnnDL

@@ -22,21 +22,20 @@
 #include "ISnnComputeCore.h"
 #include "ICoreWorkload.h"
 #include "ICoreControlHooks.h"
+#include "ICoreMemoryLink.h"
 #include "IGlobalStepHooks.h"
 #include "IGasOrchestrator.h"
 #include "IGasStageSink.h"
-#include "ILegacySnnWorkloadHost.h"
 
 namespace SST { namespace SnnDL {
 
 class SpikeEvent;
-class SnnPEParentInterface;
-class ParentSpikeTransport;
 class NocSpikeTransport;
 class BcsrWeightManager;
 class StdMemEndpoint;
 class ISnnSpikeCommWorkload;
 class IGasStageSink;
+class IWeightReader;
 
 class IPeAggregation; // PE级汇聚接口（避免依赖 MultiCorePE 具体实现）
 class IManualWindowDrive;
@@ -52,10 +51,10 @@ class SpikeCommSubsystem;
 
 class SnnPESubComponent : public SnnCoreAPI,
                           public ICoreControlHooks,
+                          public ICoreMemoryLink,
                           public IGlobalStepHooks,
                           public IGasOrchestrator,
-                          public IGasStageSink,
-                          public ILegacySnnWorkloadHost {
+                          public IGasStageSink {
 public:
     SST_ELI_REGISTER_SUBCOMPONENT(
         SnnPESubComponent,
@@ -63,7 +62,7 @@ public:
         "SnnPESubComponent",
         SST_ELI_ELEMENT_VERSION(1, 0, 0),
         "SNN Processing Element SubComponent",
-        SST::SnnDL::SnnPESubComponent
+        SST::SnnDL::CoreShellAPI
     )
 
     SST_ELI_DOCUMENT_PARAMS(
@@ -235,7 +234,7 @@ public:
     SnnPESubComponent(SST::ComponentId_t id, SST::Params& params);
     ~SnnPESubComponent();
 
-    virtual void setParentInterface(SnnPEParentInterface* parent);
+    virtual void setParentInterface(IPeAggregation* parent) override;
     void setNocTransport(INocTransport* noc) override;
     void onGlobalStepStart(uint32_t seq) override;
     virtual void init(unsigned int phase) override;
@@ -248,7 +247,7 @@ public:
     virtual bool hasWork() const override;
     virtual double getUtilization() const override;
     virtual void getStatistics(std::map<std::string, uint64_t>& stats) const override;
-    void setMemoryLink(SST::Link* link);
+    void setMemoryLink(SST::Link* link) override;
     void resetMembraneState(float v_rest) override;
     // 回退驱动：当上层无法自动触发clockTick时，由父组件每拍调用一次
     inline void driveOneCycle() override { (void)clockTick((Cycle_t)0); }
@@ -264,27 +263,28 @@ public:
     void orchestrateBeginScatterSequence() override;
     void orchestrateEndScatterSequence() override;
 
-    // Phase4-Task5: legacy host entrypoints used by workload=snn during cutover.
-    bool legacySnnOnClockTick(uint64_t now_cycle) override;
-	    void legacySnnOnWeightsTick(uint64_t now_cycle) override;
-	    void legacySnnDeliverSpike(SpikeEvent* spike) override;
-	    void legacySnnBindComputeCore(ISnnComputeCore* core) override;
-	    IWeightReader* legacySnnGetWeightReader() override;
-	    std::unique_ptr<IWeightReader> legacySnnTakeWeightReader() override;
-	    bool legacySnnWriteback(const std::unordered_map<uint64_t, float>& grads,
-	                            float learning_rate,
-	                            float weight_decay) override;
-	    bool legacySnnHasWork() const override;
-	    double legacySnnGetUtilization() const override;
-	    void legacySnnGetStatistics(std::map<std::string, uint64_t>& stats) const override;
-	    void legacySnnOnNeuronFires(const std::vector<uint32_t>& neuron_indices, uint64_t now_cycle) override;
-        void legacySnnOnGasScatterSpikesEmitted(uint32_t seq, uint64_t spikes_emitted) override;
+private:
+    // Phase4-Task5: legacy host entrypoints used during cutover.
+    // Phase10+: workload=snn 已自洽闭环后，这些函数不再作为“外部可依赖接口”暴露；仅保留为 CoreShell 内部实现细节（回退路径/统计口径）。
+    bool legacySnnOnClockTick(uint64_t now_cycle);
+    void legacySnnOnWeightsTick(uint64_t now_cycle);
+    void legacySnnDeliverSpike(SpikeEvent* spike);
+    void legacySnnBindComputeCore(ISnnComputeCore* core);
+    IWeightReader* legacySnnGetWeightReader();
+    std::unique_ptr<IWeightReader> legacySnnTakeWeightReader();
+    bool legacySnnWriteback(const std::unordered_map<uint64_t, float>& grads,
+                            float learning_rate,
+                            float weight_decay);
+    bool legacySnnHasWork() const;
+    double legacySnnGetUtilization() const;
+    void legacySnnGetStatistics(std::map<std::string, uint64_t>& stats) const;
+    void legacySnnOnNeuronFires(const std::vector<uint32_t>& neuron_indices, uint64_t now_cycle);
+    void legacySnnOnGasScatterSpikesEmitted(uint32_t seq, uint64_t spikes_emitted);
 
-	private:
-	    // Helper modules extracted to standalone files; keep private access via friends.
-	    friend struct WeightAccessor;
-	    struct Impl;
-	    std::unique_ptr<Impl> impl_;
+    // Helper modules extracted to standalone files; keep private access via friends.
+    friend struct WeightAccessor;
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 
 	    // Phase4 Task6.3: unify workload runtime binding points (init / parent / noc).
 	    void bindWorkloadRuntime_();
@@ -503,8 +503,15 @@ public:
         // Phase7 (opt-in): allow migrating strict window-read spike input into workload=snn.
         bool workload_spike_input_enable_ = false;
 	    static void reportStreamMemIssueThunk_(void* ctx, size_t bytes);
+        static void reportSnnMemIssueThunk_(void* ctx, size_t bytes);
+        static void reportApplyScatterThunk_(void* ctx,
+                                            uint64_t acc_updates,
+                                            uint64_t posts_touched,
+                                            uint64_t spikes_emitted,
+                                            uint64_t hwm_bytes,
+                                            uint64_t spill_records,
+                                            uint64_t spilled_bytes);
 
-    SnnPEParentInterface* parent_;
     IPeAggregation* parent_pe_cached_ = nullptr;
     Output* output_;
     std::unique_ptr<StdMemEndpoint> stdmem_ep_;

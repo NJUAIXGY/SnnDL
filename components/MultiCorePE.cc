@@ -12,11 +12,13 @@
 #include "SnnNIC.h"
 #include "GatingDecisionEvent.h"
 #include "ICoreControlHooks.h"
+#include "ICoreMemoryLink.h"
 #include "IGlobalStepHooks.h"
 #include "NocPacketEvent.h"
 #include "NocPacketBatchEvent.h"
 #include "GasStepBarrierEvent.h"
 #include "WorkloadConfig.h"
+#include "SnnCoreAPI.h"
 
 #include <fstream>
 #include <sstream>
@@ -223,8 +225,6 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
         step_rt.step_diag_cap_cfg = step_diag_cap_cfg_;
         step_rt.step_diag_enable_cfg = step_diag_enable_cfg_;
         step_rt.noc = &noc_subsys_;
-        step_rt.deliver_to_core = [this](int core_id, SpikeEvent* spike) { deliverSpikeToCore(core_id, spike); };
-        step_rt.send_external = [this](SpikeEvent* spike) { sendExternalSpike(spike); };
         step_rt.reset_membranes = [this]() { resetAllCoreMembranes(); };
 
         step_activation_subsys_.bindRuntime(step_rt);
@@ -236,11 +236,12 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
         ExternalSpikeInputSubsystem::Runtime ex_rt;
         ex_rt.log = output_;
         ex_rt.node_id = node_id_;
+        ex_rt.layout = &global_layout_;
+        ex_rt.noc = &noc_subsys_;
         ex_rt.global_neuron_base = global_neuron_base_;
         ex_rt.num_cores = num_cores_;
         ex_rt.neurons_per_core = neurons_per_core_;
         ex_rt.total_neurons = total_neurons_;
-        ex_rt.deliver_to_core = [this](int core_id, SpikeEvent* spike) { deliverSpikeToCore(core_id, spike); };
         external_spike_input_subsys_.bindRuntime(ex_rt);
     }
 
@@ -252,7 +253,6 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
         brt.num_cores = num_cores_;
         brt.layout = &global_layout_;
         brt.noc = &noc_subsys_;
-        brt.deliver_to_core = [this](int core_id, SpikeEvent* spike) { deliverSpikeToCore(core_id, spike); };
         spike_packet_bridge_.bindRuntime(brt);
     }
     
@@ -286,8 +286,28 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
         unit_states_[i].is_active = false;
         unit_states_[i].spikes_processed = 0;
         unit_states_[i].neurons_fired = 0;
+        unit_states_[i].stream_mem_writes_issued_total = 0;
+        unit_states_[i].stream_mem_reads_issued_total = 0;
+        unit_states_[i].stream_mem_bytes_written_total = 0;
+        unit_states_[i].stream_mem_bytes_read_total = 0;
+        unit_states_[i].stream_mem_verify_pass_total = 0;
+        unit_states_[i].stream_mem_verify_fail_total = 0;
+        unit_states_[i].stream_pkt_sent_total = 0;
+        unit_states_[i].stream_pkt_recv_total = 0;
+        unit_states_[i].stream_pkt_bad_crc_total = 0;
+        unit_states_[i].stream_pkt_bad_magic_total = 0;
         unit_states_[i].utilization = 0.0;
     }
+    stream_mem_verify_fail_last_.assign(static_cast<size_t>(num_cores_), 0);
+    stream_mem_verify_pass_last_.assign(static_cast<size_t>(num_cores_), 0);
+    stream_mem_writes_issued_last_.assign(static_cast<size_t>(num_cores_), 0);
+    stream_mem_reads_issued_last_.assign(static_cast<size_t>(num_cores_), 0);
+    stream_mem_bytes_written_last_.assign(static_cast<size_t>(num_cores_), 0);
+    stream_mem_bytes_read_last_.assign(static_cast<size_t>(num_cores_), 0);
+    stream_pkt_sent_last_.assign(static_cast<size_t>(num_cores_), 0);
+    stream_pkt_recv_last_.assign(static_cast<size_t>(num_cores_), 0);
+    stream_pkt_bad_crc_last_.assign(static_cast<size_t>(num_cores_), 0);
+    stream_pkt_bad_magic_last_.assign(static_cast<size_t>(num_cores_), 0);
     
     // 初始化组件指针为空
     l2_cache_ = nullptr;
@@ -696,17 +716,19 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
     if (manual_core_drive_enable_) {
         for (int i = 0; i < num_cores_; i++) {
             if (cores_[i] != nullptr) {
-                if (auto* hooks = dynamic_cast<ICoreControlHooks*>(cores_[i])) {
-                    hooks->driveOneCycle();
-                    if (manual_gas_gather_cycles_ > 0 && (current_cycle_ % manual_gas_gather_cycles_) == 0) {
-                        PE_LOG(2, "[diag-PE] forceEndGather: core=%d cyc=%" PRIu64 " period=%" PRIu64 "\n",
-                               i, (uint64_t)current_cycle_, (uint64_t)manual_gas_gather_cycles_);
-                        cores_[i]->forceEndGather();
-                    }
-                }
-            }
-        }
-    }
+	                if (auto* hooks = dynamic_cast<ICoreControlHooks*>(cores_[i])) {
+	                    hooks->driveOneCycle();
+	                    if (manual_gas_gather_cycles_ > 0 && (current_cycle_ % manual_gas_gather_cycles_) == 0) {
+	                        PE_LOG(2, "[diag-PE] forceEndGather: core=%d cyc=%" PRIu64 " period=%" PRIu64 "\n",
+	                               i, (uint64_t)current_cycle_, (uint64_t)manual_gas_gather_cycles_);
+	                        if (auto* snn = dynamic_cast<SnnCoreAPI*>(cores_[i])) {
+	                            snn->forceEndGather();
+	                        }
+	                    }
+	                }
+	            }
+	        }
+	    }
     // 更新处理单元状态统计（从SnnPE SubComponent获取实际数据）
     for (int i = 0; i < num_cores_; i++) {
         if (cores_[i] != nullptr) {
@@ -714,10 +736,30 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
             cores_[i]->getStatistics(core_stats);
             auto it_sp = core_stats.find("spikes_received");
             auto it_nf = core_stats.find("neurons_fired");
+            auto it_sm_w = core_stats.find("stream_mem_writes_issued_total");
+            auto it_sm_r = core_stats.find("stream_mem_reads_issued_total");
+            auto it_sm_bw = core_stats.find("stream_mem_bytes_written_total");
+            auto it_sm_br = core_stats.find("stream_mem_bytes_read_total");
+            auto it_sm_vp = core_stats.find("stream_mem_verify_pass_total");
+            auto it_sm_vf = core_stats.find("stream_mem_verify_fail_total");
+            auto it_pkt_s = core_stats.find("stream_pkt_sent_total");
+            auto it_pkt_r = core_stats.find("stream_pkt_recv_total");
+            auto it_pkt_bc = core_stats.find("stream_pkt_bad_crc_total");
+            auto it_pkt_bm = core_stats.find("stream_pkt_bad_magic_total");
             uint64_t old_spikes = unit_states_[i].spikes_processed;
             uint64_t new_spikes = (it_sp != core_stats.end()) ? it_sp->second : 0;
             unit_states_[i].spikes_processed = new_spikes;
             unit_states_[i].neurons_fired = (it_nf != core_stats.end()) ? it_nf->second : 0;
+            unit_states_[i].stream_mem_writes_issued_total = (it_sm_w != core_stats.end()) ? it_sm_w->second : 0;
+            unit_states_[i].stream_mem_reads_issued_total = (it_sm_r != core_stats.end()) ? it_sm_r->second : 0;
+            unit_states_[i].stream_mem_bytes_written_total = (it_sm_bw != core_stats.end()) ? it_sm_bw->second : 0;
+            unit_states_[i].stream_mem_bytes_read_total = (it_sm_br != core_stats.end()) ? it_sm_br->second : 0;
+            unit_states_[i].stream_mem_verify_pass_total = (it_sm_vp != core_stats.end()) ? it_sm_vp->second : 0;
+            unit_states_[i].stream_mem_verify_fail_total = (it_sm_vf != core_stats.end()) ? it_sm_vf->second : 0;
+            unit_states_[i].stream_pkt_sent_total = (it_pkt_s != core_stats.end()) ? it_pkt_s->second : 0;
+            unit_states_[i].stream_pkt_recv_total = (it_pkt_r != core_stats.end()) ? it_pkt_r->second : 0;
+            unit_states_[i].stream_pkt_bad_crc_total = (it_pkt_bc != core_stats.end()) ? it_pkt_bc->second : 0;
+            unit_states_[i].stream_pkt_bad_magic_total = (it_pkt_bm != core_stats.end()) ? it_pkt_bm->second : 0;
             unit_states_[i].utilization = cores_[i]->getUtilization();
             unit_states_[i].is_active = cores_[i]->hasWork();
             
@@ -875,6 +917,16 @@ void MultiCorePE::initializeStatistics() {
     stat_unique_neurons_fired_total_ = registerStatistic<uint64_t>("unique_neurons_fired_total");
     stat_external_spikes_sent_ = registerStatistic<uint64_t>("external_spikes_sent");
     stat_external_spikes_received_ = registerStatistic<uint64_t>("external_spikes_received");
+    stat_stream_mem_verify_fail_total_ = registerStatistic<uint64_t>("stream_mem_verify_fail_total");
+    stat_stream_mem_writes_issued_total_ = registerStatistic<uint64_t>("stream_mem_writes_issued_total");
+    stat_stream_mem_reads_issued_total_ = registerStatistic<uint64_t>("stream_mem_reads_issued_total");
+    stat_stream_mem_bytes_written_total_ = registerStatistic<uint64_t>("stream_mem_bytes_written_total");
+    stat_stream_mem_bytes_read_total_ = registerStatistic<uint64_t>("stream_mem_bytes_read_total");
+    stat_stream_mem_verify_pass_total_ = registerStatistic<uint64_t>("stream_mem_verify_pass_total");
+    stat_stream_pkt_sent_total_ = registerStatistic<uint64_t>("stream_pkt_sent_total");
+    stat_stream_pkt_recv_total_ = registerStatistic<uint64_t>("stream_pkt_recv_total");
+    stat_stream_pkt_bad_crc_total_ = registerStatistic<uint64_t>("stream_pkt_bad_crc_total");
+    stat_stream_pkt_bad_magic_total_ = registerStatistic<uint64_t>("stream_pkt_bad_magic_total");
     // Batch-A: 注册组件级直方图统计（具体类型由Python侧设置为Histogram）
     stat_mem_read_latency_cycles_ = registerStatistic<uint64_t>("mem_read_latency_cycles");
     stat_mem_read_latency_cycles_weights_ = registerStatistic<uint64_t>("mem_read_latency_cycles_weights");
@@ -1127,22 +1179,32 @@ void MultiCorePE::initializeProcessingUnits() {
         core_params.insert("enable_memory_weights", std::to_string(enable_memory_weights_ ? 1 : 0));
         core_params.insert("write_weights_on_init", std::to_string(write_weights_on_init_ ? 1 : 0));
         
-        // 记录槽位可用性
-        bool slot_api_ok = isSubComponentLoadableUsingAPI<SnnCoreAPI>("core" + std::to_string(i));
+        // 记录槽位可用性（Phase9：核心槽位 API 改为 CoreShellAPI）
+        bool slot_api_ok = isSubComponentLoadableUsingAPI<CoreShellAPI>("core" + std::to_string(i));
 
         // 优先尝试通过用户在Python中配置的槽位加载
-        SnnCoreAPI* core = loadUserSubComponent<SnnCoreAPI>(
+        CoreShellAPI* core = loadUserSubComponent<CoreShellAPI>(
             "core" + std::to_string(i), ComponentInfo::SHARE_NONE);
         if (core) {
         }
 
         if (!core) {
             // 如果用户未配置，则回退到匿名加载默认实现
-            core = loadAnonymousSubComponent<SnnCoreAPI>(
+            core = loadAnonymousSubComponent<CoreShellAPI>(
                 "SnnDL.SnnPESubComponent", "core" + std::to_string(i), 0, ComponentInfo::SHARE_NONE, core_params);
             if (core) {
             } else {
-                PE_LOG(1, "[core%d] 匿名加载失败\n", i);
+                if (output_) {
+                    output_->fatal(
+                        CALL_INFO, -1,
+                        "Phase9 fatal: failed to load core%d SubComponent.\n"
+                        "  - slot=\"core%d\" api_ok(CoreShellAPI)=%d\n"
+                        "  - attempted anonymous impl: \"SnnDL.SnnPESubComponent\"\n"
+                        "请检查：SnnPESubComponent 的 ELI 注册父接口是否为 SnnCoreAPI/CoreShellAPI，以及 Python 侧是否覆写了 core%d 槽位。\n",
+                        i, i, slot_api_ok ? 1 : 0, i);
+                }
+                // output_ == nullptr 时仍保持旧行为，避免 nullptr 解引用
+                PE_LOG(1, "[core%d] 匿名加载失败（output_=nullptr）\n", i);
             }
         } else {
             // 若由用户配置，补充必要参数（若Python侧未给全量）
@@ -1158,7 +1220,15 @@ void MultiCorePE::initializeProcessingUnits() {
             // 为每个核心配置内存Link（若用户在Python连接了对应端口则不为None）
             std::string port = "core" + std::to_string(i) + "_mem";
             Link* l = configureLink(port);
-            if (l) core->setMemoryLink(l);
+            if (l) {
+                auto* ml = dynamic_cast<ICoreMemoryLink*>(core);
+                if (!ml) {
+                    output_->fatal(CALL_INFO, -1,
+                                   "Phase9 fatal: core%d has a configured memory link (%s) but does not implement ICoreMemoryLink\n",
+                                   i, port.c_str());
+                }
+                ml->setMemoryLink(l);
+            }
             cores_.push_back(core);
         } else {
             cores_.push_back(nullptr);
@@ -1212,16 +1282,111 @@ void MultiCorePE::updateStatistics() {
     uint64_t total_spikes = 0;
     uint64_t total_fired = 0;
     double total_utilization = 0.0;
+    uint64_t stream_mem_verify_fail_delta = 0;
+    uint64_t stream_mem_verify_pass_delta = 0;
+    uint64_t stream_mem_writes_issued_delta = 0;
+    uint64_t stream_mem_reads_issued_delta = 0;
+    uint64_t stream_mem_bytes_written_delta = 0;
+    uint64_t stream_mem_bytes_read_delta = 0;
+    uint64_t stream_pkt_sent_delta = 0;
+    uint64_t stream_pkt_recv_delta = 0;
+    uint64_t stream_pkt_bad_crc_delta = 0;
+    uint64_t stream_pkt_bad_magic_delta = 0;
     
     for (int i = 0; i < num_cores_; i++) {
         total_spikes += unit_states_[i].spikes_processed;
         total_fired += unit_states_[i].neurons_fired;
         total_utilization += unit_states_[i].utilization;
+
+        if (static_cast<size_t>(i) < stream_mem_verify_fail_last_.size()) {
+            const size_t idx = static_cast<size_t>(i);
+            auto delta_of = [](uint64_t cur, uint64_t prev) -> uint64_t {
+                return (cur >= prev) ? (cur - prev) : cur;
+            };
+
+            // stream mem verify
+            {
+                const uint64_t cur = unit_states_[i].stream_mem_verify_fail_total;
+                const uint64_t prev = stream_mem_verify_fail_last_[idx];
+                stream_mem_verify_fail_delta += delta_of(cur, prev);
+                stream_mem_verify_fail_last_[idx] = cur;
+            }
+            {
+                const uint64_t cur = unit_states_[i].stream_mem_verify_pass_total;
+                const uint64_t prev = stream_mem_verify_pass_last_[idx];
+                stream_mem_verify_pass_delta += delta_of(cur, prev);
+                stream_mem_verify_pass_last_[idx] = cur;
+            }
+
+            // stream mem io
+            {
+                const uint64_t cur = unit_states_[i].stream_mem_writes_issued_total;
+                const uint64_t prev = stream_mem_writes_issued_last_[idx];
+                stream_mem_writes_issued_delta += delta_of(cur, prev);
+                stream_mem_writes_issued_last_[idx] = cur;
+            }
+            {
+                const uint64_t cur = unit_states_[i].stream_mem_reads_issued_total;
+                const uint64_t prev = stream_mem_reads_issued_last_[idx];
+                stream_mem_reads_issued_delta += delta_of(cur, prev);
+                stream_mem_reads_issued_last_[idx] = cur;
+            }
+            {
+                const uint64_t cur = unit_states_[i].stream_mem_bytes_written_total;
+                const uint64_t prev = stream_mem_bytes_written_last_[idx];
+                stream_mem_bytes_written_delta += delta_of(cur, prev);
+                stream_mem_bytes_written_last_[idx] = cur;
+            }
+            {
+                const uint64_t cur = unit_states_[i].stream_mem_bytes_read_total;
+                const uint64_t prev = stream_mem_bytes_read_last_[idx];
+                stream_mem_bytes_read_delta += delta_of(cur, prev);
+                stream_mem_bytes_read_last_[idx] = cur;
+            }
+
+            // stream packets
+            {
+                const uint64_t cur = unit_states_[i].stream_pkt_sent_total;
+                const uint64_t prev = stream_pkt_sent_last_[idx];
+                stream_pkt_sent_delta += delta_of(cur, prev);
+                stream_pkt_sent_last_[idx] = cur;
+            }
+            {
+                const uint64_t cur = unit_states_[i].stream_pkt_recv_total;
+                const uint64_t prev = stream_pkt_recv_last_[idx];
+                stream_pkt_recv_delta += delta_of(cur, prev);
+                stream_pkt_recv_last_[idx] = cur;
+            }
+            {
+                const uint64_t cur = unit_states_[i].stream_pkt_bad_crc_total;
+                const uint64_t prev = stream_pkt_bad_crc_last_[idx];
+                stream_pkt_bad_crc_delta += delta_of(cur, prev);
+                stream_pkt_bad_crc_last_[idx] = cur;
+            }
+            {
+                const uint64_t cur = unit_states_[i].stream_pkt_bad_magic_total;
+                const uint64_t prev = stream_pkt_bad_magic_last_[idx];
+                stream_pkt_bad_magic_delta += delta_of(cur, prev);
+                stream_pkt_bad_magic_last_[idx] = cur;
+            }
+        }
     }
     
     // 更新统计信息
+    if (stat_spikes_processed_) stat_spikes_processed_->addData(total_spikes);
     stat_neurons_fired_->addData(total_fired);
     stat_avg_utilization_->addData(total_utilization / num_cores_);
+    // Stream stats: always addData (even 0) so that CSV has stable keys for summary/DoD checks.
+    if (stat_stream_mem_verify_fail_total_) stat_stream_mem_verify_fail_total_->addData(stream_mem_verify_fail_delta);
+    if (stat_stream_mem_verify_pass_total_) stat_stream_mem_verify_pass_total_->addData(stream_mem_verify_pass_delta);
+    if (stat_stream_mem_writes_issued_total_) stat_stream_mem_writes_issued_total_->addData(stream_mem_writes_issued_delta);
+    if (stat_stream_mem_reads_issued_total_) stat_stream_mem_reads_issued_total_->addData(stream_mem_reads_issued_delta);
+    if (stat_stream_mem_bytes_written_total_) stat_stream_mem_bytes_written_total_->addData(stream_mem_bytes_written_delta);
+    if (stat_stream_mem_bytes_read_total_) stat_stream_mem_bytes_read_total_->addData(stream_mem_bytes_read_delta);
+    if (stat_stream_pkt_sent_total_) stat_stream_pkt_sent_total_->addData(stream_pkt_sent_delta);
+    if (stat_stream_pkt_recv_total_) stat_stream_pkt_recv_total_->addData(stream_pkt_recv_delta);
+    if (stat_stream_pkt_bad_crc_total_) stat_stream_pkt_bad_crc_total_->addData(stream_pkt_bad_crc_delta);
+    if (stat_stream_pkt_bad_magic_total_) stat_stream_pkt_bad_magic_total_->addData(stream_pkt_bad_magic_delta);
 
     if (diag_fire_log_ && output_) {
         std::ostringstream oss;
@@ -1454,42 +1619,29 @@ void MultiCorePE::requestMemoryAccess(uint64_t address, size_t size,
         static_cast<uint64_t>(address), size);
 }
 
-void MultiCorePE::deliverSpikeToCore(int core_id, SpikeEvent* spike) {
-    if (core_id < 0 || core_id >= num_cores_ || !spike) {
-        // printf("DEBUG: deliverSpikeToCore失败 - 无效参数：core_id=%d, spike=%p，节点%d\n", core_id, (void*)spike, node_id_);
-        // fflush(stdout);
-        delete spike;
-        return;
-    }
-    
-    // 检查核心是否存在
-    if (cores_[core_id] == nullptr) {
-        // printf("DEBUG: deliverSpikeToCore失败 - 核心%d未配置，节点%d\n", core_id, node_id_);
-        // fflush(stdout);
-        PE_LOG(2, "⚠️ 核心%d未配置，丢弃脉冲\n", core_id);
-        delete spike;
-        return;
-    }
-    
-    // 直接调用SnnPE SubComponent的接口
-    cores_[core_id]->deliverSpike(spike);
-    
-    // 更新两种统计：SST统计对象和本地unit_states_
-    stat_spikes_processed_->addData(1);
-    unit_states_[core_id].spikes_processed++;
-    
-    // printf("DEBUG: deliverSpikeToCore完成 - 统计已更新：SST统计+本地unit_states_[%d]，节点%d\n", core_id, node_id_);
-    // fflush(stdout);
-
-    PE_LOG(4, "📨 向核心%d递送脉冲: 神经元%d\n", 
-                    core_id, spike->getDestinationNeuron());
-}
-
 void MultiCorePE::deliverPacketToEndpoint_(int endpoint_id, NocPacketEvent* pkt) {
     if (!pkt) return;
     if (pkt->packetKind() == NocPacketKind::Spike) {
-        spike_packet_bridge_.deliverPacketToEndpoint(endpoint_id, pkt);
-        return;
+        // Phase8 (strict): 平台层不再对 Spike packet 做任何 SpikeEvent 语义处理。
+        // Spike 的编解码/处理必须由 core/workload 通过 deliverPacket() 完成；
+        // 若 core 不接管，则直接 fail-fast，避免边界回退造成“看似能跑但语义漂移/非确定性”。
+        if (endpoint_id < 0 || endpoint_id >= num_cores_) {
+            output_->fatal(CALL_INFO, -1,
+                           "Phase8(strict): invalid endpoint_id=%d for Spike packet (kind=%u) on node=%d\n",
+                           endpoint_id, static_cast<unsigned>(pkt->kind), node_id_);
+        }
+        if (!cores_[endpoint_id]) {
+            output_->fatal(CALL_INFO, -1,
+                           "Phase8(strict): endpoint(core)=%d not configured for Spike packet (kind=%u) on node=%d\n",
+                           endpoint_id, static_cast<unsigned>(pkt->kind), node_id_);
+        }
+        const bool taken = cores_[endpoint_id]->deliverPacket(pkt);
+        if (!taken) {
+            output_->fatal(CALL_INFO, -1,
+                           "Phase8(strict): core=%d refused Spike packet (kind=%u); legacy deliverSpike fallback is disabled\n",
+                           endpoint_id, static_cast<unsigned>(pkt->kind));
+        }
+        return; // packet owned by core
     }
 
     if (endpoint_id < 0 || endpoint_id >= num_cores_) {
@@ -1516,7 +1668,11 @@ void MultiCorePE::deliverPacketToEndpoint_(int endpoint_id, NocPacketEvent* pkt)
 void MultiCorePE::resetAllCoreMembranes() {
     for (auto* core : cores_) {
         if (!core) continue;
-        core->resetMembraneState(v_rest_);
+        // Legacy-only hook: resetMembraneState is not part of CoreShellAPI.
+        // It is used only by StepActivationSubsystem's optional reset_mem_each_step behavior.
+        if (auto* snn = dynamic_cast<SnnCoreAPI*>(core)) {
+            snn->resetMembraneState(v_rest_);
+        }
     }
 }
 

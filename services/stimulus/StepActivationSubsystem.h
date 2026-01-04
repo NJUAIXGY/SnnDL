@@ -77,10 +77,6 @@ public:
 
         // NoC 抽象接口（Phase4-A1.3）：优先使用该接口进行注入/外发
         INocTransport* noc = nullptr;
-
-        // 注入回调（由 MultiCorePE 提供，保持“直达目标 core / 外部 NIC”语义不变）
-        std::function<void(int /*core_id*/, SpikeEvent*)> deliver_to_core;
-        std::function<void(SpikeEvent*)> send_external;
         std::function<void()> reset_membranes;
     };
 

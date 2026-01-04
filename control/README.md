@@ -1,41 +1,51 @@
-# control/（控制/编排层：通用 Core 壳）
+# control/（CoreShell：通用子核壳）
 
-本目录存放 **SnnPESubComponent 及其拆分后的控制面实现**。它的定位是“通用控制壳（control plane）”，面向可替换的 compute core 提供统一的时序、内存与路由编排能力。
+本目录存放 **SnnPESubComponent（CoreShell）** 及其内部实现。CoreShell 的定位是：**每个 PE 内的“通用控制壳”**，只负责把 SST 的时钟/packet/统计汇聚接到可插拔 workload 上；任何业务语义（SNN/Step/GAS/BCSR 或非 SNN stream）都应落在 `services/workload/*` 中。
 
-## 职责
+> 目标：让 CoreShell/NoC/Memory 能复用为“通用仿真核”，workload 可替换而不影响平台面。
 
-- SST 生命周期对接：`init/setup/finish`、clock 驱动。
-- GAS（Gather/Apply/Scatter）窗口状态机与窗口边界事件上报。
-- 内存事务编排（通过 `api/IMemoryAccess` 与 `services/memory/StandardMemAccess`）、缓存命中统计、请求合并策略等控制面逻辑。
-- 路由与 fanout：从 compute core 拉取发放事件，交由 `services/synapse/route/SpikeCommSubsystem` 完成 fanout/封包/发送（控制层不持有路由表/缓存）。
-- 统计汇总：对上层（MultiCorePE）汇报窗口/内存/发放等统计。
+---
 
-> 重要：本层 **不应包含具体 SNN 动力学**（膜电位、不应期、阈值判定等），这些应全部由 `compute/` 中的 `ISnnComputeCore` 实现。
+## 职责（CoreShell 只做平台面）
 
-## 主要内容
+- SST 子组件生命周期对接：`init/setup/finish`、clock 驱动。
+- **执行分发**：每拍调用 `workload_->onClockTick(now_cycle)`。
+- **packet 递送**：接收来自 NoC 的 `events/NocPacketEvent` 并转交 `workload_->deliverPacket(pkt)`（packet-first）。
+- **最小运行时装配**：为 workload 注入通用 runtime 句柄（日志/节点标识/必要的 sink 回调）。
+- **统计汇聚**：把 workload 的统计 map 汇总到上层（MultiCorePE）用于写出 `mesh_stats.csv`。
+
+---
+
+## 不做什么（边界冻结）
+
+- 不持有/实现 SNN 业务状态机（GAS window 阶段机、edge/weights 编排、fanout/route 选择、Spike 语义等）。
+- `control/*.h/*.cc` **不出现** `StandardMem::`（包括 include `stdMem.h`）。StandardMem glue 必须隔离在 `services/synapse/stdmem/`。
+- 不直接依赖 NoC/Mem 的具体实现细节：通过 `api/*` 的窄接口交互。
+
+---
+
+## 主要文件与职责
 
 - `SnnPESubComponent.{h,cc}`
-  - 子核心控制壳本体：持有 `std::unique_ptr<ISnnComputeCore>`，并通过接口喂入输入/时间、拉取输出事件。
-  - `compute_core_impl` 参数控制 core 选择（默认 `default`）。
+  - CoreShell 本体：解析最小通用参数（`node_id/core_id/workload_impl/verbose` 等），创建并持有 `std::unique_ptr<ICoreWorkload>`。
+  - 入口收敛：`clockTick()` 与 `deliverPacket()`。
 - `SnnPESubComponent_impl.h`（internal）
-  - Phase5 边界硬化用的 PImpl 内部状态：阶段事件（Begin*/EndScatter）、统计汇报、`gas_ctrl_` 等重实现对象统一收进 `Impl`。
-  - 仅允许被 `.cc` include；禁止在对外头文件传播该依赖。
-- 拆分实现文件（按功能拆分，便于继续瘦身）：
-  - `SnnPESubComponent_spike.cc`：输入侧 spike 递送与本地处理路径。
-  - `services/synapse/stdmem/SnnPESubComponent_mem.cc`：StandardMem glue（与 `StdMemEndpoint`/`StandardMemAccess` 对接）。为满足“control/ 不出现 StandardMem::”约束，该文件刻意迁出 `control/`。
-  - `SnnPESubComponent_bcsr.cc`：BCSR 相关控制面与诊断（不含动力学）。
-  - `SnnPESubComponent_routing.cc`：历史路由实现封存（已迁入 `services/synapse/route/SpikeCommSubsystem`）；当前仅保留模板解析与门控转发入口。
-  - `SnnPESubComponent_scheme1.cc`：scheme1（slice 顺序执行）控制路径。
-- `SnnPEApplyScatter.cc`：窗口累加器 Apply/Scatter 的控制面执行与输出收敛点。
-- `SnnPEOrchestrators.cc`：控制层小型 orchestrator/辅助结构（含窗口读发起编排：`issueFromEdges_/issueFromSets_/issueFallbackReadsIfNeeded_`）；同时承载 `Impl::report*` 统计汇报实现（Phase5.4）。
+  - PImpl 内部状态：统计、reporter、以及对 workload 的 runtime 绑定等“与接口隔离相关”的实现细节。
+  - 仅允许被 `.cc` include；禁止在对外头文件传播依赖。
+- （隔离文件）`services/synapse/stdmem/SnnPESubComponent_mem.cc`
+  - StandardMem glue 实现文件（刻意不放在 `control/`）。
 
-## 依赖边界（建议）
+---
 
-- 允许依赖：`api/`、`events/`、`services/`、`compute/`。
-- 避免：在控制层新增任何“神经元状态存储/扫描发放”等逻辑；新增 compute 范式时应通过 `ISnnComputeCore` 扩展或替换实现。
+## 与 workload 的关系（推荐理解方式）
 
-## 扩展指南（引入新 compute core）
+- CoreShell（本目录）：**平台面**（time/packet/stat）。
+- `services/workload/snn`：SNN 业务主链路（输入队列/weights/route/comm/GAS window），并在内部调用 `services/synapse/*`、`services/stimulus/*`。
+- `services/workload/stream`：纯通信/纯内存 streaming（read-after-write verify），不依赖 synapse/stimulus/SpikeEvent。
 
-1. 在 `compute/` 实现新的 `ISnnComputeCore`；
-2. 在 `compute/createComputeCoreByName()` 注册名称；
-3. 在脚本中为 `SnnPESubComponent` 设置 `compute_core_impl=<name>`。
+---
+
+## 扩展指南（新增 workload / compute core）
+
+- 新增 workload：在 `services/workload/` 增加实现并注册到 `api/CoreWorkloadFactory.h`，通过 `workload_impl=<name>`（或环境变量 `SNNDL_WORKLOAD_IMPL`）选择。
+- 新增 compute core（SNN 内多模型/多范式）：在 `compute/` 实现新的 `ISnnComputeCore`，并由 `workload=snn` 在其内部按参数选择与装配。

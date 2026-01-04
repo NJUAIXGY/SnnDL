@@ -131,17 +131,24 @@ void StdMemEndpoint::handleResponseOpaque(void* req) {
         return;
     }
 
-    // Fail-fast for untracked ReadResp (preserve previous control behavior).
-    if (dynamic_cast<SST::Interfaces::StandardMem::ReadResp*>(stdmem_req)) {
+    // Untracked ReadResp indicates a broken demux/ownership boundary:
+    // a Read was issued on this endpoint without being tracked by StandardMemAccess (IMemoryAccess layer),
+    // which will lead to silent data loss and non-determinism. Fail-fast.
+    if (auto* rr = dynamic_cast<SST::Interfaces::StandardMem::ReadResp*>(stdmem_req)) {
+        const uint64_t rid = static_cast<uint64_t>(rr->getID()) + 1;
+        const size_t pending = (mem_access_ ? mem_access_->pendingSize() : 0);
         if (rt_.log) {
             rt_.log->fatal(CALL_INFO, -1,
-                           "[stdmem-untracked] node=%u core=%u type=ReadResp id=%" PRIu64 "\n",
+                           "[stdmem-untracked] node=%u core=%u type=ReadResp id=%" PRIu64 " addr=0x%llx bytes=%zu pending=%zu\n",
                            static_cast<uint32_t>(rt_.node_id),
                            static_cast<uint32_t>(rt_.core_id),
-                           static_cast<uint64_t>(stdmem_req->getID()));
+                           (uint64_t)rid,
+                           (unsigned long long)rr->pAddr,
+                           (size_t)rr->size,
+                           pending);
         }
-        delete stdmem_req;
-        return;
+        // If no logger, still fail-fast.
+        abort();
     }
 
     delete stdmem_req;
