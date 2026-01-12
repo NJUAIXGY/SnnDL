@@ -9,6 +9,7 @@
 #include <sst/core/serialization/serialize.h>
 #include <sstream>
 #include <fstream>
+#include <cinttypes>
 #include <limits>
 #include <cmath>
 
@@ -91,23 +92,19 @@ SnnNIC::SnnNIC(ComponentId_t id, Params& params)
     }
     
     // 新增：虚拟通道与批处理参数（默认保持兼容）
-    // 将默认虚拟通道数改为1以与常见路由配置对齐，避免VN不一致导致的崩溃
-    virtual_channels_ = params.find<uint32_t>("virtual_channels", 1);
+    // Merlin hr_router 默认 num_vns=2：在高并发 spike 流量下，强制单VN容易导致 credit/backpressure 不收敛。
+    // 因此这里允许脚本显式配置 VN 数；若不配置则默认 2。
+    virtual_channels_ = params.find<uint32_t>("virtual_channels", 2);
     network_num_vns_ = params.find<uint32_t>("network_num_vns", 0);
     auto_vn_fallback_ = params.find<bool>("auto_vn_fallback", true);
     effective_num_vns_ = (network_num_vns_ > 0) ? std::min(virtual_channels_, network_num_vns_) : virtual_channels_;
+    if (effective_num_vns_ == 0) effective_num_vns_ = 1;
     NIC_LOG(2, "VN配置: virtual_channels=%u, network_num_vns=%u, effective_num_vns=%u\n",
                  virtual_channels_, network_num_vns_, effective_num_vns_);
     vn_spike_data_ = params.find<uint32_t>("vn_spike_data", 0);
     vn_batch_data_ = params.find<uint32_t>("vn_batch_data", 1);
-    // 强制单VN运行，移除VN相关不稳定因素
-    virtual_channels_ = 1;
-    network_num_vns_ = 1;
-    auto_vn_fallback_ = false;
-    effective_num_vns_ = 1;
-    vn_spike_data_ = 0;
-    vn_batch_data_ = 0;
-    NIC_LOG(2, "VN配置: 已强制单VN (vn=0)\n");
+    if (vn_spike_data_ >= effective_num_vns_) vn_spike_data_ = 0;
+    if (vn_batch_data_ >= effective_num_vns_) vn_batch_data_ = 0;
     enable_batching_ = params.find<bool>("enable_batching", false);
     flush_on_credit_ = params.find<bool>("flush_on_credit", true);
     probe_vn_on_setup_ = params.find<bool>("probe_vn_on_setup", false);
@@ -117,6 +114,7 @@ SnnNIC::SnnNIC(ComponentId_t id, Params& params)
     total_nodes_ = params.find<uint32_t>("total_nodes", 16);
     // 控制VN（用于门控等控制事件）
     vn_control_ = params.find<uint32_t>("vn_control", 1);
+    if (vn_control_ >= effective_num_vns_) vn_control_ = 0;
 
     // 跨Rank代理聚合参数（默认关闭）
     enable_inter_rank_batching_ = params.find<bool>("enable_inter_rank_batching", false);
@@ -348,73 +346,89 @@ std::string SnnNIC::getNetworkStatus() const
     return ss.str();
 }
 
+size_t SnnNIC::pendingSendCount() const
+{
+    // 只统计 NIC 内部排队的“尚未进入网络”的事件：
+    // - pending_sends_: 由于 backpressure 导致的待发送队列
+    // - batch_buckets_: 批处理尚未 flush 的包
+    size_t total = pending_sends_.size();
+    for (const auto& kv : batch_buckets_) {
+        total += kv.second.size();
+    }
+    return total;
+}
+
 bool SnnNIC::handleIncoming(int vn)
 {
     if (!network) return true;
-    SimpleNetwork::Request* req = network->recv(vn);
-    if (!req) return true;
+    // 注意：SimpleNetwork 的 receive 通知仅表示“有数据可读”，必须 drain 到 recv()==nullptr，
+    // 否则会导致对端信用/缓冲无法回收，进而让发送侧永久 spaceToSend=false（并卡住全局 drain-barrier）。
+    while (true) {
+        SimpleNetwork::Request* req = network->recv(vn);
+        if (!req) break;
 
-    packets_received_count++;
-    if (stat_packets_received) stat_packets_received->addData(1);
+        packets_received_count++;
+        if (stat_packets_received) stat_packets_received->addData(1);
 
-    const uint32_t src_node = static_cast<uint32_t>(req->src);
-    const uint32_t dst_node = static_cast<uint32_t>(req->dest);
+        const uint32_t src_node = static_cast<uint32_t>(req->src);
+        const uint32_t dst_node = static_cast<uint32_t>(req->dest);
 
-    SST::Event* ev = req->takePayload(); // 接管 payload 生命周期
-    delete req;
-    if (!ev) return true;
+        SST::Event* ev = req->takePayload(); // 接管 payload 生命周期
+        delete req;
+        if (!ev) continue;
 
-    auto deliverPacket = [&](NocPacketEvent* pkt) {
-        if (!pkt) return;
-        // 容错：若发送端未填 node 字段，按 Request 头补齐（不会覆盖非0值）
-        if (pkt->src_node == 0 && src_node != 0) pkt->src_node = src_node;
-        if (pkt->dst_node == 0 && dst_node != 0) pkt->dst_node = dst_node;
+        auto deliverPacket = [&](NocPacketEvent* pkt) {
+            if (!pkt) return;
+            // 容错：若发送端未填 node 字段，按 Request 头补齐（不会覆盖非0值）
+            if (pkt->src_node == 0 && src_node != 0) pkt->src_node = src_node;
+            if (pkt->dst_node == 0 && dst_node != 0) pkt->dst_node = dst_node;
 
-        if (pkt->packetKind() == NocPacketKind::Spike) {
-            spikes_received_count++;
-            if (stat_spikes_received) stat_spikes_received->addData(1);
-            if (stat_msg_latency_ns) {
-                const uint64_t now_ns = getCurrentSimTimeNano();
-                if (now_ns >= pkt->timestamp) stat_msg_latency_ns->addData(now_ns - pkt->timestamp);
+            if (pkt->packetKind() == NocPacketKind::Spike) {
+                spikes_received_count++;
+                if (stat_spikes_received) stat_spikes_received->addData(1);
+                if (stat_msg_latency_ns) {
+                    const uint64_t now_ns = getCurrentSimTimeNano();
+                    if (now_ns >= pkt->timestamp) stat_msg_latency_ns->addData(now_ns - pkt->timestamp);
+                }
             }
+
+            if (receive_handler_) {
+                receive_handler_(pkt); // handler 接管生命周期
+            } else {
+                delete pkt;
+            }
+        };
+
+        // 批量包：在 NIC 内展开为单条 NocPacketEvent，保持上层逻辑不变
+        if (auto* batch = dynamic_cast<NocPacketBatchEvent*>(ev)) {
+            for (auto& p : batch->packets) {
+                auto* pkt = new NocPacketEvent();
+                pkt->src_node = batch->src_node;
+                pkt->dst_node = batch->dst_node;
+                pkt->src_endpoint = p.src_endpoint;
+                pkt->dst_endpoint = p.dst_endpoint;
+                pkt->kind = p.kind;
+                pkt->hop_count = p.hop_count;
+                pkt->timestamp = p.timestamp;
+                pkt->payload = std::move(p.payload);
+                deliverPacket(pkt);
+            }
+            delete batch;
+            continue;
         }
 
-        if (receive_handler_) {
-            receive_handler_(pkt); // handler 接管生命周期
-        } else {
-            delete pkt;
-        }
-    };
-
-    // 批量包：在 NIC 内展开为单条 NocPacketEvent，保持上层逻辑不变
-    if (auto* batch = dynamic_cast<NocPacketBatchEvent*>(ev)) {
-        for (auto& p : batch->packets) {
-            auto* pkt = new NocPacketEvent();
-            pkt->src_node = batch->src_node;
-            pkt->dst_node = batch->dst_node;
-            pkt->src_endpoint = p.src_endpoint;
-            pkt->dst_endpoint = p.dst_endpoint;
-            pkt->kind = p.kind;
-            pkt->hop_count = p.hop_count;
-            pkt->timestamp = p.timestamp;
-            pkt->payload = std::move(p.payload);
+        // 普通包
+        if (auto* pkt = dynamic_cast<NocPacketEvent*>(ev)) {
             deliverPacket(pkt);
+            continue;
         }
-        delete batch;
-        return true;
-    }
 
-    // 普通包
-    if (auto* pkt = dynamic_cast<NocPacketEvent*>(ev)) {
-        deliverPacket(pkt);
-        return true;
-    }
-
-    // 非 NoC 包事件：直接透传给 handler
-    if (receive_handler_) {
-        receive_handler_(ev);
-    } else {
-        delete ev;
+        // 非 NoC 包事件：直接透传给 handler
+        if (receive_handler_) {
+            receive_handler_(ev);
+        } else {
+            delete ev;
+        }
     }
     return true;
 }
@@ -475,10 +489,10 @@ void SnnNIC::init(unsigned int phase)
     if (!use_direct_link && network) {
         network->init(phase);
     }
-    // 可选：注册周期性tick用于批处理窗口刷新
-    if (phase == 0 && (enable_batching_ || enable_inter_rank_batching_)) {
-        // 轻量tick；网络未就绪时仅返回false不做事
-        registerClock("1GHz", new Clock::Handler<SnnNIC>(this, &SnnNIC::flushClockTick));
+    // 周期性轻量刷新：确保 pending_sends_ 在某些 spaceAvailable 回调不触发的组合下仍能被推进，
+    // 避免 Global step drain-based barrier 被 NIC 背压队列永久卡住。
+    if (phase == 0) {
+        registerClock("10ns", new Clock::Handler2<SnnNIC, &SnnNIC::flushClockTick>(this));
     }
     if (phase >= 1) init_done_ = true;
     if (output && sentinel_enabled_) {
@@ -513,7 +527,9 @@ bool SnnNIC::flushClockTick(SST::Cycle_t /*currentCycle*/)
     if (enable_batching_) {
         flushAllBatches_();
     }
-    return false; // 不要求持续tick
+    // 同时刷新 pending_sends_（避免背压队列依赖 spaceAvailable 回调）
+    flushPendingSends_();
+    return false; // 返回 false 表示保持 handler 继续挂在时钟上
 }
 
 uint32_t SnnNIC::computeDestNode(uint32_t /*dest_neuron*/) const
@@ -580,12 +596,50 @@ void SnnNIC::flushPendingSends_()
 
         auto* req = createNetworkRequest_(ps.dest_node, ps.payload, vn_use, bits);
         bool sent = false;
-        if (network->spaceToSend(req->vn, req->size_in_bits)) {
+        const bool space_ok = network->spaceToSend(req->vn, req->size_in_bits);
+        if (space_ok) {
             sent = network->send(req, req->vn);
         }
         if (!sent) {
             ps.payload = req->takePayload();
             delete req;
+            if (sentinel_enabled_ && output &&
+                (pending_send_stall_log_count_ < 32 || pending_sends_.size() <= 16)) {
+                const uint32_t dst = ps.dest_node;
+                const uint64_t total_bytes_u64 = static_cast<uint64_t>((bits + 7) / 8);
+                const int isInit = network ? (int)network->isNetworkInitialized() : 0;
+
+                const char* etype = "Event";
+                uint32_t pkt_kind_u = 0;
+                uint64_t payload_bytes_u64 = 0;
+                if (auto* pkt = dynamic_cast<NocPacketEvent*>(ps.payload)) {
+                    etype = "NocPacketEvent";
+                    pkt_kind_u = static_cast<uint32_t>(pkt->kind);
+                    payload_bytes_u64 = static_cast<uint64_t>(pkt->payload.size());
+                } else if (auto* batch = dynamic_cast<NocPacketBatchEvent*>(ps.payload)) {
+                    etype = "NocPacketBatchEvent";
+                    pkt_kind_u = static_cast<uint32_t>(batch->packets.empty() ? 0 : batch->packets[0].kind);
+                    payload_bytes_u64 = static_cast<uint64_t>(batch->packets.size());
+                }
+
+                output->output(
+                    "[[sentinel-nic-stall]] node=%u dst=%u vn=%d bits=%d bytes=%" PRIu64 " out_buf=%s pending=%zu ready=%d isInit=%d link_ready=%d space=%d type=%s kind=%u payload=%" PRIu64 "\n",
+                    node_id,
+                    dst,
+                    vn_use,
+                    bits,
+                    (uint64_t)total_bytes_u64,
+                    output_buf_size.c_str(),
+                    pending_sends_.size(),
+                    (int)network_ready_,
+                    isInit,
+                    (int)link_ready_,
+                    (int)space_ok,
+                    etype,
+                    pkt_kind_u,
+                    (uint64_t)payload_bytes_u64);
+                pending_send_stall_log_count_ += 1;
+            }
             break;
         }
 

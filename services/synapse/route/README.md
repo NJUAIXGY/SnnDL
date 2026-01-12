@@ -18,6 +18,10 @@
 - **输出**：
   - `routesShared()`：共享只读路由表；
   - `routesLocalFallback()`：本地 fallback（无共享或构建失败时保守使用）。
+ - **Native multicast（SpikeKey）相关**：
+   - 负责在构建期将“目的集合”聚合为 block 级 target：`BlockTarget{block_id, ingress_node, core_mask[cell]}`；
+   - `ingress_node` 由 `multicast_ingress_policy` 决定（构建期策略点），并与运行期 router 的 inter/intra 策略解耦；
+   - 对外提供 `computeMulticastTargets(...)`，供 `SpikeCommSubsystem` 选择 SpikeKey 发射路径。
 
 ### `SnnRouteProvider.{h,cc}`
 - **定位**：fanout provider（扇出列表生成器）。
@@ -33,6 +37,10 @@
   - `applyGatingDecision()`：将 gating 决策转发给 Synapse/Route 子系统（缓存并生效）。
 - **说明**：
   - `SpikeCommSubsystem` 通过 `api/ISpikeTransport` 发出事件；常见情况下该 transport 是 `services/synapse/route/SpikePacketTransport`（把 SpikeEvent 编码为 packet 并映射为 `INocTransport::sendFromCore`）。
+  - 当 `multicast_enable=1` 且 Synapse/Route 已构建 multicast targets 时，`SpikeCommSubsystem` 会优先走 **SpikeKey native multicast**：
+    - 通过 `computeMulticastTargets(...)` 得到 per-block 目标集合；
+    - 为每个目标 block 构造 `NocPacketEvent(kind=SpikeKey)`，payload 使用 `SpikeNocCodec::WireSpikeKeyV2`（固定大小，带 `block_w_h` 与 `core_mask[64]`）；
+    - 通过 `INocTransport::sendFromCore(...)` 将包注入网络，由 router 完成两阶段路由与块内投递。
 
 ### `SpikePacketBridge.{h,cc}`
 - **定位**：SpikeEvent ↔ NoC packet 的编解码与投递 glue（Phase3-C）。
@@ -50,6 +58,29 @@
 3) `SpikeCommSubsystem` 调用 `ISynapseRoute::computeFanout()` 得到目的集合；
 4) `SpikeCommSubsystem` 构造 `events/SpikeEvent` 并调用 `ISpikeTransport::send(...)`；
 5) `ISpikeTransport` 的具体实现（通常由 NoC 域承载）完成实际发送与本地投递。
+
+---
+
+## Native Multicast（SpikeKey / blocked multicast）要点
+
+### 语义与数据载体
+- **语义**：块间单播到 ingress + 块内多播（按 core mask 精确投递）。
+- **载体**：`events/NocPacketEvent(kind=SpikeKey)`，payload 由 `SpikeNocCodec` 编解码：
+  - 兼容解码：V1/V2；
+  - 推荐发射：V2（固定 `core_mask[64]`，由 `block_w_h` 指定实际使用的 cells 数）。
+
+### 配置参数（来自 `SynapseRouteBuildConfig`）
+- `multicast_enable`：开关（默认 off，保持兼容）
+- `multicast_block_w/multicast_block_h`：block 尺寸（要求 mesh 可整除；且 `block_w*block_h<=64`）
+- `multicast_ingress_policy`：构建期选择 ingress（`top_left/top_right/bottom_left/bottom_right/hash4`）
+- `multicast_inter_policy`：运行期块间单播走法（router 参数，当前支持 `xy/yx/hash_xy`）
+- `multicast_intra_policy`：运行期块内树（router 参数，当前支持 `manhattan_x_first/manhattan_y_first`）
+
+### 统计与正确性自检（实验口径）
+- `TrafficWorkload` 在实验中提供：
+  - per-packet mask 自检（`sk_bad_*` 计数）
+  - group-level 覆盖自检（`[traffic][sk-group] ... missing/dup/extra/meta_mismatch`）
+  用于验证“确实发生了多播且投递集合正确”。
 
 ---
 

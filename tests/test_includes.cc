@@ -22,6 +22,7 @@
 
 // 事件类型（上层语义可能存在，但应当可被独立包含）
 #include "events/SpikeEvent.h"
+#include "events/NocPacketEvent.h"
 
 // 子系统 public 头（应当通过 API 交互）
 #include "services/synapse/stdmem/StdMemEndpoint.h"
@@ -30,9 +31,15 @@
 #include "services/synapse/route/SynapseRouteSubsystem.h"
 #include "services/noc/NocSubsystem.h"
 #include "services/stimulus/StepActivationSubsystem.h"
+// Phase: native multicast lab (traffic-only workload)
+#include "services/workload/traffic/TrafficWorkload.h"
 
 int main(int argc, char** argv) {
     (void)argc;
     (void)argv;
+
+    // compile-only reference for new kinds/helpers
+    (void)SST::SnnDL::NocPacketKind::SpikeKey;
+
     return 0;
 }

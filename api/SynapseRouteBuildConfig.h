@@ -11,6 +11,8 @@
 #include <cstdint>
 #include <string>
 
+#include "MulticastLimits.h"
+
 namespace SST { namespace SnnDL {
 
 struct SynapseRouteBuildConfig {
@@ -18,6 +20,17 @@ struct SynapseRouteBuildConfig {
     bool log_weight_details = false;
     bool verify_routing_weights = false;
     bool route_summary_enable = false;
+
+    // Native multicast (blocked multicast; block size configurable; ingress selectable)
+    bool multicast_enable = false;
+    uint32_t multicast_block_w = 2;
+    uint32_t multicast_block_h = 2;
+    std::string multicast_ingress_policy = "top_left";
+    // Orthogonal policy points (string-based for backward compatibility & easy extension):
+    // - inter: how INTER-stage unicast is routed across mesh (router-level)
+    // - intra: how INTRA-stage blocked multicast expands within a block (router-level)
+    std::string multicast_inter_policy = "xy";
+    std::string multicast_intra_policy = "manhattan_x_first";
 
     // Route inputs (keep consistent with legacy cache key semantics).
     uint32_t rows = 0;            // per-core rows (num_neurons)
@@ -59,4 +72,3 @@ struct SynapseRouteBuildConfig {
 using SpikeCommRoutingConfig = SynapseRouteBuildConfig;
 
 }} // namespace SST::SnnDL
-

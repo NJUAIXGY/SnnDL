@@ -339,6 +339,12 @@ private:
     bool apply_pending_emit_ = false;
     std::vector<SST::Interfaces::StandardMem::Read*> queued_non_gather_reads_; // 非Gather阶段缓存的上游读
 
+    // Step-gate explicit end handshake (Phase-X):
+    // In window_auto=1 && step_gate_enable=1, Gather/Scatter should be ended by upstream workload,
+    // not by fixed window_cycles_* caps. We latch EndScatter requests and let clockTick advance.
+    bool end_scatter_req_pending_ = false;
+    uint32_t end_scatter_req_seq_ = 0;
+
     // Utilities for LRU（带buf选择）
     void touchLRU_(int buf, uint64_t key);
     void ensureCapacity_(int buf, uint64_t need);

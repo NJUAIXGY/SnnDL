@@ -148,12 +148,50 @@ void StepActivationSubsystem::onBeginGather(uint32_t seq, uint64_t ts_ns, int co
             pending_step_ts_ns_ = ts_ns;
         }
     } else {
+        // 多核/全局 step 同步场景下，同一个 seq 可能会重复触发 BeginGather（属于正常现象，静默忽略）。
+        // 仅对回退 seq（seq < last）做告警。
+        if (seq < last_injection_seq_) {
+            if (rt_.log && seq_warn_count_ < 16) {
+                STEP_LOG(1, "[step-warn] non-monotonic BeginGather ignored: node=%d core=%d seq=%u last=%u\n",
+                         rt_.node_id, core_id, seq, last_injection_seq_);
+                ++seq_warn_count_;
+            }
+        }
+    }
+}
+
+void StepActivationSubsystem::onGlobalStepStart(uint32_t seq, uint64_t ts_ns) {
+    if (!cfg_.enable) return;
+    if (cfg_.period_cycles != 0) return;
+
+    const bool first_inject = (last_injection_seq_ == std::numeric_limits<uint32_t>::max());
+    if (first_inject || seq > last_injection_seq_) {
+        if (injection_ready_) {
+            injectStepActivations_(seq, ts_ns);
+            last_injection_seq_ = seq;
+        } else {
+            pending_step_inject_ = true;
+            pending_step_seq_ = seq;
+            pending_step_ts_ns_ = ts_ns;
+        }
+        return;
+    }
+
+    // 重复 seq 属于正常（例如 PE 侧重复收到 START_STEP），静默忽略；仅对回退 seq 报警。
+    if (seq < last_injection_seq_) {
         if (rt_.log && seq_warn_count_ < 16) {
-            STEP_LOG(1, "[step-warn] non-monotonic BeginGather ignored: node=%d core=%d seq=%u last=%u\n",
-                     rt_.node_id, core_id, seq, last_injection_seq_);
+            STEP_LOG(1, "[step-warn] non-monotonic GlobalStepStart ignored: node=%d seq=%u last=%u\n",
+                     rt_.node_id, seq, last_injection_seq_);
             ++seq_warn_count_;
         }
     }
+}
+
+bool StepActivationSubsystem::injectedForSeq(uint32_t seq) const {
+    if (!cfg_.enable) return true;
+    const uint32_t kInvalid = std::numeric_limits<uint32_t>::max();
+    if (last_injection_seq_ == kInvalid) return false;
+    return last_injection_seq_ >= seq;
 }
 
 void StepActivationSubsystem::onEndScatter(uint32_t seq) {

@@ -19,10 +19,14 @@
 namespace SST { namespace SnnDL {
 
 class SpikeEvent;
+class INocTransport;
 
 struct SpikeCommRuntimeConfig {
     Output* log = nullptr;
     ISpikeTransport* transport = nullptr;
+    INocTransport* noc = nullptr;  // optional (native multicast path uses packet injection)
+    int src_core = 0;
+    uint32_t node_id = 0;
     ISynapseRoute* synapse_route = nullptr;
     uint64_t global_neuron_base = 0;
 };
@@ -56,7 +60,11 @@ private:
 
     Output* log_ = nullptr;
     ISpikeTransport* transport_ = nullptr;     // 非拥有；由外部管理生命周期
+    INocTransport* noc_ = nullptr;            // 非拥有；由外部管理生命周期
+    int src_core_ = 0;
+    uint32_t node_id_ = 0;
     uint64_t global_neuron_base_ = 0;
+    uint64_t emit_seq_ = 0; // monotonic per run; used to ensure group_id uniqueness under high-rate injection
 
     bool route_provider_ready_ = false;
     ISynapseRoute* synapse_route_ = nullptr;  // 非拥有；由控制层装配并保证生命周期

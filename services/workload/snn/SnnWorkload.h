@@ -12,6 +12,7 @@
 #include <memory>
 #include <queue>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "IGasStageSink.h"
@@ -127,6 +128,15 @@ private:
     uint64_t last_scatter_spikes_emitted_ = 0;
     uint64_t total_scatter_spikes_emitted_ = 0;
 
+    // Step-gate mode: end Gather/Scatter explicitly (load-driven), instead of fixed window_cycles_*.
+    uint32_t gather_seq_ = 0;
+    uint64_t gather_begin_cycle_ = 0;
+    uint64_t gather_last_activity_cycle_ = 0;
+    uint32_t gather_quiesce_cycles_ = 32; // end-gather after N quiet cycles since last spike/edge activity
+    uint32_t gather_min_cycles_ = 1;      // avoid ending gather in the same cycle as BeginGather
+    bool gather_end_requested_ = false;
+    bool scatter_end_requested_ = false;
+
     // WeightLoader barrier (shared signal)
     std::string loader_done_key_;
     bool wait_for_loader_done_ = false;
@@ -143,6 +153,11 @@ private:
     std::unique_ptr<SpikeCommSubsystem> spike_comm_;
     std::unique_ptr<NocSpikeTransport> noc_spike_transport_;
     bool spike_comm_configured_ = false;
+
+    // Native multicast receive-side expansion cache: pre_global -> posts_local (for this core only).
+    // Cached against the current shared routes table pointer to avoid stale reuse across reconfigure.
+    std::shared_ptr<const std::unordered_map<uint32_t, std::vector<uint32_t>>> routes_shared_for_posts_cache_;
+    std::unordered_map<uint32_t, std::vector<uint32_t>> pre_to_posts_local_;
 };
 
 }} // namespace SST::SnnDL

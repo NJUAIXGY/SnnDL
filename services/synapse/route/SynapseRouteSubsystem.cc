@@ -28,6 +28,9 @@ namespace SST { namespace SnnDL {
 std::mutex SynapseRouteSubsystem::s_route_cache_mtx_;
 std::unordered_map<std::string, std::weak_ptr<const SynapseRouteSubsystem::RouteMap>> SynapseRouteSubsystem::s_route_cache_;
 
+std::mutex SynapseRouteSubsystem::s_multicast_cache_mtx_;
+std::unordered_map<std::string, std::weak_ptr<const SynapseRouteSubsystem::MulticastTargetMap>> SynapseRouteSubsystem::s_multicast_cache_;
+
 namespace {
 
 uint32_t layerIdFromPe_(uint32_t pe) {
@@ -36,6 +39,77 @@ uint32_t layerIdFromPe_(uint32_t pe) {
     if (pe <= 7) return 1;
     if (pe <= 11) return 2;
     return 3;
+}
+
+enum class IngressPolicy : uint8_t {
+    TopLeft = 0,
+    TopRight = 1,
+    BottomLeft = 2,
+    BottomRight = 3,
+    Hash4 = 4,
+};
+
+bool parseIngressPolicy_(const std::string& s, IngressPolicy& out) {
+    if (s == "top_left") { out = IngressPolicy::TopLeft; return true; }
+    if (s == "top_right") { out = IngressPolicy::TopRight; return true; }
+    if (s == "bottom_left") { out = IngressPolicy::BottomLeft; return true; }
+    if (s == "bottom_right") { out = IngressPolicy::BottomRight; return true; }
+    if (s == "hash4") { out = IngressPolicy::Hash4; return true; }
+    return false;
+}
+
+inline uint32_t selectIngressNodeBlocked_(IngressPolicy policy,
+                                         uint32_t pre_global,
+                                         uint32_t block_id,
+                                         uint32_t block_x0,
+                                         uint32_t block_y0,
+                                         uint32_t block_w,
+                                         uint32_t block_h,
+                                         uint32_t mesh_w) {
+    if (block_w == 0 || block_h == 0) return block_y0 * mesh_w + block_x0;
+    uint32_t lx = 0;
+    uint32_t ly = 0;
+    switch (policy) {
+    case IngressPolicy::TopLeft:
+        lx = 0; ly = 0;
+        break;
+    case IngressPolicy::TopRight:
+        lx = block_w - 1; ly = 0;
+        break;
+    case IngressPolicy::BottomLeft:
+        lx = 0; ly = block_h - 1;
+        break;
+    case IngressPolicy::BottomRight:
+        lx = block_w - 1; ly = block_h - 1;
+        break;
+    case IngressPolicy::Hash4: {
+        const uint32_t cells = block_w * block_h;
+        if (cells == 0) {
+            lx = 0; ly = 0;
+            break;
+        }
+        const uint32_t pick = (pre_global ^ (block_id * 0x9e3779b9u));
+        const uint32_t idx = (cells ? (pick % cells) : 0u);
+        lx = idx % block_w;
+        ly = idx / block_w;
+        break;
+    }
+    default:
+        lx = 0; ly = 0;
+        break;
+    }
+    return (block_y0 + ly) * mesh_w + (block_x0 + lx);
+}
+
+inline uint32_t blockBaseNodeFromId_(uint32_t block_id,
+                                     uint32_t mesh_w,
+                                     uint32_t block_w,
+                                     uint32_t block_h) {
+    if (mesh_w == 0 || block_w == 0 || block_h == 0) return 0;
+    const uint32_t blocks_w = mesh_w / block_w;
+    const uint32_t bx0 = (block_id % blocks_w) * block_w;
+    const uint32_t by0 = (block_id / blocks_w) * block_h;
+    return by0 * mesh_w + bx0;
 }
 
 void parseLayerMask_(const std::string& mask_in,
@@ -105,6 +179,18 @@ std::string buildRouteCacheKey_(const SynapseRouteBuildConfig& cfg) {
         << "-mapsplit" << cfg.mapping_csv_separator
         << "-mapblk" << (cfg.mapping_assume_block_ids ? 1 : 0);
     return oss.str();
+}
+
+bool deriveSquareMeshDims_(uint32_t total_nodes, uint32_t& out_w, uint32_t& out_h) {
+    out_w = 0;
+    out_h = 0;
+    if (total_nodes == 0) return false;
+    uint32_t w = static_cast<uint32_t>(std::sqrt(static_cast<double>(total_nodes)));
+    while (w * w < total_nodes) ++w;
+    if (w * w != total_nodes) return false;
+    out_w = w;
+    out_h = w;
+    return true;
 }
 
 void buildRoutesFromCandidates_(const SynapseRouteBuildConfig& cfg,
@@ -252,13 +338,21 @@ bool buildRoutesFromEdgesCSV_(const SynapseRouteBuildConfig& cfg,
     }
     std::string line;
     if (cfg.mapping_csv_has_header) std::getline(fin, line);
-    auto split = [&cfg](const std::string& s)->std::vector<std::string>{
+    auto trim_inplace = [](std::string& t) {
+        size_t b = 0;
+        while (b < t.size() && std::isspace(static_cast<unsigned char>(t[b]))) ++b;
+        size_t e = t.size();
+        while (e > b && std::isspace(static_cast<unsigned char>(t[e - 1]))) --e;
+        if (b == 0 && e == t.size()) return;
+        t = t.substr(b, e - b);
+    };
+    auto split = [&cfg, &trim_inplace](const std::string& s)->std::vector<std::string>{
         std::vector<std::string> outv;
         std::string cur;
         char sep = cfg.mapping_csv_separator.empty() ? ',' : cfg.mapping_csv_separator[0];
         std::istringstream ss(s);
-        while (std::getline(ss, cur, sep)) outv.push_back(cur);
-        if (outv.empty()) { std::istringstream ss2(s); while (ss2 >> cur) outv.push_back(cur); }
+        while (std::getline(ss, cur, sep)) { trim_inplace(cur); outv.push_back(cur); }
+        if (outv.empty()) { std::istringstream ss2(s); while (ss2 >> cur) { trim_inplace(cur); outv.push_back(cur); } }
         return outv;
     };
     std::unordered_map<uint32_t, std::vector<std::pair<float,uint32_t>>> tmp;
@@ -417,6 +511,11 @@ void SynapseRouteSubsystem::configure(const SynapseRouteBuildConfig& cfg) {
     route_summary_logged_ = false;
     fanout_provider_ready_ = false;
     gating_cache_.clear();
+    multicast_ready_ = false;
+    mesh_w_ = 0;
+    mesh_h_ = 0;
+    multicast_targets_shared_.reset();
+    multicast_targets_local_.clear();
 }
 
 void SynapseRouteSubsystem::configureGating(bool gating_event_mode,
@@ -449,6 +548,11 @@ bool SynapseRouteSubsystem::initRoutes() {
     routes_shared_.reset();
     routes_local_fallback_.clear();
     fanout_provider_ready_ = false;
+    multicast_ready_ = false;
+    mesh_w_ = 0;
+    mesh_h_ = 0;
+    multicast_targets_shared_.reset();
+    multicast_targets_local_.clear();
 
     routing_weight_driven_active_ = cfg_.routing_weight_driven;
     if (!routing_weight_driven_active_) {
@@ -540,6 +644,7 @@ bool SynapseRouteSubsystem::initRoutes() {
         logRoutingSummary_("init", routing_weight_driven_active_ ? (hit_cache ? "active(cache)" : "active") : "fallback_fixed");
     }
 
+    initMulticastTargets_();
     configureFanoutProvider_();
     return routing_weight_driven_active_;
 }
@@ -568,6 +673,198 @@ void SynapseRouteSubsystem::applyGatingDecision(uint32_t src_global,
             "📥 应用门控: src_g=%u, k=%zu, expire=%" PRIu64 "\n",
             src_global, dest_pes.size(), gating_cache_[src_global].expire_cycle);
     }
+}
+
+bool SynapseRouteSubsystem::multicastEnabled() const {
+    return routing_weight_driven_active_ && cfg_.multicast_enable;
+}
+
+bool SynapseRouteSubsystem::computeMulticastTargets(uint32_t source_global,
+                                                    uint32_t neuron_idx,
+                                                    uint64_t now_cycles,
+                                                    std::vector<BlockTarget>& out_targets,
+                                                    bool& applied_gating) const {
+    (void)neuron_idx;
+
+    out_targets.clear();
+    applied_gating = false;
+    if (!multicast_ready_) return false;
+
+    const MulticastTargetMap* table = multicast_targets_shared_ ? multicast_targets_shared_.get() : &multicast_targets_local_;
+    auto it = table->find(source_global);
+    if (it == table->end()) return false;
+    out_targets = it->second;
+
+    // gating 过滤：仅保留 allowed dest_pes 的块内 core_mask（保持“按 PE 选择”的语义）
+    if (gating_event_mode_) {
+        bool scope_ok = !gating_scope_inputs_only_ ? true : (node_id_ <= 3);
+        if (scope_ok) {
+            auto itg = gating_cache_.find(source_global);
+            if (itg != gating_cache_.end() && now_cycles <= itg->second.expire_cycle) {
+                const auto& dpes = itg->second.dest_pes;
+                if (!dpes.empty()) {
+                    std::unordered_set<uint32_t> allowed_nodes(dpes.begin(), dpes.end());
+                    for (auto& bt : out_targets) {
+                        // 注意：block 的 4 个节点集合应由 block_id 推导，不能从 ingress_node 推导，
+                        // 否则当 ingress policy 不是 top_left 时会错杀/漏杀。
+                        const uint32_t base = blockBaseNodeFromId_(bt.block_id, mesh_w_, cfg_.multicast_block_w, cfg_.multicast_block_h);
+                        const uint32_t bw = cfg_.multicast_block_w;
+                        const uint32_t bh = cfg_.multicast_block_h;
+                        const uint32_t cells = bw * bh;
+                        for (uint32_t idx = 0; idx < cells && idx < kMaxMulticastBlockCells; ++idx) {
+                            const uint32_t lx = idx % bw;
+                            const uint32_t ly = idx / bw;
+                            const uint32_t node = base + lx + ly * mesh_w_;
+                            if (allowed_nodes.find(node) == allowed_nodes.end()) bt.core_mask[idx] = 0;
+                        }
+                    }
+
+                    const uint32_t bw = cfg_.multicast_block_w;
+                    const uint32_t bh = cfg_.multicast_block_h;
+                    const uint32_t cells = bw * bh;
+                    out_targets.erase(std::remove_if(out_targets.begin(), out_targets.end(),
+                                                    [&](const BlockTarget& bt) {
+                                                        for (uint32_t idx = 0; idx < cells && idx < kMaxMulticastBlockCells; ++idx) {
+                                                            if (bt.core_mask[idx] != 0) return false;
+                                                        }
+                                                        return true;
+                                                    }),
+                                      out_targets.end());
+                    applied_gating = true;
+                }
+            }
+        }
+    }
+    return !out_targets.empty();
+}
+
+void SynapseRouteSubsystem::initMulticastTargets_() {
+    multicast_ready_ = false;
+    mesh_w_ = 0;
+    mesh_h_ = 0;
+    multicast_targets_shared_.reset();
+    multicast_targets_local_.clear();
+
+    if (!routing_weight_driven_active_ || !cfg_.multicast_enable) return;
+    if (!routes_shared_) return;
+
+    if (cfg_.multicast_block_w == 0 || cfg_.multicast_block_h == 0) {
+        if (log_) log_->verbose(CALL_INFO, 1, 0, "⚠️ multicast block 尺寸非法（当前=%ux%u），已禁用\n",
+                                cfg_.multicast_block_w, cfg_.multicast_block_h);
+        return;
+    }
+    const uint32_t block_cells = cfg_.multicast_block_w * cfg_.multicast_block_h;
+    if (block_cells == 0 || block_cells > kMaxMulticastBlockCells) {
+        if (log_) log_->verbose(CALL_INFO, 1, 0, "⚠️ multicast block 过大（当前=%ux%u, cells=%u, max=%u），已禁用\n",
+                                cfg_.multicast_block_w, cfg_.multicast_block_h, block_cells, kMaxMulticastBlockCells);
+        return;
+    }
+    IngressPolicy ingress_policy{};
+    if (!parseIngressPolicy_(cfg_.multicast_ingress_policy, ingress_policy)) {
+        if (log_) log_->verbose(CALL_INFO, 1, 0,
+                                "⚠️ multicast ingress_policy 不支持（当前='%s'），已禁用\n",
+                                cfg_.multicast_ingress_policy.c_str());
+        return;
+    }
+
+    if (!deriveSquareMeshDims_(cfg_.total_nodes, mesh_w_, mesh_h_)) {
+        if (log_) log_->verbose(CALL_INFO, 1, 0, "⚠️ multicast 需要 square mesh（total_nodes=%u），已禁用\n",
+                                cfg_.total_nodes);
+        return;
+    }
+    if (mesh_w_ % cfg_.multicast_block_w != 0 || mesh_h_ % cfg_.multicast_block_h != 0) {
+        if (log_) log_->verbose(CALL_INFO, 1, 0, "⚠️ multicast block 无法整除 mesh（mesh=%ux%u, block=%ux%u），已禁用\n",
+                                mesh_w_, mesh_h_, cfg_.multicast_block_w, cfg_.multicast_block_h);
+        return;
+    }
+
+    const std::string cache_key = buildRouteCacheKey_(cfg_);
+    std::string mc_key;
+    if (!cache_key.empty()) {
+        mc_key = cache_key;
+        mc_key.append("|mc:blocked:").append(std::to_string(cfg_.multicast_block_w)).append("x").append(std::to_string(cfg_.multicast_block_h));
+        mc_key.append("|ingress:").append(cfg_.multicast_ingress_policy);
+    }
+
+    if (!mc_key.empty()) {
+        std::shared_ptr<const MulticastTargetMap> hit;
+        {
+            std::lock_guard<std::mutex> g(s_multicast_cache_mtx_);
+            auto it = s_multicast_cache_.find(mc_key);
+            if (it != s_multicast_cache_.end()) hit = it->second.lock();
+        }
+        if (hit) {
+            multicast_targets_shared_ = hit;
+            multicast_ready_ = true;
+            return;
+        }
+    }
+
+    const uint32_t denom = (neurons_per_pe_cfg_ > 0) ? neurons_per_pe_cfg_ : num_neurons_;
+    if (denom == 0 || num_neurons_ == 0 || cfg_.cores_per_pe == 0) return;
+
+    const uint32_t blocks_w = mesh_w_ / cfg_.multicast_block_w;
+
+    MulticastTargetMap built;
+    built.reserve(routes_shared_->size());
+
+    for (const auto& kv : *routes_shared_) {
+        const uint32_t pre_global = kv.first;
+        const auto& dests = kv.second;
+        if (dests.empty()) continue;
+
+        std::unordered_map<uint32_t, BlockTarget> per_block;
+        for (uint32_t dest_global : dests) {
+            const uint32_t dest_node = denom ? (dest_global / denom) : 0;
+            if (dest_node >= cfg_.total_nodes) continue;
+
+            const uint32_t local_in_pe = denom ? (dest_global % denom) : dest_global;
+            const uint32_t dest_core = (num_neurons_ ? (local_in_pe / num_neurons_) : 0);
+            if (dest_core >= cfg_.cores_per_pe) continue;
+
+            const uint32_t x = dest_node % mesh_w_;
+            const uint32_t y = dest_node / mesh_w_;
+
+            const uint32_t block_x = (x / cfg_.multicast_block_w) * cfg_.multicast_block_w;
+            const uint32_t block_y = (y / cfg_.multicast_block_h) * cfg_.multicast_block_h;
+            const uint32_t block_id = (y / cfg_.multicast_block_h) * blocks_w + (x / cfg_.multicast_block_w);
+            const uint32_t ingress = selectIngressNodeBlocked_(ingress_policy,
+                                                               pre_global,
+                                                               block_id,
+                                                               block_x,
+                                                               block_y,
+                                                               cfg_.multicast_block_w,
+                                                               cfg_.multicast_block_h,
+                                                               mesh_w_);
+
+            const uint32_t local_x = x - block_x;
+            const uint32_t local_y = y - block_y;
+            const uint32_t idx = local_y * cfg_.multicast_block_w + local_x;
+            if (idx >= block_cells || idx >= kMaxMulticastBlockCells) continue;
+
+            auto& bt = per_block[block_id];
+            bt.block_id = block_id;
+            bt.ingress_node = ingress;
+            bt.core_mask[idx] |= (1u << dest_core);
+        }
+
+        if (!per_block.empty()) {
+            std::vector<BlockTarget> vec;
+            vec.reserve(per_block.size());
+            for (auto& itb : per_block) vec.push_back(itb.second);
+            std::sort(vec.begin(), vec.end(),
+                      [](const BlockTarget& a, const BlockTarget& b) { return a.block_id < b.block_id; });
+            built.emplace(pre_global, std::move(vec));
+        }
+    }
+
+    auto shared = std::make_shared<MulticastTargetMap>(std::move(built));
+    multicast_targets_shared_ = shared;
+    if (!mc_key.empty()) {
+        std::lock_guard<std::mutex> g(s_multicast_cache_mtx_);
+        s_multicast_cache_[mc_key] = shared;
+    }
+    multicast_ready_ = true;
 }
 
 void SynapseRouteSubsystem::configureFanoutProvider_() {

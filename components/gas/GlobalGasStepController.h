@@ -34,6 +34,7 @@ public:
         {"clock", "controller clock", "1GHz"},
         {"verbose", "verbosity", "0"},
         {"start_seq", "initial step sequence id", "1"},
+        {"max_steps", "stop after completing this many steps (0=unbounded)", "0"},
         {"require_all_ready", "wait for PeReady from all connected PEs (0/1)", "1"},
         {"strict_seq_check", "fatal on unexpected seq transitions (0/1)", "1"}
     )
@@ -63,6 +64,9 @@ private:
     uint32_t start_seq_ = 1;
     uint32_t current_seq_ = 0;
     bool started_ = false;
+    uint32_t max_steps_ = 0;         // 0=unbounded
+    uint32_t steps_completed_ = 0;   // count of completed steps (allDone barriers observed)
+    bool primary_keepalive_ = false; // only enabled when max_steps_ > 0
 
     int verbose_ = 0;
     bool require_all_ready_ = true;

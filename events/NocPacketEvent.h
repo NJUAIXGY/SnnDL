@@ -21,6 +21,7 @@ enum class NocPacketKind : uint16_t {
     Spike = 1,
     Control = 2,
     RawBytes = 3,
+    SpikeKey = 4,
 };
 
 class NocPacketEvent : public SST::Event {
@@ -51,6 +52,19 @@ public:
           timestamp(ts)
     {}
 
+    NocPacketEvent* clone() override {
+        auto* ev = new NocPacketEvent();
+        ev->src_node = src_node;
+        ev->dst_node = dst_node;
+        ev->src_endpoint = src_endpoint;
+        ev->dst_endpoint = dst_endpoint;
+        ev->kind = kind;
+        ev->hop_count = hop_count;
+        ev->timestamp = timestamp;
+        ev->payload = payload;
+        return ev;
+    }
+
     NocPacketKind packetKind() const { return static_cast<NocPacketKind>(kind); }
 
     void serialize_order(SST::Core::Serialization::serializer& ser) override {
@@ -72,4 +86,3 @@ private:
 }} // namespace SST::SnnDL
 
 #endif // SNNDL_NOC_PACKET_EVENT_H
-

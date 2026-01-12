@@ -98,6 +98,22 @@ void SnnPESubComponent::reportApplyScatterThunk_(void* ctx,
     }
 }
 
+void SnnPESubComponent::requestGasEndGatherThunk_(void* ctx, uint32_t superstep) {
+    auto* core = static_cast<SnnPESubComponent*>(ctx);
+    if (!core) return;
+    if (superstep == 0) return;
+    if (!core->stdmem_ep_ || !core->stdmem_ep_->available()) return;
+    core->stdmem_ep_->sendGasCmd(GasOp::EndGather, superstep, /*slice*/0, /*tot*/1, /*flag*/false);
+}
+
+void SnnPESubComponent::requestGasEndScatterThunk_(void* ctx, uint32_t superstep) {
+    auto* core = static_cast<SnnPESubComponent*>(ctx);
+    if (!core) return;
+    if (superstep == 0) return;
+    if (!core->stdmem_ep_ || !core->stdmem_ep_->available()) return;
+    core->stdmem_ep_->sendGasCmd(GasOp::EndScatter, superstep, /*slice*/0, /*tot*/1, /*flag*/false);
+}
+
 // === 静态共享路由缓存 / 阶段事件写入锁 ===
 std::mutex SnnPESubComponent::s_stage_csv_mutex_;
 
@@ -141,6 +157,10 @@ void SnnPESubComponent::Impl::markEndScatter(uint32_t seq, uint64_t spikes_emitt
     if (gas_ctrl_) gas_ctrl_->onEndScatter(seq, spikes_emitted);
     uint64_t now = core->getCurrentSimTimeNano();
     core->appendStageEventRow_("EndScatter", now, spikes_emitted);
+    // 额外诊断：输出本窗口权重/BCSR 读流量摘要（仅 window_read_debug=1 时启用）
+    if (core->window_read_debug_ && core->weight_mem_subsystem_) {
+        core->weight_mem_subsystem_->endScatterWindow(seq);
+    }
     reportWindowSpikes(static_cast<uint32_t>(seq), spikes_emitted);
     core->spikes_emitted_window_ = 0;
     core->window_spikes_all_ = 0;
@@ -404,12 +424,12 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
         std::transform(w.begin(), w.end(), w.begin(),
                        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
         if (w == "stream") workload_impl_ = WorkloadImpl::Stream;
+        else if (w == "traffic") workload_impl_ = WorkloadImpl::Traffic;
         else workload_impl_ = WorkloadImpl::Snn;
     }
-    // Phase4：默认也创建 `workload=snn`（暂不切换默认执行入口，仅用于后续逐步壳化迁移）。
-    // 说明：当前仅区分 stream/snn；未知值已在上方归一化为 SNN。
+    // Phase6：通过工厂创建 workload（snn/stream/traffic）；未知值已在上方归一化为 SNN。
     {
-        const char* name = isStreamWorkload_() ? "stream" : "snn";
+        const char* name = isTrafficWorkload_() ? "traffic" : (isStreamWorkload_() ? "stream" : "snn");
         if (!workload_) workload_ = createWorkloadByName(std::string(name));
         if (!workload_) {
             if (output_) {
@@ -897,6 +917,8 @@ void SnnPESubComponent::bindWorkloadRuntime_() {
     rt.reporting.ctx = this;
     rt.reporting.report_mem_issue = &SnnPESubComponent::reportSnnMemIssueThunk_;
     rt.reporting.report_apply_scatter = &SnnPESubComponent::reportApplyScatterThunk_;
+    rt.reporting.request_gas_end_gather = &SnnPESubComponent::requestGasEndGatherThunk_;
+    rt.reporting.request_gas_end_scatter = &SnnPESubComponent::requestGasEndScatterThunk_;
     rt.sinks.spikes_received = &count_spikes_received_;
     rt.sinks.spikes_generated = &count_spikes_generated_;
     rt.sinks.neurons_fired = &count_neurons_fired_;
@@ -972,14 +994,21 @@ void SnnPESubComponent::onGlobalStepStart(uint32_t seq) {
         return;
     }
     auto* gate = stdmem_ep_->stepGate();
-    if (!gate) {
+    if (gate) {
+        gate->openStep(seq);
+        return;
+    }
+
+    // naive/non-window 模式：memory 可能是 memHierarchy.standardInterface（不实现 IGasStepGate）。
+    // 仅在窗口化 GAS 模式下，缺失 step gate 才属于配置错误（fail-fast）。
+    if (gas_window_mode_ && window_read_enable_) {
         if (output_) output_->fatal(
             CALL_INFO, -1,
             "core=%d onGlobalStepStart(seq=%u) requires memory to implement IGasStepGate (did you load GatherBufferIF with step_gate_enable=1?)\n",
             core_id_, seq);
         return;
     }
-    gate->openStep(seq);
+    curr_stage_seq_ = seq;
 }
 
 // === GAS stage/stat sink (Phase4-Task6.4) ===
@@ -1240,8 +1269,8 @@ void SnnPESubComponent::setup() {
             core_id_, (uint64_t)global_neuron_base_, num_neurons_, weights_cols_);
     }
     // 配置一致性：启用窗口端到端语义时要求 window 模式的 GAS
-    if (isStreamWorkload_()) {
-        // stream workload 不依赖 GAS/Apply/Scatter，也不要求路由/权重子系统就绪。
+    if (isNonSnnWorkload_()) {
+        // Non-SNN workloads (stream/traffic) do not depend on GAS/Apply/Scatter.
         if (workload_) workload_->onSetup();
         return;
     }
@@ -1291,6 +1320,10 @@ void SnnPESubComponent::finish() {
     }
 #endif
     // Phase4 Task6.1：compute core finish 下沉到 workload=snn。
+    // 调试：若目标 core 在 Apply 阶段卡住导致窗口未完成，收尾时仍输出窗口级权重读摘要，便于定位瓶颈。
+    if (window_read_debug_ && weight_mem_subsystem_) {
+        weight_mem_subsystem_->finishWindowDiag();
+    }
     if (workload_) workload_->onFinish();
 }
 

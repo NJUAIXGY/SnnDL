@@ -40,9 +40,34 @@ export MESH_SIM_TIME="100us"
 ./tools/run_mesh_with_time.sh
 ```
 
+切换到 `workload=traffic`（不建模动力学；用于通信/多播（SpikeKey）链路验证）：
+
+```bash
+cd "sst_dram_si"
+export SNNDL_WORKLOAD_IMPL="traffic"
+export MESH_SIM_TIME="100us"
+./tools/run_mesh_with_time.sh
+```
+
 输出目录通常位于：
 - `sst_dram_si/outputs_large/paper2/dram_mesh_4x4/YYYYMMDD-HHMMSS/`
   - `essential_summary_mesh.json`：关键指标摘要（用于 100us 回归判定）。
+
+---
+
+## Native Multicast（SpikeKey / blocked multicast）
+
+SnnDL 支持一条“原生多播（native multicast）”路径：以 `SpikeKey` 包承载“块内多播目标集合（core mask）”，并采用“两阶段路由”：
+
+- **INTER（块间单播）**：每个目标 block 只发一个包，单播到该 block 的 `ingress_node`。
+- **INTRA（块内多播）**：包到达 ingress 后在 block 内按树扩散，并按 `core_mask[cell]` 精确投递到目标 core。
+
+关键约束（当前实现口径）：
+- `multicast_block_w * multicast_block_h <= 64`（固定 payload 上限）
+- `cores_per_pe <= 32`（core mask 使用 32-bit 位图）
+
+推荐入口（端到端验证 + 统计落盘）：
+- `experimental_features/native_multicast_lab/`（实验脚本与 runner）
 
 ---
 
@@ -75,6 +100,7 @@ SnnDL/
 - `components/`：SST 对接与装配壳（端口、Link、Clock、Stat、生命周期）；尽量不写算法事务。
 - `control/`：通用 CoreShell（时钟驱动、packet 递送、统计汇聚）；**不包含 SNN 业务状态机**。
 - `services/workload/`：workload 插件（例如 `snn`/`stream`）；承载业务状态机与事务编排。
+- `services/workload/traffic`：通信/多播验证用 workload；不建模动力学，但可复用 `synapse/route` 的 fanout/multicast 事务。
 - `compute/`：神经动力学与学习等计算逻辑（`ISnnComputeCore`）；**不直接触碰 StandardMem/NoC**（通过 `IWeightReader`/workload 注入）。
 - `services/noc/`：纯传输（send/recv/forward/本地投递）；**不做 fanout/权重语义**。
 - `services/memory/`：纯地址/字节访问；**不出现权重/突触/路由语义**。
@@ -88,3 +114,13 @@ SnnDL/
 - 修改 C++ 后必须执行 `make install` 才会影响实际 `sst` 运行加载的元素库。
 - 若需要调整构建清单：优先改 `Makefile.am`，并同步保持 `Makefile.in` 与之匹配（`make` 会通过 `config.status` 重生成 `Makefile`）。
 - 回归建议：每个阶段至少跑一次 `MESH_SIM_TIME="100us"`，并对比 `essential_summary_mesh.json` 的关键字段（避免非确定性回归）。
+
+---
+
+## 对比实验输出（GAS vs naive）
+
+mesh 模板支持 `MESH_EXEC_MODE=gas|naive_raw|naive_opt` 的对比实验（统一 step-limited 口径建议使用 `MESH_MAX_STEPS=4`），输出目录为：
+
+- `sst_dram_si/outputs_large/paper2/dram_mesh_4x4_exec_mode_compare/`
+
+详见该目录的 README：`sst_dram_si/outputs_large/paper2/dram_mesh_4x4_exec_mode_compare/README.md`

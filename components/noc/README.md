@@ -23,10 +23,24 @@
   - 提供 `send/recv/spaceToSend/requestToReceive` 等 SimpleNetwork 接口
   - 将网络请求队列与回调通知（notify-on-receive/send）封装为可复用代理
 
+### `MulticastRouter.{h,cc}` / `MulticastNIC.{h,cc}`（原生多播实验后端）
+- **类型**：
+  - `SST::Component`（ELI：`SnnDL.MulticastRouter`）
+  - `SST::SubComponent`（ELI：`SnnDL.MulticastNIC`，替换 MultiCorePE 的 network_interface）
+- **定位**：用于 **SpikeKey native multicast（blocked multicast）** 的轻量 mesh router 后端：
+  - INTER：块间单播到 `ingress_node`
+  - INTRA：块内按树扩散 + 按 `core_mask[cell]` 精确投递到 cores
+- **与边界的关系**：
+  - Router **只解析 SpikeKey 路由头**（`version/stage/block_w_h/block_id/ingress_node/group_id/core_mask[]`），不解析权重/BCSR/GAS 语义；
+  - 该后端主要用于 `experimental_features/native_multicast_lab/` 的端到端验证与性能画像，属于实验性网络后端。
+- **可调策略点（params）**：
+  - `multicast_inter_policy`：INTER 阶段单播走法（`xy`/`yx`/`hash_xy`）
+  - `multicast_intra_policy`：INTRA 阶段块内扩散树（`manhattan_x_first`/`manhattan_y_first`）
+  - 注意：`ingress_node` 的选择属于构建期策略（`multicast_ingress_policy`），由 Synapse/Route 构建 multicast target 时决定。
+
 ---
 
 ## 与 NoC 子系统的关系
 
 - `services/noc/NocSubsystem` 的主目标是“传输事务下沉 + 冻结接口（`api/INocTransport.h`）”，并以 `events/NocPacketEvent` 作为 payload。
 - 本目录组件属于“网络后端/适配层工具”，用于与路由器/链路端口进行对接；是否启用取决于具体实验脚本与装配方式。
-

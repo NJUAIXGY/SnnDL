@@ -155,6 +155,22 @@ void NocSubsystem::onCoreSend(NocPacketEvent* packet) {
 void NocSubsystem::sendFromCore(int src_core, NocPacketEvent* packet) {
     if (!packet) return;
 
+    // SpikeKey（原生多播）必须经过外部 router mesh，即便 ingress_node 恰好等于本节点：
+    // 否则会走本地 ring 直投，导致跳过 MulticastRouter 的 INTER→INTRA 阶段切换与 block 内复制，
+    // 从而出现“看似收到了包但不是真多播”的语义漂移。
+    if (packet->packetKind() == NocPacketKind::SpikeKey) {
+        if (rt_.nic) {
+            rt_.nic->sendToNode(packet->dst_node, packet);
+            if (static_cast<int>(packet->dst_node) != rt_.node_id) {
+                if (st_.external_spikes_sent) st_.external_spikes_sent->addData(1);
+            }
+            return;
+        }
+        // No NIC configured: cannot route SpikeKey; drop to avoid hidden semantics drift.
+        delete packet;
+        return;
+    }
+
     const bool is_local = (static_cast<int>(packet->dst_node) == rt_.node_id);
     if (is_local) {
         const int dst_core = static_cast<int>(packet->dst_endpoint);
@@ -347,6 +363,21 @@ void NocSubsystem::drainIncomingQueue(uint64_t /*current_cycle*/) {
         // 中继转发（保持原 clockTick 语义：不更新 external_spikes_sent）
         forwardExternalPacket_(packet);
     }
+}
+
+bool NocSubsystem::isIdle() const {
+    if (!incoming_queue_.empty()) return false;
+    if (rt_.optimized_ring && rt_.optimized_ring->getPendingMessageCount() != 0) return false;
+    if (rt_.nic && rt_.nic->pendingSendCount() != 0) return false;
+    return true;
+}
+
+size_t NocSubsystem::nicPendingSendCount() const {
+    return rt_.nic ? rt_.nic->pendingSendCount() : 0;
+}
+
+int NocSubsystem::ringPendingMessageCount() const {
+    return rt_.optimized_ring ? rt_.optimized_ring->getPendingMessageCount() : 0;
 }
 
 void NocSubsystem::tickRing(uint64_t current_cycle) {

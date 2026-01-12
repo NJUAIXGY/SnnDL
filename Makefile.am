@@ -108,6 +108,10 @@ libSnnDL_la_SOURCES = \
 	services/synapse/weights/SnnWeightDiagnostics.h \
 	components/noc/SnnNetworkAdapter.cc \
 	components/noc/SnnNetworkAdapter.h \
+	components/noc/MulticastRouter.cc \
+	components/noc/MulticastRouter.h \
+	components/noc/MulticastNIC.cc \
+	components/noc/MulticastNIC.h \
 	services/SnnProfiler.h \
 	services/synapse/route/SnnRouteProvider.cc \
 	services/synapse/route/SnnRouteProvider.h \
@@ -139,6 +143,8 @@ libSnnDL_la_SOURCES = \
 	services/workload/snn/SnnWorkload.h \
 	services/workload/stream/StreamWorkload.cc \
 	services/workload/stream/StreamWorkload.h \
+	services/workload/traffic/TrafficWorkload.cc \
+	services/workload/traffic/TrafficWorkload.h \
 	services/memory/StandardMemAccess.cc \
 	services/memory/StandardMemAccess.h
 

@@ -1,0 +1,93 @@
+// -*- c++ -*-
+//
+// TrafficWorkload：
+// - 原生 SpikeKey 多播实验用的最小 traffic-only workload。
+// - 生成可复现（伪随机但确定性）的本地 pre neuron 集合，并通过 SpikeCommSubsystem 发射。
+// - 不建模神经动力学，不依赖 GAS/memHierarchy/WeightLoader。
+//
+
+#pragma once
+
+#include <cstdint>
+#include <map>
+#include <memory>
+#include <vector>
+
+#include "api/ICoreWorkload.h"
+
+namespace SST { namespace SnnDL {
+
+class NocSpikeTransport;
+class SpikeCommSubsystem;
+class SynapseRouteSubsystem;
+
+class TrafficWorkload final : public ICoreWorkload {
+public:
+    TrafficWorkload();
+    ~TrafficWorkload() override;
+
+    void configureFromParams(const SST::Params& params) override;
+    void bindRuntime(const Runtime& rt) override;
+
+    void onInitPhase(unsigned phase) override;
+    void onSetup() override;
+    void onFinish() override;
+
+    bool onClockTick(uint64_t now_cycle) override;
+    bool deliverPacket(NocPacketEvent* packet) override;
+
+    bool hasWork() const override;
+    double getUtilization() const override;
+    void getStatistics(std::map<std::string, uint64_t>& stats) const override;
+
+private:
+    void ensureCommReady_();
+    std::vector<uint32_t> sampleNeuronIndices_(uint64_t now_cycle);
+
+    const SST::Params* params_ = nullptr;
+    Runtime rt_{};
+
+    bool configured_ = false;
+    bool comm_ready_ = false;
+
+    bool traffic_enable_ = false;
+    uint64_t traffic_period_cycles_ = 0;
+    uint32_t traffic_batch_size_ = 0;
+    uint64_t traffic_seed_ = 0;
+    uint32_t traffic_pre_begin_ = 0;
+    uint32_t traffic_pre_end_ = 0;
+    uint64_t traffic_stop_cycle_ = 0; // 0=never stop (until sim ends)
+
+    bool spikekey_check_enable_ = true;
+    bool spikekey_check_fatal_ = false;
+    uint32_t spikekey_check_log_cap_ = 8;
+    uint32_t spikekey_group_log_cap_ = 8;
+    uint32_t spikekey_check_logged_ = 0;
+
+    uint64_t next_cycle_ = 0;
+    uint32_t seq_ = 1;
+
+    uint64_t tx_batches_ = 0;
+    uint64_t tx_pres_total_ = 0;
+    uint64_t rx_spike_total_ = 0;
+    uint64_t rx_spikekey_total_ = 0;
+    uint64_t rx_spike_hops_sum_ = 0;
+    uint64_t rx_spike_hops_max_ = 0;
+    uint64_t rx_spikekey_hops_sum_ = 0;
+    uint64_t rx_spikekey_hops_max_ = 0;
+
+    uint64_t rx_spikekey_checked_total_ = 0;
+    uint64_t rx_spikekey_ok_total_ = 0;
+    uint64_t rx_spikekey_bad_total_ = 0;
+    uint64_t rx_spikekey_bad_decode_ = 0;
+    uint64_t rx_spikekey_bad_stage_ = 0;
+    uint64_t rx_spikekey_bad_dst_ = 0;
+    uint64_t rx_spikekey_bad_blockpos_ = 0;
+    uint64_t rx_spikekey_bad_mask_ = 0;
+
+    std::unique_ptr<SynapseRouteSubsystem> synapse_route_;
+    std::unique_ptr<SpikeCommSubsystem> spike_comm_;
+    std::unique_ptr<NocSpikeTransport> noc_spike_transport_;
+};
+
+}} // namespace SST::SnnDL

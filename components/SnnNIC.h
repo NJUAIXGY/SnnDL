@@ -15,6 +15,7 @@
 #include <sst/core/output.h>
 #include <sst/core/statapi/statbase.h>
 #include <sst/core/clock.h>
+#include <cstddef>
 #include <queue>
 #include <vector>
 #include <map>
@@ -137,6 +138,7 @@ public:
     void setNodeId(uint32_t node_id) override;
     uint32_t getNodeId() const override;
     std::string getNetworkStatus() const override;
+    size_t pendingSendCount() const override;
 
     // === SimpleNetwork 回调方法 ===
     bool handleIncoming(int vn);
@@ -234,6 +236,7 @@ private:
         SST::Event* payload = nullptr;
     };
     std::queue<PendingSend> pending_sends_;
+    uint32_t pending_send_stall_log_count_ = 0;
 
     // 简单批处理：按目标节点分桶
     // 旧实现：map 桶，保留以兼容；新实现：按 total_nodes_ 直接索引，减少map查找与扩容

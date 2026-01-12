@@ -334,14 +334,49 @@ void GatherBufferIF::send(Request* req) {
     if (auto* cr = dynamic_cast<StandardMem::CustomReq*>(req)) {
         auto* data = dynamic_cast<GasOpData*>(&cr->getData());
         if (data) {
-            // In auto mode, ignore external GasOp control requests (manual drive deprecated)
+            // In auto mode, most external GasOp control requests are ignored (manual drive deprecated).
+            // Exception: in step-gate mode we accept EndGather/EndScatter as "explicit end handshake"
+            // so Gather/Scatter can be load-driven and globally synchronized.
             if (window_auto_) {
-                if (!warned_auto_custom_req_ && diagEnabled_()) {
-                    warned_auto_custom_req_ = true;
-                    out_.verbose(CALL_INFO, 0, 0,
-                        "[diag-gbi] CustomReq ignored: window_auto=1 manual_drive=0 (logged once)");
+                const bool allow_explicit_end = step_gate_enable_ &&
+                                                (data->op == GasOp::EndGather || data->op == GasOp::EndScatter);
+                if (!allow_explicit_end) {
+                    if (!warned_auto_custom_req_ && diagEnabled_()) {
+                        warned_auto_custom_req_ = true;
+                        out_.verbose(CALL_INFO, 0, 0,
+                            "[diag-gbi] CustomReq ignored: window_auto=1 manual_drive=0 (logged once)");
+                    }
+                    delete req;
+                    return;
                 }
-                delete req; return;
+
+                if (data->op == GasOp::EndGather) {
+                    // Tolerant in mixed modes: if Gather already ended (cycle fallback), ignore late EndGather.
+                    if (stage_ != Stage::Gather) { delete req; return; }
+                    if (data->superstep == 0 || static_cast<uint64_t>(data->superstep) != current_gather_id_) {
+                        delete req;
+                        return;
+                    }
+                    // Latch end_gather_seen; clockTick will advance to Apply (avoid re-entrancy).
+                    sb_[gather_buf_index_].end_gather_seen = true;
+                    tail_wait_start_ns_ = getCurrentSimTimeNano();
+                    delete req;
+                    return;
+                }
+
+                if (data->op == GasOp::EndScatter) {
+                    // Tolerant in mixed modes: if Scatter already ended (cycle fallback), ignore late EndScatter.
+                    if (stage_ != Stage::Scatter) { delete req; return; }
+                    if (data->superstep == 0 || static_cast<uint64_t>(data->superstep) != current_gather_id_) {
+                        delete req;
+                        return;
+                    }
+                    // Latch and let clockTick emit EndScatter + advance (avoid recursive callbacks).
+                    end_scatter_req_pending_ = true;
+                    end_scatter_req_seq_ = data->superstep;
+                    delete req;
+                    return;
+                }
             }
             if (out_.getVerboseLevel() >= 1) {
                 out_.verbose(CALL_INFO, 1, 0,
@@ -610,6 +645,18 @@ void GatherBufferIF::onDownstreamResp_(Request* r) {
         // Pass-through ReadResp (i.e., requests not issued by GatherBufferIF) must be forwarded upstream.
         // Otherwise upstream pending maps (e.g., StandardMemAccess) will never see the response and may deadlock.
         if (it == inflight_down_.end()) {
+            // Debug: if downstream returns unexpected IDs, granules may never retire.
+            // Limit printing to avoid log explosion.
+            if (diagEnabled_(1)) {
+                static int diag_untracked_rr = 0;
+                if (diag_untracked_rr < 64) {
+                    out_.verbose(CALL_INFO, 1, 0,
+                        "[diag-gbi] ReadResp UNTRACKED id=%" PRIu64 " bytes=%zu node=%u core=%u stage=%d inflight0=%" PRIu64 " inflight1=%" PRIu64 "\n",
+                        (uint64_t)rr->getID(), rr->data.size(), node_id_param_, core_id_param_, (int)stage_,
+                        (uint64_t)inflight_counts_[0], (uint64_t)inflight_counts_[1]);
+                    ++diag_untracked_rr;
+                }
+            }
             if (upstream_handler_) {
                 (*upstream_handler_)(r);
             } else {
@@ -1526,20 +1573,36 @@ bool GatherBufferIF::clockTick(Cycle_t) {
     else if (stage_ == Stage::Apply) stage_cycles_accum_[1]++;
     else if (stage_ == Stage::Scatter) stage_cycles_accum_[2]++;
     if (stage_ == Stage::Gather) {
-        const bool empty_window = sb_[gather_buf_index_].granules.empty() && sb_[gather_buf_index_].required_set.empty();
-        if (empty_window) {
-            // 尝试主动结束 Gather 并进入 Apply（即便没有边），保持窗口推进
-            if (win_cyc_gather_ == 0 || stage_counter_ >= win_cyc_gather_) {
-                sb_[gather_buf_index_].end_gather_seen = true;
+        // Step-gate mode: Gather should be ended explicitly by workload (EndGather),
+        // not by fixed window_cycles_gather (preferred). For compatibility, window_cycles_gather
+        // remains a fallback end condition when explicit EndGather is not used.
+        if (step_gate_enable_) {
+            if (sb_[gather_buf_index_].end_gather_seen) {
                 maybeEnterApply_();
+            } else {
+                if (win_cyc_gather_ && stage_counter_ >= win_cyc_gather_) {
+                    sb_[gather_buf_index_].end_gather_seen = true;
+                    maybeEnterApply_();
+                } else {
+                    tryAutoEndGather_();
+                }
             }
         } else {
-            if (win_cyc_gather_ && stage_counter_ >= win_cyc_gather_) {
-                sb_[gather_buf_index_].end_gather_seen = true;
-                maybeEnterApply_();
-                // in immediate path stage_ may now be Idle or Scatter; optional wait handled there
+            const bool empty_window = sb_[gather_buf_index_].granules.empty() && sb_[gather_buf_index_].required_set.empty();
+            if (empty_window) {
+                // 尝试主动结束 Gather 并进入 Apply（即便没有边），保持窗口推进
+                if (win_cyc_gather_ == 0 || stage_counter_ >= win_cyc_gather_) {
+                    sb_[gather_buf_index_].end_gather_seen = true;
+                    maybeEnterApply_();
+                }
             } else {
-                tryAutoEndGather_();
+                if (win_cyc_gather_ && stage_counter_ >= win_cyc_gather_) {
+                    sb_[gather_buf_index_].end_gather_seen = true;
+                    maybeEnterApply_();
+                    // in immediate path stage_ may now be Idle or Scatter; optional wait handled there
+                } else {
+                    tryAutoEndGather_();
+                }
             }
         }
     } else if (stage_ == Stage::Apply) {
@@ -1574,7 +1637,7 @@ bool GatherBufferIF::clockTick(Cycle_t) {
                 if (it != gmap.end() && !it->second.issued) issueGranuleBuf_(gather_buf_index_, p.second, it->second);
             }
         }
-        if (apply_auto_end_enable_ && win_cyc_apply_ > 0) {
+        if (apply_auto_end_enable_) {
             if (tryAutoEndApply_()) return false;
         }
         if (win_cyc_apply_ && stage_counter_ >= win_cyc_apply_) {
@@ -1582,16 +1645,26 @@ bool GatherBufferIF::clockTick(Cycle_t) {
         }
     } else if (stage_ == Stage::Scatter) {
         bool scatter_due = false;
-        if (scatter_immediate_complete_ && stage_counter_ >= 1) {
-            scatter_due = true;
-        } else if (win_cyc_scatter_ && stage_counter_ >= win_cyc_scatter_) {
-            scatter_due = true;
+        if (step_gate_enable_) {
+            if (end_scatter_req_pending_ && end_scatter_req_seq_ == static_cast<uint32_t>(current_gather_id_)) {
+                scatter_due = true;
+            } else if (scatter_immediate_complete_ && stage_counter_ >= 1) {
+                scatter_due = true;
+            } else if (win_cyc_scatter_ && stage_counter_ >= win_cyc_scatter_) {
+                scatter_due = true;
+            }
+        } else {
+            if (scatter_immediate_complete_ && stage_counter_ >= 1) {
+                scatter_due = true;
+            } else if (win_cyc_scatter_ && stage_counter_ >= win_cyc_scatter_) {
+                scatter_due = true;
+            }
         }
         if (scatter_due) {
             if (out_.getVerboseLevel() >= 1) {
                 out_.verbose(CALL_INFO, 1, 0,
                     "[diag-gbi] EndScatter reason=%s gather_id=%" PRIu64 " stage_counter=%" PRIu64 " inflight_apply=%" PRIu64 " inflight_gather=%" PRIu64 "\n",
-                    scatter_immediate_complete_ ? "scatter-immediate" : "scatter-cycle",
+                    step_gate_enable_ ? "scatter-explicit" : (scatter_immediate_complete_ ? "scatter-immediate" : "scatter-cycle"),
                     current_gather_id_, stage_counter_,
                     inflight_counts_[apply_buf_index_], inflight_counts_[gather_buf_index_]);
             }
@@ -1607,6 +1680,8 @@ bool GatherBufferIF::clockTick(Cycle_t) {
                 stage_ = Stage::Idle;
                 stage_counter_ = 0;
                 sb_[gather_buf_index_].end_gather_seen = false;
+                end_scatter_req_pending_ = false;
+                end_scatter_req_seq_ = 0;
             } else {
                 stage_ = Stage::Gather; stage_counter_ = 0; sb_[gather_buf_index_].end_gather_seen = false; current_gather_id_++;
                 if (emit_stage_events_ && upstream_handler_) {
@@ -1722,7 +1797,6 @@ bool GatherBufferIF::tryAutoEndApply_() {
     if (!window_auto_) return false;
     if (!apply_auto_end_enable_) return false;
     if (stage_ != Stage::Apply) return false;
-    if (win_cyc_apply_ == 0) return false;
     bool allReady = true;
     for (auto key : sb_[apply_buf_index_].required_set) {
         auto it = sb_[apply_buf_index_].granules.find(key);

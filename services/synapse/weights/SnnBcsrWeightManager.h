@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <list>
 #include <unordered_map>
 #include <vector>
 
@@ -11,6 +12,8 @@ namespace SnnDL {
 
 class BcsrWeightManager {
 public:
+    enum class BlockCachePolicy : uint8_t { LegacyUnordered = 0, FIFO = 1, LRU = 2 };
+
     BcsrWeightManager() = default;
 
     void configure(uint64_t rowptr_addr,
@@ -24,6 +27,8 @@ public:
 
     void setRowIndexCacheCapacity(uint32_t cap);
     void setBlockCacheCapacity(uint32_t cap);
+    void setBlockCachePolicy(BlockCachePolicy policy);
+    BlockCachePolicy blockCachePolicy() const { return block_cache_policy_; }
     uint32_t rowIndexCacheCapacity() const { return row_index_cache_cap_; }
     uint32_t blockCacheCapacity() const { return block_cache_cap_; }
 
@@ -58,7 +63,7 @@ public:
 
     bool rowIndexGet(uint32_t block_row, std::vector<uint32_t>& out) const;
     void rowIndexPut(uint32_t block_row, std::vector<uint32_t>&& cols);
-    bool blockGet(uint32_t block_row, uint32_t block_col, std::vector<float>& out) const;
+    bool blockGet(uint32_t block_row, uint32_t block_col, std::vector<float>& out);
     void blockPut(uint32_t block_row, uint32_t block_col, std::vector<float>&& data);
     bool hasBlock(uint32_t block_row, uint32_t block_col) const;
 
@@ -69,7 +74,6 @@ public:
 private:
     static uint64_t makeBlockKey(uint32_t block_row, uint32_t block_col);
     void evictRowIndexIfNeeded(uint32_t incoming_key);
-    void evictBlockIfNeeded(uint64_t incoming_key);
 
     uint64_t rowptr_addr_ = 0;
     uint64_t colidx_addr_ = 0;
@@ -87,7 +91,13 @@ private:
     uint32_t row_index_cache_cap_ = 64;
     uint32_t block_cache_cap_ = 256;
     std::unordered_map<uint32_t, std::vector<uint32_t>> row_index_cache_;
-    std::unordered_map<uint64_t, std::vector<float>> block_cache_;
+    BlockCachePolicy block_cache_policy_ = BlockCachePolicy::LRU;
+    struct BlockCacheEntry {
+        std::vector<float> data;
+        std::list<uint64_t>::iterator it;
+    };
+    std::list<uint64_t> block_cache_order_;
+    std::unordered_map<uint64_t, BlockCacheEntry> block_cache_;
 };
 
 } // namespace SnnDL

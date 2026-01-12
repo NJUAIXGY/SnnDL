@@ -10,13 +10,16 @@
 #pragma once
 
 #include <cstdint>
+#include <array>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "ISynapseRoute.h"
+#include "api/MulticastLimits.h"
 #include "SynapseRouteBuildConfig.h"
 #include "SnnRouteProvider.h"
 
@@ -28,6 +31,12 @@ namespace SST { namespace SnnDL {
 class SynapseRouteSubsystem final : public ISynapseRoute {
 public:
     using RouteMap = ISynapseRoute::RouteMap;
+
+    struct BlockTarget final {
+        uint32_t block_id = 0;
+        uint32_t ingress_node = 0;
+        std::array<uint32_t, kMaxMulticastBlockCells> core_mask{};
+    };
 
     void configure(const SynapseRouteBuildConfig& cfg);
     void configureGating(bool gating_event_mode,
@@ -56,9 +65,22 @@ public:
                              uint64_t current_cycle,
                              uint64_t ttl_cycles) override;
 
+    bool multicastEnabled() const;
+    uint32_t multicastBlockW() const { return cfg_.multicast_block_w; }
+    uint32_t multicastBlockH() const { return cfg_.multicast_block_h; }
+
+    // 计算 blocked multicast targets（不改变 ISynapseRoute 接口，仅供 SpikeCommSubsystem 使用）。
+    // applied_gating=true 表示命中 gating 且已对目标集合做过滤。
+    bool computeMulticastTargets(uint32_t source_global,
+                                 uint32_t neuron_idx,
+                                 uint64_t now_cycles,
+                                 std::vector<BlockTarget>& out_targets,
+                                 bool& applied_gating) const;
+
 private:
     void logRoutingSummary_(const char* phase, const char* reason) const;
     void configureFanoutProvider_();
+    void initMulticastTargets_();
 
     SynapseRouteBuildConfig cfg_{};
     Output* log_ = nullptr;
@@ -84,8 +106,19 @@ private:
     bool gating_scope_inputs_only_ = true;
     std::unordered_map<uint32_t, GatingEntry> gating_cache_;
 
+    // Native multicast targets (MVP: 2x2 blocked)
+    using MulticastTargetMap = std::unordered_map<uint32_t, std::vector<BlockTarget>>;
+    bool multicast_ready_ = false;
+    uint32_t mesh_w_ = 0;
+    uint32_t mesh_h_ = 0;
+    std::shared_ptr<const MulticastTargetMap> multicast_targets_shared_;
+    MulticastTargetMap multicast_targets_local_;
+
     static std::mutex s_route_cache_mtx_;
     static std::unordered_map<std::string, std::weak_ptr<const RouteMap>> s_route_cache_;
+
+    static std::mutex s_multicast_cache_mtx_;
+    static std::unordered_map<std::string, std::weak_ptr<const MulticastTargetMap>> s_multicast_cache_;
 };
 
 }} // namespace SST::SnnDL

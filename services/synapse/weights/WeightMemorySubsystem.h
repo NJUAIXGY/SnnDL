@@ -10,9 +10,12 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cinttypes>
 #include <functional>
+#include <deque>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -49,6 +52,7 @@ public:
         uint32_t budget = 0;
         uint32_t issued = 0;
         uint32_t outstanding = 0;
+        uint32_t peak_outstanding = 0;
         uint32_t max_outstanding = 0;
     };
 
@@ -72,7 +76,22 @@ public:
         ReadBcsrFileFn read_bcsr_from_file;
         bool use_bcsr = false;
         bool bcsr_force_file_read = false;
+        bool bcsr_rowptr_file_fallback_enable = false;
         bool bcsr_prefetch_all = false;
+        // PhaseX: naive baseline needs a way to disable in-flight coalescing without disabling BCSR format.
+        bool bcsr_colidx_inflight_coalesce_enable = true;
+        bool bcsr_block_inflight_coalesce_enable = true;
+        // RowIndex(colidx) 冷启动/热路径优化：默认启用 "auto"（当 colidx 总量很小才用 all_rows；否则用 posts_prev）。
+        std::string bcsr_row_index_prefetch_mode = "auto"; // off/all_rows/posts_prev/auto
+        uint32_t bcsr_row_index_prefetch_all_rows_threshold = 1024;
+        uint64_t bcsr_row_index_prefetch_all_rows_max_bytes = 64ull * 1024ull;
+        // Block 缓存稳定性/性能：默认启用 LRU（由 BcsrWeightManager 托管），并允许按 miss 比率自适应扩容。
+        bool bcsr_block_cache_auto_tune = true;
+        uint64_t bcsr_block_cache_max_bytes = 64ull * 1024ull * 1024ull;
+        float bcsr_block_cache_tune_miss_ratio = 0.05f;
+        uint32_t bcsr_block_cache_tune_min_misses = 64;
+        // Populate dense weight cache from returned BCSR blocks (optimization; disable for naive_raw).
+        bool bcsr_populate_weight_cache_enable = true;
         bool bcsr_weight_guard_enable = true;
         float bcsr_weight_abs_max = 10.0f;
         bool readresp_zero_fallback = false;
@@ -100,6 +119,15 @@ public:
     // ===== Runtime binding (Phase1) =====
     void bindMemory(IMemoryAccess* mem) { mem_access_ = mem; }
     size_t pendingSize() const { return mem_access_ ? mem_access_->pendingSize() : 0; }
+    bool hasDeferredWork() const {
+        return !pending_bcsr_rowptr_waiters_.empty() ||
+               row_index_prefetch_bulk_pending_ ||
+               row_index_prefetch_bulk_inflight_ ||
+               !row_index_prefetch_rows_.empty() ||
+               !pending_colidx_reads_.empty() ||
+               !pending_block_reads_.empty() ||
+               !pending_direct_reads_.empty();
+    }
     void setNowCycle(uint64_t now_cycle) { now_cycle_ = now_cycle; }
     void onClockTick(uint64_t now_cycle);
     // 低层 dense 预取发起（scheme1 baseline 使用）：由调用方提供地址/大小与 row/col 起点。
@@ -122,23 +150,37 @@ public:
     // This is used when GAS/window orchestration moves into workload=snn and accumulator state is owned there.
     void overrideAccUpdate(AccUpdateFn fn) { orch_.acc_update = std::move(fn); }
 
-    // ===== Window counters (budget/outstanding) =====
-    void configureWindow(uint32_t budget, uint32_t max_outstanding) {
-        window_.budget = budget;
-        window_.max_outstanding = max_outstanding;
+    // ===== Read issuance counters (budget/inflight) =====
+    // NOTE:
+    // - issued: per-window issued "real reads" (issueRead_ calls), used for budget.
+    // - outstanding: global in-flight reads (issued but not yet resp), used for max_outstanding_requests throttle.
+    // This avoids the previous "edge-count throttle" bug: after colidx/block coalescing, many edges map to
+    // few real reads; throttling by edges would underfill inflight and inflate Apply latency.
+    void configureWindow(uint32_t budget_reads, uint32_t max_inflight_reads) {
+        window_.budget = budget_reads;
+        window_.max_outstanding = max_inflight_reads;
     }
     void beginWindow() {
         window_.issued = 0;
-        window_.outstanding = 0;
+        window_.peak_outstanding = window_.outstanding;
     }
-    bool canIssue(uint32_t n = 1) const {
-        const bool budget_ok = (window_.budget == 0) || (window_.issued + n <= window_.budget);
+    bool canIssue(uint32_t n = 1, bool count_budget = true) const {
+        const bool budget_ok =
+            (!count_budget) ||
+            (window_seq_ == 0) ||
+            (window_.budget == 0) ||
+            (window_.issued + n <= window_.budget);
         const bool ostd_ok = (window_.outstanding + n <= window_.max_outstanding);
         return budget_ok && ostd_ok;
     }
-    void noteIssue(uint32_t n = 1) {
-        window_.issued += n;
+    void noteIssue(uint32_t n = 1, bool count_budget = true) {
+        if (count_budget && window_seq_ != 0) {
+            window_.issued += n;
+        }
         window_.outstanding += n;
+        if (window_.outstanding > window_.peak_outstanding) {
+            window_.peak_outstanding = window_.outstanding;
+        }
     }
     void noteComplete(uint32_t n = 1) {
         if (window_.outstanding >= n) window_.outstanding -= n;
@@ -146,6 +188,7 @@ public:
     }
     uint32_t issued() const { return window_.issued; }
     uint32_t outstanding() const { return window_.outstanding; }
+    uint32_t peakOutstanding() const { return window_.peak_outstanding; }
     uint32_t budget() const { return window_.budget; }
     uint32_t maxOutstanding() const { return window_.max_outstanding; }
 
@@ -223,17 +266,67 @@ public:
 
     // ===== Orchestration entrypoints =====
     void beginApplyWindow(uint32_t seq, bool debug, SST::Output* out, int core_id) {
+        window_seq_ = seq;
+        // 若上一窗口未显式收尾（例如仿真提前结束/卡在 BeginApply），在新窗口开启前先输出上一窗口诊断摘要。
+        if (diag_debug_ && diag_window_active_ && diag_seq_ != 0 && diag_seq_ != seq) {
+            dumpWindowDiagSummary_("[diag-window-weights] rollover");
+            resetWindowDiag_();
+        }
+
         diag_out_ = out;
         diag_debug_ = debug;
         diag_core_id_ = core_id;
         diag_seq_ = seq;
+        if (diag_debug_) {
+            diag_window_active_ = true;
+            diag_window_seq_ = seq;
+            resetWindowDiag_();
+        } else {
+            diag_window_active_ = false;
+            diag_window_seq_ = 0;
+        }
         if (orch_.use_bcsr && orch_.bcsr_rowptr_ready && !orch_.bcsr_rowptr_ready()) {
             // defer until rowptr ready (preserve old behavior)
         }
         flipEdgesForApply(debug, out, core_id, seq);
         beginWindow();
+        block_hit_window_ = 0;
+        block_miss_window_ = 0;
         resetEdgeRetire_();
+        // RowIndex(colidx) 预取：用于降低 window1/2 的 rowidx_miss，以及提升后续窗口命中率（不改语义，仅提前读）。
+        if (orch_.use_bcsr) {
+            maybeEnqueueRowIndexPrefetchPostsPrev_();
+            drainRowIndexPrefetch_();
+        }
         diag_node_id_ = static_cast<int>(orch_.node_id);
+    }
+
+    // 仅用于调试：在 EndScatter 或仿真结束前输出当前窗口的权重读摘要。
+    // 该函数无行为副作用；仅打印并清空本地诊断计数器。
+    void endScatterWindow(uint32_t seq) {
+        (void)seq;
+        // Always perform non-diagnostic housekeeping (applies to all cores, not only debug targets).
+        maybeAutoTuneBlockCache_();
+        window_seq_ = 0;
+
+        if (!diag_debug_ || !diag_out_) return;
+        if (!diag_window_active_) return;
+        if (diag_window_seq_ != 0 && seq != diag_window_seq_) return;
+        dumpWindowDiagSummary_("[diag-window-weights] EndScatter");
+        resetWindowDiag_();
+        diag_window_active_ = false;
+        diag_window_seq_ = 0;
+    }
+
+    // 调试兜底：在仿真结束/提前退出时输出当前窗口（可能未完成）的权重读摘要。
+    void finishWindowDiag() {
+        if (!diag_debug_ || !diag_out_) return;
+        if (!diag_window_active_) return;
+        dumpWindowDiagSummary_("[diag-window-weights] finish");
+        resetWindowDiag_();
+        diag_window_active_ = false;
+        diag_window_seq_ = 0;
+        window_seq_ = 0;
     }
 
     void issueFromEdges() {
@@ -297,8 +390,6 @@ private:
                     tryRetireEdges_();
                     continue;
                 }
-                noteIssue();
-                if (orch_.update_pending_peak) orch_.update_pending_peak(outstanding());
                 if (diag_debug_ && diag_out_) {
                     diag_out_->verbose(CALL_INFO, 0, 0,
                         "[diag-read-issue-WMS] core=%d pre=%u post=%u window=%u seq=%zu use_bcsr=1\n",
@@ -308,7 +399,6 @@ private:
                     float resolved = w;
                     if (orch_.readresp_zero_fallback && resolved == 0.0f) resolved = orch_.init_default_weight;
                     setEdgeRetireReady_(seq, resolved, EdgeSrc::BCSR);
-                    noteComplete();
                     tryRetireEdges_();
                     issueFromEdges();
                 };
@@ -426,10 +516,8 @@ public:
             for (uint32_t post_l : posts_sorted) {
                 if (!canIssueMoreReads_()) break;
                 if (orch_.report_cache_access) orch_.report_cache_access(false);
-                noteIssue();
-                if (orch_.update_pending_peak) orch_.update_pending_peak(outstanding());
                 primed++;
-                auto cb = [this](float) { noteComplete(); };
+                auto cb = [](float) {};
                 requestBCSR_(pre_g, post_l, std::move(cb));
             }
             if (!canIssueMoreReads_()) break;
@@ -489,7 +577,7 @@ public:
 
 private:
     bool canIssueMoreReads_() const {
-        if (canIssue()) return true;
+        if (canIssue(/*n*/1, /*count_budget*/true)) return true;
         if (diag_debug_ && diag_out_) {
             diag_out_->verbose(CALL_INFO, 0, 0,
                 "[diag-edge-loop] core=%d budget/ostd stop issued=%u outstanding=%u budget=%u limit=%u\n",
@@ -587,8 +675,94 @@ private:
     int diag_core_id_ = 0;
     uint32_t diag_seq_ = 0;
 
+    struct WindowDiag {
+        // issue side (bytes == meta.size)
+        uint64_t issue_cnt_total = 0;
+        uint64_t issue_bytes_total = 0;
+        uint64_t issue_cnt_dense = 0;
+        uint64_t issue_bytes_dense = 0;
+        uint64_t issue_cnt_rowptr = 0;
+        uint64_t issue_bytes_rowptr = 0;
+        uint64_t issue_cnt_colidx = 0;
+        uint64_t issue_bytes_colidx = 0;
+        uint64_t issue_cnt_block = 0;
+        uint64_t issue_bytes_block = 0;
+
+        // response side (bytes == resp bytes from mem)
+        uint64_t resp_cnt_total = 0;
+        uint64_t resp_bytes_total = 0;
+        uint64_t resp_cnt_dense = 0;
+        uint64_t resp_bytes_dense = 0;
+        uint64_t resp_cnt_rowptr = 0;
+        uint64_t resp_bytes_rowptr = 0;
+        uint64_t resp_cnt_colidx = 0;
+        uint64_t resp_bytes_colidx = 0;
+        uint64_t resp_cnt_block = 0;
+        uint64_t resp_bytes_block = 0;
+
+        // quality checks
+        uint64_t resp_short_total = 0; // bytes < meta.size
+
+        // semantic cache behavior (BCSR)
+        uint64_t rowidx_hit = 0;
+        uint64_t rowidx_miss = 0;
+        uint64_t block_hit = 0;
+        uint64_t block_miss = 0;
+
+        // coarse duplicate detection (per window, bounded)
+        uint64_t issue_unique_addrs = 0;
+        uint64_t issue_dup_addrs = 0;
+    };
+
+    bool diag_window_active_ = false;
+    uint32_t diag_window_seq_ = 0;
+    WindowDiag diag_win_{};
+    std::unordered_set<uint64_t> diag_req_addrs_{};
+
+    void resetWindowDiag_() {
+        diag_win_ = WindowDiag{};
+        diag_req_addrs_.clear();
+    }
+
+    void dumpWindowDiagSummary_(const char* tag) {
+        if (!diag_out_) return;
+        const uint32_t seq = diag_window_seq_;
+        diag_out_->verbose(
+            CALL_INFO, 0, 0,
+            "%s node=%d core=%d window=%u "
+            "issue(cnt=%" PRIu64 " bytes=%" PRIu64 " dense=%" PRIu64 " rowptr=%" PRIu64 " colidx=%" PRIu64 " block=%" PRIu64 ") "
+            "resp(cnt=%" PRIu64 " bytes=%" PRIu64 " dense=%" PRIu64 " rowptr=%" PRIu64 " colidx=%" PRIu64 " block=%" PRIu64 " short=%" PRIu64 ") "
+            "bcsr(rowidx_hit=%" PRIu64 " rowidx_miss=%" PRIu64 " block_hit=%" PRIu64 " block_miss=%" PRIu64 ") "
+            "addr(unique=%" PRIu64 " dup=%" PRIu64 ")\n",
+            tag ? tag : "[diag-window-weights]",
+            diag_node_id_,
+            diag_core_id_,
+            seq,
+            diag_win_.issue_cnt_total,
+            diag_win_.issue_bytes_total,
+            diag_win_.issue_bytes_dense,
+            diag_win_.issue_bytes_rowptr,
+            diag_win_.issue_bytes_colidx,
+            diag_win_.issue_bytes_block,
+            diag_win_.resp_cnt_total,
+            diag_win_.resp_bytes_total,
+            diag_win_.resp_bytes_dense,
+            diag_win_.resp_bytes_rowptr,
+            diag_win_.resp_bytes_colidx,
+            diag_win_.resp_bytes_block,
+            diag_win_.resp_short_total,
+            diag_win_.rowidx_hit,
+            diag_win_.rowidx_miss,
+            diag_win_.block_hit,
+            diag_win_.block_miss,
+            diag_win_.issue_unique_addrs,
+            diag_win_.issue_dup_addrs);
+    }
+
     // ===== Phase1: memory is pure; semantic pending stays in this subsystem =====
     struct PendingMeta {
+        // Apply/window sequence id (from beginApplyWindow); used to scope in-flight coalescing to a single window.
+        uint32_t window_seq = 0;
         uint64_t address = 0;
         size_t size = 0;
         uint64_t orig_address = 0;
@@ -600,6 +774,7 @@ private:
         uint32_t count_floats = 0;
         bool is_weight = true;
         bool count_weight_read = true;
+        bool counted_inflight = false;
         uint64_t issue_cycle = 0;
         // 0=dense, 1=rowptr, 2=colidx, 3=blockdata
         int bcsr_kind = 0;
@@ -611,6 +786,7 @@ private:
         uint32_t bcsr_idx_in_row = 0;
         uint32_t bcsr_global_block_index = 0;
         bool bcsr_prefetch_all = false;
+        bool bcsr_colidx_bulk_all_rows = false;
         bool scheme1_prefetch = false;
         bool has_single_cb = false;
         uint32_t cb_post = 0;
@@ -620,6 +796,82 @@ private:
     IMemoryAccess* mem_access_ = nullptr;
     uint64_t now_cycle_ = 0;
     bool bcsr_prefetch_issued_ = false;
+    bool row_index_prefetch_all_done_ = false;
+    bool row_index_prefetch_bulk_pending_ = false;
+    bool row_index_prefetch_bulk_inflight_ = false;
+    std::deque<uint32_t> row_index_prefetch_rows_{};
+    uint32_t window_seq_ = 0;
+    bool bcsr_rowptr_file_preload_attempted_ = false;
+    bool bcsr_rowidx_file_preloaded_ = false;
+
+    // Lightweight always-on window counters (for auto-tune; independent of debug-only diag_win_).
+    uint32_t block_hit_window_ = 0;
+    uint32_t block_miss_window_ = 0;
+
+    // ===== Phase A/B: in-flight coalescing (per-window) =====
+    // 目的：消除同一窗口内对同一 colidx/blockdata 的重复读发起（大量 edge 在 colidx/block 未就绪时会抖动）。
+    // 约束：只在同一 window_seq 内合并；不跨窗共享（保持严格 GAS 边界语义）。
+    struct ColidxWaiter {
+        uint32_t pre_global = 0;
+        uint32_t post_local = 0;
+        uint32_t target_block_col = 0;
+        uint32_t intra_row = 0;
+        uint32_t intra_col = 0;
+        std::function<void(float)> cb;
+    };
+
+    struct ColidxInflight {
+        uint32_t window_seq = 0;
+        uint32_t block_row = 0;
+        uint32_t row_start = 0;
+        uint32_t row_end = 0;
+        bool issued = false;
+        bool queued = false;
+        bool count_budget = true;
+        std::vector<ColidxWaiter> waiters;
+    };
+
+    struct BlockWaiter {
+        uint32_t pre_global = 0;
+        uint32_t post_local = 0;
+        uint32_t intra_row = 0;
+        uint32_t intra_col = 0;
+        std::function<void(float)> cb;
+    };
+
+    struct BlockInflight {
+        uint32_t window_seq = 0;
+        uint32_t block_row = 0;
+        uint32_t block_col = 0;
+        uint32_t global_block_index = 0;
+        bool issued = false;
+        bool queued = false;
+        bool count_budget = true;
+        std::vector<BlockWaiter> waiters;
+    };
+
+    std::unordered_map<uint64_t, ColidxInflight> inflight_colidx_{};
+    std::unordered_map<uint64_t, BlockInflight> inflight_block_{};
+    std::deque<uint64_t> pending_colidx_reads_{};
+    std::deque<uint64_t> pending_block_reads_{};
+    struct PendingBcsrRowptrWaiter {
+        uint32_t pre_global = 0;
+        uint32_t post_local = 0;
+        std::function<void(float)> cb;
+    };
+    std::deque<PendingBcsrRowptrWaiter> pending_bcsr_rowptr_waiters_{};
+    // Direct (non-coalesced) read queue: used by naive baseline when coalescing is disabled, while still respecting inflight limits.
+    std::deque<PendingMeta> pending_direct_reads_{};
+    bool drain_pending_in_progress_ = false;
+
+    enum class IssueStatus : uint8_t { Issued, DeferredInflight, DeferredBudget, Failed };
+    IssueStatus tryIssueRead_(PendingMeta meta, bool count_budget, bool budget_reserved);
+    void drainPendingReads_();
+    void drainPendingDirectReads_();
+
+    static uint64_t makeInflightKey_(uint32_t window_seq, uint32_t id) {
+        return (static_cast<uint64_t>(window_seq) << 32) | static_cast<uint64_t>(id);
+    }
 
     void handleReadResp_(uint64_t req_id, uint64_t addr, PendingMeta meta, std::vector<uint8_t>&& data);
     uint64_t issueRead_(PendingMeta meta);
@@ -630,8 +882,22 @@ private:
     void issueDenseResolved_(uint32_t row, uint32_t col, uint32_t cb_col,
                              std::function<void(float)> cb);
     void requestDense_(uint32_t pre, uint32_t post, std::function<void(float)> cb);
+    void enqueueBcsrBlockReadCoalesced_(uint32_t win_seq,
+                                        uint32_t block_row,
+                                        uint32_t block_col,
+                                        uint32_t global_block_index,
+                                        uint32_t intra_row,
+                                        uint32_t intra_col,
+                                        uint32_t pre_global,
+                                        uint32_t post_local,
+                                        std::function<void(float)> cb);
     void requestBCSR_(uint32_t pre_global, uint32_t post_local, std::function<void(float)> cb);
     void maybeIssueBcsrRowptrPrefetch_();
+    void drainPendingBcsrRowptrWaiters_();
+    void maybeEnqueueRowIndexPrefetchAllRows_();
+    void maybeEnqueueRowIndexPrefetchPostsPrev_();
+    void drainRowIndexPrefetch_();
+    void maybeAutoTuneBlockCache_();
     void bcsrPrefetchAll_();
     void bcsrPrefetchRowBlocks_(uint32_t block_row, const std::vector<uint32_t>& cols, uint32_t row_start);
     void bcsrPopulateWeightCache_(uint32_t block_row, uint32_t block_col, const std::vector<float>& blk);

@@ -20,6 +20,18 @@
 
 ---
 
+## 与 “step 完成策略（done policy）” 的关系（容易误解点）
+
+`GlobalGasStepController` 只做 **全局 barrier**：它只关心每个 PE 是否上报了 `PeDone(seq)`。
+
+**每个 PE “什么时候决定自己完成了一个 step”** 属于 PE 侧策略，当前由 `components/MultiCorePE` 实现（参数 `global_step_done_policy`）：
+
+- `endscatter`：GAS/window 路径常用；收到所有 core 的 `EndScatter(seq)` 后上报 `PeDone(seq)`。
+- `quiescent`：non-window（naive）路径可用；当 PE 在一段静默周期内无输入/无在途事务时上报 `PeDone(seq)`。
+- `fixed_cycles`：用于 step-limited 的 `naive_raw` baseline；每 step 运行固定 cycles 后强制上报 `PeDone(seq)`，避免 quiescent 难以满足导致卡 step。
+
+---
+
 ## 参数与端口（与 ELI 文档一致）
 
 - **参数**：

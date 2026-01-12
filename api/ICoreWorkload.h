@@ -82,6 +82,11 @@ public:
                                      uint64_t hwm_bytes,
                                      uint64_t spill_records,
                                      uint64_t spilled_bytes) = nullptr;
+
+        // Optional: GAS/window explicit end handshake (for global step-gate sync).
+        // When provided, workload may request ending the current Gather/Scatter stage.
+        void (*request_gas_end_gather)(void* ctx, uint32_t superstep) = nullptr;
+        void (*request_gas_end_scatter)(void* ctx, uint32_t superstep) = nullptr;
     };
 
     struct TimeSource {

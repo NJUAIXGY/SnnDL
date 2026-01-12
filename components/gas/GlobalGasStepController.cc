@@ -18,8 +18,16 @@ GlobalGasStepController::GlobalGasStepController(SST::ComponentId_t id, SST::Par
     out_ = new SST::Output("GlobalGasStepController[@p:@l]: ", verbose_, 0, SST::Output::STDOUT);
 
     start_seq_ = params.find<uint32_t>("start_seq", 1);
+    max_steps_ = params.find<uint32_t>("max_steps", 0);
     require_all_ready_ = params.find<int>("require_all_ready", 1) != 0;
     strict_seq_check_ = params.find<int>("strict_seq_check", 1) != 0;
+
+    // 仅在 step-limited 模式下注册为 primary，避免影响默认的 time-based stop-at 回归口径。
+    primary_keepalive_ = (max_steps_ > 0);
+    if (primary_keepalive_) {
+        registerAsPrimaryComponent();
+        primaryComponentDoNotEndSim();
+    }
 
     // 端口向量：pe_link0, pe_link1, ...
     const std::string prefix = "pe_link";
@@ -58,7 +66,22 @@ void GlobalGasStepController::setup() {
 }
 
 void GlobalGasStepController::finish() {
-    // no-op
+    if (!out_) return;
+    size_t ready = 0;
+    size_t done = 0;
+    for (auto v : pe_ready_) if (v) ++ready;
+    for (auto v : pe_done_) if (v) ++done;
+    out_->verbose(
+        CALL_INFO, 1, 0,
+        "[step-sync] finish: started=%d current_seq=%u max_steps=%u completed=%u ready=%zu/%zu done=%zu/%zu\n",
+        started_ ? 1 : 0,
+        current_seq_,
+        max_steps_,
+        steps_completed_,
+        ready,
+        pe_ready_.size(),
+        done,
+        pe_done_.size());
 }
 
 bool GlobalGasStepController::allReady_() const {
@@ -139,6 +162,20 @@ void GlobalGasStepController::handleBarrierEvent_(SST::Event* ev, int pe_index) 
             out_->verbose(CALL_INFO, 3, 0, "[step-sync] PE_DONE seq=%u pe=%d src_node=%u\n", seq, pe_index, src_node);
         }
         if (allDone_()) {
+            steps_completed_ += 1;
+            if (max_steps_ > 0 && steps_completed_ >= max_steps_) {
+                if (out_) {
+                    out_->verbose(CALL_INFO, 1, 0,
+                                  "[step-sync] reached max_steps=%u (completed=%u), stopping\n",
+                                  max_steps_, steps_completed_);
+                }
+                if (primary_keepalive_) {
+                    primaryComponentOKToEndSim();
+                }
+                delete msg;
+                return;
+            }
+
             ++current_seq_;
             pe_done_.assign(pe_links_.size(), 0);
             broadcastStart_(current_seq_);

@@ -6,6 +6,8 @@
 
 - `SNNDL_HIERARCHY_AND_WORKFLOW.md`
   - SnnDL 总览文档：目录层次（Hierarchy）、跨层接口、以及以 `sst_dram_si/test_mesh_4x4.py` 为例的端到端工作流与回归口径。
+- `BCSR_WEIGHT_GENERATION_GUIDE.md`
+  - BCSR 权重文件的二进制布局（rowptr/colidx/blockdata/blockids）、常用数据集（10k/100k）生成命令、meta/stride/对齐校验与在 mesh 模版中的加载方式。
 - `plans/2026-01-03-universal-core-completion.md`
   - “通用计算核完成态”（packet-first + 可插拔 workload）推进计划与 DoD（最终验收口径的唯一真源）。
 - `UNIVERSAL_CONTROL_CORE_DESIGN.md`

@@ -69,7 +69,7 @@ public:
         {"core_id", "ID of the core", ""},
         {"compute_core_impl", "Compute core implementation name (default/snn)", "default"},
         // Phase6：通用 workload（默认仍为 SNN；stream 用于通信+内存 read-after-write 验证负载）
-        {"workload_impl", "Workload implementation: snn (default) or stream", "snn"},
+        {"workload_impl", "Workload implementation: snn (default) / stream / traffic", "snn"},
         {"stream_mem_enable", "Enable stream memory read/write verify (0/1)", "1"},
         {"stream_mem_period_cycles", "Issue one stream write per N cycles (0=as fast as possible)", "100"},
         {"stream_mem_region_bytes", "Stream memory region size in bytes (0=disable mem)", "4096"},
@@ -492,9 +492,11 @@ private:
     bool read_force_single_ = false; // 当为真时，强制按单元素读取（req_size=4B），用于定位对齐/切片问题
 
 	    // === Phase6: Workload selection ===
-	    enum class WorkloadImpl : uint8_t { Snn = 0, Stream = 1 };
+	    enum class WorkloadImpl : uint8_t { Snn = 0, Stream = 1, Traffic = 2 };
 	    WorkloadImpl workload_impl_ = WorkloadImpl::Snn;
 	    inline bool isStreamWorkload_() const { return workload_impl_ == WorkloadImpl::Stream; }
+	    inline bool isTrafficWorkload_() const { return workload_impl_ == WorkloadImpl::Traffic; }
+	    inline bool isNonSnnWorkload_() const { return workload_impl_ != WorkloadImpl::Snn; }
 
 	    // Phase6.3：workload 插件（Phase6/Phase3）；当前仅 stream 通过工厂创建，SNN 保持原快路径。
 	    std::unique_ptr<ICoreWorkload> workload_;
@@ -511,6 +513,8 @@ private:
                                             uint64_t hwm_bytes,
                                             uint64_t spill_records,
                                             uint64_t spilled_bytes);
+        static void requestGasEndGatherThunk_(void* ctx, uint32_t superstep);
+        static void requestGasEndScatterThunk_(void* ctx, uint32_t superstep);
 
     IPeAggregation* parent_pe_cached_ = nullptr;
     Output* output_;

@@ -106,8 +106,16 @@ public:
     // 由 MultiCorePE 的阶段事件转发：BeginGather（仅当 period_cycles==0 时有效）
     void onBeginGather(uint32_t seq, uint64_t ts_ns, int core_id);
 
+    // 由 MultiCorePE 的全局 Step barrier 转发：START_STEP(seq)
+    // 语义：在 GLOBAL_STEP_SYNC_ENABLE=1 下作为“每 step 一次”的首选触发点；
+    // 仅当 period_cycles==0 时生效（固定周期注入仍由 tick() 驱动）。
+    void onGlobalStepStart(uint32_t seq, uint64_t ts_ns);
+
     // 由 MultiCorePE 的阶段事件转发：EndScatter（用于 step_reset_mem_each_step）
     void onEndScatter(uint32_t seq);
+
+    bool enabled() const { return cfg_.enable; }
+    bool injectedForSeq(uint32_t seq) const;
 
 private:
     int determineTargetUnit_(uint32_t neuron_id) const;

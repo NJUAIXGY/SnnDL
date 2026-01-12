@@ -97,8 +97,9 @@ bool appendRoutesFromBcsrFile(const SynapseRouteBuildConfig& cfg,
     uint64_t blockids_off = (cfg.bcsr_blockids_addr > cfg.base_addr) ? (cfg.bcsr_blockids_addr - cfg.base_addr) : 0;
     uint32_t total_blocks = 0;
 
-    // Phase5‑5.3：BCSR meta 口径仅用于“补齐缺省值”，不得无条件覆盖 cfg 下发的 offsets，
-    // 避免 Step reachability 与 WeightMemorySubsystem 产生 drift。
+    // 注意：同一目录下不同 core 的 total_blocks 可能不同，导致 blockdata/blockids 的 offset 随文件变化。
+    // 因此对于“读文件构建路由”的路径：优先使用每个文件自身的 .meta.json offsets/total_blocks，
+    // 以避免使用“全局固定 offset”造成错位读取（会导致 Step reachability 随 run/布局漂移）。
     const std::string meta_path = path + ".meta.json";
     BcsrMeta meta{};
     if (parseBcsrMetaJsonFile(meta_path, meta)) {
@@ -108,12 +109,12 @@ bool appendRoutesFromBcsrFile(const SynapseRouteBuildConfig& cfg,
         if (!cfg.bcsr_bc && meta.bc) bc = meta.bc;
         if (!cfg.bcsr_idx_bytes && meta.idx_bytes) idx_bytes = meta.idx_bytes;
         if (!cfg.bcsr_val_bytes && meta.val_bytes) val_bytes = meta.val_bytes;
-
-        if (rowptr_off == 0) rowptr_off = meta.rowptr_offset;
-        if (colidx_off == 0) colidx_off = meta.colidx_offset;
-        if (blockdata_off == 0) blockdata_off = meta.blockdata_offset;
-        if (blockids_off == 0) blockids_off = meta.blockids_offset;
-        if (total_blocks == 0 && meta.total_blocks) total_blocks = meta.total_blocks;
+        // offsets/blocks：使用 per-file meta（否则在 total_blocks 波动时会错位）
+        rowptr_off = meta.rowptr_offset;
+        colidx_off = meta.colidx_offset;
+        blockdata_off = meta.blockdata_offset;
+        blockids_off = meta.blockids_offset;
+        if (meta.total_blocks) total_blocks = meta.total_blocks;
     } else {
         total_blocks = 0;
     }

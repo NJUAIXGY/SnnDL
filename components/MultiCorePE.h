@@ -20,6 +20,7 @@
 
 #include <vector>
 #include <string>
+#include <array>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -165,6 +166,12 @@ public:
         {"step_activation_log_enable", "启用步级激活BCSR路由构建日志(0/1)", "0"}
         ,
         {"global_step_sync_enable", "启用全局 Step/GAS barrier 同步(0/1)", "0"}
+        ,
+        {"global_step_done_policy", "全局 step 完成判定策略：endscatter/drain/quiescent/fixed_cycles（默认endscatter）", "endscatter"}
+        ,
+        {"global_step_quiescent_min_cycles", "quiescent 模式：每 step 至少等待的周期数（避免同拍开始即完成）", "1"}
+        ,
+        {"global_step_drain_min_cycles", "drain 模式：判定无在途事务后仍需保持静默的周期数（覆盖网络最坏延迟；语义等价对比推荐）", "200"}
     )
 
     // 子组件槽位文档
@@ -251,6 +258,7 @@ public:
         {"mem_outstanding_at_issue", "发起时并发请求数", "count", 1},
         {"gas_activity_f", "GAS 窗口内活跃度 f（活跃轴数/列宽）", "ratio", 1},
         {"sim_cycles_total", "总仿真周期（组件clock tick累计）", "cycles", 1},
+        {"global_steps_done_total", "全局 Step/GAS 同步：本PE已完成的step数（PeDone次数）", "count", 1},
         {"step_activation_invocations", "step随机激活触发次数", "count", 1},
         {"step_activation_pre_selected", "step随机激活选中的pre节点数", "count", 1},
         {"step_activation_spike_attempts", "step随机激活尝试产生的spike数量", "count", 1},
@@ -450,6 +458,7 @@ private:
     Statistic<double>*  stat_gas_activity_f_ = nullptr;
     Statistic<uint64_t>* stat_mem_outstanding_at_issue_ = nullptr;
     Statistic<uint64_t>* stat_sim_cycles_total_ = nullptr;
+    Statistic<uint64_t>* stat_global_steps_done_total_ = nullptr;
     Statistic<uint64_t>* stat_step_activation_invocations_ = nullptr;
     Statistic<uint64_t>* stat_step_activation_pre_selected_ = nullptr;
     Statistic<uint64_t>* stat_step_activation_spike_attempts_ = nullptr;
@@ -526,6 +535,17 @@ private:
     uint64_t test_cycle_counter_;
     int test_spikes_sent_;  // 已发送的测试脉冲计数
 
+    // ===== NoC 端到端延迟画像（native multicast lab）=====
+    uint32_t noc_lat_hist_max_ = 131072; // cycles；>hist_max 归入 overflow bin（hist_max+1）
+    uint64_t noc_lat_spike_cnt_ = 0;
+    uint64_t noc_lat_spike_sum_ = 0;
+    uint64_t noc_lat_spike_max_ = 0;
+    std::vector<uint64_t> noc_lat_spike_hist_{};
+    uint64_t noc_lat_spikekey_cnt_ = 0;
+    uint64_t noc_lat_spikekey_sum_ = 0;
+    uint64_t noc_lat_spikekey_max_ = 0;
+    std::vector<uint64_t> noc_lat_spikekey_hist_{};
+
     // ===== 时间窗口化统计（Batch‑B） =====
     bool window_stats_enable_ = false;
     uint64_t window_us_ = 20;      // 默认窗口长度
@@ -569,6 +589,12 @@ private:
     StepActivationSubsystem step_activation_subsys_{};
 
     // Global Step/GAS barrier sync (Phase-step-sync)
+    enum class GlobalStepDonePolicy : uint8_t {
+        EndScatter = 0,
+        Drain = 1,      // drain-based：显式检查 core/NoC/NIC 后，再要求静默 N 周期
+        Quiescent = 2,  // legacy：仅基于 hasWork/incomingQueue 的静默判定（保留兼容）
+        FixedCycles = 3 // 每 step 运行固定 cycles 后强制完成（吞吐口径/调试用；不用于语义等价对比）
+    };
     bool global_step_sync_enable_ = false;
     bool global_step_sync_ready_ = false;
     bool global_step_ready_sent_ = false;
@@ -577,7 +603,20 @@ private:
     uint32_t global_step_pending_seq_ = 0;
     uint32_t global_step_active_seq_ = 0;
     bool global_step_done_sent_ = false;
+    GlobalStepDonePolicy global_step_done_policy_ = GlobalStepDonePolicy::EndScatter;
+    uint64_t global_step_begin_cycle_ = 0;
+    uint64_t global_step_quiescent_min_cycles_ = 1;
+    uint64_t global_step_drain_min_cycles_ = 200;
+    uint64_t global_step_fixed_cycles_ = 0;
+    uint64_t global_step_last_activity_cycle_ = 0;
+    uint32_t global_step_drain_diag_count_ = 0;
     std::vector<uint8_t> global_step_done_cores_{};
+    // 全局 Step 诊断：记录当前 active_seq 的每核最后一次阶段事件，便于在 finish() 处输出“卡在哪”
+    // code: 0=None 1=BeginGather 2=BeginApply 3=EndApply 4=BeginScatter 5=EndScatter
+    std::vector<uint8_t> global_step_last_stage_code_{};
+    std::vector<uint32_t> global_step_last_stage_seq_{};
+    std::vector<uint64_t> global_step_last_stage_ts_ns_{};
+    std::vector<uint64_t> global_step_last_stage_spikes_{};
     // Spike packet bridge (Phase3-C): Spike 编解码与投递 glue 下沉到 synapse 域
     SpikePacketBridge spike_packet_bridge_{};
     // NoC 子系统（Phase4-A1.1）：收敛 send/recv/forward + 本地投递

@@ -10,6 +10,7 @@
 
 #include <sst/core/subcomponent.h>
 #include <sst/core/params.h>
+#include <cstddef>
 #include <functional>
 #include <string>
 
@@ -84,6 +85,17 @@ public:
      * @return 状态字符串
      */
     virtual std::string getNetworkStatus() const = 0;
+
+    /**
+     * @brief 平台侧可选探针：当前仍在 NIC 内部排队、尚未进入网络的待发送事件数量
+     *
+     * 用途：
+     * - Global step drain-based barrier：避免在 NIC 背压堆积时把 step 误判为已完成。
+     *
+     * 说明：
+     * - 默认返回 0，表示“不支持/未知”；不会影响功能正确性，但 drain 判定可能更保守或退化为基于静默周期。
+     */
+    virtual size_t pendingSendCount() const { return 0; }
 };
 
 } // namespace SnnDL

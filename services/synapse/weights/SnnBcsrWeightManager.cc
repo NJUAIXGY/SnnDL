@@ -41,16 +41,30 @@ void BcsrWeightManager::setRowIndexCacheCapacity(uint32_t cap) {
 void BcsrWeightManager::setBlockCacheCapacity(uint32_t cap) {
     block_cache_cap_ = cap;
     if (block_cache_cap_ == 0) {
+        block_cache_order_.clear();
         block_cache_.clear();
         return;
     }
-    while (block_cache_.size() > block_cache_cap_) {
-        block_cache_.erase(block_cache_.begin());
+    const bool evict_front =
+        (block_cache_policy_ == BlockCachePolicy::FIFO) ||
+        (block_cache_policy_ == BlockCachePolicy::LegacyUnordered);
+    while (block_cache_.size() > block_cache_cap_ && !block_cache_order_.empty()) {
+        const uint64_t victim = evict_front ? block_cache_order_.front() : block_cache_order_.back();
+        if (evict_front) block_cache_order_.pop_front();
+        else block_cache_order_.pop_back();
+        block_cache_.erase(victim);
     }
+}
+
+void BcsrWeightManager::setBlockCachePolicy(BlockCachePolicy policy) {
+    if (block_cache_policy_ == policy) return;
+    block_cache_policy_ = policy;
+    resetCaches();
 }
 
 void BcsrWeightManager::resetCaches() {
     row_index_cache_.clear();
+    block_cache_order_.clear();
     block_cache_.clear();
 }
 
@@ -142,19 +156,56 @@ void BcsrWeightManager::rowIndexPut(uint32_t block_row, std::vector<uint32_t>&& 
     row_index_cache_[block_row] = std::move(cols);
 }
 
-bool BcsrWeightManager::blockGet(uint32_t block_row, uint32_t block_col, std::vector<float>& out) const {
+bool BcsrWeightManager::blockGet(uint32_t block_row, uint32_t block_col, std::vector<float>& out) {
     const uint64_t key = makeBlockKey(block_row, block_col);
     auto it = block_cache_.find(key);
     if (it == block_cache_.end()) return false;
-    out = it->second;
+    out = it->second.data;
+    if (block_cache_policy_ == BlockCachePolicy::LRU) {
+        // LRU: bump to MRU on hit.
+        block_cache_order_.splice(block_cache_order_.begin(), block_cache_order_, it->second.it);
+        it->second.it = block_cache_order_.begin();
+    }
     return true;
 }
 
 void BcsrWeightManager::blockPut(uint32_t block_row, uint32_t block_col, std::vector<float>&& data) {
     if (block_cache_cap_ == 0) return;
     const uint64_t key = makeBlockKey(block_row, block_col);
-    evictBlockIfNeeded(key);
-    block_cache_[key] = std::move(data);
+    auto it = block_cache_.find(key);
+    if (it != block_cache_.end()) {
+        it->second.data = std::move(data);
+        if (block_cache_policy_ == BlockCachePolicy::LRU) {
+            block_cache_order_.splice(block_cache_order_.begin(), block_cache_order_, it->second.it);
+            it->second.it = block_cache_order_.begin();
+        }
+        return;
+    }
+
+    if (block_cache_cap_ > 0 && block_cache_.size() >= block_cache_cap_) {
+        const bool evict_front =
+            (block_cache_policy_ == BlockCachePolicy::FIFO) ||
+            (block_cache_policy_ == BlockCachePolicy::LegacyUnordered);
+        if (!block_cache_order_.empty()) {
+            const uint64_t victim = evict_front ? block_cache_order_.front() : block_cache_order_.back();
+            if (evict_front) block_cache_order_.pop_front();
+            else block_cache_order_.pop_back();
+            block_cache_.erase(victim);
+        }
+    }
+
+    std::list<uint64_t>::iterator order_it;
+    if (block_cache_policy_ == BlockCachePolicy::LRU) {
+        block_cache_order_.push_front(key);
+        order_it = block_cache_order_.begin();
+    } else {
+        block_cache_order_.push_back(key);
+        order_it = std::prev(block_cache_order_.end());
+    }
+    BlockCacheEntry entry;
+    entry.data = std::move(data);
+    entry.it = order_it;
+    block_cache_.emplace(key, std::move(entry));
 }
 
 bool BcsrWeightManager::hasBlock(uint32_t block_row, uint32_t block_col) const {
@@ -171,11 +222,4 @@ void BcsrWeightManager::evictRowIndexIfNeeded(uint32_t incoming_key) {
     if (row_index_cache_.size() < row_index_cache_cap_) return;
     if (row_index_cache_.find(incoming_key) != row_index_cache_.end()) return;
     row_index_cache_.erase(row_index_cache_.begin());
-}
-
-void BcsrWeightManager::evictBlockIfNeeded(uint64_t incoming_key) {
-    if (block_cache_cap_ == 0) return;
-    if (block_cache_.size() < block_cache_cap_) return;
-    if (block_cache_.find(incoming_key) != block_cache_.end()) return;
-    block_cache_.erase(block_cache_.begin());
 }

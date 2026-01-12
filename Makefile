@@ -202,6 +202,8 @@ am_libSnnDL_la_OBJECTS = events/SimpleTestEvent.lo \
 	services/synapse/weights/SnnBcsrWeightManager.lo \
 	services/synapse/weights/SnnWeightDiagnostics.lo \
 	components/noc/SnnNetworkAdapter.lo \
+	components/noc/MulticastRouter.lo \
+	components/noc/MulticastNIC.lo \
 	services/synapse/route/SnnRouteProvider.lo \
 	services/synapse/route/BcsrRouteBuilder.lo \
 	services/synapse/route/StepBcsrReachability.lo \
@@ -217,6 +219,7 @@ am_libSnnDL_la_OBJECTS = events/SimpleTestEvent.lo \
 	services/workload/CoreWorkloadFactory.lo \
 	services/workload/snn/SnnWorkload.lo \
 	services/workload/stream/StreamWorkload.lo \
+	services/workload/traffic/TrafficWorkload.lo \
 	services/memory/StandardMemAccess.lo
 libSnnDL_la_OBJECTS = $(am_libSnnDL_la_OBJECTS)
 AM_V_lt = $(am__v_lt_$(V))
@@ -703,6 +706,10 @@ libSnnDL_la_SOURCES = \
 	services/synapse/weights/SnnWeightDiagnostics.h \
 	components/noc/SnnNetworkAdapter.cc \
 	components/noc/SnnNetworkAdapter.h \
+	components/noc/MulticastRouter.cc \
+	components/noc/MulticastRouter.h \
+	components/noc/MulticastNIC.cc \
+	components/noc/MulticastNIC.h \
 	services/SnnProfiler.h \
 	services/synapse/route/SnnRouteProvider.cc \
 	services/synapse/route/SnnRouteProvider.h \
@@ -734,6 +741,8 @@ libSnnDL_la_SOURCES = \
 	services/workload/snn/SnnWorkload.h \
 	services/workload/stream/StreamWorkload.cc \
 	services/workload/stream/StreamWorkload.h \
+	services/workload/traffic/TrafficWorkload.cc \
+	services/workload/traffic/TrafficWorkload.h \
 	services/memory/StandardMemAccess.cc \
 	services/memory/StandardMemAccess.h
 

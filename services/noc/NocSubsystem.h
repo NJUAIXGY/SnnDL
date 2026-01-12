@@ -78,6 +78,9 @@ public:
     void tickRing(uint64_t current_cycle);
 
     size_t incomingQueueSize() const { return incoming_queue_.size(); }
+    bool isIdle() const;
+    size_t nicPendingSendCount() const;
+    int ringPendingMessageCount() const;
 
 private:
     void enqueueIncoming_(NocPacketEvent* packet);
