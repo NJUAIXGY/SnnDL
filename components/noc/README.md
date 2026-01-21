@@ -4,6 +4,12 @@
 
 > 重要：主链路默认推荐使用 `components/SnnNIC.*`（SimpleNetwork/linkcontrol 路径）。本目录的适配器用于更高级/实验性的“拓扑适配/直连端口”场景。
 
+## 口径说明：NoC payload 与内存粒度
+
+- NoC 子系统以 `events/NocPacketEvent` 为 payload（packet-first），**不解析 SNN/Synapse 语义**。
+- SnnDL 的默认内存建模语义为 **cacheline 粒度**（与 `memHierarchy` 的 `GetS/GetX` 事务统计对齐）。NoC 组件本身不应隐式引入 row-streaming/DMA 等更强假设；如需
+实验该类假设，应在上层 workload/synapse 域显式配置并在输出中标注。
+
 ---
 
 ## 主要组件

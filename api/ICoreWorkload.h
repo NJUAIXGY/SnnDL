@@ -124,6 +124,8 @@ public:
     virtual void onInitPhase(unsigned /*phase*/) {}
     virtual void onSetup() {}
     virtual void onFinish() {}
+    // Optional: global step start hook (used by step-limited experiments / platform sync).
+    virtual void onGlobalStepStart(uint32_t /*seq*/) {}
 
     // === Optional metrics (default empty/zero) ===
     virtual bool hasWork() const { return false; }

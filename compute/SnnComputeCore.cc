@@ -35,7 +35,7 @@ void DefaultSnnComputeCore::configure(const ComputeCoreContext& ctx, const SST::
     // 基础参数
     num_neurons_ = ctx.num_neurons;
     global_neuron_base_ = ctx.global_neuron_base;
-    neurons_per_pe_cfg_ = ctx.neurons_per_pe_cfg ? ctx.neurons_per_pe_cfg : (ctx.num_neurons *  ctx.num_neurons ? 1 : 0); // fallback
+    neurons_per_pe_cfg_ = ctx.neurons_per_pe_cfg ? ctx.neurons_per_pe_cfg : ctx.num_neurons;
     v_thresh_ = params.find<float>("v_thresh", 1.0f);
     v_reset_ = params.find<float>("v_reset", 0.0f);
     v_rest_ = params.find<float>("v_rest", 0.0f);
@@ -189,7 +189,7 @@ void DefaultSnnComputeCore::onClockTick(uint64_t now_cycle) {
 
 void DefaultSnnComputeCore::endCycle(uint64_t now_cycle) {
     // 诊断：观察 pending dv 列表与膜电位上限（限制次数）
-    if (output_) {
+    if (output_ && window_read_debug_ && output_->getVerboseLevel() >= 2) {
         static uint32_t diag_end_logs = 0;
         const uint32_t kLogLimit = 16;
         if (diag_end_logs < kLogLimit) {
@@ -199,7 +199,7 @@ void DefaultSnnComputeCore::endCycle(uint64_t now_cycle) {
                 float v = core_engine_.getMem(i);
                 if (v > v_max) { v_max = v; v_max_idx = i; }
             }
-            output_->verbose(CALL_INFO, 0, 0,
+            output_->verbose(CALL_INFO, 2, 0,
                 "[diag-endcycle] core=%u pending=%zu stage=%d apply_acc=%d gas_window=%d v_max=%.6f idx=%u v_thresh=%.6f\n",
                 ctx_.core_id, pending_dv_list_.size(),
                 static_cast<int>(gas_stage_), apply_acc_enable_ ? 1 : 0,
@@ -266,11 +266,11 @@ void DefaultSnnComputeCore::applySynapticDelta(uint32_t post_local, float dv) {
             pending_dv_list_.push_back(post_local);
         }
         // 诊断：确认 pending 列表被填充（限制次数，避免日志膨胀）
-        if (output_ && dv != 0.0f) {
+        if (output_ && window_read_debug_ && output_->getVerboseLevel() >= 2 && dv != 0.0f) {
             static uint32_t diag_delta_logs = 0;
             const uint32_t kLogLimit = 16;
             if (diag_delta_logs < kLogLimit) {
-                output_->verbose(CALL_INFO, 0, 0,
+                output_->verbose(CALL_INFO, 2, 0,
                     "[diag-dv] core=%u post=%u dv=%.6f pending_sz=%zu num_neurons=%u\n",
                     ctx_.core_id, post_local, dv, pending_dv_list_.size(), num_neurons_);
                 ++diag_delta_logs;

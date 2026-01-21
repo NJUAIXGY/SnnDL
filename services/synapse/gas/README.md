@@ -4,6 +4,14 @@
 
 > 边界原则：GAS 域负责“窗口与累加辅助”，不负责神经动力学（compute），也不负责 NoC/路由表构建。
 
+## 默认内存语义（cacheline）与 GAS granule 统计
+
+- 平台默认内存语义：**cacheline 粒度**（对齐 `memHierarchy` 的 `GetS/GetX` 事务统计）。
+- GAS 可能在 Apply 阶段进行合并读/补洞，从而形成大于 cacheline 的“granule”读取；这类 overfetch 必须通过 GAS 自身统计闭环解释：
+  - `gas_unique_bytes_total / gas_unique_reads_total`（唯一覆盖字节数与唯一读次数）
+  - `gas.avg_granule_bytes`（聚合指标，dense microbench 默认应接近 `line_size_bytes`）
+- 若实验需要 row-streaming/DMA 假设，应显式开启并单列结果；默认不允许隐式回退到 row/granule 语义。
+
 ---
 
 ## 目录结构与组件职责

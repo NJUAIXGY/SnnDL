@@ -41,3 +41,12 @@
 
 - **禁止**：在 `services/memory` 里出现 `weight/synapse/bcsr/route` 的业务语义。
 - **建议**：任何回包解析（float/idx 解码）放到 `services/synapse/weights` 的语义层；Memory 只保证“正确的字节块”。
+
+---
+
+## 内存建模口径（默认 cacheline）
+
+Memory 域不负责“粒度语义”，但项目默认的体系结构抽象是 memHierarchy 的 cacheline 事务模型：
+
+- 论文/报告的 traffic 主口径应以 MemController 的 `requests_received_*` 为准（L2 traffic，近似 off-chip）。
+- `memory_bytes/memory_requests` 表示上层发起的逻辑请求（L1），用于解释合并/去重形态，不应直接等价为 DRAM 流量。

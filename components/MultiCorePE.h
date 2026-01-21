@@ -17,6 +17,7 @@
 #include <sst/core/clock.h>
 #include <sst/core/interfaces/simpleNetwork.h>
 #include <sst/core/interfaces/stdMem.h>
+#include <sst/core/shared/sharedArray.h>
 
 #include <vector>
 #include <string>
@@ -172,6 +173,10 @@ public:
         {"global_step_quiescent_min_cycles", "quiescent 模式：每 step 至少等待的周期数（避免同拍开始即完成）", "1"}
         ,
         {"global_step_drain_min_cycles", "drain 模式：判定无在途事务后仍需保持静默的周期数（覆盖网络最坏延迟；语义等价对比推荐）", "200"}
+        ,
+        {"loader_done_key", "SharedArray key toggled by WeightLoader upon completion（用于 Step-limited 下延迟 PE_READY）", ""}
+        ,
+        {"global_step_ready_delay_cycles", "global_step_sync_enable=1 时：在 loader_done 后额外等待 N 周期再发送 PE_READY（避免 naive_* 在 rowptr 未就绪时积压）", "0"}
     )
 
     // 子组件槽位文档
@@ -381,6 +386,7 @@ private:
     bool primary_registered_ = false;
     uint64_t global_neuron_base_;
     int verbose_;
+    std::string clock_freq_ = "1GHz";
     std::string weights_file_;
     bool enable_numa_;
     bool enable_test_traffic_;
@@ -610,6 +616,13 @@ private:
     uint64_t global_step_fixed_cycles_ = 0;
     uint64_t global_step_last_activity_cycle_ = 0;
     uint32_t global_step_drain_diag_count_ = 0;
+    // Step-limited 下的就绪门控：等待 WeightLoader 发布 done 再发送 PE_READY（避免 naive_* 在 rowptr 未就绪时爆炸式积压）
+    std::string loader_done_key_;
+    bool wait_for_loader_done_ = false;
+    bool loader_ready_latched_ = false;
+    uint64_t loader_ready_cycle_ = 0;
+    uint64_t global_step_ready_delay_cycles_ = 0;
+    std::unique_ptr<SST::Shared::SharedArray<int>> loader_done_shared_;
     std::vector<uint8_t> global_step_done_cores_{};
     // 全局 Step 诊断：记录当前 active_seq 的每核最后一次阶段事件，便于在 finish() 处输出“卡在哪”
     // code: 0=None 1=BeginGather 2=BeginApply 3=EndApply 4=BeginScatter 5=EndScatter

@@ -4,6 +4,32 @@
 
 > 边界原则：Weights 域可以理解 “权重/BCSR/缓存/ΔV 更新” 语义，但不负责 NoC 发送，不构建 fanout 路由表。
 
+## 默认内存语义（cacheline）与显式 overfetch
+
+- 平台默认的体系结构口径是 **cacheline 粒度**（对齐 `memHierarchy GetS/GetX` 事务统计）。
+- Weights 域可能在“窗口读合并/补洞/预取”时形成大于 cacheline 的覆盖读（尤其是 BCSR 的索引与块数据路径）；此时必须：
+  - 在输出中记录 effective 参数（`effective_config.json`）；
+  - 通过 `gas_unique_bytes_total/gas_unique_reads_total`（以及 `gas.avg_granule_bytes`）闭环解释 overfetch；
+  - 在 dense microbench 默认语义下，要求 granule 逼近 cacheline（避免把 row-streaming/DMA 假设混入默认结论）。
+
+---
+
+## BCSR “仅格式（format-only）”模式的功能正确性约束（重要）
+
+为了做“只归因 GAS/window”的公平对比，我们有时会在 SnnDL 内部**全局禁用** BCSR 级优化（rowIndex cache/prefetch、block cache、populate、inflight coalescing 等），让 BCSR 只作为：
+
+- **存储格式**（rowptr/colidx/blockdata/blockids 的布局与寻址）；
+- **地址映射**（pre/post → block_row/block_col/global_block_index）。
+
+但注意：**“禁用缓存”不等于可以不解析 colidx**。即使 rowIndex cache 关闭，colidx 回包仍必须能定位 `target_block_col`，否则每次 BCSR 权重读会退化为 `0.0f`（功能错误，典型症状是 `spikes_injected_total>0` 但 `neurons_fired_total=0`）。
+
+当前实现保证：
+
+- `WeightMemorySubsystem::handleReadResp_()` 在处理 `bcsr_kind==2`（colidx）时，**始终使用本次回包解析出的 `cols`** 来寻找目标 block；
+- 仅当 `BcsrWeightManager::rowIndexCacheCapacity()!=0`（缓存启用）时，才会把 `cols` 写入 rowIndex cache（可选，不影响正确性）。
+
+这条约束的目标是：在“BCSR 优化全部关闭”的实验口径下，依然保持 weight read / ΔV / firing 的功能闭环不被破坏喵。
+
 ---
 
 ## 目录结构与组件职责

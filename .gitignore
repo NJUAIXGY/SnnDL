@@ -32,3 +32,6 @@ weight_verification_test.log
 
 # Temporary files
 /tmp/
+
+# Generated docs
+docs/*.pdf

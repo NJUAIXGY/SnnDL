@@ -68,9 +68,13 @@ void AccumulatorOps::reset() {
 void AccumulatorOps::update(uint32_t post, float dv) {
 #ifdef SNNDL_ENABLE_DEBUG_LOG
     if (cfg_.window_read_debug && cfg_.out && std::fabs(dv) > 1e-6f) {
-        cfg_.out->verbose(CALL_INFO, 0, 0,
+        if (cfg_.out->getVerboseLevel() < 2) {
+            // suppress by default
+        } else {
+            cfg_.out->verbose(CALL_INFO, 2, 0,
             "[diag-delta] core=%d post=%u dv=%.6f\n",
             cfg_.core_id, post, dv);
+        }
     }
 #endif
 
@@ -167,7 +171,8 @@ void AccumulatorOps::verifyDense(uint32_t seq) {
 
     auto log_once = [&](const char* reason, uint32_t post, double dense, double reference) {
         if (shadow_mismatch_logged_ || !cfg_.out) return;
-        cfg_.out->verbose(CALL_INFO, 0, 0,
+        if (cfg_.out->getVerboseLevel() < 2) return;
+        cfg_.out->verbose(CALL_INFO, 2, 0,
             "[acc-shadow] core=%u seq=%u %s post=%u dense=%.6f ref=%.6f diff=%.6g\n",
             static_cast<uint32_t>(cfg_.core_id), seq, reason ? reason : "-", post,
             dense, reference, dense - reference);

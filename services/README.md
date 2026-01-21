@@ -6,6 +6,15 @@
 
 ---
 
+## 内存建模口径（默认 cacheline）
+
+在 `services/` 的子系统边界内：
+
+- `services/memory` 只做 `addr + size ↔ bytes`（不携带权重/突触语义），并默认按 memHierarchy 的 cacheline 事务模型理解“系统层流量”。
+- 若某子系统（例如 GAS 的内存前端）改变了合并粒度（可能引入 over-fetch），必须通过 `gas_unique_* / avg_granule_bytes` 等指标显式暴露，并在实验输出中标注有效参数（见 mesh 模板的 `effective_config.json`）。
+
+---
+
 ## 子域目录（按边界拆分）
 
 - `services/noc/`：NoC 传输域（send/recv/forward/本地投递），实现 `api/INocTransport.h`  

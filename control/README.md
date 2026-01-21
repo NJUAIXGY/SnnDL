@@ -6,6 +6,16 @@
 
 ---
 
+## 内存建模口径（默认 cacheline）
+
+CoreShell 只负责“发起/接收内存请求并把 bytes 交给 workload”，不负责定义读粒度语义；默认体系结构语义以 memHierarchy 的 **cacheline** 为主：
+
+- traffic 主口径建议以 MemController 的 `requests_received_*`（L2 traffic）为准；
+- `memory_bytes` 仅代表上层 logical request（L1），不等价于 off-chip 流量；
+- dense 场景下是否允许 row-streaming/DMA 必须作为显式架构模式单列，避免与 cacheline 模式混算。
+
+---
+
 ## 职责（CoreShell 只做平台面）
 
 - SST 子组件生命周期对接：`init/setup/finish`、clock 驱动。

@@ -31,8 +31,9 @@
 #include "synapse/route/SpikeCommSubsystem.h"
 #include "synapse/route/SynapseRouteSubsystem.h"
 #include "WorkloadConfig.h"
+#include "SnnDLLogging.h"
 
-#include <iostream>
+#include <sstream>
 #include <cmath>
 #include <algorithm>
 #include <cctype>
@@ -48,24 +49,6 @@ using namespace SST;
 using namespace SST::SnnDL;
 
 // 诊断门控改为参数化：由 enable_extended_diagnostics_ 成员控制
-
-// Lightweight logging helpers (file-local). Use consistent style across SnnDL.
-#ifndef SNNDL_LOGPTR
-#define SNNDL_LOGPTR(ptr, lvl, ...) do { if (ptr) (ptr)->verbose(CALL_INFO, (lvl), 0, __VA_ARGS__); } while(0)
-#endif
-#ifndef SNNDL_LOG
-#define SNNDL_LOG(lvl, ...) SNNDL_LOGPTR(output_, (lvl), __VA_ARGS__)
-#endif
-
-#ifdef SNNDL_ENABLE_DEBUG_LOG
-#define SNNDL_DEBUG_ENABLED 1
-#define SNNDL_DEBUG_LOG(lvl, ...) SNNDL_LOG(lvl, __VA_ARGS__)
-#define SNNDL_DEBUG_BLOCK(stmt) do { stmt; } while(0)
-#else
-#define SNNDL_DEBUG_ENABLED 0
-#define SNNDL_DEBUG_LOG(lvl, ...) do {} while(0)
-#define SNNDL_DEBUG_BLOCK(stmt) do {} while(0)
-#endif
 
 void SnnPESubComponent::reportStreamMemIssueThunk_(void* ctx, size_t bytes) {
     auto* core = static_cast<SnnPESubComponent*>(ctx);
@@ -239,7 +222,8 @@ void SnnPESubComponent::diagEdgeWeight_(const char* tag, uint32_t post_local,
                                         uint32_t count) {
     if (!enable_extended_diagnostics_ && !window_read_debug_) return;
     if (!output_) return;
-    output_->verbose(CALL_INFO, 1, 0,
+    if (output_->getVerboseLevel() < 2) return;
+    output_->verbose(CALL_INFO, 2, 0,
         "[diag-weight] %s core=%d window=%u post_local=%u pre_global=%u weight=%.6f count=%u\n",
         tag ? tag : "edge", core_id_, curr_stage_seq_, post_local, pre_global,
         (double)weight, count);
@@ -247,11 +231,12 @@ void SnnPESubComponent::diagEdgeWeight_(const char* tag, uint32_t post_local,
 
 void SnnPESubComponent::logBcsrWindowStats_(const char* tag) {
     if (!window_read_debug_ || !use_bcsr_ || !output_) return;
+    if (output_->getVerboseLevel() < 2) return;
     if (bcsr_req_edges_ == 0 && bcsr_req_wait_rowptr_ == 0 &&
         bcsr_req_block_hit_ == 0 && bcsr_req_block_miss_ == 0) {
         return;
     }
-    output_->verbose(CALL_INFO, 0, 0,
+    output_->verbose(CALL_INFO, 2, 0,
         "[diag-bcsr-window] core=%d window=%u tag=%s edges=%" PRIu64
         " rowptr_wait=%" PRIu64 " hits=%" PRIu64 " miss=%" PRIu64 "\n",
         core_id_, curr_stage_seq_, tag ? tag : "-",
@@ -280,8 +265,8 @@ bool SnnPESubComponent::ensureLoaderReady_() {
     int ready = loader_done_shared_.mutex_read(0);
     if (ready != 0) {
         loader_ready_latched_ = true;
-        if (window_read_debug_ && !loader_ready_logged_ && output_) {
-            output_->verbose(CALL_INFO, 0, 0,
+        if (window_read_debug_ && !loader_ready_logged_ && output_ && output_->getVerboseLevel() >= 2) {
+            output_->verbose(CALL_INFO, 2, 0,
                 "[diag-loader] core=%d weights_ready at cycle=%" PRIu64 "\n",
                 core_id_, total_cycles_);
         }
@@ -297,8 +282,8 @@ bool SnnPESubComponent::ensureMemoryReady_() const {
 
 void SnnPESubComponent::issueEdgeWeightFetches_() {
     const size_t prev_edges = weight_mem_subsystem_ ? weight_mem_subsystem_->edgesPrevSize() : 0;
-    if (window_read_debug_ && output_) {
-        output_->verbose(CALL_INFO, 0, 0,
+    if (window_read_debug_ && output_ && output_->getVerboseLevel() >= 2) {
+        output_->verbose(CALL_INFO, 2, 0,
             "[diag-edge-fetch] core=%d stage=%d prev_edges=%zu issued=%u outstanding=%u budget=%u\n",
             core_id_, static_cast<int>(gas_stage_), prev_edges,
             windowStateIssued_(), windowStateOutstanding_(), window_read_budget_);
@@ -307,16 +292,11 @@ void SnnPESubComponent::issueEdgeWeightFetches_() {
 }
 
 void SnnPESubComponent::recordEdge_(uint32_t post_local, uint32_t pre_global) {
-    if (!(enable_weight_fetch_ && ensureMemoryReady_())) {
+    // Correctness note:
+    // Recording edges is a pure "gather" operation and must not depend on memory readiness.
+    // Memory/loader readiness is enforced later at issue time (WMS.ensure_loader_ready / memory_warmup).
+    if (!enable_weight_fetch_) {
         diag_edges_cond_skips_++;
-        if (window_read_debug_ && !record_edge_cond_warned_) {
-            output_->verbose(CALL_INFO, 0, 0,
-                "[diag-edges] recordEdge skipped enable_weight_fetch=%d stdmem_ep=%d ready=%d\n",
-                enable_weight_fetch_ ? 1 : 0,
-                (stdmem_ep_ && stdmem_ep_->available()) ? 1 : 0,
-                memory_ready_ ? 1 : 0);
-            record_edge_cond_warned_ = true;
-        }
         return;
     }
     bool stage_ok = false;
@@ -339,8 +319,8 @@ void SnnPESubComponent::recordEdge_(uint32_t post_local, uint32_t pre_global) {
     }
     if (!(apply_acc_enable_ && gas_window_mode_ && stage_ok)) {
         diag_edges_stage_skips_++;
-        if (window_read_debug_ && !record_edge_stage_warned_) {
-            output_->verbose(CALL_INFO, 0, 0,
+        if (window_read_debug_ && !record_edge_stage_warned_ && output_ && output_->getVerboseLevel() >= 2) {
+            output_->verbose(CALL_INFO, 2, 0,
                 "[diag-edges] recordEdge skipped apply_acc=%d gas_window=%d stage=%d (apply_en=%d idle_en=%d scatter_en=%d)\n",
                 apply_acc_enable_ ? 1 : 0, gas_window_mode_ ? 1 : 0, static_cast<int>(gas_stage_),
                 record_edge_apply_enable_ ? 1 : 0, record_edge_idle_enable_ ? 1 : 0,
@@ -349,13 +329,19 @@ void SnnPESubComponent::recordEdge_(uint32_t post_local, uint32_t pre_global) {
         }
         return;
     }
+    if (!weight_mem_subsystem_) {
+        diag_edges_cond_skips_++;
+        return;
+    }
     // 容量保护：极端情况下避免map无限增长
     const size_t curr_edges = weight_mem_subsystem_ ? weight_mem_subsystem_->edgesCurrSize() : 0;
     if (curr_edges >= edge_collector_max_capacity_) {
         if (!record_edge_capacity_warned_) {
-            output_->verbose(CALL_INFO, 0, 0,
-                "[diag-edges] ⚠️ edge_collector capacity reached (core=%d seq=%u cap=%zu), stop recording this window\n",
-                core_id_, curr_stage_seq_, edge_collector_max_capacity_);
+            if (output_ && output_->getVerboseLevel() >= 2) {
+                output_->verbose(CALL_INFO, 2, 0,
+                    "[diag-edges] ⚠️ edge_collector capacity reached (core=%d seq=%u cap=%zu), stop recording this window\n",
+                    core_id_, curr_stage_seq_, edge_collector_max_capacity_);
+            }
             record_edge_capacity_warned_ = true;
             if (stat_gas_edge_overflow_) stat_gas_edge_overflow_->addData(1);
         }
@@ -366,8 +352,8 @@ void SnnPESubComponent::recordEdge_(uint32_t post_local, uint32_t pre_global) {
     }
     diag_edges_record_hits_++;
     const size_t after_edges = weight_mem_subsystem_ ? weight_mem_subsystem_->edgesCurrSize() : 0;
-    if (window_read_debug_ && after_edges <= 5) {
-        output_->verbose(CALL_INFO, 0, 0,
+    if (window_read_debug_ && after_edges <= 5 && output_ && output_->getVerboseLevel() >= 2) {
+        output_->verbose(CALL_INFO, 2, 0,
             "[diag-edges] recordEdge sample core=%d seq=%u post_local=%u pre_global=%u size_now=%zu\n",
             core_id_, curr_stage_seq_, post_local, pre_global, after_edges);
     }
@@ -401,8 +387,8 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     if (!stdmem_ep_) stdmem_ep_ = std::make_unique<StdMemEndpoint>();
     if (!bcsr_weights_) bcsr_weights_ = std::make_unique<BcsrWeightManager>();
     if (kSentinelOn && output_) {
-        SNNDL_LOG(0, "[[sentinel-core-ctor]] core_ctor enter\n");
-        SNNDL_LOG(0, "[[sentinel-core-ctor]] after params: core_id=%d\n", core_id_);
+        SNNDL_LOG(2, "[[sentinel-core-ctor]] core_ctor enter\n");
+        SNNDL_LOG(2, "[[sentinel-core-ctor]] after params: core_id=%d\n", core_id_);
     }
     total_cores_ = params.find<int>("total_cores", 8);
     global_neuron_base_ = params.find<uint64_t>("global_neuron_base", 0);
@@ -413,21 +399,24 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     enable_extended_diagnostics_ = params.find<int>("enable_extended_diagnostics", 0) != 0;
     total_nodes_cfg_ = params.find<uint32_t>("total_nodes", 1);
 
-    // Phase6：workload 选择（优先 Params，其次环境变量；默认 snn 保持回归口径不变）
-    {
-        std::string w = "snn";
-        if (params.contains("workload_impl")) {
-            w = params.find<std::string>("workload_impl", "snn");
-        } else if (const char* env = workloadImplFromEnvCached()) {
-            w = std::string(env);
-        }
-        std::transform(w.begin(), w.end(), w.begin(),
-                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        if (w == "stream") workload_impl_ = WorkloadImpl::Stream;
-        else if (w == "traffic") workload_impl_ = WorkloadImpl::Traffic;
-        else workload_impl_ = WorkloadImpl::Snn;
+    // Phase6：workload 选择（优先 Params，其次环境变量）
+    // 约定：默认 "snn" 仍走 legacy 主链路；仅当显式选择 stream/traffic 时才启用 workload_。
+    std::string w = params.find<std::string>("workload_impl", "snn");
+    if (const char* env = workloadImplFromEnvCached()) {
+        // 兼容：允许用环境变量覆盖（README 中用于 stream/traffic 回归切换）
+        w = std::string(env);
     }
-    // Phase6：通过工厂创建 workload（snn/stream/traffic）；未知值已在上方归一化为 SNN。
+    std::transform(w.begin(), w.end(), w.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (w == "stream") {
+        workload_impl_ = WorkloadImpl::Stream;
+    } else if (w == "traffic") {
+        workload_impl_ = WorkloadImpl::Traffic;
+    } else {
+        workload_impl_ = WorkloadImpl::Snn;
+    }
+
+    // Phase6：通过工厂创建 workload（snn/stream/traffic）
     {
         const char* name = isTrafficWorkload_() ? "traffic" : (isStreamWorkload_() ? "stream" : "snn");
         if (!workload_) workload_ = createWorkloadByName(std::string(name));
@@ -443,7 +432,7 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
         gas_stage_workload_ = dynamic_cast<IGasStageSink*>(workload_.get());
     }
     if (kSentinelOn && output_) {
-        SNNDL_LOG(0, "[[sentinel-core-ctor]] after params2: node_id=%u num_neurons=%u base_addr=%" PRIu64 "\n",
+        SNNDL_LOG(2, "[[sentinel-core-ctor]] after params2: node_id=%u num_neurons=%u base_addr=%" PRIu64 "\n",
                 node_id_, num_neurons_, (uint64_t)base_addr_);
     }
     enable_weight_fetch_ = params.find<int>("enable_weight_fetch", 0) != 0;
@@ -489,8 +478,8 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     // Deprecate manual window driving: read param for compatibility but force-disable
     bool manual_drive_param = params.find<int>("gas_manual_window_drive", 0) != 0;
     gas_manual_window_drive_ = false;
-    if (manual_drive_param && output_) {
-        output_->verbose(CALL_INFO, 0, 0,
+    if (manual_drive_param && output_ && output_->getVerboseLevel() >= 2) {
+        output_->verbose(CALL_INFO, 2, 0,
             "[diag-gas-config] core=%d gas_manual_window_drive 已弃用，仍将使用自动窗口驱动\n",
             core_id_);
     }
@@ -505,13 +494,17 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     scheme1_partition_mod_ = params.find<int>("scheme1_partition_mod", 0) != 0;
     merge_read_auto_ = params.find<int>("merge_read_auto", 0) != 0; // default off
     line_size_bytes_ = params.find<uint32_t>("line_size_bytes", 64);
+    byte_exact_verify_enable_ = params.find<int>("byte_exact_verify_enable", 0) != 0;
+    byte_exact_verify_mode_ = params.find<std::string>("byte_exact_verify_mode", "");
+    byte_exact_verify_row_scale_ = params.find<uint32_t>("byte_exact_verify_row_scale", 1024);
+    byte_exact_verify_max_mismatch_ = params.find<uint32_t>("byte_exact_verify_max_mismatch", 8);
     loader_done_key_ = params.find<std::string>("loader_done_key", "");
     wait_for_loader_done_ = !loader_done_key_.empty();
     if (wait_for_loader_done_) {
         loader_done_shared_.initialize(loader_done_key_, 1, 0);
         loader_done_shared_initialized_ = true;
-        if (window_read_debug_ && output_) {
-            output_->verbose(CALL_INFO, 1, 0,
+        if (window_read_debug_ && output_ && output_->getVerboseLevel() >= 2) {
+            output_->verbose(CALL_INFO, 2, 0,
                 "[diag-loader] core=%d init loader_done_key=%s\n",
                 core_id_, loader_done_key_.c_str());
         }
@@ -529,12 +522,13 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     edge_collector_max_capacity_ = static_cast<size_t>(params.find<uint64_t>("edge_collector_max_capacity", 1000000));
     if (window_read_enable_) {
         reserveWindowContainers_();
-    if (!record_edge_idle_enable_ && !record_edge_scatter_enable_ && window_read_debug_ && output_ && enable_extended_diagnostics_) {
-            output_->verbose(CALL_INFO, 0, 0,
+    if (!record_edge_idle_enable_ && !record_edge_scatter_enable_ && window_read_debug_ &&
+        output_ && enable_extended_diagnostics_ && output_->getVerboseLevel() >= 2) {
+            output_->verbose(CALL_INFO, 2, 0,
                 "[diag-record-edge] core=%d 仅在Gather阶段记录边 (Apply/Idle/Scatter=0)", core_id_);
         }
-    } else if (window_read_debug_ && output_ && enable_extended_diagnostics_) {
-        output_->verbose(CALL_INFO, 0, 0,
+    } else if (window_read_debug_ && output_ && enable_extended_diagnostics_ && output_->getVerboseLevel() >= 2) {
+        output_->verbose(CALL_INFO, 2, 0,
             "[diag-record-edge] core=%d window_read_enable=0 => 忽略 window_read_debug", core_id_);
     }
     // 全网读取扩展参数
@@ -616,8 +610,8 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     const int record_apply_default = (gas_window_mode_ && apply_acc_enable_) ? 1 : 0;
     record_edge_apply_enable_ = params.find<int>("record_edge_apply_enable", record_apply_default) != 0;
     record_edge_idle_enable_ = params.find<int>("record_edge_idle_enable", 0) != 0;
-    if (record_edge_idle_enable_ && output_ && enable_extended_diagnostics_) {
-        output_->verbose(CALL_INFO, 0, 0,
+    if (record_edge_idle_enable_ && output_ && enable_extended_diagnostics_ && output_->getVerboseLevel() >= 2) {
+        output_->verbose(CALL_INFO, 2, 0,
             "[diag-gas-config] core=%d 已启用 record_edge_idle（诊断配置，回归默认关闭）\n",
             core_id_);
     }
@@ -672,8 +666,8 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     uint32_t computed_neurons_per_pe = static_cast<uint32_t>(total_cores_) * static_cast<uint32_t>(num_neurons_);
     if (np_from_params > 0) {
         neurons_per_pe_cfg_ = np_from_params;
-        if (np_from_params != computed_neurons_per_pe && output_) {
-            output_->verbose(CALL_INFO, 0, 0,
+        if (np_from_params != computed_neurons_per_pe && output_ && output_->getVerboseLevel() >= 2) {
+            output_->verbose(CALL_INFO, 2, 0,
                 "[diag-gas-config] core=%d neurons_per_pe=%u (脚本指定) ≠ cores*rows=%u\n",
                 core_id_, np_from_params, computed_neurons_per_pe);
         }
@@ -693,8 +687,8 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     if (!output_) {
         output_ = new Output("SnnPESubComponent[@p:@l]: ", verbose_, 0, Output::STDOUT);
     }
-    if (window_read_debug_) {
-        output_->verbose(CALL_INFO, 0, 0,
+    if (window_read_debug_ && output_ && output_->getVerboseLevel() >= 2) {
+        output_->verbose(CALL_INFO, 2, 0,
             "[diag-bcsr-base] node=%u core=%d base=0x%llx rowptr=0x%llx colidx=0x%llx blockdata=0x%llx blockids=0x%llx\n",
             node_id_, core_id_,
             (unsigned long long)base_addr_,
@@ -704,14 +698,14 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
             (unsigned long long)bcsr_blockids_addr_);
     }
     if (use_bcsr_) {
-        if (weights_template_.empty() && window_read_debug_) {
-            output_->verbose(CALL_INFO, 0, 0,
+        if (weights_template_.empty() && window_read_debug_ && output_ && output_->getVerboseLevel() >= 2) {
+            output_->verbose(CALL_INFO, 2, 0,
                 "[diag-bcsr] node=%u core=%d warning: weights_template empty while BCSR enabled\n",
                 node_id_, core_id_);
         } else if (bcsr_rowptr_file_fallback_enable_ && !weights_template_.empty() &&
                    !bcsr_weights_->isRowptrReady() && loadBcsrRowptrFromFile_()) {
-            if (window_read_debug_) {
-                output_->verbose(CALL_INFO, 0, 0,
+            if (window_read_debug_ && output_ && output_->getVerboseLevel() >= 2) {
+                output_->verbose(CALL_INFO, 2, 0,
                     "[diag-bcsr] core=%u preload rowptr entries=%zu first=%u second=%u\n",
                     core_id_, bcsr_weights_->rowptrHost().size(),
                     bcsr_weights_->rowptrHost().empty()?0u:bcsr_weights_->rowptrHost()[0],
@@ -1100,6 +1094,11 @@ void SnnPESubComponent::onGasStatEvent(const GasStatEvent& st) {
     // Local (per-core) copies for unique_* only (optional)
     if (stat_gas_unique_reads_total_ && st.unique_reads) stat_gas_unique_reads_total_->addData(st.unique_reads);
     if (stat_gas_unique_bytes_total_ && st.unique_bytes) stat_gas_unique_bytes_total_->addData(st.unique_bytes);
+    if (stat_gas_row_window_triggers_total_ && st.rowwin_triggers) stat_gas_row_window_triggers_total_->addData(st.rowwin_triggers);
+    if (stat_gas_row_window_bytes_total_ && st.rowwin_bytes) stat_gas_row_window_bytes_total_->addData(st.rowwin_bytes);
+    if (stat_gas_bursts_total_ && st.bursts) stat_gas_bursts_total_->addData(st.bursts);
+    if (stat_gas_payload_bytes_total_ && st.payload_bytes) stat_gas_payload_bytes_total_->addData(st.payload_bytes);
+    if (stat_gas_gap_absorbed_bytes_total_ && st.gap_absorbed_bytes) stat_gas_gap_absorbed_bytes_total_->addData(st.gap_absorbed_bytes);
 
     // Optional forward (mostly no-op for workload=snn; kept for completeness).
     if (gas_stage_workload_) {
@@ -1158,6 +1157,11 @@ void SnnPESubComponent::configureWeightReaderSubsystem_(const Params& params) {
             ocfg.bcsr_prefetch_all = bcsr_prefetch_all_;
             ocfg.bcsr_weight_guard_enable = bcsr_weight_guard_enable_;
             ocfg.bcsr_weight_abs_max = bcsr_weight_abs_max_;
+            ocfg.bcsr_semantic_verify_enable = params.find<int>("bcsr_semantic_verify_enable", 0) != 0;
+            ocfg.bcsr_semantic_verify_max_edges = params.find<uint32_t>("bcsr_semantic_verify_max_edges", 64);
+            ocfg.bcsr_semantic_verify_max_mismatch = params.find<uint32_t>("bcsr_semantic_verify_max_mismatch", 8);
+            ocfg.bcsr_semantic_verify_abs_tol = params.find<float>("bcsr_semantic_verify_abs_tol", 1e-6f);
+            ocfg.bcsr_semantic_verify_rel_tol = params.find<float>("bcsr_semantic_verify_rel_tol", 1e-6f);
             ocfg.readresp_zero_fallback = readresp_zero_fallback_;
             ocfg.init_default_weight = init_default_weight_;
             ocfg.num_neurons = num_neurons_;
@@ -1170,6 +1174,10 @@ void SnnPESubComponent::configureWeightReaderSubsystem_(const Params& params) {
             ocfg.merge_read_row = merge_read_row_;
             ocfg.merge_read_auto = merge_read_auto_;
             ocfg.line_size_bytes = line_size_bytes_;
+            ocfg.byte_exact_verify_enable = byte_exact_verify_enable_;
+            ocfg.byte_exact_verify_mode = byte_exact_verify_mode_;
+            ocfg.byte_exact_verify_row_scale = byte_exact_verify_row_scale_;
+            ocfg.byte_exact_verify_max_mismatch = byte_exact_verify_max_mismatch_;
             ocfg.memory_warmup_cycles = memory_warmup_cycles_;
             ocfg.loader_barrier_cycles = loader_barrier_cycles_;
             ocfg.node_id = node_id_;
@@ -1177,6 +1185,14 @@ void SnnPESubComponent::configureWeightReaderSubsystem_(const Params& params) {
             ocfg.weights_template = weights_template_;
             ocfg.bcsr_mgr = bcsr_weights_.get();
             mem->configureOrchestrator(std::move(ocfg));
+            if (byte_exact_verify_enable_ && output_) {
+                output_->verbose(CALL_INFO, 0, 0,
+                    "[byte-exact] enabled=1 mode=%s row_scale=%u max_mismatch=%u node=%u core=%d\n",
+                    byte_exact_verify_mode_.c_str(),
+                    byte_exact_verify_row_scale_,
+                    byte_exact_verify_max_mismatch_,
+                    node_id_, core_id_);
+            }
         }
         weight_mem_subsystem_ = mem.get();
         // Phase E：BCSR 缓存容量配置下沉到 BcsrWeightManager
@@ -1289,8 +1305,9 @@ void SnnPESubComponent::finish() {
     double utilization = (total_cycles_ > 0) ? (double)active_cycles_ / (double)total_cycles_ : 0.0;
     if (!quiet_finish_logs_) {
         // 输出统计信息（使用内部计数器获得正确值）
-        output_->verbose(CALL_INFO, 1, 0, "📊 核心%d统计: 接收脉冲=%" PRIu64 ", 生成脉冲=%" PRIu64 ", 神经元发放=%" PRIu64 "\n",
-                        core_id_, count_spikes_received_, count_spikes_generated_, count_neurons_fired_);
+        output_->verbose(CALL_INFO, 1, 0,
+                         "[summary] core=%d spikes_recv=%" PRIu64 " spikes_gen=%" PRIu64 " neurons_fired=%" PRIu64 "\n",
+                         core_id_, count_spikes_received_, count_spikes_generated_, count_neurons_fired_);
         if (verify_weights_) {
             uint64_t completed = 0;
             uint64_t mismatch = 0;
@@ -1300,19 +1317,24 @@ void SnnPESubComponent::finish() {
                 if (core_stats.count("core_verify_completed")) completed = core_stats["core_verify_completed"];
                 if (core_stats.count("core_verify_mismatch_count")) mismatch = core_stats["core_verify_mismatch_count"];
             }
-            output_->verbose(CALL_INFO, 1, 0, "🔍 权重验证: 完成=%" PRIu64 ", 不匹配=%" PRIu64 "\n",
+            output_->verbose(CALL_INFO, 1, 0,
+                             "[summary] weight_verify completed=%" PRIu64 " mismatch=%" PRIu64 "\n",
                              completed, mismatch);
         }
-        output_->verbose(CALL_INFO, 0, 0,
-            "📈 核心%d性能摘要: total_cycles=%" PRIu64 ", active_cycles=%" PRIu64 ", utilization=%.4f, memory_req=%" PRIu64 ", cache_hit=%" PRIu64 ", cache_miss=%" PRIu64 ", pending_peak=%u, avg_mem_lat=%.2f\n",
+        output_->verbose(CALL_INFO, 1, 0,
+            "[summary] core=%d perf total_cycles=%" PRIu64 " active_cycles=%" PRIu64 " util=%.4f mem_req=%" PRIu64 " cache_hit=%" PRIu64 " cache_miss=%" PRIu64 " pending_peak=%u avg_mem_lat=%.2f\n",
             core_id_, total_cycles_, active_cycles_, utilization,
             count_memory_requests_, count_cache_hits_, count_cache_misses_, pending_reqs_peak_, avg_lat);
     }
 
 #ifdef SNNDL_ENABLE_PROFILING
     if (profiler_enabled_ && profiler_) {
-        // 控制台摘要
-        profiler_->generate_report(std::cout, 3.0);
+        // Keep profiler output consistent with SnnDL logging (avoid raw std::cout).
+        if (output_ && output_->getVerboseLevel() >= 1) {
+            std::ostringstream oss;
+            profiler_->generate_report(oss, 3.0);
+            output_->verbose(CALL_INFO, 1, 0, "%s", oss.str().c_str());
+        }
         // CSV 导出：prefix 优先；否则回退到工程级 analysis
         std::string csv = profiler_csv_prefix_.empty() ? std::string("analysis/profile_core") : profiler_csv_prefix_;
         csv += std::string("_c") + std::to_string(core_id_) + std::string(".csv");
@@ -1320,9 +1342,15 @@ void SnnPESubComponent::finish() {
     }
 #endif
     // Phase4 Task6.1：compute core finish 下沉到 workload=snn。
-    // 调试：若目标 core 在 Apply 阶段卡住导致窗口未完成，收尾时仍输出窗口级权重读摘要，便于定位瓶颈。
-    if (window_read_debug_ && weight_mem_subsystem_) {
-        weight_mem_subsystem_->finishWindowDiag();
+    // Phase4-Task6.4：窗口读诊断与 BCSR 语义校验 marker 下沉到 workload=snn。
+    // 若未加载 workload（legacy 路径），仍在控制层收尾阶段输出 marker，避免静默缺失。
+    if (!workload_) {
+        if (window_read_debug_ && weight_mem_subsystem_) {
+            weight_mem_subsystem_->finishWindowDiag();
+        }
+        if (weight_mem_subsystem_) {
+            weight_mem_subsystem_->finishSemanticVerify();
+        }
     }
     if (workload_) workload_->onFinish();
 }
@@ -1330,8 +1358,12 @@ void SnnPESubComponent::finish() {
 bool SnnPESubComponent::clockTick(Cycle_t current_cycle) {
     (void)current_cycle; // 统一使用内部 cycle 计数，避免不同 SST 调度口径导致漂移
     total_cycles_++;
-    if (!workload_) return false;
-    const bool did = workload_->onClockTick(static_cast<uint64_t>(total_cycles_));
+    bool did = false;
+    if (workload_) {
+        did = workload_->onClockTick(static_cast<uint64_t>(total_cycles_));
+    } else {
+        did = legacyClockTickInternal_(current_cycle);
+    }
     // Phase10: active_cycles 由 workload 的返回值定义（SNN/stream 一致）。
     if (did) active_cycles_++;
     return false;
@@ -1341,8 +1373,8 @@ bool SnnPESubComponent::legacyClockTickInternal_(Cycle_t current_cycle) {
     (void)current_cycle;
     // Phase4-Task6.1：compute core 的 per-tick 驱动已下沉到 workload=snn（SnnWorkload）。
     bool has_activity = false;
-    if (!clock_tick_logged_ && window_read_debug_) {
-        output_->verbose(CALL_INFO, 0, 0,
+    if (!clock_tick_logged_ && window_read_debug_ && output_ && output_->getVerboseLevel() >= 2) {
+        output_->verbose(CALL_INFO, 2, 0,
             "[diag-gas] 核心%d clockTick start stage=%d gas_enable=%d window_mode=%d manual_drive=%d\n",
             core_id_, (int)gas_stage_, gas_enable_ ? 1 : 0, gas_window_mode_ ? 1 : 0,
             gas_manual_window_drive_ ? 1 : 0);
@@ -1361,8 +1393,8 @@ bool SnnPESubComponent::legacyClockTickInternal_(Cycle_t current_cycle) {
     if (gas_enable_ && gas_window_mode_ && gas_manual_window_drive_) {
         auto* drive = (stdmem_ep_ && stdmem_ep_->available()) ? stdmem_ep_->manualWindowDrive() : nullptr;
         if (!drive) {
-            if (window_read_debug_ && output_ && !manual_window_tick_logged_) {
-                output_->verbose(CALL_INFO, 0, 0,
+            if (window_read_debug_ && output_ && !manual_window_tick_logged_ && output_->getVerboseLevel() >= 2) {
+                output_->verbose(CALL_INFO, 2, 0,
                     "[diag-gas] core=%d manual window drive requested but unavailable (IManualWindowDrive not provided by stdmem)\n",
                     core_id_);
                 manual_window_tick_logged_ = true;
@@ -1370,17 +1402,20 @@ bool SnnPESubComponent::legacyClockTickInternal_(Cycle_t current_cycle) {
         } else {
             drive->manualWindowTick();
             manual_gas_counter_++;
-            if (!manual_tick_sampled_ && manual_gas_counter_ <= manual_gas_gather_cycles_cfg_) {
-                output_->verbose(CALL_INFO, 0, 0,
+            if (!manual_tick_sampled_ && manual_gas_counter_ <= manual_gas_gather_cycles_cfg_ &&
+                window_read_debug_ && output_ && output_->getVerboseLevel() >= 2) {
+                output_->verbose(CALL_INFO, 2, 0,
                     "[diag-gas] 核心%d manual_tick stage=%d counter=%" PRIu64 " threshold=%" PRIu64 "\n",
                     core_id_, (int)gas_stage_, manual_gas_counter_, manual_gas_gather_cycles_cfg_);
                 if (manual_gas_counter_ >= manual_gas_gather_cycles_cfg_) manual_tick_sampled_ = true;
             }
             if (manual_gas_counter_ >= manual_gas_gather_cycles_cfg_) {
                 stdmem_ep_->sendGasCmd(GasOp::EndGather, /*ss*/0, /*slice*/0, /*tot*/1);
-                output_->verbose(CALL_INFO, 0, 0,
+                if (window_read_debug_ && output_ && output_->getVerboseLevel() >= 2) {
+                    output_->verbose(CALL_INFO, 2, 0,
                     "[diag-gas] 核心%d手动发出 EndGather (stage=%d cnt=%" PRIu64 ")\n",
                     core_id_, (int)gas_stage_, manual_gas_counter_);
+                }
                 manual_gas_counter_ = 0;
                 manual_tick_sampled_ = false;
             }
@@ -1613,10 +1648,12 @@ bool SnnPESubComponent::legacyClockTickInternal_(Cycle_t current_cycle) {
                     block_addr = bcsr_blockdata_addr_ + (uint64_t)(start + verify_bcsr_block_col_) * block_bytes;
                 }
                 if (output_) {
-                    output_->verbose(CALL_INFO, 0, 0,
+                    if (output_->getVerboseLevel() >= 2) {
+                        output_->verbose(CALL_INFO, 2, 0,
                         "[VERIFY][mem-addr] core=%d post=%u pre=%u blk_row=%u blk_col=%u block_addr=0x%llx rowptr_start=%u block_bytes=%zu\n",
                         core_id_, post_local, pre_global, block_row, blk_col,
                         (unsigned long long)block_addr, start, block_bytes);
+                    }
                 }
                 requestWeightBCSR(pre_global, post_local, [this, post_local, pre_global](float w){
                     if (output_) {
@@ -1789,8 +1826,8 @@ void SnnPESubComponent::legacySnnGetStatistics(std::map<std::string, uint64_t>& 
 void SnnPESubComponent::forceEndGather() {
     if (!(gas_enable_ && gas_window_mode_ && gas_manual_window_drive_ && ensureMemoryReady_())) return;
     stdmem_ep_->sendGasCmd(GasOp::EndGather, /*ss*/0, /*slice*/0, /*tot*/1);
-    if (window_read_debug_ && output_) {
-        output_->verbose(CALL_INFO, 0, 0, "[diag-gas] 核心%d 手动触发 EndGather\n", core_id_);
+    if (window_read_debug_ && output_ && output_->getVerboseLevel() >= 2) {
+        output_->verbose(CALL_INFO, 2, 0, "[diag-gas] 核心%d 手动触发 EndGather\n", core_id_);
     }
 }
 
@@ -1919,8 +1956,12 @@ void SnnPESubComponent::legacySnnOnGasScatterSpikesEmitted(uint32_t /*seq*/, uin
 
 void SnnPESubComponent::handleNeuronFire_(uint32_t neuron_idx, float v_before, float v_after) {
     legacySnnOnNeuronFires(std::vector<uint32_t>{neuron_idx}, static_cast<uint64_t>(total_cycles_));
-    output_->verbose(CALL_INFO, 3, 0, "🔥 核心%d神经元%d发放脉冲! v_before=%.3f -> v_after=%.3f\n",
-                    core_id_, neuron_idx, v_before, v_after);
+#ifdef SNNDL_ENABLE_DEBUG_LOG
+    if (output_) {
+        output_->verbose(CALL_INFO, 3, 0, "[fire] core=%d neuron=%d v_before=%.3f v_after=%.3f\n",
+                         core_id_, neuron_idx, v_before, v_after);
+    }
+#endif
     // 发送职责已迁入 workload=snn（Phase4 Task6.3）。
     if (snn_comm_workload_) {
         snn_comm_workload_->emitNeuronFire(neuron_idx, static_cast<uint64_t>(total_cycles_));
@@ -1987,6 +2028,11 @@ void SnnPESubComponent::initializeStatistics() {
     // GAS totals accumulated from GatherBufferIF via CustomResp
     stat_gas_unique_reads_total_ = registerStatistic<uint64_t>("gas_unique_reads_total");
     stat_gas_unique_bytes_total_ = registerStatistic<uint64_t>("gas_unique_bytes_total");
+    stat_gas_row_window_triggers_total_ = registerStatistic<uint64_t>("gas_row_window_triggers_total");
+    stat_gas_row_window_bytes_total_ = registerStatistic<uint64_t>("gas_row_window_bytes_total");
+    stat_gas_bursts_total_ = registerStatistic<uint64_t>("gas_bursts_total");
+    stat_gas_payload_bytes_total_ = registerStatistic<uint64_t>("gas_payload_bytes_total");
+    stat_gas_gap_absorbed_bytes_total_ = registerStatistic<uint64_t>("gas_gap_absorbed_bytes_total");
     // 边集合溢出计数（仅在容量保护触发时递增）
     stat_gas_edge_overflow_ = registerStatistic<uint64_t>("gas_edge_overflow");
     // Apply/Scatter端到端统计（Phase‑1）

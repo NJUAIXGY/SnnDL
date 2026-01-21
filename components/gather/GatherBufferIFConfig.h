@@ -1,0 +1,108 @@
+// -*- c++ -*-
+//
+// GatherBufferIFConfig:
+// - 将 GatherBufferIF 构造期的大量 params.find(...) 收敛到一处，降低主构造函数噪音。
+// - 仅做参数解析/默认值，不引入新的运行期组件或装配点。
+//
+
+#pragma once
+
+#include <cstdint>
+#include <string>
+
+namespace SST {
+class Params;
+}
+
+namespace SST { namespace SnnDL {
+
+struct GatherBufferIFConfig {
+    int verbose = 0;
+
+    // Diagnostics (P2)
+    bool diag_enable = false;
+    bool debug_enable = false;
+    bool sentinel_enable = false;
+
+    // Policies
+    // 默认使用 cacheline 语义（更贴近 memHierarchy/通用 cacheline 事务建模）。
+    // row-streaming/DMA 属于显式架构假设，必须显式 opt-in，避免默认 over-fetch 污染结论。
+    std::string merge_policy = "cacheline";
+    std::string sort_policy = "row";
+
+    // Core knobs
+    uint32_t row_bytes_guess = 8192;
+    uint64_t sram_bytes = 256 * 1024;
+    bool gap_merge_enable = true;
+    uint64_t gap_merge_k_bytes = 0;
+    uint64_t burst_bytes_max = 64 * 1024;
+
+    // Bank/row ordering
+    uint32_t bank_bits = 0;
+    uint32_t bank_shift = 0;
+    bool bank_auto_enable = true;
+    uint32_t bank_auto_min_banks = 4;
+    uint32_t bank_auto_max_banks = 32;
+
+    // Coarse row-window
+    bool row_window_enable = false;
+    uint64_t row_window_bytes = 0;
+    uint64_t row_window_timeout_ns = 0;
+
+    // Pipeline / timing
+    uint32_t sram_access_ns = 0;
+    uint32_t max_inflight_reads = 128;
+    uint64_t tail_wait_timeout_ns = 0;
+    bool allow_apply_miss_read = false;
+    bool flush_after_scatter = true;
+    bool strict_mode = true;
+    bool double_buffer_enable = true;
+    bool window_auto = false;
+    bool step_gate_enable = false;
+    int manual_window_drive_ignored = 0; // deprecated
+    uint64_t window_cycles_gather = 0;
+    uint64_t window_cycles_apply = 0;
+    uint64_t window_cycles_scatter = 0;
+    bool apply_auto_end_enable = true;
+    bool scatter_immediate_complete = false;
+    std::string clock = "1GHz";
+
+    // Optional exports / probes
+    bool emit_stage_events = false;
+    bool emit_stage_events_lenient = false;
+    std::string stage_cycles_csv;
+    std::string probe_gas_csv;
+    bool defer_issue_until_apply = false;
+    uint64_t gather_auto_end_bytes = 0;
+    uint64_t gather_auto_end_reads = 0;
+
+    // Adaptive k
+    bool k_adapt_enable = false;
+    uint32_t k_adapt_window_N = 8;
+    double k_alpha_bw = 0.2;
+    double k_alpha_k = 0.2;
+    uint64_t k_min_bytes = 512;
+    uint64_t k_max_bytes = 64 * 1024;
+    uint64_t k_delta_bytes = 512;
+
+    // Adaptive control
+    bool ctrl_enable = false;
+    uint32_t ctrl_probe_every_N = 4;
+    uint32_t ctrl_cooldown_N = 4;
+    double ctrl_eps_reqs = 0.02;
+    double ctrl_eps_burst = 0.05;
+    uint64_t ctrl_lat_tol_ns = 1;
+    std::string ctrl_k_list = "512,1024,2048,4096,8192";
+    std::string ctrl_rowwin_list = "0,16384,32768,65536";
+    std::string ctrl_timeout_list = "0,300,600";
+
+    // Granule/window metrics export
+    std::string export_granules_csv;
+    uint32_t node_id = 0;
+    uint32_t core_id = static_cast<uint32_t>(-1);
+    std::string export_window_metrics_csv;
+};
+
+GatherBufferIFConfig parseGatherBufferIFConfig(const SST::Params& params);
+
+}} // namespace SST::SnnDL

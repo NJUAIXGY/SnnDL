@@ -103,7 +103,7 @@ events/* (payload) ← components/services/control 用于跨层传递数据
 - `MemKCalBench.{h,cc}`：micro-benchmark
 - `SnnPE.{h,cc}`：旧架构兼容（deprecated/compat）
 
-子目录（可选/扩展）：`components/mpi`、`components/noc`、`components/gas`、`components/stimulus`。
+子目录（可选/扩展）：`components/noc`、`components/gas`、`components/stimulus`。
 
 ---
 
@@ -230,7 +230,23 @@ make install
 - `ns:...`：文件头部出现的 `namespace` 名称集合
 - `ELI:...`：若文件中包含 SST ELI 注册宏，会列出注册名（对组件层尤为有用）
 
+如何把它当作“每个文件的作用”来读：
+- `doc`：对应文档说明（以标题为主线入口）
+- `header`：主要承载声明/接口（看 `types:` 能快速知道它定义了哪些关键类型）
+- `source`：主要承载实现（看 `include:"..."` 通常能快速定位它实现/支撑的头文件入口）
+- `build`：构建清单与编译安装相关文件
+
 为保持可读性，按目录拆分到多个可折叠块中。
+
+常见“从需求到文件”的快速跳转（先看这些通常能最快进入代码语境）：
+- 想改 `workload_impl` 的选择与装配：`api/ICoreWorkload.h`、`api/CoreWorkloadFactory.h`、`services/workload/CoreWorkloadFactory.cc`、`control/SnnPESubComponent.cc`
+- 想改 packet-first 的投递/外发路径：`api/INocTransport.h`、`services/noc/NocSubsystem.{h,cc}`、`components/SnnNIC.{h,cc}`
+- 想改 SpikeEvent ↔ packet 的编解码/桥接：`events/NocPacketEvent.h`、`services/synapse/route/SpikeNocCodec.h`、`services/synapse/route/SpikePacketBridge.{h,cc}`
+- 想改 fanout/路由构建与 gating：`api/ISynapseRoute.h`、`services/synapse/route/SynapseRouteSubsystem.{h,cc}`、`services/synapse/route/SnnRouteProvider.{h,cc}`
+- 想改 native multicast（SpikeKey）载体与约束：`api/MulticastLimits.h`、`api/SynapseRouteBuildConfig.h`、`services/synapse/route/SpikeNocCodec.h`、`components/noc/MulticastRouter.{h,cc}`
+- 想改权重读取/BCSR/缓存：`api/SnnWeightReader.h`、`services/synapse/weights/WeightMemorySubsystem.{h,cc}`、`services/synapse/weights/SnnBcsrWeightManager.{h,cc}`、`services/synapse/common/BcsrMeta.h`
+- 想改 GAS 窗口的 edge/累加器辅助：`services/synapse/gas/GasEdgeCollector.{h,cc}`、`services/synapse/gas/AccumulatorOps.{h,cc}`、`services/synapse/gas/GasCustomCmd.h`
+- 想改 StandardMem glue 与阶段事件分发：`services/synapse/stdmem/StdMemEndpoint.{h,cc}`、`services/memory/StandardMemAccess.{h,cc}`、`components/GatherBufferIF.{h,cc}`
 
 <details>
 <summary><b>根目录文件（SnnDL/）</b></summary>
@@ -329,19 +345,6 @@ make install
 | `components/gas/GlobalGasStepController.cc` | `source` | include:"gas/GlobalGasStepController.h"; ns:SST |
 | `components/gas/GlobalGasStepController.h` | `header` | types:GlobalGasStepController; ns:SST |
 | `components/gas/README.md` | `doc` | components/gas/（全局 Step/GAS 同步组件） |
-
-</details>
-
-<details>
-<summary><b>components/mpi/（MPI 扩展）</b></summary>
-
-| 文件 | 类型 | 主要符号/标题（从文件头提取） |
-|---|---|---|
-| `components/mpi/MPIMultiCorePE.cc` | `source` | include:"MPIMultiCorePE.h" |
-| `components/mpi/MPIMultiCorePE.h` | `header` | include:"MultiCorePE.h"; types:MPIMultiCorePE, MPICommManager; ns:SST, SnnDL |
-| `components/mpi/MPITypes.cc` | `source` | include:"MPITypes.h"; ns:SST, SnnDL |
-| `components/mpi/MPITypes.h` | `header` | include:"SpikeEvent.h"; types:SpikeEvent, MPITypes, MPIConfig, SSTMPICommHelper, SSTMPIPerformanceMonitor, MPIStats; ns:SST, SnnDL |
-| `components/mpi/README.md` | `doc` | components/mpi/（MPI 扩展组件） |
 
 </details>
 

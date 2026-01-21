@@ -6,6 +6,15 @@
 
 ---
 
+## 内存建模口径（默认 cacheline）与 Synapse 域的职责
+
+Synapse 域会影响“读粒度/合并策略”（例如 GAS 的 granule 合并、权重访问局部性），因此必须把口径说清楚：
+
+- 默认通用体系结构语义：cacheline（memHierarchy）事务是 L2 traffic 的基本单位。
+- 若 Synapse 侧策略导致下游按更大 granule（row/块）读，会引入 over-fetch；必须通过 `gas_unique_reads_total/gas_unique_bytes_total/avg_granule_bytes` 显式暴露，并在实验输出中标注有效参数（`effective_config.json`）。
+
+---
+
 ## 子域目录
 
 - `services/synapse/weights/`：权重语义与缓存子系统（dense/BCSR/窗口读编排），实现 `api/SnnWeightReader.h`

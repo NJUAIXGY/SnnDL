@@ -15,15 +15,12 @@
 
 #include "NocPacketBatchEvent.h"
 #include "NocPacketEvent.h"
+#include "SnnDLLogging.h"
 
 using namespace SST;
 using namespace SST::SnnDL;
 using namespace SST::Interfaces;
 
-// Lightweight logging helpers (file-local)
-#ifndef SNNDL_LOGPTR
-#define SNNDL_LOGPTR(ptr, lvl, ...) do { if (ptr) (ptr)->verbose(CALL_INFO, (lvl), 0, __VA_ARGS__); } while(0)
-#endif
 #ifndef NIC_LOG
 // Usage: NIC_LOG(level, "fmt...", args...)
 // Note: Do NOT pass CALL_INFO here; SNNDL_LOGPTR injects it.
@@ -76,7 +73,7 @@ SnnNIC::SnnNIC(ComponentId_t id, Params& params)
         int sent_param = params.find<int>("sentinel_enable", 0);
         sentinel_enabled_ = (sent_param != 0);
         if (sentinel_enabled_) {
-            NIC_LOG(0, "[[sentinel-nic-ctor]] enter\n");
+            NIC_LOG(2, "[[sentinel-nic-ctor]] enter\n");
         }
     }
     // 获取参数
@@ -152,8 +149,8 @@ SnnNIC::SnnNIC(ComponentId_t id, Params& params)
             net_params.insert("link_bw", link_bw);
             net_params.insert("input_buf_size", input_buf_size);
             net_params.insert("output_buf_size", output_buf_size);
-            // 强制单VN
-            net_params.insert("num_vns", std::to_string(1));
+            // 使用一致的VN数量（与 effective_num_vns_ 对齐）
+            net_params.insert("num_vns", std::to_string(effective_num_vns_));
             // 添加PortControl协议调试参数
             net_params.insert("job_id", "0");
             // job_size=总节点数
@@ -483,8 +480,8 @@ void SnnNIC::handleDirectSpikeEvent(SST::Event* event)
 // === SST lifecycle ===
 void SnnNIC::init(unsigned int phase)
 {
-    if (output && sentinel_enabled_) {
-        output->output("[[sentinel-nic-init]] node=%u phase=%u enter\n", node_id, phase);
+    if (output && sentinel_enabled_ && output->getVerboseLevel() >= 2) {
+        output->verbose(CALL_INFO, 2, 0, "[[sentinel-nic-init]] node=%u phase=%u enter\n", node_id, phase);
     }
     if (!use_direct_link && network) {
         network->init(phase);
@@ -495,15 +492,15 @@ void SnnNIC::init(unsigned int phase)
         registerClock("10ns", new Clock::Handler2<SnnNIC, &SnnNIC::flushClockTick>(this));
     }
     if (phase >= 1) init_done_ = true;
-    if (output && sentinel_enabled_) {
-        output->output("[[sentinel-nic-init]] node=%u phase=%u done\n", node_id, phase);
+    if (output && sentinel_enabled_ && output->getVerboseLevel() >= 2) {
+        output->verbose(CALL_INFO, 2, 0, "[[sentinel-nic-init]] node=%u phase=%u done\n", node_id, phase);
     }
 }
 
 void SnnNIC::setup()
 {
-    if (output && sentinel_enabled_) {
-        output->output("[[sentinel-nic-setup]] node=%u enter\n", node_id);
+    if (output && sentinel_enabled_ && output->getVerboseLevel() >= 2) {
+        output->verbose(CALL_INFO, 2, 0, "[[sentinel-nic-setup]] node=%u enter\n", node_id);
     }
     if (!use_direct_link && network) {
         network->setup();
@@ -516,8 +513,8 @@ void SnnNIC::setup()
         use_direct_link ? "direct" : "SimpleNetwork",
         link_bw.c_str(), input_buf_size.c_str(), output_buf_size.c_str(),
         effective_num_vns_);
-    if (output && sentinel_enabled_) {
-        output->output("[[sentinel-nic-setup]] node=%u done\n", node_id);
+    if (output && sentinel_enabled_ && output->getVerboseLevel() >= 2) {
+        output->verbose(CALL_INFO, 2, 0, "[[sentinel-nic-setup]] node=%u done\n", node_id);
     }
 }
 
@@ -603,7 +600,7 @@ void SnnNIC::flushPendingSends_()
         if (!sent) {
             ps.payload = req->takePayload();
             delete req;
-            if (sentinel_enabled_ && output &&
+            if (sentinel_enabled_ && output && output->getVerboseLevel() >= 2 &&
                 (pending_send_stall_log_count_ < 32 || pending_sends_.size() <= 16)) {
                 const uint32_t dst = ps.dest_node;
                 const uint64_t total_bytes_u64 = static_cast<uint64_t>((bits + 7) / 8);
@@ -622,7 +619,8 @@ void SnnNIC::flushPendingSends_()
                     payload_bytes_u64 = static_cast<uint64_t>(batch->packets.size());
                 }
 
-                output->output(
+                output->verbose(
+                    CALL_INFO, 2, 0,
                     "[[sentinel-nic-stall]] node=%u dst=%u vn=%d bits=%d bytes=%" PRIu64 " out_buf=%s pending=%zu ready=%d isInit=%d link_ready=%d space=%d type=%s kind=%u payload=%" PRIu64 "\n",
                     node_id,
                     dst,

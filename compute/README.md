@@ -36,3 +36,12 @@
   - 实现 `endCycle/endCycleCandidates + drainOutputs` 的一致语义（输出由控制层统一路由）。
 - 在 `createComputeCoreByName()` 中注册 `name -> XxxComputeCore`；
 - 在仿真脚本/参数中设置 `compute_core_impl=name`。
+
+---
+
+## 内存建模口径（默认 cacheline）与 compute 的关系
+
+compute 层不应假设“权重一次读就是整行/整块”：
+
+- 默认体系结构语义是 cacheline（memHierarchy）事务；是否存在更大粒度（row-streaming/DMA）属于上层 workload/内存前端的显式架构假设。
+- compute 只接收“已解析后的权重值/向量”（由 synapse/weights 或 workload 提供），不直接基于 StandardMem 的请求粒度做推断。

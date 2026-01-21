@@ -26,6 +26,12 @@ using namespace SST;
 using namespace SST::SnnDL;
 
 namespace {
+// NOTE(Universal-core experiments):
+// We globally disable all BCSR optimizations, including in-flight coalescing.
+// BCSR remains as a storage format/addressing scheme only.
+static constexpr bool kEnableBcsrOptimizations = false;
+static constexpr bool kEnableBcsrInflightCoalescing = false;
+
 static inline bool isPow2(uint32_t v) { return v != 0 && (v & (v - 1u)) == 0; }
 static inline uint64_t alignDownU64(uint64_t v, uint64_t a) { return a ? (v & ~(a - 1u)) : v; }
 static inline uint64_t alignUpU64(uint64_t v, uint64_t a) {
@@ -323,8 +329,9 @@ void WeightMemorySubsystem::drainPendingDirectReads_() {
         PendingMeta meta = std::move(pending_direct_reads_.front());
         pending_direct_reads_.pop_front();
 
-        // Direct reads are used only for non-window naive baseline, so we never count window budget here.
-        const IssueStatus st = tryIssueRead_(meta, /*count_budget*/false, /*budget_reserved*/false);
+        // Direct reads can be used by naive baseline and by BCSR paths when coalescing is disabled.
+        const bool count_budget = (window_seq_ != 0);
+        const IssueStatus st = tryIssueRead_(meta, /*count_budget*/count_budget, /*budget_reserved*/false);
         if (st == IssueStatus::Issued) continue;
         if (st == IssueStatus::DeferredInflight) {
             pending_direct_reads_.push_front(std::move(meta));
@@ -336,6 +343,7 @@ void WeightMemorySubsystem::drainPendingDirectReads_() {
 }
 
 void WeightMemorySubsystem::maybeEnqueueRowIndexPrefetchAllRows_() {
+    if (!kEnableBcsrOptimizations) return;
     if (!orch_.use_bcsr || !orch_.bcsr_mgr) return;
     if (!orch_.bcsr_mgr->isRowptrReady()) return;
 
@@ -369,6 +377,7 @@ void WeightMemorySubsystem::maybeEnqueueRowIndexPrefetchAllRows_() {
 }
 
 void WeightMemorySubsystem::maybeEnqueueRowIndexPrefetchPostsPrev_() {
+    if (!kEnableBcsrOptimizations) return;
     if (!orch_.use_bcsr || !orch_.bcsr_mgr) return;
     if (!orch_.bcsr_mgr->isRowptrReady()) return;
 
@@ -412,6 +421,7 @@ void WeightMemorySubsystem::maybeEnqueueRowIndexPrefetchPostsPrev_() {
 }
 
 void WeightMemorySubsystem::drainRowIndexPrefetch_() {
+    if (!kEnableBcsrOptimizations) return;
     if (!orch_.use_bcsr || !orch_.bcsr_mgr) return;
     if (!orch_.bcsr_mgr->isRowptrReady()) return;
 
@@ -512,6 +522,7 @@ void WeightMemorySubsystem::drainRowIndexPrefetch_() {
 }
 
 void WeightMemorySubsystem::maybeAutoTuneBlockCache_() {
+    if (!kEnableBcsrOptimizations) return;
     if (!orch_.use_bcsr || !orch_.bcsr_mgr) return;
     if (!orch_.bcsr_block_cache_auto_tune) return;
     if (orch_.bcsr_block_cache_max_bytes == 0) return;
@@ -548,8 +559,9 @@ void WeightMemorySubsystem::maybeAutoTuneBlockCache_() {
     orch_.bcsr_mgr->setBlockCacheCapacity(new_cap);
 
     static int dbg_tune = 0;
-    if (diag_out_ && diag_node_id_ == 0 && diag_core_id_ == 0 && dbg_tune < 32) {
-        diag_out_->verbose(CALL_INFO, 0, 0,
+    if (diag_out_ && diag_out_->getVerboseLevel() >= 2 &&
+        diag_node_id_ == 0 && diag_core_id_ == 0 && dbg_tune < 32) {
+        diag_out_->verbose(CALL_INFO, 2, 0,
             "[bcsr] auto-tune block_cache_cap %u -> %u (miss=%u hit=%u ratio=%.3f max_bytes=%" PRIu64 " block_bytes=%zu)\n",
             cap, new_cap, misses, hits, ratio,
             static_cast<uint64_t>(orch_.bcsr_block_cache_max_bytes),
@@ -771,148 +783,46 @@ void WeightMemorySubsystem::enqueueBcsrBlockReadCoalesced_(uint32_t win_seq,
         return;
     }
 
-    // Fast path: block cached.
-    std::vector<float> blk;
-    if (orch_.bcsr_mgr->blockGet(block_row, block_col, blk)) {
-        block_hit_window_ += 1;
-        if (diag_debug_ && diag_window_active_) diag_win_.block_hit += 1;
-        const uint32_t bc = orch_.bcsr_mgr->effectiveBlockCols();
-        const uint32_t off = intra_row * bc + intra_col;
-        const float w = (off < blk.size()) ? blk[off] : 0.0f;
-        if (cb) cb(applyWeightGuards(orch_, w));
+    // Global policy: no BCSR cache, no prefetch, no in-flight coalescing.
+    // Always issue a direct blockdata read per request (BCSR is format-only).
+    (void)pre_global;
+    (void)post_local;
+
+    const size_t block_bytes = orch_.bcsr_mgr->blockBytes();
+    const uint64_t addr = orch_.bcsr_mgr->blockDataAddr(global_block_index);
+    uint64_t req_addr = addr;
+    size_t req_size = block_bytes;
+    size_t slice_off = 0;
+    prepareAlignedRead(addr, block_bytes, orch_.line_size_bytes, req_addr, req_size, slice_off);
+
+    PendingMeta meta{};
+    meta.window_seq = win_seq;
+    meta.address = req_addr;
+    meta.size = req_size;
+    meta.orig_address = addr;
+    meta.orig_size = block_bytes;
+    meta.slice_offset = slice_off;
+    meta.issue_cycle = now_cycle_;
+    meta.bcsr_kind = 3;
+    meta.bcsr_block_row = block_row;
+    meta.bcsr_target_block_col = block_col;
+    meta.bcsr_intra_row = intra_row;
+    meta.bcsr_intra_col = intra_col;
+    meta.bcsr_global_block_index = global_block_index;
+    meta.bcsr_prefetch_all = false;
+    meta.has_single_cb = true;
+    meta.single_cb = std::move(cb);
+    meta.is_weight = true;
+    meta.count_weight_read = true;
+
+    const bool count_budget = (window_seq_ != 0);
+    const IssueStatus st = tryIssueRead_(meta, /*count_budget*/count_budget, /*budget_reserved*/false);
+    if (st == IssueStatus::Issued) return;
+    if (st == IssueStatus::DeferredInflight) {
+        pending_direct_reads_.push_back(std::move(meta));
         return;
     }
-
-    // naive baseline: disable in-flight coalescing for blockdata while still respecting inflight limits.
-    // NOTE: this path is only intended for non-window mode (window_seq_==0). GAS/window mode relies on
-    // budget-aware coalescing to guarantee forward progress under a finite window budget.
-    if (!orch_.bcsr_block_inflight_coalesce_enable && window_seq_ == 0) {
-        const size_t block_bytes = orch_.bcsr_mgr->blockBytes();
-        const uint64_t addr = orch_.bcsr_mgr->blockDataAddr(global_block_index);
-        uint64_t req_addr = addr;
-        size_t req_size = block_bytes;
-        size_t slice_off = 0;
-        prepareAlignedRead(addr, block_bytes, orch_.line_size_bytes, req_addr, req_size, slice_off);
-
-        PendingMeta meta{};
-        meta.window_seq = win_seq;
-        meta.address = req_addr;
-        meta.size = req_size;
-        meta.orig_address = addr;
-        meta.orig_size = block_bytes;
-        meta.slice_offset = slice_off;
-        meta.issue_cycle = now_cycle_;
-        meta.bcsr_kind = 3;
-        meta.bcsr_block_row = block_row;
-        meta.bcsr_target_block_col = block_col;
-        meta.bcsr_intra_row = intra_row;
-        meta.bcsr_intra_col = intra_col;
-        meta.bcsr_global_block_index = global_block_index;
-        meta.bcsr_prefetch_all = false;
-        meta.has_single_cb = true;
-        meta.single_cb = std::move(cb);
-        meta.is_weight = true;
-        meta.count_weight_read = true;
-
-        const IssueStatus st = tryIssueRead_(meta, /*count_budget*/false, /*budget_reserved*/false);
-        if (st == IssueStatus::Issued) return;
-        if (st == IssueStatus::DeferredInflight) {
-            pending_direct_reads_.push_back(std::move(meta));
-            return;
-        }
-        if (meta.has_single_cb && meta.single_cb) meta.single_cb(0.0f);
-        return;
-    }
-
-    // B: block-granule coalescing (per window + global_block_index).
-    const uint64_t inflight_key = makeInflightKey_(win_seq, global_block_index);
-    auto& inflight = inflight_block_[inflight_key];
-    if (!inflight.issued) {
-        inflight.window_seq = win_seq;
-        inflight.block_row = block_row;
-        inflight.block_col = block_col;
-        inflight.global_block_index = global_block_index;
-        inflight.count_budget = (window_seq_ != 0);
-    }
-    BlockWaiter waiter{};
-    waiter.pre_global = pre_global;
-    waiter.post_local = post_local;
-    waiter.intra_row = intra_row;
-    waiter.intra_col = intra_col;
-    waiter.cb = std::move(cb);
-    inflight.waiters.push_back(std::move(waiter));
-
-    if (!inflight.issued) {
-        if (inflight.queued) return; // already queued, wait for drainPendingReads_
-        if (inflight.waiters.size() == 1) {
-            // Count unique block miss once per window (leader miss).
-            block_miss_window_ += 1;
-        }
-
-        const size_t block_bytes = orch_.bcsr_mgr->blockBytes();
-        const uint64_t addr = orch_.bcsr_mgr->blockDataAddr(global_block_index);
-        uint64_t req_addr = addr;
-        size_t req_size = block_bytes;
-        size_t slice_off = 0;
-        prepareAlignedRead(addr, block_bytes, orch_.line_size_bytes, req_addr, req_size, slice_off);
-
-        PendingMeta meta{};
-        meta.window_seq = win_seq;
-        meta.address = req_addr;
-        meta.size = req_size;
-        meta.orig_address = addr;
-        meta.orig_size = block_bytes;
-        meta.slice_offset = slice_off;
-        meta.issue_cycle = now_cycle_;
-        meta.bcsr_kind = 3;
-        meta.bcsr_block_row = block_row;
-        meta.bcsr_target_block_col = block_col;
-        meta.bcsr_global_block_index = global_block_index;
-        meta.bcsr_prefetch_all = false;
-        meta.has_single_cb = false;
-        meta.is_weight = true;
-        meta.count_weight_read = true;
-
-        // 诊断：blockdata 读取发起地址/跨度（只对 leader 打印一次）
-        static int dbg_block_issue_coalesced = 0;
-        const IssueStatus st = tryIssueRead_(std::move(meta), inflight.count_budget, /*budget_reserved*/false);
-        if (st == IssueStatus::Issued) {
-            inflight.issued = true;
-            inflight.queued = false;
-            if (diag_debug_ && diag_window_active_) diag_win_.block_miss += 1;
-            if (diag_debug_ && diag_out_ && diag_node_id_ == 0 && dbg_block_issue_coalesced < 64) {
-                diag_out_->verbose(CALL_INFO, 0, 0,
-                    "[diag-bcsr-block-issue] node=%d core=%d block_row=%u block_col=%u gbi=%u addr=0x%llx bytes=%zu aligned=(0x%llx,%zu off=%zu) window=%u (coalesced)\n",
-                    diag_node_id_, diag_core_id_,
-                    block_row, block_col, global_block_index,
-                    (unsigned long long)addr, block_bytes,
-                    (unsigned long long)req_addr, req_size, slice_off,
-                    win_seq);
-                ++dbg_block_issue_coalesced;
-            }
-            return;
-        }
-        if (st == IssueStatus::DeferredInflight) {
-            inflight.queued = true;
-            pending_block_reads_.push_back(inflight_key);
-            return;
-        }
-        if (st == IssueStatus::DeferredBudget) {
-            // Budget exhausted: do not queue (would deadlock); drain waiters to preserve forward progress.
-            auto waiters = std::move(inflight.waiters);
-            inflight_block_.erase(inflight_key);
-            for (auto& ww : waiters) {
-                if (ww.cb) ww.cb(0.0f);
-            }
-            return;
-        }
-        // Failed: drain waiters immediately to avoid deadlock.
-        auto waiters = std::move(inflight.waiters);
-        inflight_block_.erase(inflight_key);
-        for (auto& ww : waiters) {
-            if (ww.cb) ww.cb(0.0f);
-        }
-    }
+    if (meta.has_single_cb && meta.single_cb) meta.single_cb(0.0f);
 }
 
 void WeightMemorySubsystem::requestBCSR_(uint32_t pre_global, uint32_t post_local, std::function<void(float)> cb) {
@@ -981,27 +891,9 @@ void WeightMemorySubsystem::requestBCSR_(uint32_t pre_global, uint32_t post_loca
         const size_t bytes = orch_.bcsr_mgr->colIndexBytes(block_count);
         const uint64_t addr = orch_.bcsr_mgr->colIndexAddr(start);
 
-        // If we are doing all_rows bulk prefetch, do not issue per-row colidx reads.
-        std::string mode = lowerCopy_(orch_.bcsr_row_index_prefetch_mode);
-        if (mode.empty()) mode = "auto";
-        const uint32_t nBlockRows =
-            br ? ((orch_.num_neurons + br - 1u) / br) : static_cast<uint32_t>(orch_.num_neurons);
-        bool auto_all = false;
-        if (mode == "auto" && nBlockRows <= orch_.bcsr_row_index_prefetch_all_rows_threshold) {
-            uint32_t last_start = 0;
-            uint32_t last_end = 0;
-            if (nBlockRows > 0 &&
-                orch_.bcsr_mgr->rowBounds(nBlockRows - 1u, last_start, last_end) &&
-                last_end > 0) {
-                const size_t colidx_bytes = orch_.bcsr_mgr->colIndexBytes(last_end);
-                auto_all = (colidx_bytes <= orch_.bcsr_row_index_prefetch_all_rows_max_bytes);
-            }
-        }
-        const bool do_all = (mode == "all_rows") || auto_all;
-
-        // naive baseline: disable in-flight coalescing for colidx in non-window mode (while still respecting inflight limits).
-        // NOTE: in GAS/window mode, colidx coalescing is required for forward progress under finite window budgets.
-        if (!orch_.bcsr_colidx_inflight_coalesce_enable && window_seq_ == 0 && !do_all) {
+        // Global policy: no rowIndex cache/prefetch, no in-flight coalescing.
+        // Always issue a direct colidx read per request (BCSR is format-only).
+        if (!kEnableBcsrOptimizations || !kEnableBcsrInflightCoalescing) {
             PendingMeta meta{};
             meta.window_seq = window_seq_;
             meta.address = addr;
@@ -1022,7 +914,8 @@ void WeightMemorySubsystem::requestBCSR_(uint32_t pre_global, uint32_t post_loca
             meta.is_weight = true;
             meta.count_weight_read = false;
 
-            const IssueStatus st = tryIssueRead_(meta, /*count_budget*/false, /*budget_reserved*/false);
+            const bool count_budget = (window_seq_ != 0);
+            const IssueStatus st = tryIssueRead_(meta, /*count_budget*/count_budget, /*budget_reserved*/false);
             if (st == IssueStatus::Issued) {
                 if (diag_debug_ && diag_window_active_) diag_win_.rowidx_miss += 1;
                 return;
@@ -1035,92 +928,6 @@ void WeightMemorySubsystem::requestBCSR_(uint32_t pre_global, uint32_t post_loca
             return;
         }
 
-        // A: in-flight 合并（按 block_row + window_seq）
-        const uint32_t win_seq = window_seq_;
-        const uint64_t inflight_key = makeInflightKey_(win_seq, block_row);
-        auto& inflight = inflight_colidx_[inflight_key];
-        if (!inflight.issued) {
-            inflight.window_seq = win_seq;
-            inflight.block_row = block_row;
-            inflight.row_start = start;
-            inflight.row_end = end;
-            inflight.count_budget = (window_seq_ != 0);
-        }
-        ColidxWaiter w{};
-        w.pre_global = pre_global;
-        w.post_local = post_local;
-        w.target_block_col = block_col;
-        w.intra_row = intra_row;
-        w.intra_col = intra_col;
-        w.cb = std::move(cb);
-        inflight.waiters.push_back(std::move(w));
-
-        if (do_all) {
-            maybeEnqueueRowIndexPrefetchAllRows_();
-            drainRowIndexPrefetch_();
-            if (row_index_prefetch_bulk_pending_ || row_index_prefetch_bulk_inflight_) {
-                inflight.queued = true;
-                return;
-            }
-        }
-
-        if (!inflight.issued) {
-            if (inflight.queued) return;
-            // NOTE: 对 colidx 段不要扩展到整 cacheline 读（例如 450B→512B）。在 memHierarchy.Cache
-            // 的 non-coherent/L1 配置下，多 cacheline 的“扩展读”在部分地址上会返回全 0 的 rr->data，
-            // 而同地址的 64B 单行读却是正确的；这会直接导致 BCSR miss→权重=0→发放归零。
-            // 保持与稳定版本一致：按原始 addr/bytes 发起。
-            PendingMeta meta{};
-            meta.window_seq = win_seq;
-            meta.address = addr;
-            meta.size = bytes;
-            meta.orig_address = addr;
-            meta.orig_size = bytes;
-            meta.slice_offset = 0;
-            meta.issue_cycle = now_cycle_;
-            meta.bcsr_kind = 2;
-            meta.bcsr_block_row = block_row;
-            meta.bcsr_target_block_col = UINT32_MAX; // coalesced
-            meta.bcsr_row_start = start;
-            meta.bcsr_prefetch_all = false;
-            meta.has_single_cb = false;
-            meta.is_weight = true;
-            meta.count_weight_read = false;
-
-            // 诊断：colidx 读取发起地址/跨度（只对 leader 打印一次）
-            static int dbg_colidx_issue = 0;
-            const IssueStatus st = tryIssueRead_(std::move(meta), inflight.count_budget, /*budget_reserved*/false);
-            if (st == IssueStatus::Issued) {
-                inflight.issued = true; // mark leader after successful issue
-                inflight.queued = false;
-                if (diag_debug_ && diag_window_active_) diag_win_.rowidx_miss += 1;
-                if (diag_debug_ && diag_out_ && diag_node_id_ == 0 && dbg_colidx_issue < 64) {
-                    diag_out_->verbose(CALL_INFO, 0, 0,
-                        "[diag-bcsr-colidx-issue] node=%d core=%d block_row=%u start=%u end=%u addr=0x%llx bytes=%zu window=%u (coalesced)\n",
-                        diag_node_id_, diag_core_id_, block_row, start, end,
-                        (unsigned long long)addr, bytes, win_seq);
-                    ++dbg_colidx_issue;
-                }
-            } else if (st == IssueStatus::DeferredInflight) {
-                inflight.queued = true;
-                pending_colidx_reads_.push_back(inflight_key);
-            } else if (st == IssueStatus::DeferredBudget) {
-                // Budget exhausted: do not queue (would deadlock); drain waiters to preserve forward progress.
-                auto waiters = std::move(inflight.waiters);
-                inflight_colidx_.erase(inflight_key);
-                for (auto& ww : waiters) {
-                    if (ww.cb) ww.cb(0.0f);
-                }
-            } else {
-                // issue failed: drain waiters immediately to avoid deadlock
-                auto waiters = std::move(inflight.waiters);
-                inflight_colidx_.erase(inflight_key);
-                for (auto& ww : waiters) {
-                    if (ww.cb) ww.cb(0.0f);
-                }
-            }
-        }
-        return;
     }
     if (diag_debug_ && diag_window_active_) diag_win_.rowidx_hit += 1;
 
@@ -1179,8 +986,8 @@ void WeightMemorySubsystem::maybeIssueBcsrRowptrPrefetch_() {
     meta.bcsr_kind = 1;
     meta.is_weight = true;
     meta.count_weight_read = false;
-    if (diag_out_) {
-        diag_out_->verbose(CALL_INFO, 0, 0,
+    if (diag_out_ && diag_out_->getVerboseLevel() >= 2) {
+        diag_out_->verbose(CALL_INFO, 2, 0,
             "[diag-bcsr-rowptr-issue] node=%d core=%d addr=0x%llx bytes=%zu nBlockRows=%u\n",
             diag_node_id_, diag_core_id_,
             (unsigned long long)addr, bytes,
@@ -1212,6 +1019,7 @@ void WeightMemorySubsystem::drainPendingBcsrRowptrWaiters_() {
 }
 
 void WeightMemorySubsystem::bcsrPrefetchAll_() {
+    if (!kEnableBcsrOptimizations) return;
     if (!orch_.use_bcsr || !orch_.bcsr_mgr) return;
     if (!orch_.bcsr_prefetch_all) return;
     if (bcsr_prefetch_issued_) return;
@@ -1259,6 +1067,7 @@ void WeightMemorySubsystem::bcsrPrefetchAll_() {
 }
 
 void WeightMemorySubsystem::bcsrPrefetchRowBlocks_(uint32_t block_row, const std::vector<uint32_t>& cols, uint32_t row_start) {
+    if (!kEnableBcsrOptimizations) return;
     if (!orch_.use_bcsr || !orch_.bcsr_mgr) return;
     if (!mem_access_) return;
     const size_t block_bytes = orch_.bcsr_mgr->blockBytes();
@@ -1292,6 +1101,7 @@ void WeightMemorySubsystem::bcsrPrefetchRowBlocks_(uint32_t block_row, const std
 }
 
 void WeightMemorySubsystem::bcsrPopulateWeightCache_(uint32_t block_row, uint32_t block_col, const std::vector<float>& blk) {
+    if (!kEnableBcsrOptimizations) return;
     if (!orch_.use_bcsr || !orch_.bcsr_mgr) return;
     if (!orch_.bcsr_populate_weight_cache_enable) return;
     if (blk.empty()) return;
@@ -1370,6 +1180,11 @@ void WeightMemorySubsystem::handleReadResp_(uint64_t req_id, uint64_t addr, Pend
         }
     }
 
+    // Byte-exact correctness (dense-only): validate every returned byte before any slice/caching logic.
+    if (meta.bcsr_kind == 0 && meta.is_weight && byteExactVerifyEnabled_()) {
+        verifyDenseReadBytes_(addr, meta.size, bytes);
+    }
+
     // ---- BCSR ----
     if (meta.bcsr_kind == 1) {
         // rowptr
@@ -1392,8 +1207,8 @@ void WeightMemorySubsystem::handleReadResp_(uint64_t req_id, uint64_t addr, Pend
                     const size_t expect = orch_.bcsr_mgr->expectedRowptrBytes(orch_.num_neurons);
                     if (readFileSlice(path, rp_off, expect, rp_bytes)) {
                         ok = orch_.bcsr_mgr->installRowptrFromBytes(rp_bytes.data(), rp_bytes.size(), orch_.num_neurons);
-                        if (ok && diag_out_) {
-                            diag_out_->verbose(CALL_INFO, 0, 0,
+                        if (ok && diag_out_ && diag_out_->getVerboseLevel() >= 2) {
+                            diag_out_->verbose(CALL_INFO, 2, 0,
                                 "[diag-bcsr-rowptr-file] node=%d core=%d fallback ok path=%s bytes=%zu\n",
                                 diag_node_id_, diag_core_id_, path.c_str(), rp_bytes.size());
                         }
@@ -1446,8 +1261,8 @@ void WeightMemorySubsystem::handleReadResp_(uint64_t req_id, uint64_t addr, Pend
                                     orch_.bcsr_mgr->rowIndexPut(block_row, std::move(cols));
                                 }
                                 bcsr_rowidx_file_preloaded_ = true;
-                                if (diag_out_) {
-                                    diag_out_->verbose(CALL_INFO, 0, 0,
+                                if (diag_out_ && diag_out_->getVerboseLevel() >= 2) {
+                                    diag_out_->verbose(CALL_INFO, 2, 0,
                                         "[diag-bcsr-colidx-file] node=%d core=%d preload all_rows ok bytes=%zu\n",
                                         diag_node_id_, diag_core_id_, all.size());
                                 }
@@ -1460,12 +1275,7 @@ void WeightMemorySubsystem::handleReadResp_(uint64_t req_id, uint64_t addr, Pend
                 orch_.ensure_rowptr_ready_or_fatal("rowptr load failed (dram)");
             }
             if (orch_.bcsr_mgr->isRowptrReady()) {
-                // Rowptr 就绪后触发一次预取（可选）并尝试恢复 Apply 阶段发起
-                if (!bcsr_rowidx_file_preloaded_) {
-                    maybeEnqueueRowIndexPrefetchAllRows_();
-                    drainRowIndexPrefetch_();
-                }
-                bcsrPrefetchAll_();
+                // Rowptr 就绪后仅恢复 Apply 阶段发起（BCSR 预取/缓存优化已全局禁用）
                 if (orch_.resume_issue_after_rowptr_ready) {
                     orch_.resume_issue_after_rowptr_ready();
                 }
@@ -1628,7 +1438,8 @@ void WeightMemorySubsystem::handleReadResp_(uint64_t req_id, uint64_t addr, Pend
         }
         // 诊断：node0/core0 仅采样部分 colidx 内容，验证与文件偏移一致
         static int dbg_colidx_dump = 0;
-        if (diag_debug_ && diag_out_ && diag_node_id_ == 0 && diag_core_id_ == 0 && dbg_colidx_dump < 16 && !cols.empty()) {
+        if (diag_debug_ && diag_out_ && diag_out_->getVerboseLevel() >= 2 &&
+            diag_node_id_ == 0 && diag_core_id_ == 0 && dbg_colidx_dump < 16 && !cols.empty()) {
             const size_t dump = std::min<size_t>(cols.size(), 8);
             std::string first_vals;
             for (size_t i = 0; i < dump; ++i) {
@@ -1643,18 +1454,20 @@ void WeightMemorySubsystem::handleReadResp_(uint64_t req_id, uint64_t addr, Pend
                 if (i) first_bytes.push_back(' ');
                 first_bytes += buf;
             }
-            diag_out_->verbose(CALL_INFO, 0, 0,
+            diag_out_->verbose(CALL_INFO, 2, 0,
                 "[diag-bcsr-colidx-dump] node=0 core=0 block_row=%u start=%u end=%u count=%zu first=%s idx_bytes=%u bytes=[%s] slice_off=%zu\n",
                 meta.bcsr_block_row, meta.bcsr_row_start, meta.bcsr_row_start + (uint32_t)cols.size(),
                 cols.size(), first_vals.c_str(), idx_bytes, first_bytes.c_str(), slice_off);
             ++dbg_colidx_dump;
         }
-        orch_.bcsr_mgr->rowIndexPut(meta.bcsr_block_row, std::move(cols));
-
-        std::vector<uint32_t> cached_cols;
-        (void)orch_.bcsr_mgr->rowIndexGet(meta.bcsr_block_row, cached_cols);
+        // 重要：
+        // - 某些实验会全局关闭 BCSR 缓存（rowIndex/block cache），此时 rowIndexPut/get 为 no-op。
+        // - 但 colidx 回包仍必须能定位 target_block_col；否则所有 BCSR 权重读都会退化为 0（功能错误）。
+        // 因此：本次回包逻辑始终使用本地解析得到的 `cols`；仅在缓存启用时再写入 rowIndex cache。
+        const uint32_t row_index_cap = orch_.bcsr_mgr->rowIndexCacheCapacity();
         if (meta.bcsr_prefetch_all) {
-            bcsrPrefetchRowBlocks_(meta.bcsr_block_row, cached_cols, meta.bcsr_row_start);
+            bcsrPrefetchRowBlocks_(meta.bcsr_block_row, cols, meta.bcsr_row_start);
+            if (row_index_cap != 0) orch_.bcsr_mgr->rowIndexPut(meta.bcsr_block_row, std::move(cols));
             return;
         }
 
@@ -1668,10 +1481,10 @@ void WeightMemorySubsystem::handleReadResp_(uint64_t req_id, uint64_t addr, Pend
 
             // Build quick index (block_col -> idx_in_row) once for this row.
             std::unordered_map<uint32_t, uint32_t> idx_lookup;
-            if (waiters.size() > 1 && !cached_cols.empty()) {
-                idx_lookup.reserve(cached_cols.size());
-                for (size_t i = 0; i < cached_cols.size(); ++i) {
-                    idx_lookup[cached_cols[i]] = static_cast<uint32_t>(i);
+            if (waiters.size() > 1 && !cols.empty()) {
+                idx_lookup.reserve(cols.size());
+                for (size_t i = 0; i < cols.size(); ++i) {
+                    idx_lookup[cols[i]] = static_cast<uint32_t>(i);
                 }
             }
             auto findIdx = [&](uint32_t target, uint32_t& out_idx) -> bool {
@@ -1681,8 +1494,8 @@ void WeightMemorySubsystem::handleReadResp_(uint64_t req_id, uint64_t addr, Pend
                     out_idx = it->second;
                     return true;
                 }
-                for (size_t i = 0; i < cached_cols.size(); ++i) {
-                    if (cached_cols[i] == target) {
+                for (size_t i = 0; i < cols.size(); ++i) {
+                    if (cols[i] == target) {
                         out_idx = static_cast<uint32_t>(i);
                         return true;
                     }
@@ -1707,13 +1520,14 @@ void WeightMemorySubsystem::handleReadResp_(uint64_t req_id, uint64_t addr, Pend
                                                w.post_local,
                                                std::move(w.cb));
             }
+            if (row_index_cap != 0) orch_.bcsr_mgr->rowIndexPut(meta.bcsr_block_row, std::move(cols));
             return;
         }
 
         uint32_t idx_in_row = 0;
         bool found = false;
-        for (size_t i = 0; i < cached_cols.size(); ++i) {
-            if (cached_cols[i] == meta.bcsr_target_block_col) {
+        for (size_t i = 0; i < cols.size(); ++i) {
+            if (cols[i] == meta.bcsr_target_block_col) {
                 idx_in_row = static_cast<uint32_t>(i);
                 found = true;
                 break;
@@ -1721,9 +1535,11 @@ void WeightMemorySubsystem::handleReadResp_(uint64_t req_id, uint64_t addr, Pend
         }
         if (!found) {
             if (meta.has_single_cb && meta.single_cb) meta.single_cb(0.0f);
+            if (row_index_cap != 0) orch_.bcsr_mgr->rowIndexPut(meta.bcsr_block_row, std::move(cols));
             return;
         }
         const uint32_t global_block_index = meta.bcsr_row_start + idx_in_row;
+        if (row_index_cap != 0) orch_.bcsr_mgr->rowIndexPut(meta.bcsr_block_row, std::move(cols));
         enqueueBcsrBlockReadCoalesced_(meta.window_seq,
                                        meta.bcsr_block_row,
                                        meta.bcsr_target_block_col,
@@ -1750,14 +1566,15 @@ void WeightMemorySubsystem::handleReadResp_(uint64_t req_id, uint64_t addr, Pend
         const size_t slice_off = meta.slice_offset;
         const size_t slice_len = meta.orig_size ? meta.orig_size : meta.size;
         const bool ok = (bytes.size() >= slice_off + slice_len) && (slice_len >= expect_bytes);
-        if (diag_debug_ && diag_out_ && diag_node_id_ == 0 && diag_core_id_ == 0) {
+        if (diag_debug_ && diag_out_ && diag_out_->getVerboseLevel() >= 2 &&
+            diag_node_id_ == 0 && diag_core_id_ == 0) {
             static int dbg_block_resp = 0;
             if (dbg_block_resp < 2048) {
                 float f0 = 0.0f;
                 if (bytes.size() >= slice_off + sizeof(float)) {
                     std::memcpy(&f0, bytes.data() + slice_off, sizeof(float));
                 }
-                diag_out_->verbose(CALL_INFO, 0, 0,
+                diag_out_->verbose(CALL_INFO, 2, 0,
                     "[diag-bcsr-block-resp] node=%d core=%d block_row=%u block_col=%u gbi=%u addr=0x%llx bytes=%zu slice_off=%zu f0=%.6f ok=%d\n",
                     diag_node_id_, diag_core_id_, meta.bcsr_block_row, meta.bcsr_target_block_col,
                     meta.bcsr_global_block_index, (unsigned long long)meta.address,
@@ -1778,12 +1595,19 @@ void WeightMemorySubsystem::handleReadResp_(uint64_t req_id, uint64_t addr, Pend
                 for (auto& w : waiters) {
                     const uint32_t off = w.intra_row * bc + w.intra_col;
                     const float ww = (off < blk.size()) ? blk[off] : 0.0f;
-                    if (w.cb) w.cb(applyWeightGuards(orch_, ww));
+                    const float guarded = applyWeightGuards(orch_, ww);
+                    verifyBcsrEdgeWeight_(w.pre_global, w.post_local, guarded);
+                    if (w.cb) w.cb(guarded);
                 }
             } else if (meta.has_single_cb && meta.single_cb) {
                 const uint32_t off = meta.bcsr_intra_row * bc + meta.bcsr_intra_col;
                 float w = (off < blk.size()) ? blk[off] : 0.0f;
-                meta.single_cb(applyWeightGuards(orch_, w));
+                const float guarded = applyWeightGuards(orch_, w);
+                verifyBcsrEdgeWeight_(
+                    /*pre_global=*/meta.bcsr_target_block_col * bc + meta.bcsr_intra_col,
+                    /*post_local=*/meta.bcsr_block_row * br + meta.bcsr_intra_row,
+                    guarded);
+                meta.single_cb(guarded);
             }
 
             // Optional: populate dense weight cache from this returned block (optimization).
@@ -1849,4 +1673,348 @@ void WeightMemorySubsystem::handleReadResp_(uint64_t req_id, uint64_t addr, Pend
         if (orch_.readresp_zero_fallback && w == 0.0f) w = orch_.init_default_weight;
         meta.single_cb(w);
     }
+}
+
+bool WeightMemorySubsystem::byteExactVerifyEnabled_() const {
+    if (!orch_.byte_exact_verify_enable) return false;
+    return lowerCopy_(orch_.byte_exact_verify_mode) == "dense_rowcol_v1";
+}
+
+float WeightMemorySubsystem::expectedDenseWeight_(uint32_t row, uint32_t col) const {
+    const uint64_t v =
+        static_cast<uint64_t>(row) * static_cast<uint64_t>(orch_.byte_exact_verify_row_scale) +
+        static_cast<uint64_t>(col);
+    return static_cast<float>(v);
+}
+
+void WeightMemorySubsystem::verifyDenseReadBytes_(uint64_t addr, size_t req_size, const std::vector<uint8_t>& bytes) {
+    if (!byteExactVerifyEnabled_()) return;
+    // Dense-only; BCSR uses file-backed/structured format and has its own invariants.
+    if (orch_.use_bcsr) return;
+    if (orch_.num_neurons == 0) return;
+    const uint32_t width = orch_.use_post_row_pre_col ? orch_.weights_cols : orch_.num_neurons;
+    if (width == 0) return;
+    if (orch_.base_addr == 0) return;
+    if (addr < orch_.base_addr) return;
+
+    static SST::Output fallback("WeightMemorySubsystem[@p:@l]: ", 0, 0, SST::Output::STDERR);
+    SST::Output* out = diag_out_ ? diag_out_ : &fallback;
+
+    if (bytes.size() != req_size) {
+        byte_exact_mismatch_count_ += 1;
+        if (byte_exact_mismatch_logged_ < orch_.byte_exact_verify_max_mismatch) {
+            byte_exact_mismatch_logged_ += 1;
+            out->verbose(CALL_INFO, 0, 0,
+                "[byte-exact] size-mismatch node=%u core=%u window=%u addr=0x%llx got=%zu req=%zu\n",
+                orch_.node_id, orch_.core_id, window_seq_,
+                (unsigned long long)addr, bytes.size(), req_size);
+        }
+    }
+
+    const uint64_t off_bytes = addr - orch_.base_addr;
+    if ((off_bytes & 0x3ull) != 0ull) {
+        byte_exact_mismatch_count_ += 1;
+        out->fatal(CALL_INFO, -1,
+            "❌ [byte-exact] unaligned addr: node=%u core=%u window=%u base=0x%llx addr=0x%llx off=%" PRIu64 "\n",
+            orch_.node_id, orch_.core_id, window_seq_,
+            (unsigned long long)orch_.base_addr,
+            (unsigned long long)addr,
+            off_bytes);
+    }
+
+    const uint64_t total_floats = static_cast<uint64_t>(orch_.num_neurons) * static_cast<uint64_t>(width);
+    const uint64_t start_float = off_bytes / 4ull;
+    const size_t nbytes = bytes.size();
+    const size_t nfloat = nbytes / 4u;
+
+    for (size_t i = 0; i < nfloat; ++i) {
+        const uint64_t idx = start_float + static_cast<uint64_t>(i);
+        if (idx >= total_floats) {
+            byte_exact_mismatch_count_ += 1;
+            if (byte_exact_mismatch_logged_ < orch_.byte_exact_verify_max_mismatch) {
+                byte_exact_mismatch_logged_ += 1;
+                out->verbose(CALL_INFO, 0, 0,
+                    "[byte-exact] oob idx node=%u core=%u window=%u addr=0x%llx float_i=%zu idx=%" PRIu64 " total=%" PRIu64 "\n",
+                    orch_.node_id, orch_.core_id, window_seq_,
+                    (unsigned long long)addr, i, idx, total_floats);
+            }
+            continue;
+        }
+        const uint32_t row = static_cast<uint32_t>(idx / static_cast<uint64_t>(width));
+        const uint32_t col = static_cast<uint32_t>(idx % static_cast<uint64_t>(width));
+        const float expect_f = expectedDenseWeight_(row, col);
+        uint8_t expect_b[4];
+        std::memcpy(expect_b, &expect_f, sizeof(expect_b));
+        const uint8_t* got_b = bytes.data() + i * 4u;
+        if (std::memcmp(got_b, expect_b, 4u) != 0) {
+            byte_exact_mismatch_count_ += 1;
+            if (byte_exact_mismatch_logged_ < orch_.byte_exact_verify_max_mismatch) {
+                byte_exact_mismatch_logged_ += 1;
+                float got_f = 0.0f;
+                std::memcpy(&got_f, got_b, sizeof(got_f));
+                out->verbose(CALL_INFO, 0, 0,
+                    "[byte-exact] mismatch node=%u core=%u window=%u addr=0x%llx float_i=%zu row=%u col=%u got_f=%.9g expect_f=%.9g got=[%02x %02x %02x %02x] expect=[%02x %02x %02x %02x]\n",
+                    orch_.node_id, orch_.core_id, window_seq_,
+                    (unsigned long long)addr,
+                    i, row, col,
+                    got_f, expect_f,
+                    got_b[0], got_b[1], got_b[2], got_b[3],
+                    expect_b[0], expect_b[1], expect_b[2], expect_b[3]);
+            }
+            if (byte_exact_mismatch_count_ >= orch_.byte_exact_verify_max_mismatch) {
+                out->fatal(CALL_INFO, -1,
+                    "❌ [byte-exact] too many mismatches: node=%u core=%u window=%u mismatches=%u max=%u\n",
+                    orch_.node_id, orch_.core_id, window_seq_,
+                    byte_exact_mismatch_count_, orch_.byte_exact_verify_max_mismatch);
+            }
+        }
+    }
+
+    // Count a response as "verified" only when we could meaningfully interpret it as dense floats.
+    if (nfloat > 0) byte_exact_verified_reads_ += 1;
+}
+
+void WeightMemorySubsystem::verifyDenseEdgeWeight_(uint32_t pre_global, uint32_t post_local, uint32_t count, float weight) {
+    if (!byteExactVerifyEnabled_()) return;
+    if (orch_.use_bcsr) return;
+    if (!orch_.accessor) return;
+
+    static SST::Output fallback("WeightMemorySubsystem[@p:@l]: ", 0, 0, SST::Output::STDERR);
+    SST::Output* out = diag_out_ ? diag_out_ : &fallback;
+
+    uint32_t req_pre = 0;
+    uint32_t req_post = 0;
+    uint64_t cache_key = 0;
+    if (!orch_.accessor->resolve(pre_global, post_local, req_pre, req_post, cache_key)) return;
+
+    const uint32_t row = orch_.use_post_row_pre_col ? req_post : req_pre;
+    const uint32_t col = orch_.use_post_row_pre_col ? req_pre : req_post;
+    const float expect = expectedDenseWeight_(row, col);
+
+    if (!(weight == expect)) {
+        byte_exact_mismatch_count_ += 1;
+        if (byte_exact_mismatch_logged_ < orch_.byte_exact_verify_max_mismatch) {
+            byte_exact_mismatch_logged_ += 1;
+            out->verbose(CALL_INFO, 0, 0,
+                "[byte-exact] edge-mismatch node=%u core=%u window=%u pre=%u post=%u req_pre=%u req_post=%u row=%u col=%u got=%.9g expect=%.9g count=%u\n",
+                orch_.node_id, orch_.core_id, window_seq_,
+                pre_global, post_local, req_pre, req_post, row, col,
+                weight, expect, count);
+        }
+        if (byte_exact_mismatch_count_ >= orch_.byte_exact_verify_max_mismatch) {
+            out->fatal(CALL_INFO, -1,
+                "❌ [byte-exact] too many mismatches: node=%u core=%u window=%u mismatches=%u max=%u\n",
+                orch_.node_id, orch_.core_id, window_seq_,
+                byte_exact_mismatch_count_, orch_.byte_exact_verify_max_mismatch);
+        }
+    }
+
+    // dv correctness (should be exact under dense_rowcol_v1 range constraints).
+    const float dv = weight * static_cast<float>(count);
+    const float dv_expect = expect * static_cast<float>(count);
+    if (!(dv == dv_expect)) {
+        byte_exact_mismatch_count_ += 1;
+        if (byte_exact_mismatch_logged_ < orch_.byte_exact_verify_max_mismatch) {
+            byte_exact_mismatch_logged_ += 1;
+            out->verbose(CALL_INFO, 0, 0,
+                "[byte-exact] dv-mismatch node=%u core=%u window=%u pre=%u post=%u dv=%.9g dv_expect=%.9g count=%u\n",
+                orch_.node_id, orch_.core_id, window_seq_,
+                pre_global, post_local, dv, dv_expect, count);
+        }
+        if (byte_exact_mismatch_count_ >= orch_.byte_exact_verify_max_mismatch) {
+            out->fatal(CALL_INFO, -1,
+                "❌ [byte-exact] too many mismatches: node=%u core=%u window=%u mismatches=%u max=%u\n",
+                orch_.node_id, orch_.core_id, window_seq_,
+                byte_exact_mismatch_count_, orch_.byte_exact_verify_max_mismatch);
+        }
+    }
+
+    byte_exact_verified_edges_ += 1;
+}
+
+void WeightMemorySubsystem::emitByteExactPassMarker_(const char* where, uint32_t seq) {
+    if (!byteExactVerifyEnabled_()) return;
+    if (byte_exact_pass_logged_) return;
+
+    static SST::Output fallback("WeightMemorySubsystem[@p:@l]: ", 0, 0, SST::Output::STDERR);
+    SST::Output* out = diag_out_ ? diag_out_ : &fallback;
+
+    if (byte_exact_mismatch_count_ != 0) {
+        out->fatal(CALL_INFO, -1,
+            "❌ BYTE_EXACT_VERIFY: mismatches=%u (expected 0) node=%u core=%u where=%s seq=%u\n",
+            byte_exact_mismatch_count_,
+            orch_.node_id, orch_.core_id,
+            (where ? where : "?"), seq);
+    }
+    if (byte_exact_verified_reads_ == 0 || byte_exact_verified_edges_ == 0) {
+        out->fatal(CALL_INFO, -1,
+            "❌ BYTE_EXACT_VERIFY: no effective verification (reads=%" PRIu64 " edges=%" PRIu64 ") node=%u core=%u where=%s seq=%u\n",
+            byte_exact_verified_reads_, byte_exact_verified_edges_,
+            orch_.node_id, orch_.core_id,
+            (where ? where : "?"), seq);
+    }
+    out->verbose(CALL_INFO, 0, 0,
+        "BYTE_EXACT_VERIFY: PASS mode=%s node=%u core=%u where=%s seq=%u verified_reads=%" PRIu64 " verified_edges=%" PRIu64 "\n",
+        orch_.byte_exact_verify_mode.c_str(),
+        orch_.node_id, orch_.core_id,
+        (where ? where : "?"), seq,
+        byte_exact_verified_reads_, byte_exact_verified_edges_);
+    byte_exact_pass_logged_ = true;
+}
+
+bool WeightMemorySubsystem::bcsrSemanticVerifyEnabled_() const {
+    if (!orch_.bcsr_semantic_verify_enable) return false;
+    if (!orch_.use_bcsr) return false;
+    return true;
+}
+
+void WeightMemorySubsystem::verifyBcsrEdgeWeight_(uint32_t pre_global, uint32_t post_local, float weight) {
+    if (!bcsrSemanticVerifyEnabled_()) return;
+    if (bcsr_sem_pass_logged_) return;
+    if (orch_.bcsr_semantic_verify_max_edges == 0) return;
+    if (bcsr_sem_verified_edges_ >= static_cast<uint64_t>(orch_.bcsr_semantic_verify_max_edges)) return;
+
+    static SST::Output fallback("WeightMemorySubsystem[@p:@l]: ", 0, 0, SST::Output::STDERR);
+    SST::Output* out = diag_out_ ? diag_out_ : &fallback;
+
+    bool have_ref = false;
+    float ref_raw = 0.0f;
+    if (orch_.read_bcsr_from_file) {
+        ref_raw = orch_.read_bcsr_from_file(post_local, pre_global);
+        have_ref = true;
+    } else if (orch_.bcsr_mgr && !orch_.weights_template.empty() && orch_.base_addr != 0) {
+        // Fallback: direct file read (independent of control/workload).
+        const std::string path = resolveWeightsTemplatePath(orch_.weights_template, orch_.node_id, orch_.core_id);
+        if (!path.empty()) {
+            std::ifstream fin(path, std::ios::in | std::ios::binary);
+            if (fin.good()) {
+                const uint32_t br = orch_.bcsr_mgr->effectiveBlockRows();
+                const uint32_t bc = orch_.bcsr_mgr->effectiveBlockCols();
+                const uint32_t idxB = orch_.bcsr_mgr->effectiveIdxBytes();
+                const uint32_t valB = orch_.bcsr_mgr->effectiveValBytes();
+                if (br != 0 && bc != 0 && (idxB == 2 || idxB == 4) && valB == 4) {
+                    const uint32_t block_row = post_local / br;
+                    const uint32_t intra_row = post_local % br;
+                    const uint32_t blk_col = pre_global / bc;
+                    const uint32_t intra_col = pre_global % bc;
+
+                    const uint64_t rp_off = orch_.bcsr_mgr->rowptrAddr() - orch_.base_addr;
+                    const uint64_t ci_off = orch_.bcsr_mgr->colidxAddr() - orch_.base_addr;
+                    const uint64_t bd_off = orch_.bcsr_mgr->blockdataAddr() - orch_.base_addr;
+
+                    uint32_t start = 0;
+                    uint32_t end = 0;
+                    fin.seekg(static_cast<std::streamoff>(rp_off + static_cast<uint64_t>(block_row) * sizeof(uint32_t)), std::ios::beg);
+                    fin.read(reinterpret_cast<char*>(&start), 4);
+                    fin.read(reinterpret_cast<char*>(&end), 4);
+                    if (fin.good() && end > start) {
+                        int idx_in_row = -1;
+                        for (uint32_t j = 0; j < (end - start); ++j) {
+                            fin.seekg(static_cast<std::streamoff>(ci_off + static_cast<uint64_t>(start + j) * idxB), std::ios::beg);
+                            uint32_t colv = 0;
+                            if (idxB == 2) {
+                                uint16_t v = 0;
+                                fin.read(reinterpret_cast<char*>(&v), 2);
+                                colv = v;
+                            } else {
+                                fin.read(reinterpret_cast<char*>(&colv), 4);
+                            }
+                            if (!fin.good()) break;
+                            if (colv == blk_col) { idx_in_row = static_cast<int>(j); break; }
+                        }
+                        if (fin.good() && idx_in_row >= 0) {
+                            const size_t blk_bytes = static_cast<size_t>(br) * static_cast<size_t>(bc) * sizeof(float);
+                            fin.seekg(static_cast<std::streamoff>(bd_off + static_cast<uint64_t>(start + static_cast<uint32_t>(idx_in_row)) * blk_bytes), std::ios::beg);
+                            std::vector<float> blk(static_cast<size_t>(br) * static_cast<size_t>(bc), 0.0f);
+                            fin.read(reinterpret_cast<char*>(blk.data()), static_cast<std::streamsize>(blk_bytes));
+                            if (fin.good()) {
+                                const uint32_t off = intra_row * bc + intra_col;
+                                ref_raw = (off < blk.size()) ? blk[off] : 0.0f;
+                                have_ref = true;
+                            }
+                        } else {
+                            // Block not present -> weight is logically 0.
+                            ref_raw = 0.0f;
+                            have_ref = true;
+                        }
+                    }
+                } else {
+                    bcsr_sem_inconclusive_ = true;
+                    if (bcsr_sem_inconclusive_reason_.empty()) bcsr_sem_inconclusive_reason_ = "unsupported_bcsr_val_or_idx_bytes";
+                    return;
+                }
+            }
+        }
+    }
+
+    if (!have_ref) {
+        bcsr_sem_inconclusive_ = true;
+        if (bcsr_sem_inconclusive_reason_.empty()) bcsr_sem_inconclusive_reason_ = "missing_ref_reader";
+        return;
+    }
+    const float ref = applyWeightGuards(orch_, ref_raw);
+
+    const float abs_tol = orch_.bcsr_semantic_verify_abs_tol;
+    const float rel_tol = orch_.bcsr_semantic_verify_rel_tol;
+    const float diff = std::fabs(weight - ref);
+    const float tol = abs_tol + rel_tol * std::fabs(ref);
+    const bool ok = std::isfinite(weight) && std::isfinite(ref) && (diff <= tol);
+    if (!ok) {
+        bcsr_sem_mismatch_count_ += 1;
+        if (bcsr_sem_mismatch_logged_ < orch_.bcsr_semantic_verify_max_mismatch) {
+            bcsr_sem_mismatch_logged_ += 1;
+            out->verbose(CALL_INFO, 0, 0,
+                "BCSR_SEMANTIC_VERIFY: MISMATCH node=%u core=%u window=%u pre=%u post=%u got=%.9g ref=%.9g diff=%.9g tol=%.9g\n",
+                orch_.node_id, orch_.core_id, window_seq_,
+                pre_global, post_local,
+                weight, ref, diff, tol);
+        }
+        if (bcsr_sem_mismatch_count_ >= orch_.bcsr_semantic_verify_max_mismatch) {
+            out->fatal(CALL_INFO, -1,
+                "❌ BCSR_SEMANTIC_VERIFY: too many mismatches node=%u core=%u mismatches=%u max=%u\n",
+                orch_.node_id, orch_.core_id,
+                bcsr_sem_mismatch_count_, orch_.bcsr_semantic_verify_max_mismatch);
+        }
+        return;
+    }
+
+    bcsr_sem_verified_edges_ += 1;
+}
+
+void WeightMemorySubsystem::emitBcsrSemanticVerifyMarker_(const char* where, uint32_t seq) {
+    if (!bcsrSemanticVerifyEnabled_()) return;
+    if (bcsr_sem_pass_logged_) return;
+
+    static SST::Output fallback("WeightMemorySubsystem[@p:@l]: ", 0, 0, SST::Output::STDERR);
+    SST::Output* out = diag_out_ ? diag_out_ : &fallback;
+
+    if (bcsr_sem_mismatch_count_ != 0) {
+        out->fatal(CALL_INFO, -1,
+            "❌ BCSR_SEMANTIC_VERIFY: mismatches=%u (expected 0) node=%u core=%u where=%s seq=%u\n",
+            bcsr_sem_mismatch_count_,
+            orch_.node_id, orch_.core_id,
+            (where ? where : "?"), seq);
+    }
+
+    if (bcsr_sem_verified_edges_ == 0) {
+        const char* reason = bcsr_sem_inconclusive_reason_.empty()
+                                 ? (bcsr_sem_inconclusive_ ? "inconclusive" : "no_verified_edges")
+                                 : bcsr_sem_inconclusive_reason_.c_str();
+        out->verbose(CALL_INFO, 0, 0,
+            "BCSR_SEMANTIC_VERIFY: WARN INCONCLUSIVE node=%u core=%u where=%s seq=%u verified_edges=%" PRIu64 " reason=%s\n",
+            orch_.node_id, orch_.core_id,
+            (where ? where : "?"), seq,
+            bcsr_sem_verified_edges_,
+            reason);
+        bcsr_sem_pass_logged_ = true;
+        return;
+    }
+
+    out->verbose(CALL_INFO, 0, 0,
+        "BCSR_SEMANTIC_VERIFY: PASS node=%u core=%u where=%s seq=%u verified_edges=%" PRIu64 " max_edges=%u\n",
+        orch_.node_id, orch_.core_id,
+        (where ? where : "?"), seq,
+        bcsr_sem_verified_edges_,
+        orch_.bcsr_semantic_verify_max_edges);
+    bcsr_sem_pass_logged_ = true;
 }

@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <list>
 #include <fstream>
+#include <mutex>
 
 #include <sst/core/sst_config.h>
 #include <sst/core/output.h>
@@ -29,7 +30,7 @@ public:
 
     SST_ELI_DOCUMENT_PARAMS(
         {"verbose", "verbosity", "0"},
-        {"merge_policy", "none|cacheline|row|auto", "auto"},
+        {"merge_policy", "none|cacheline|row|auto", "cacheline"},
         {"sort_policy", "addr|row|bank_row", "row"},
         {"row_bytes_guess", "row bytes guess for ordering", "8192"},
         {"sram_bytes", "scratchpad capacity bytes", "262144"},
@@ -71,6 +72,22 @@ public:
         {"diag_enable", "启用诊断打印(0/1)", "0"},
         {"snndl_debug", "调试增强开关(0/1)", "0"},
         {"sentinel_enable", "启用 sentinel 调试输出(0/1)", "0"}
+        ,
+        // Dense microbench correctness: byte-exact validation (off by default).
+        {"byte_exact_verify_enable", "启用字节级校验(0/1)", "0"},
+        {"byte_exact_verify_mode", "校验模式: dense_rowcol_v1|raw_bcsr_v1", ""},
+        {"byte_exact_verify_row_scale", "dense_rowcol_v1 的 row_scale（默认1024）", "1024"},
+        {"byte_exact_verify_max_mismatch", "最多打印/允许的 mismatch 数（超过 fatal）", "8"},
+        {"byte_exact_verify_base_addr", "dense_rowcol_v1 权重区基址（字节）", "0"},
+        {"byte_exact_verify_rows", "dense_rowcol_v1 rows（用于范围约束）", "0"},
+        {"byte_exact_verify_cols", "dense_rowcol_v1 cols（用于 row/col 反推）", "0"}
+        ,
+        // BCSR merge-read correctness (raw file slice compare; off by default).
+        {"byte_exact_verify_file_path", "raw_bcsr_v1: raw bcsr.bin 文件路径", ""},
+        {"byte_exact_verify_sample_bytes", "raw_bcsr_v1: 每个 ReadResp 抽样校验的字节数", "64"},
+        {"byte_exact_verify_max_resps", "raw_bcsr_v1: 最多校验的 ReadResp 次数（避免性能劣化）", "8"},
+        {"byte_exact_verify_owner_node", "raw_bcsr_v1: 仅对指定 node 校验（-1=不限制）", "-1"},
+        {"byte_exact_verify_owner_core", "raw_bcsr_v1: 仅对指定 core 校验（-1=不限制）", "-1"}
         ,
         // --- Adaptive control (Phase-1) ---
         {"ctrl_enable", "Enable window-level adaptive control (0/1)", "0"},
@@ -210,6 +227,13 @@ private:
     void applyCtrlConfig_(uint64_t k, uint64_t rowwin_bytes, uint64_t timeout_ns);
     bool rebuildPendingAsGranules_(int buf);
     static std::vector<uint64_t> parseCsvU64_(const std::string& s);
+    uint64_t ensureSortKey_(Granule& g);
+    void rebuildIssueOrder_(int buf);
+    void issueMoreUnissuedFromOrder_(int buf);
+    bool byteExactVerifyEnabled_() const;
+    void verifyByteExactDenseRowcol_(uint64_t addr, const std::vector<uint8_t>& data);
+    void verifyByteExactRawBcsr_(uint64_t addr, const std::vector<uint8_t>& data);
+    void finishByteExact_();
 
     // Backend
     SST::Interfaces::StandardMem* backend_ = nullptr; // downstream standardInterface
@@ -220,7 +244,7 @@ private:
     bool probe_csv_header_written_ = false;
 
     // Config
-    Merge merge_ = Merge::Auto;
+    Merge merge_ = Merge::Cacheline;
     Sort sort_ = Sort::Row;
     uint32_t row_bytes_guess_ = 8192;
     uint64_t sram_bytes_ = 256*1024;
@@ -263,6 +287,35 @@ private:
     uint64_t gather_bytes_accum_ = 0;
     uint64_t gather_reads_accum_ = 0;
     bool gather_auto_triggered_ = false;
+    // --- Byte-exact correctness (dense microbench) ---
+    bool byte_exact_verify_enable_ = false;
+    std::string byte_exact_verify_mode_;
+    uint32_t byte_exact_verify_row_scale_ = 1024;
+    uint32_t byte_exact_verify_max_mismatch_ = 8;
+    uint64_t byte_exact_base_addr_ = 0;
+    uint32_t byte_exact_rows_ = 0;
+    uint32_t byte_exact_cols_ = 0;
+    // raw_bcsr_v1 (optional; byte_exact_* reused to avoid another config namespace)
+    std::string byte_exact_file_path_;
+    uint64_t byte_exact_file_size_ = 0;
+    uint64_t byte_exact_rowptr_offset_ = 0;
+    uint64_t byte_exact_colidx_offset_ = 0;
+    uint64_t byte_exact_blockdata_offset_ = 0;
+    uint32_t byte_exact_sample_bytes_ = 64;
+    uint32_t byte_exact_max_resps_ = 8;
+    int byte_exact_owner_node_ = -1;
+    int byte_exact_owner_core_ = -1;
+    uint32_t byte_exact_verified_resps_ = 0;
+    uint32_t byte_exact_region_verified_mask_ = 0; // bit0=rowptr bit1=colidx bit2=blockdata
+    bool byte_exact_inconclusive_ = false;
+    std::string byte_exact_inconclusive_reason_;
+    std::ifstream byte_exact_file_;
+    mutable std::mutex byte_exact_mu_;
+    uint32_t byte_exact_mismatch_count_ = 0;
+    uint32_t byte_exact_mismatch_logged_ = 0;
+    uint64_t byte_exact_verified_frags_ = 0;
+    bool byte_exact_pass_logged_ = false;
+    bool byte_exact_skip_logged_ = false;
     // --- Granule export (P1-2) ---
     std::string export_granules_csv_; // CSV path; empty to disable
     bool export_header_written_ = false;
@@ -314,6 +367,12 @@ private:
         std::vector<SST::Interfaces::StandardMem::Read*> staging_reads;
         std::unordered_map<Request::id_t, uint64_t> staged_arrival_ns; // arrival time
         std::unordered_set<uint64_t> required_set; // required granules
+        // Apply阶段的确定性发射序列（避免每次 ReadResp 都对 granules 做全量排序）：
+        // - 用于 defer_issue_until_apply=1 时保证“inflight 限流下仍能持续补发未发 granule”，防止卡死。
+        // - 也可用于 Apply 阶段 miss-read/late-read 进入后，统一补发。
+        std::vector<std::pair<uint64_t, uint64_t>> issue_order; // (sort_key, key)
+        size_t issue_cursor = 0;
+        bool issue_order_dirty = true;
 
         std::unordered_map<uint64_t, std::vector<uint8_t>> sram_blocks; // key->data
         uint64_t bytes_in_sram = 0;
@@ -326,6 +385,7 @@ private:
             staging_reads.reserve(128);     // 假设约128个暂存读请求
             staged_arrival_ns.reserve(128); // 与staging_reads对应
             required_set.reserve(64);       // 与granules对应
+            issue_order.reserve(64);
             lru_map.reserve(256);           // SRAM缓存块映射
             sram_blocks.reserve(256);       // SRAM数据块存储
         }

@@ -8,7 +8,10 @@
 #include <cmath>
 #include <fstream>
 #include <cstdlib>
+#include <cstdio>
 #include <mutex>
+
+#include "gather/GatherBufferIFConfig.h"
 
 using namespace SST;
 using namespace SST::Interfaces;
@@ -16,61 +19,137 @@ using namespace SST::SnnDL;
 
 // P2: 移除TU级别的 getenv 依赖；改为构造期解析的成员 debug/diag 标志
 
+namespace {
+static std::string lowerCopy_(const std::string& s) {
+    std::string out = s;
+    for (auto& ch : out) {
+        if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+    }
+    return out;
+}
+} // namespace
+
 GatherBufferIF::GatherBufferIF(ComponentId_t id, Params& params, TimeConverter* time, HandlerBase* handler)
     : StandardMem(id, params, time, handler), time_(time), upstream_handler_(handler)
 {
     setDefaultTimeBase(*time);
-    int verbose = params.find<int>("verbose", 0);
-    // P2: 解析 diag/debug/sentinel（参数优先；未设置回退环境变量）
-    {
-        // P2 Step3：移除 getenv 回退，仅参数驱动（默认禁用）
-        diag_enable_ = (params.find<int>("diag_enable", 0) != 0);
-        debug_enable_ = (params.find<int>("snndl_debug", 0) != 0);
-        sentinel_enable_ = (params.find<int>("sentinel_enable", 0) != 0);
-    }
-    out_.init("GatherBufferIF[@p:@l]: ", verbose, 0, Output::STDOUT);
+    const GatherBufferIFConfig cfg = parseGatherBufferIFConfig(params);
 
-    merge_ = parseMerge(params.find<std::string>("merge_policy", "auto"));
-    sort_  = parseSort(params.find<std::string>("sort_policy", "row"));
-    row_bytes_guess_ = params.find<uint32_t>("row_bytes_guess", 8192);
-    sram_bytes_ = params.find<uint64_t>("sram_bytes", 256*1024);
-    gap_merge_enable_ = params.find<int>("gap_merge_enable", 1) != 0;
-    gap_k_bytes_ = params.find<uint64_t>("gap_merge_k_bytes", 0);
-    burst_bytes_max_ = params.find<uint64_t>("burst_bytes_max", 64*1024);
-    bank_bits_ = params.find<uint32_t>("bank_bits", 0);
-    bank_shift_ = params.find<uint32_t>("bank_shift", 0);
-    bank_auto_enable_ = params.find<int>("bank_auto_enable", 1) != 0;
-    bank_auto_min_banks_ = params.find<uint32_t>("bank_auto_min_banks", 4);
-    bank_auto_max_banks_ = params.find<uint32_t>("bank_auto_max_banks", 32);
-    row_window_enable_ = params.find<int>("row_window_enable", 0) != 0;
-    row_window_bytes_  = params.find<uint64_t>("row_window_bytes", 0);
-    row_window_timeout_ns_ = params.find<uint64_t>("row_window_timeout_ns", 0);
-    sram_access_ns_ = params.find<uint32_t>("sram_access_ns", 0);
-    max_inflight_reads_ = params.find<uint32_t>("max_inflight_reads", 128);
-    tail_wait_timeout_ns_ = params.find<uint64_t>("tail_wait_timeout_ns", 0);
-    allow_apply_miss_read_ = params.find<int>("allow_apply_miss_read", 0) != 0;
-    flush_after_scatter_ = params.find<int>("flush_after_scatter", 1) != 0;
-    strict_mode_ = params.find<int>("strict_mode", 1) != 0;
-    double_buffer_enable_ = params.find<int>("double_buffer_enable", 1) != 0;
-    window_auto_ = params.find<int>("window_auto", 0) != 0;
-    step_gate_enable_ = params.find<int>("step_gate_enable", 0) != 0;
+    // P2: 解析 diag/debug/sentinel（参数优先；未设置回退环境变量）
+    // P2 Step3：移除 getenv 回退，仅参数驱动（默认禁用）
+    diag_enable_ = cfg.diag_enable;
+    debug_enable_ = cfg.debug_enable;
+    sentinel_enable_ = cfg.sentinel_enable;
+
+    out_.init("GatherBufferIF[@p:@l]: ", cfg.verbose, 0, Output::STDOUT);
+
+    // Dense microbench correctness: byte-exact verification (optional).
+    byte_exact_verify_enable_ = params.find<int>("byte_exact_verify_enable", 0) != 0;
+    byte_exact_verify_mode_ = params.find<std::string>("byte_exact_verify_mode", "");
+    byte_exact_verify_row_scale_ = params.find<uint32_t>("byte_exact_verify_row_scale", 1024);
+    byte_exact_verify_max_mismatch_ = params.find<uint32_t>("byte_exact_verify_max_mismatch", 8);
+    byte_exact_base_addr_ = params.find<uint64_t>("byte_exact_verify_base_addr", 0);
+    byte_exact_rows_ = params.find<uint32_t>("byte_exact_verify_rows", 0);
+    byte_exact_cols_ = params.find<uint32_t>("byte_exact_verify_cols", 0);
+    byte_exact_file_path_ = params.find<std::string>("byte_exact_verify_file_path", "");
+    byte_exact_sample_bytes_ = params.find<uint32_t>("byte_exact_verify_sample_bytes", 64);
+    byte_exact_max_resps_ = params.find<uint32_t>("byte_exact_verify_max_resps", 8);
+    byte_exact_owner_node_ = params.find<int>("byte_exact_verify_owner_node", -1);
+    byte_exact_owner_core_ = params.find<int>("byte_exact_verify_owner_core", -1);
+    byte_exact_rowptr_offset_ = params.find<uint64_t>("byte_exact_verify_rowptr_offset", 0);
+    byte_exact_colidx_offset_ = params.find<uint64_t>("byte_exact_verify_colidx_offset", 0);
+    byte_exact_blockdata_offset_ = params.find<uint64_t>("byte_exact_verify_blockdata_offset", 0);
+    if (byte_exact_verify_enable_) {
+        out_.verbose(CALL_INFO, 1, 0,
+            "[byte-exact] GatherBufferIF enabled=1 mode=%s base=0x%llx rows=%u cols=%u row_scale=%u max_mismatch=%u\n",
+            byte_exact_verify_mode_.c_str(),
+            (unsigned long long)byte_exact_base_addr_,
+            byte_exact_rows_, byte_exact_cols_,
+            byte_exact_verify_row_scale_, byte_exact_verify_max_mismatch_);
+    }
+    // raw_bcsr_v1: open file early (best-effort validation is still gated later).
+    if (byte_exact_verify_enable_ && lowerCopy_(byte_exact_verify_mode_) == "raw_bcsr_v1") {
+        // Default behavior: allow enabling on a single target node/core via owner filters.
+        if ((byte_exact_owner_node_ >= 0 && (int)cfg.node_id != byte_exact_owner_node_) ||
+            (byte_exact_owner_core_ >= 0 && (int)cfg.core_id != byte_exact_owner_core_)) {
+            byte_exact_verify_enable_ = false;
+        } else {
+            if (byte_exact_file_path_.empty()) {
+                out_.fatal(CALL_INFO, -1, "raw_bcsr_v1 requires byte_exact_verify_file_path\n");
+            }
+            if (byte_exact_base_addr_ == 0) {
+                out_.fatal(CALL_INFO, -1, "raw_bcsr_v1 requires byte_exact_verify_base_addr\n");
+            }
+            byte_exact_file_.open(byte_exact_file_path_, std::ios::in | std::ios::binary);
+            if (!byte_exact_file_.good()) {
+                out_.fatal(CALL_INFO, -1, "raw_bcsr_v1 failed to open file: %s\n", byte_exact_file_path_.c_str());
+            }
+            byte_exact_file_.seekg(0, std::ios::end);
+            byte_exact_file_size_ = (uint64_t)byte_exact_file_.tellg();
+            byte_exact_file_.seekg(0, std::ios::beg);
+            if (byte_exact_file_size_ == 0) {
+                out_.fatal(CALL_INFO, -1, "raw_bcsr_v1 file size is 0: %s\n", byte_exact_file_path_.c_str());
+            }
+            byte_exact_region_verified_mask_ = 0;
+            byte_exact_inconclusive_ = false;
+            byte_exact_inconclusive_reason_.clear();
+            const bool offsets_sane =
+                (byte_exact_colidx_offset_ > byte_exact_rowptr_offset_) &&
+                (byte_exact_colidx_offset_ < byte_exact_file_size_) &&
+                (byte_exact_blockdata_offset_ > byte_exact_colidx_offset_) &&
+                (byte_exact_blockdata_offset_ < byte_exact_file_size_);
+            if (!offsets_sane) {
+                byte_exact_inconclusive_ = true;
+                byte_exact_inconclusive_reason_ = "meta_offsets_unsane_or_missing";
+            }
+            out_.verbose(CALL_INFO, 1, 0,
+                "[byte-exact] raw_bcsr_v1 enabled: node=%u core=%u file=%s size=%" PRIu64 " sample_bytes=%u max_resps=%u\n",
+                cfg.node_id, cfg.core_id, byte_exact_file_path_.c_str(),
+                byte_exact_file_size_, byte_exact_sample_bytes_, byte_exact_max_resps_);
+        }
+    }
+
+    merge_ = parseMerge(cfg.merge_policy);
+    sort_  = parseSort(cfg.sort_policy);
+    row_bytes_guess_ = cfg.row_bytes_guess;
+    sram_bytes_ = cfg.sram_bytes;
+    gap_merge_enable_ = cfg.gap_merge_enable;
+    gap_k_bytes_ = cfg.gap_merge_k_bytes;
+    burst_bytes_max_ = cfg.burst_bytes_max;
+    bank_bits_ = cfg.bank_bits;
+    bank_shift_ = cfg.bank_shift;
+    bank_auto_enable_ = cfg.bank_auto_enable;
+    bank_auto_min_banks_ = cfg.bank_auto_min_banks;
+    bank_auto_max_banks_ = cfg.bank_auto_max_banks;
+    row_window_enable_ = cfg.row_window_enable;
+    row_window_bytes_  = cfg.row_window_bytes;
+    row_window_timeout_ns_ = cfg.row_window_timeout_ns;
+    sram_access_ns_ = cfg.sram_access_ns;
+    max_inflight_reads_ = cfg.max_inflight_reads;
+    tail_wait_timeout_ns_ = cfg.tail_wait_timeout_ns;
+    allow_apply_miss_read_ = cfg.allow_apply_miss_read;
+    flush_after_scatter_ = cfg.flush_after_scatter;
+    strict_mode_ = cfg.strict_mode;
+    double_buffer_enable_ = cfg.double_buffer_enable;
+    window_auto_ = cfg.window_auto;
+    step_gate_enable_ = cfg.step_gate_enable;
     // Deprecate manual_window_drive: keep param for compatibility but force-disable
-    (void)params.find<int>("manual_window_drive", 0);
+    (void)cfg.manual_window_drive_ignored;
     manual_window_drive_ = false;
-    win_cyc_gather_ = params.find<uint64_t>("window_cycles_gather", 0);
-    win_cyc_apply_  = params.find<uint64_t>("window_cycles_apply", 0);
-    win_cyc_scatter_= params.find<uint64_t>("window_cycles_scatter", 0);
-    apply_auto_end_enable_ = params.find<int>("apply_auto_end_enable", 1) != 0;
-    scatter_immediate_complete_ = params.find<int>("scatter_immediate_complete", 0) != 0;
-    clock_freq_ = params.find<std::string>("clock", "1GHz");
-    emit_stage_events_ = params.find<int>("emit_stage_events", 0) != 0;
-    emit_lenient_ = params.find<int>("emit_stage_events_lenient", 0) != 0;
-    stage_cycles_csv_ = params.find<std::string>("stage_cycles_csv", "");
+    win_cyc_gather_ = cfg.window_cycles_gather;
+    win_cyc_apply_  = cfg.window_cycles_apply;
+    win_cyc_scatter_= cfg.window_cycles_scatter;
+    apply_auto_end_enable_ = cfg.apply_auto_end_enable;
+    scatter_immediate_complete_ = cfg.scatter_immediate_complete;
+    clock_freq_ = cfg.clock;
+    emit_stage_events_ = cfg.emit_stage_events;
+    emit_lenient_ = cfg.emit_stage_events_lenient;
+    stage_cycles_csv_ = cfg.stage_cycles_csv;
     stage_cycles_export_enable_ = !stage_cycles_csv_.empty();
-    probe_csv_path_ = params.find<std::string>("probe_gas_csv", "");
-    defer_issue_until_apply_ = params.find<int>("defer_issue_until_apply", 0) != 0;
-    gather_auto_end_bytes_ = params.find<uint64_t>("gather_auto_end_bytes", 0);
-    gather_auto_end_reads_ = params.find<uint64_t>("gather_auto_end_reads", 0);
+    probe_csv_path_ = cfg.probe_gas_csv;
+    defer_issue_until_apply_ = cfg.defer_issue_until_apply;
+    gather_auto_end_bytes_ = cfg.gather_auto_end_bytes;
+    gather_auto_end_reads_ = cfg.gather_auto_end_reads;
     // Gating: if k or Lmax invalid, disable gap merge
     if (!gap_merge_enable_ || gap_k_bytes_ == 0 || burst_bytes_max_ == 0) {
         gap_merge_enable_ = false;
@@ -114,33 +193,33 @@ GatherBufferIF::GatherBufferIF(ComponentId_t id, Params& params, TimeConverter* 
     queued_non_gather_reads_.reserve(32);
     last_stage_change_ns_ = getCurrentSimTimeNano();
     // Adaptive k params
-    k_adapt_enable_   = params.find<int>("k_adapt_enable", 0) != 0;
-    k_adapt_window_N_ = params.find<uint32_t>("k_adapt_window_N", 8);
-    k_alpha_bw_       = params.find<double>("k_alpha_bw", 0.2);
-    k_alpha_k_        = params.find<double>("k_alpha_k", 0.2);
-    k_min_bytes_      = params.find<uint64_t>("k_min_bytes", 512);
-    k_max_bytes_      = params.find<uint64_t>("k_max_bytes", 64*1024);
-    k_delta_bytes_    = params.find<uint64_t>("k_delta_bytes", 512);
+    k_adapt_enable_   = cfg.k_adapt_enable;
+    k_adapt_window_N_ = cfg.k_adapt_window_N;
+    k_alpha_bw_       = cfg.k_alpha_bw;
+    k_alpha_k_        = cfg.k_alpha_k;
+    k_min_bytes_      = cfg.k_min_bytes;
+    k_max_bytes_      = cfg.k_max_bytes;
+    k_delta_bytes_    = cfg.k_delta_bytes;
     // Adaptive control params
-    ctrl_enable_ = params.find<int>("ctrl_enable", 0) != 0;
-    ctrl_probe_every_N_ = params.find<uint32_t>("ctrl_probe_every_N", 4);
-    ctrl_cooldown_N_ = params.find<uint32_t>("ctrl_cooldown_N", 4);
-    ctrl_eps_reqs_ = params.find<double>("ctrl_eps_reqs", 0.02);
-    ctrl_eps_burst_ = params.find<double>("ctrl_eps_burst", 0.05);
-    ctrl_lat_tol_ns_ = params.find<uint64_t>("ctrl_lat_tol_ns", 1);
-    ctrl_k_list_ = parseCsvU64_(params.find<std::string>("ctrl_k_list", "512,1024,2048,4096,8192"));
-    ctrl_rowwin_list_ = parseCsvU64_(params.find<std::string>("ctrl_rowwin_list", "0,16384,32768,65536"));
-    ctrl_timeout_list_ = parseCsvU64_(params.find<std::string>("ctrl_timeout_list", "0,300,600"));
+    ctrl_enable_ = cfg.ctrl_enable;
+    ctrl_probe_every_N_ = cfg.ctrl_probe_every_N;
+    ctrl_cooldown_N_ = cfg.ctrl_cooldown_N;
+    ctrl_eps_reqs_ = cfg.ctrl_eps_reqs;
+    ctrl_eps_burst_ = cfg.ctrl_eps_burst;
+    ctrl_lat_tol_ns_ = cfg.ctrl_lat_tol_ns;
+    ctrl_k_list_ = parseCsvU64_(cfg.ctrl_k_list);
+    ctrl_rowwin_list_ = parseCsvU64_(cfg.ctrl_rowwin_list);
+    ctrl_timeout_list_ = parseCsvU64_(cfg.ctrl_timeout_list);
     // Initial control cfg from current params
     ctrl_curr_cfg_.k = gap_k_bytes_;
     ctrl_curr_cfg_.rowwin_bytes = row_window_bytes_;
     ctrl_curr_cfg_.timeout_ns = row_window_timeout_ns_;
 
     // P1-2: granule export CSV (optional)
-    export_granules_csv_ = params.find<std::string>("export_granules_csv", "");
-    node_id_param_ = params.find<uint32_t>("node_id", 0);
-    core_id_param_ = params.find<uint32_t>("core_id", (uint32_t)-1);
-    export_window_metrics_csv_ = params.find<std::string>("export_window_metrics_csv", "");
+    export_granules_csv_ = cfg.export_granules_csv;
+    node_id_param_ = cfg.node_id;
+    core_id_param_ = cfg.core_id;
+    export_window_metrics_csv_ = cfg.export_window_metrics_csv;
 
     resetGatherAutoCounters_();
 }
@@ -155,7 +234,7 @@ void GatherBufferIF::init(unsigned int phase) {
     backend_->init(phase);
     // 记录所有 phase 的初始化情况（仅在显式启用时打印）
     if (sentinel_enable_) {
-        out_.verbose(CALL_INFO, 0, 0,
+        out_.verbose(CALL_INFO, 2, 0,
             "[[sentinel-gbi-init]] phase=%u window_auto=%d manual=%d clock=%s win_cyc_g=%" PRIu64 " win_cyc_a=%" PRIu64 " win_cyc_s=%" PRIu64 " auto_bytes=%" PRIu64 " auto_reads=%" PRIu64 " defer=%d\n",
             phase, window_auto_ ? 1 : 0, manual_window_drive_ ? 1 : 0, clock_freq_.c_str(),
             win_cyc_gather_, win_cyc_apply_, win_cyc_scatter_,
@@ -163,7 +242,7 @@ void GatherBufferIF::init(unsigned int phase) {
     }
     if (phase == 0 && window_auto_) {
         if (out_.getVerboseLevel() >= 2) {
-            out_.verbose(CALL_INFO, 0, 0,
+            out_.verbose(CALL_INFO, 2, 0,
                 "[diag-gbi-init] window_auto=%d manual=%d(clock-forced) clock=%s win_cyc_g=%" PRIu64 " win_cyc_a=%" PRIu64 " win_cyc_s=%" PRIu64 " auto_bytes=%" PRIu64 " auto_reads=%" PRIu64 " defer=%d\n",
                 window_auto_ ? 1 : 0, 0, clock_freq_.c_str(), win_cyc_gather_, win_cyc_apply_, win_cyc_scatter_,
                 gather_auto_end_bytes_, gather_auto_end_reads_, defer_issue_until_apply_ ? 1 : 0);
@@ -196,6 +275,7 @@ void GatherBufferIF::complete(unsigned int phase) {
 void GatherBufferIF::setup() { backend_->setup(); }
 
 void GatherBufferIF::finish() {
+    finishByteExact_();
     if (!export_window_metrics_csv_.empty() && !window_metrics_written_) {
         exportWindowMetricsRow_(current_gather_id_, win_payload_bytes_, win_bursts_, win_inflight_peak_, win_buffer_max_bytes_);
     }
@@ -302,17 +382,18 @@ void GatherBufferIF::openStep(uint32_t seq) {
 	                sz = (uint32_t)sz_u64;
 	            }
 	            uint64_t key = (base << 32) ^ (uint64_t)sz;
-	            auto& g = sb_[gather_buf_index_].granules[key];
-	            if (g.subs.empty()) {
-	                g.base = base;
-	                g.size = sz;
-	                g.window_id = current_gather_id_;
-                g.payload_bytes = 0;
-                sb_[gather_buf_index_].required_set.insert(key);
-                if (stat_coalesce_granule_size_) {
-	                    stat_coalesce_granule_size_->addData((uint64_t)sz);
-	                }
-	            }
+		            auto& g = sb_[gather_buf_index_].granules[key];
+		            if (g.subs.empty()) {
+		                g.base = base;
+		                g.size = sz;
+		                g.window_id = current_gather_id_;
+	                g.payload_bytes = 0;
+	                sb_[gather_buf_index_].required_set.insert(key);
+                        sb_[gather_buf_index_].issue_order_dirty = true;
+	                if (stat_coalesce_granule_size_) {
+		                    stat_coalesce_granule_size_->addData((uint64_t)sz);
+		                }
+		            }
 	            if (off + (uint64_t)r->size > (uint64_t)g.size) {
 	                out_.fatal(CALL_INFO, -1,
 	                           "GatherBufferIF fatal: openStep sub-read out of granule bounds (seq=%u merge=%d use_row=%d base=0x%lx sz=%u addr=0x%lx size=%zu off=%" PRIu64 ")\n",
@@ -343,7 +424,7 @@ void GatherBufferIF::send(Request* req) {
                 if (!allow_explicit_end) {
                     if (!warned_auto_custom_req_ && diagEnabled_()) {
                         warned_auto_custom_req_ = true;
-                        out_.verbose(CALL_INFO, 0, 0,
+                        out_.verbose(CALL_INFO, 2, 0,
                             "[diag-gbi] CustomReq ignored: window_auto=1 manual_drive=0 (logged once)");
                     }
                     delete req;
@@ -388,6 +469,9 @@ void GatherBufferIF::send(Request* req) {
                     stage_ = Stage::Gather; sb_[gather_buf_index_].end_gather_seen = false; current_gather_id_++;
                     resetGatherAutoCounters_();
                     sb_[gather_buf_index_].granules.clear(); sb_[gather_buf_index_].required_set.clear();
+                    sb_[gather_buf_index_].issue_order.clear();
+                    sb_[gather_buf_index_].issue_cursor = 0;
+                    sb_[gather_buf_index_].issue_order_dirty = true;
 	                    // 将非Gather阶段缓存的读导入当前Gather窗口
 	                    if (!queued_non_gather_reads_.empty()) {
 	                        for (auto* r : queued_non_gather_reads_) {
@@ -412,17 +496,18 @@ void GatherBufferIF::send(Request* req) {
 	                                sz = (uint32_t)sz_u64;
 	                            }
 	                            uint64_t key = (base << 32) ^ (uint64_t)sz;
-	                            auto& g = sb_[gather_buf_index_].granules[key];
-	                            if (g.subs.empty()) {
-	                                g.base = base;
-	                                g.size = sz;
-	                                g.window_id = current_gather_id_;
-	                                g.payload_bytes = 0;
-	                                sb_[gather_buf_index_].required_set.insert(key);
-	                                if (stat_coalesce_granule_size_) {
-	                                    stat_coalesce_granule_size_->addData((uint64_t)sz);
-	                                }
-	                            }
+		                            auto& g = sb_[gather_buf_index_].granules[key];
+		                            if (g.subs.empty()) {
+		                                g.base = base;
+		                                g.size = sz;
+		                                g.window_id = current_gather_id_;
+		                                g.payload_bytes = 0;
+		                                sb_[gather_buf_index_].required_set.insert(key);
+                                        sb_[gather_buf_index_].issue_order_dirty = true;
+		                                if (stat_coalesce_granule_size_) {
+		                                    stat_coalesce_granule_size_->addData((uint64_t)sz);
+		                                }
+		                            }
 	                            if (off + (uint64_t)r->size > (uint64_t)g.size) {
 	                                out_.fatal(CALL_INFO, -1,
 	                                           "GatherBufferIF fatal: manual BeginGather sub-read out of granule bounds (merge=%d use_row=%d base=0x%lx sz=%u addr=0x%lx size=%zu off=%" PRIu64 ")\n",
@@ -487,14 +572,21 @@ void GatherBufferIF::send(Request* req) {
             if (stage_ == Stage::Gather) {
                 tryAutoEndGather_();
             }
-            bool take_staging_path = gap_merge_enable_ && defer_issue_until_apply_;
+            // Deferred "collect → build segments → issue" path:
+            // - Gather stage: always safe to stage when enabled.
+            // - Apply stage: stage is also allowed in window_auto mode, but we MUST ensure clockTick()
+            //   will drain staging_reads into granules; otherwise Apply could deadlock.
+            const bool take_staging_path =
+                defer_issue_until_apply_ &&
+                (gap_merge_enable_ || row_window_enable_) &&
+                (stage_ == Stage::Gather || stage_ == Stage::Apply);
             out_.verbose(CALL_INFO, 2, 0,
                 "[diag-gbi] send() Read: stage=%d tgt_buf=%d gap_merge=%d defer=%d -> path=%s\n",
                 (int)stage_, tgt, (int)gap_merge_enable_, (int)defer_issue_until_apply_,
                 take_staging_path ? "STAGING" : "IMMEDIATE");
             if (defer_issue_until_apply_ && take_staging_path && !warned_defer_issue_path_ && diagEnabled_()) {
                 warned_defer_issue_path_ = true;
-                out_.verbose(CALL_INFO, 0, 0,
+                out_.verbose(CALL_INFO, 2, 0,
                     "[diag-gbi] defer_issue_until_apply=1: upstream Read IDs will be remapped via staged granules (logged once)");
             }
             if (take_staging_path) {
@@ -522,17 +614,18 @@ void GatherBufferIF::send(Request* req) {
 	                    sz = (uint32_t)sz_u64;
 	                }
 	                uint64_t key = (base << 32) ^ (uint64_t)sz; // compact key
-	                auto& g = sb_[tgt].granules[key];
-	                if (g.subs.empty()) {
-	                    g.base = base;
-	                    g.size = sz;
-	                    g.window_id = current_gather_id_;
-                    g.payload_bytes = 0;
-                    sb_[tgt].required_set.insert(key);
-                    if (stat_coalesce_granule_size_) {
-                        stat_coalesce_granule_size_->addData((uint64_t)sz);
-	                    }
-	                }
+		                auto& g = sb_[tgt].granules[key];
+		                if (g.subs.empty()) {
+		                    g.base = base;
+		                    g.size = sz;
+		                    g.window_id = current_gather_id_;
+	                    g.payload_bytes = 0;
+	                    sb_[tgt].required_set.insert(key);
+                            sb_[tgt].issue_order_dirty = true;
+	                    if (stat_coalesce_granule_size_) {
+	                        stat_coalesce_granule_size_->addData((uint64_t)sz);
+		                    }
+		                }
 	                if (off + (uint64_t)rd->size > (uint64_t)g.size) {
 	                    out_.fatal(CALL_INFO, -1,
 	                               "GatherBufferIF fatal: sub-read out of granule bounds (stage=%d buf=%d merge=%d use_row=%d base=0x%lx sz=%u addr=0x%lx size=%zu off=%" PRIu64 ")\n",
@@ -542,7 +635,12 @@ void GatherBufferIF::send(Request* req) {
 	                }
 	                g.subs.push_back({rd->getID(), off, (uint32_t)rd->size});
 	                g.payload_bytes += (uint64_t)rd->size;
-	                if (!defer_issue_until_apply_) {
+                // NOTE:
+                // - When defer_issue_until_apply_=1, Gather-stage reads are issued at Apply entry after building segments.
+                // - Apply-stage reads, however, arrive *after* Apply has already started (e.g. miss-reads / late requests).
+                //   They must be issued immediately to guarantee forward progress; otherwise they will sit in granules
+                //   without another Apply entry to trigger issuance, causing a deadlock.
+                if (stage_ == Stage::Apply || !defer_issue_until_apply_) {
                     if (!g.issued) { issueGranuleBuf_(tgt, key, g); }
                 }
             }
@@ -591,6 +689,76 @@ GatherBufferIF::Sort GatherBufferIF::parseSort(const std::string& s) const {
     if (s == "addr") return Sort::Addr;
     if (s == "bank_row") return Sort::BankRow;
     return Sort::Row;
+}
+
+uint64_t GatherBufferIF::ensureSortKey_(Granule& g) {
+    if (!g.sort_key_valid) {
+        if (sort_ == Sort::Addr) {
+            g.cached_sort_key = g.base;
+        } else if (sort_ == Sort::BankRow) {
+            g.cached_sort_key = bankRowIndex(g.base);
+        } else {
+            g.cached_sort_key = rowIndex(g.base);
+        }
+        g.sort_key_valid = true;
+    }
+    return g.cached_sort_key;
+}
+
+void GatherBufferIF::rebuildIssueOrder_(int buf) {
+    auto& S = sb_[buf];
+    S.issue_order.clear();
+    S.issue_order.reserve(S.granules.size());
+    for (auto& kv : S.granules) {
+        S.issue_order.emplace_back(ensureSortKey_(kv.second), kv.first);
+    }
+    std::sort(S.issue_order.begin(), S.issue_order.end(),
+              [](const auto& a, const auto& b){
+                  if (a.first != b.first) return a.first < b.first;
+                  return a.second < b.second;
+              });
+    S.issue_cursor = 0;
+    S.issue_order_dirty = false;
+}
+
+void GatherBufferIF::issueMoreUnissuedFromOrder_(int buf) {
+    auto& S = sb_[buf];
+    if (S.issue_order_dirty) {
+        rebuildIssueOrder_(buf);
+    }
+
+    // Only "start" new granules here. Fragment continuation is handled by
+    // onDownstreamResp_ per-granule (issueGranuleBuf_ called on the same key).
+    while ((inflight_counts_[0] + inflight_counts_[1]) < max_inflight_reads_) {
+        // Skip already-issued / erased granules.
+        while (S.issue_cursor < S.issue_order.size()) {
+            const uint64_t key = S.issue_order[S.issue_cursor].second;
+            auto it = S.granules.find(key);
+            if (it == S.granules.end() || it->second.issued) {
+                ++S.issue_cursor;
+                continue;
+            }
+
+            Granule& g = it->second;
+            const uint32_t before_frags = g.frags_issued;
+            const bool before_issued = g.issued;
+            issueGranuleBuf_(buf, key, g);
+
+            // If we couldn't issue anything (most commonly due to inflight saturation),
+            // stop here and wait for the next downstream response to free credits.
+            if (g.frags_issued == before_frags && g.issued == before_issued) {
+                return;
+            }
+
+            // We successfully started this granule; move to the next candidate.
+            ++S.issue_cursor;
+            break;
+        }
+
+        if (S.issue_cursor >= S.issue_order.size()) {
+            return;
+        }
+    }
 }
 
 uint64_t GatherBufferIF::granuleSize() const {
@@ -698,6 +866,14 @@ void GatherBufferIF::onDownstreamResp_(Request* r) {
                             "[gbi-assert] node=%u core=%u buf=%d key=0x%lx base=0x%lx frag_off=%u frag_sz=%u resp_bytes=%zu -- payload truncated, potential cache payload corruption\n",
                             node_id_param_, core_id_param_, buf_index, (unsigned long)key,
                             (unsigned long)g.base, frag_off, frag_sz, rr->data.size());
+                    }
+                }
+                if (byteExactVerifyEnabled_()) {
+                    const std::string mode_l = lowerCopy_(byte_exact_verify_mode_);
+                    if (mode_l == "dense_rowcol_v1") {
+                        verifyByteExactDenseRowcol_(g.base + frag_off, rr->data);
+                    } else if (mode_l == "raw_bcsr_v1") {
+                        verifyByteExactRawBcsr_(g.base + frag_off, rr->data);
                     }
                 }
                 if (!rr->data.empty() && frag_off < sram.size()) {
@@ -828,6 +1004,11 @@ void GatherBufferIF::onDownstreamResp_(Request* r) {
                             }
                         }
                     }
+                    // 延后模式：Apply entry 只会“尽可能发射”，其余 granule 必须在 ReadResp 回调里持续补发，
+                    // 否则 inflight 限流会导致部分 granule 永远不被 issue，从而 required_set 永远不 ready → 卡死。
+                    if (defer_issue_until_apply_) {
+                        issueMoreUnissuedFromOrder_(apply_buf_index_);
+                    }
                 }
             }
             }
@@ -870,6 +1051,13 @@ void GatherBufferIF::onDownstreamResp_(Request* r) {
                 }
             }
         } else if (stage_ == Stage::Apply && apply_pending_emit_) {
+            // In window_auto mode (including GLOBAL_STEP_SYNC), stage transitions are driven
+            // by clockTick()/tryAutoEndApply_ to avoid re-entrancy hazards:
+            // - upstream ReadResp callbacks can synchronously enqueue new Apply-stage reads
+            //   (staging_reads/pending_up_reads) while we are inside onDownstreamResp_.
+            // Advancing Apply->Scatter here based only on required_set readiness can therefore
+            // prematurely end Apply before staged reads are converted into required granules.
+            if (window_auto_) return;
             // 检查是否全部ready，若是且无需等待Apply窗口，则发放
             bool allReady = true;
             for (auto key : sb_[apply_buf_index_].required_set) {
@@ -965,6 +1153,9 @@ void GatherBufferIF::maybeEnterApply_() {
     apply_buf_index_ = gather_buf_index_;
     gather_buf_index_ ^= 1;
     resetGatherAutoCounters_();
+    // Apply 缓冲的 granules 集合在此刻“定格”，后续会在 Apply 阶段用确定性顺序补发未发 granule。
+    sb_[apply_buf_index_].issue_order_dirty = true;
+    sb_[apply_buf_index_].issue_cursor = 0;
     // [DEBUG] 切换后记录 Apply 缓冲区状态
     out_.verbose(CALL_INFO, 1, 0,
         "[diag-gbi] AFTER switch: apply_buf=%d gather_buf=%d; apply granules=%zu required_set=%zu\n",
@@ -979,30 +1170,15 @@ void GatherBufferIF::maybeEnterApply_() {
         (*upstream_handler_)(cr);
     }
     if (defer_issue_until_apply_) {
-        // 若启用 gap/Lmax 合并，则先按 bank/row 聚合构建 granule
-        if (gap_merge_enable_) buildGranulesWithGapMergeBuf_(apply_buf_index_);
-        // 排序并发射所有未发的granule（支持 bank_row）
-        auto& gmap = sb_[apply_buf_index_].granules;
-        std::vector<std::pair<uint64_t,uint64_t>> sorted; sorted.reserve(gmap.size());
-        for (auto &kv : gmap) {
-            // 优化2：使用缓存的排序键，避免重复计算
-            if (!kv.second.sort_key_valid) {
-                if (sort_ == Sort::Addr) {
-                    kv.second.cached_sort_key = kv.second.base;
-                } else if (sort_ == Sort::BankRow) {
-                    kv.second.cached_sort_key = bankRowIndex(kv.second.base);
-                } else {
-                    kv.second.cached_sort_key = rowIndex(kv.second.base);
-                }
-                kv.second.sort_key_valid = true;
-            }
-            sorted.emplace_back(kv.second.cached_sort_key, kv.first);
+        // If we staged reads (for gap-merge and/or row-window), build segments now.
+        if (gap_merge_enable_ || row_window_enable_) {
+            buildGranulesWithGapMergeBuf_(apply_buf_index_);
         }
-        std::sort(sorted.begin(), sorted.end(),
-                  [](const auto& a, const auto& b){
-                      if (a.first != b.first) return a.first < b.first;
-                      return a.second < b.second;
-                  });
+        // 排序（确定性）并“尽可能发射”：受 inflight 限制时，后续靠 ReadResp 回调持续补发，保证 forward progress。
+        rebuildIssueOrder_(apply_buf_index_);
+        auto& gmap = sb_[apply_buf_index_].granules;
+        auto& sorted = sb_[apply_buf_index_].issue_order;
+
         // Compute pseudo row-adjacency for this window (before issuing)
         if (sorted.size() > 1) {
             for (size_t i = 1; i < sorted.size(); ++i) {
@@ -1018,10 +1194,8 @@ void GatherBufferIF::maybeEnterApply_() {
                 }
             }
         }
-        for (auto &p : sorted) {
-            auto it = gmap.find(p.second);
-            if (it != gmap.end() && !it->second.issued) issueGranuleBuf_(apply_buf_index_, p.second, it->second);
-        }
+
+        issueMoreUnissuedFromOrder_(apply_buf_index_);
     } else {
         // 非延后：在窗口切换到 Apply 时也补发未发 granule，避免在 Gather 结束时仍有未发请求被遗漏。
         auto& gmap = sb_[apply_buf_index_].granules;
@@ -1095,13 +1269,25 @@ void GatherBufferIF::maybeEnterApply_() {
 void GatherBufferIF::buildGranulesWithGapMergeBuf_(int buf) {
     auto& S = sb_[buf];
     if (S.staging_reads.empty()) return;
+
+    // Re-entrancy safety:
+    // buildGranulesWithGapMergeBuf_ may call upstream_handler_ (e.g., CustomResp stats), and
+    // upstream callbacks can synchronously issue new Read requests back into this GatherBufferIF.
+    // If we iterate/clear S.staging_reads directly, those re-entrant reads can be accidentally
+    // dropped, leading to pending_up_reads hanging and Apply deadlock under GLOBAL_STEP_SYNC.
+    std::vector<SST::Interfaces::StandardMem::Read*> staged_reads;
+    staged_reads.swap(S.staging_reads);
+    std::unordered_map<Request::id_t, uint64_t> staged_arrival_ns;
+    staged_arrival_ns.swap(S.staged_arrival_ns);
+    if (staged_reads.empty()) return;
+
     // Heuristic bank bits/shift detection if requested
     if (!bank_auto_done_ && bank_auto_enable_ && bank_bits_ == 0) {
         // Simple heuristic: reuse staged addrs of this buffer
         // (keep existing API by inlining logic here)
         std::vector<uint64_t> addrs;
-        addrs.reserve(S.staging_reads.size());
-        for (auto* rd : S.staging_reads) addrs.push_back(rd->pAddr);
+        addrs.reserve(staged_reads.size());
+        for (auto* rd : staged_reads) addrs.push_back(rd->pAddr);
         if (addrs.size() >= 16) {
             uint32_t best_bits = 0, best_shift = 0; uint64_t best_score = (uint64_t)-1;
             uint32_t minb = std::max<uint32_t>(1, bank_auto_min_banks_);
@@ -1135,16 +1321,16 @@ void GatherBufferIF::buildGranulesWithGapMergeBuf_(int buf) {
     std::unordered_map<uint64_t, std::vector<ReadItem>> groups;
 
     // 优化3：预分配groups容器（假设平均每组4个读请求）
-    size_t estimated_groups = S.staging_reads.size() / 4;
+    size_t estimated_groups = staged_reads.size() / 4;
     if (estimated_groups < 8) estimated_groups = 8;  // 最少预留8组
     groups.reserve(estimated_groups);
 
-    for (auto* rd : S.staging_reads) {
+    for (auto* rd : staged_reads) {
         uint64_t addr = rd->pAddr; uint32_t sz = rd->size;
         uint64_t key = (bank_bits_? (bankIndex(addr)<<32):0) | (uint32_t)rowIndex(addr);
         uint64_t arr = 0;
-        auto itst = S.staged_arrival_ns.find(rd->getID());
-        if (itst != S.staged_arrival_ns.end()) arr = itst->second;
+        auto itst = staged_arrival_ns.find(rd->getID());
+        if (itst != staged_arrival_ns.end()) arr = itst->second;
 
         // 优化3：预分配每组的vector空间（假设平均每组8个元素）
         auto& vec = groups[key];
@@ -1169,7 +1355,7 @@ void GatherBufferIF::buildGranulesWithGapMergeBuf_(int buf) {
             uint64_t base = cur_base; uint32_t sz = (uint32_t)(cur_end - cur_base);
             uint64_t gkey = (base << 32) ^ (uint64_t)sz;
             if (diag_granule_build_logged_ < 64) {
-                out_.verbose(CALL_INFO, 0, 0,
+                out_.verbose(CALL_INFO, 2, 0,
                     "[diag-gbi-granule] node=%u core=%u buf=%d key=0x%llx base=0x%llx size=%u subs=%zu\n",
                     node_id_param_, core_id_param_, buf,
                     (unsigned long long)gkey,
@@ -1265,8 +1451,15 @@ void GatherBufferIF::buildGranulesWithGapMergeBuf_(int buf) {
         flush_segment(/*mark_rowwin=*/seg_used_row_window);
     }
     if (stat_gap_absorbed_bytes_ && gap_abs_sum) stat_gap_absorbed_bytes_->addData(gap_abs_sum);
-    S.staging_reads.clear();
-    S.staged_arrival_ns.clear();
+    // Also surface fine-merge absorption to the PE-level stats sink (SnnPESubComponent) via CustomResp,
+    // because GatherBufferIF is instantiated during init() and cannot safely register new CSV statistics late.
+    if (gap_abs_sum && upstream_handler_) {
+        auto* s = new GasStatData(0, 0, 0, 0, 0, 0, 0, 0, gap_abs_sum);
+        auto* cr = new StandardMem::CustomResp((StandardMem::Request::id_t)0, s, 0, 0, 0);
+        (*upstream_handler_)(cr);
+    }
+    // NOTE: do NOT clear S.staging_reads / S.staged_arrival_ns here. New staged reads may have been
+    // added re-entrantly during upstream callbacks above; those must be preserved for the next tick.
 }
 
 void GatherBufferIF::emitApplyResponsesBuf_(int buf) {
@@ -1372,18 +1565,19 @@ void GatherBufferIF::emitApplyResponsesBuf_(int buf) {
             // 限量权重返回探针：仅 node_id=0 打印前16条，附带首float与地址
             if (node_id_param_ == 0) {
                 static int diag_weightresp_gbi = 0;
-                if (diag_weightresp_gbi < 16 && !resp->data.empty()) {
+                    if (diag_weightresp_gbi < 16 && !resp->data.empty()) {
                     float f0_dbg = 0.0f;
                     if (resp->data.size() >= sizeof(float)) {
                         std::memcpy(&f0_dbg, resp->data.data(), sizeof(float));
                     }
-                    out_.verbose(CALL_INFO, 0, 0,
+                    out_.verbose(CALL_INFO, 2, 0,
                         "[diag-weightresp-gbi] node=%u key=0x%lx off=%u size=%u f0=%.6f\n",
                         node_id_param_, (unsigned long)key, (unsigned)s.offset, (unsigned)s.size, f0_dbg);
                     ++diag_weightresp_gbi;
                 }
             }
-            // Diagnostic probe (no-ops when verbose==0): print first-float value of this sub-read
+#ifdef SNNDL_ENABLE_DEBUG_LOG
+            // Debug probe: print first-float value of this sub-read (noise-prone; keep debug-only).
             if (out_.getVerboseLevel() >= 1 && !resp->data.empty()) {
                 float f0 = 0.0f;
                 if (resp->data.size() >= sizeof(float)) {
@@ -1391,11 +1585,10 @@ void GatherBufferIF::emitApplyResponsesBuf_(int buf) {
                 }
                 uint64_t abs_addr = g.base + (uint64_t)s.offset;
                 out_.verbose(CALL_INFO, 1, 0,
-                    "[VERIFY][probe-gas] granule_base=0x%lx sub_off=%u abs=0x%lx size=%u f0=%.6f\n",
+                    "[diag-gbi][probe-gas] granule_base=0x%lx sub_off=%u abs=0x%lx size=%u f0=%.6f\n",
                     (unsigned long)g.base, (unsigned)s.offset,
                     (unsigned long)abs_addr, (unsigned)s.size, f0);
             }
-            #ifdef SNNDL_ENABLE_DEBUG_LOG
             if (!probe_csv_path_.empty()) {
                 // write one line per sub-read with addr,size,first-float (read from SRAM block)
                 FILE* fp = fopen(probe_csv_path_.c_str(), probe_csv_header_written_? "a" : "w");
@@ -1408,14 +1601,19 @@ void GatherBufferIF::emitApplyResponsesBuf_(int buf) {
                     fclose(fp);
                 }
             }
-            #endif
+#endif
             if (upstream_handler_) (*upstream_handler_)(resp);
             // 注意：上游StandardMem::Read的所有权由上游组件管理。
             // 这里不再delete上游请求指针，仅从追踪表移除，避免重复释放导致的崩溃。
-            S.pending_up_reads.erase(itup);
-            out_.verbose(CALL_INFO, 1, 0,
+            // Re-entrancy safety: upstream handler can synchronously issue new reads which may
+            // insert into pending_up_reads and trigger rehash; avoid erasing with a potentially
+            // invalidated iterator.
+            S.pending_up_reads.erase(s.up_id);
+#ifdef SNNDL_ENABLE_DEBUG_LOG
+            out_.verbose(CALL_INFO, 2, 0,
                 "[diag-gbi] pending erase up_id=%" PRIu64 " remaining=%zu\n",
                 (uint64_t)s.up_id, (size_t)S.pending_up_reads.size());
+#endif
         }
 
         // 标记此 granule 为已完成（可以清空）
@@ -1439,8 +1637,9 @@ void GatherBufferIF::emitApplyResponsesBuf_(int buf) {
 
     // 清理其他窗口状态（但保留未完成的 granules 和 pending_up_reads）
     S.end_gather_seen = false;
-    S.staging_reads.clear();
-    apply_pending_emit_ = false;
+    // Re-entrancy safety: do not clear staging_reads here; upstream callbacks during emission can
+    // synchronously stage new reads that must be drained by clockTick() in the same Apply window.
+    apply_pending_emit_ = !(S.granules.empty() && S.pending_up_reads.empty() && S.staging_reads.empty());
 }
 
 bool GatherBufferIF::rebuildPendingAsGranules_(int buf) {
@@ -1562,7 +1761,7 @@ bool GatherBufferIF::clockTick(Cycle_t) {
     }
     if (!clock_tick_logged_) {
         if (out_.getVerboseLevel() >= 2) {
-            out_.verbose(CALL_INFO, 0, 0,
+            out_.verbose(CALL_INFO, 2, 0,
                 "[diag-gbi-clock] first tick stage=%d counter=%" PRIu64 " win_cyc_g=%" PRIu64 "\n",
                 (int)stage_, stage_counter_, win_cyc_gather_);
         }
@@ -1606,6 +1805,15 @@ bool GatherBufferIF::clockTick(Cycle_t) {
             }
         }
     } else if (stage_ == Stage::Apply) {
+        // Drain staged reads (collected during Gather/Apply) into merged granules, then issue.
+        // This is required for row-window/gap-merge validation in dense microbench where reads
+        // are often triggered at BeginApply.
+        if (defer_issue_until_apply_ && (gap_merge_enable_ || row_window_enable_) && !sb_[apply_buf_index_].staging_reads.empty()) {
+            buildGranulesWithGapMergeBuf_(apply_buf_index_);
+            sb_[apply_buf_index_].issue_order_dirty = true;
+            rebuildIssueOrder_(apply_buf_index_);
+            issueMoreUnissuedFromOrder_(apply_buf_index_);
+        }
         // 并行：在Apply阶段也推进下一窗口的Gather构建与下发
         if (!step_gate_enable_ && double_buffer_enable_ && defer_issue_until_apply_ && !sb_[gather_buf_index_].staging_reads.empty()) {
             buildGranulesWithGapMergeBuf_(gather_buf_index_);
@@ -1668,6 +1876,8 @@ bool GatherBufferIF::clockTick(Cycle_t) {
                     current_gather_id_, stage_counter_,
                     inflight_counts_[apply_buf_index_], inflight_counts_[gather_buf_index_]);
             }
+            // Byte-exact correctness: emit PASS marker (or fatal) at window boundary.
+            finishByteExact_();
             flushStageCycles_(Stage::Scatter, true);
             // start new gather window
             if (emit_stage_events_ && upstream_handler_) {
@@ -1797,10 +2007,25 @@ bool GatherBufferIF::tryAutoEndApply_() {
     if (!window_auto_) return false;
     if (!apply_auto_end_enable_) return false;
     if (stage_ != Stage::Apply) return false;
+    // 断言式诊断/健壮性：
+    // Apply 自动结束不能只看 required_set 是否“全 ready”，否则在同一 cycle 内
+    // 若有新的上游 Read 在 Apply 阶段到达（先进入 pending/staging、尚未被
+    // buildGranulesWithGapMergeBuf_ 纳入 required_set），会出现：
+    //   required_set 空 -> allReady=true -> 触发 FinishApplyWindow -> pending_up 仍悬挂
+    // 导致窗口无法推进/全局 step barrier 永远 done=0。
+    auto& S = sb_[apply_buf_index_];
+    // 若存在待合并的 staged reads，说明 Apply 仍有未纳入 required_set 的工作，禁止 auto-end。
+    if (!S.staging_reads.empty()) return false;
+    // required_set 为空并不等价于“窗口无工作”，可能只是还没来得及把 pending 读转为 granule。
+    if (S.required_set.empty()) {
+        if (!S.pending_up_reads.empty()) return false;
+        if (inflight_counts_[apply_buf_index_] != 0) return false;
+        return finishApplyWindow_("apply-auto-empty");
+    }
     bool allReady = true;
-    for (auto key : sb_[apply_buf_index_].required_set) {
-        auto it = sb_[apply_buf_index_].granules.find(key);
-        if (it == sb_[apply_buf_index_].granules.end() || !it->second.ready) {
+    for (auto key : S.required_set) {
+        auto it = S.granules.find(key);
+        if (it == S.granules.end() || !it->second.ready) {
             allReady = false;
             break;
         }
@@ -2108,4 +2333,257 @@ void GatherBufferIF::controlStep_() {
     }
     // Reset metrics
     resetWindowMetrics_();
+}
+
+bool GatherBufferIF::byteExactVerifyEnabled_() const {
+    return byte_exact_verify_enable_;
+}
+
+void GatherBufferIF::verifyByteExactDenseRowcol_(uint64_t addr, const std::vector<uint8_t>& data) {
+    if (!byteExactVerifyEnabled_()) return;
+    if (lowerCopy_(byte_exact_verify_mode_) != "dense_rowcol_v1") return;
+    if (data.empty()) return;
+    if (byte_exact_base_addr_ == 0 || byte_exact_cols_ == 0 || byte_exact_rows_ == 0) return;
+    if (addr < byte_exact_base_addr_) return;
+
+    const uint64_t total_floats =
+        static_cast<uint64_t>(byte_exact_rows_) * static_cast<uint64_t>(byte_exact_cols_);
+    const uint64_t total_bytes = total_floats * 4ull;
+    const uint64_t off_bytes = addr - byte_exact_base_addr_;
+    if (off_bytes >= total_bytes) return;
+    if ((off_bytes & 0x3ull) != 0ull) {
+        out_.fatal(CALL_INFO, -1,
+            "❌ [byte-exact] unaligned addr: node=%u core=%u base=0x%llx addr=0x%llx off=%" PRIu64 "\n",
+            node_id_param_, core_id_param_,
+            (unsigned long long)byte_exact_base_addr_,
+            (unsigned long long)addr,
+            off_bytes);
+    }
+
+    const size_t nbytes = std::min<size_t>(data.size(), static_cast<size_t>(total_bytes - off_bytes));
+    const size_t nfloat = nbytes / 4u;
+    const uint64_t start_float = off_bytes / 4ull;
+
+    for (size_t i = 0; i < nfloat; ++i) {
+        const uint64_t idx = start_float + static_cast<uint64_t>(i);
+        const uint32_t row = static_cast<uint32_t>(idx / static_cast<uint64_t>(byte_exact_cols_));
+        const uint32_t col = static_cast<uint32_t>(idx % static_cast<uint64_t>(byte_exact_cols_));
+        const uint64_t v =
+            static_cast<uint64_t>(row) * static_cast<uint64_t>(byte_exact_verify_row_scale_) +
+            static_cast<uint64_t>(col);
+        const float expect_f = static_cast<float>(v);
+        uint8_t expect_b[4];
+        std::memcpy(expect_b, &expect_f, sizeof(expect_b));
+        const uint8_t* got_b = data.data() + i * 4u;
+        if (std::memcmp(got_b, expect_b, 4u) != 0) {
+            byte_exact_mismatch_count_ += 1;
+            if (byte_exact_mismatch_logged_ < byte_exact_verify_max_mismatch_) {
+                byte_exact_mismatch_logged_ += 1;
+                float got_f = 0.0f;
+                std::memcpy(&got_f, got_b, sizeof(got_f));
+                out_.verbose(CALL_INFO, 0, 0,
+                    "[byte-exact] mismatch node=%u core=%u addr=0x%llx float_i=%zu row=%u col=%u got_f=%.9g expect_f=%.9g got=[%02x %02x %02x %02x] expect=[%02x %02x %02x %02x]\n",
+                    node_id_param_, core_id_param_,
+                    (unsigned long long)addr,
+                    i, row, col,
+                    got_f, expect_f,
+                    got_b[0], got_b[1], got_b[2], got_b[3],
+                    expect_b[0], expect_b[1], expect_b[2], expect_b[3]);
+            }
+            if (byte_exact_mismatch_count_ >= byte_exact_verify_max_mismatch_) {
+                out_.fatal(CALL_INFO, -1,
+                    "❌ [byte-exact] too many mismatches: node=%u core=%u mismatches=%u max=%u\n",
+                    node_id_param_, core_id_param_,
+                    byte_exact_mismatch_count_, byte_exact_verify_max_mismatch_);
+            }
+        }
+    }
+
+    if (nfloat > 0) byte_exact_verified_frags_ += 1;
+}
+
+void GatherBufferIF::verifyByteExactRawBcsr_(uint64_t addr, const std::vector<uint8_t>& data) {
+    if (!byteExactVerifyEnabled_()) return;
+    if (lowerCopy_(byte_exact_verify_mode_) != "raw_bcsr_v1") return;
+    if (data.empty()) return;
+    if (byte_exact_max_resps_ == 0) return;
+    if (byte_exact_base_addr_ == 0 || byte_exact_file_size_ == 0) return;
+    if (!byte_exact_file_.is_open()) return;
+
+    // Only verify addresses that map into the raw BCSR file region.
+    if (addr < byte_exact_base_addr_) return;
+    const uint64_t off = addr - byte_exact_base_addr_;
+    if (off >= byte_exact_file_size_) {
+        if (!byte_exact_skip_logged_) {
+            out_.verbose(CALL_INFO, 0, 0,
+                "BCSR_MERGE_READ_VERIFY: SKIP_OUT_OF_RANGE mode=%s node=%u core=%u addr=0x%llx base=0x%llx file_size=%" PRIu64 "\n",
+                byte_exact_verify_mode_.c_str(),
+                node_id_param_, core_id_param_,
+                (unsigned long long)addr,
+                (unsigned long long)byte_exact_base_addr_,
+                byte_exact_file_size_);
+            byte_exact_skip_logged_ = true;
+        }
+        return;
+    }
+
+    const bool offsets_sane =
+        (byte_exact_colidx_offset_ > byte_exact_rowptr_offset_) &&
+        (byte_exact_colidx_offset_ < byte_exact_file_size_) &&
+        (byte_exact_blockdata_offset_ > byte_exact_colidx_offset_) &&
+        (byte_exact_blockdata_offset_ < byte_exact_file_size_);
+    const uint32_t required_mask = offsets_sane ? ((1u << 0) | (1u << 1) | (1u << 2)) : 0u;
+    uint8_t region = 0;
+    if (offsets_sane) {
+        if (off >= byte_exact_blockdata_offset_) region = 2;
+        else if (off >= byte_exact_colidx_offset_) region = 1;
+        else region = 0;
+    }
+
+    // Coverage-driven sampling:
+    // - When offsets are sane, prioritize verifying one fragment per segment (rowptr/colidx/blockdata).
+    // - Skip already-covered regions to preserve the limited response budget.
+    if (offsets_sane) {
+        if ((byte_exact_region_verified_mask_ & required_mask) != required_mask) {
+            if (byte_exact_region_verified_mask_ & (1u << region)) {
+                return;
+            }
+        }
+    }
+    if (byte_exact_verified_resps_ >= byte_exact_max_resps_) return;
+
+    const size_t nmax_data = std::min<size_t>(data.size(), (size_t)byte_exact_sample_bytes_);
+    const size_t nmax_file = (size_t)std::min<uint64_t>((uint64_t)nmax_data, byte_exact_file_size_ - off);
+    if (nmax_file == 0) return;
+
+    std::vector<uint8_t> expect;
+    expect.resize(nmax_file);
+    {
+        std::lock_guard<std::mutex> lk(byte_exact_mu_);
+        byte_exact_file_.clear();
+        byte_exact_file_.seekg((std::streamoff)off, std::ios::beg);
+        byte_exact_file_.read(reinterpret_cast<char*>(expect.data()), (std::streamsize)nmax_file);
+        const auto got = (size_t)byte_exact_file_.gcount();
+        if (got != nmax_file) {
+            out_.fatal(CALL_INFO, -1,
+                "BCSR_MERGE_READ_VERIFY: file read short node=%u core=%u off=%" PRIu64 " want=%zu got=%zu file=%s\n",
+                node_id_param_, core_id_param_, off, nmax_file, got, byte_exact_file_path_.c_str());
+        }
+    }
+
+    if (std::memcmp(expect.data(), data.data(), nmax_file) != 0) {
+        byte_exact_mismatch_count_ += 1;
+        if (byte_exact_mismatch_logged_ < byte_exact_verify_max_mismatch_) {
+            byte_exact_mismatch_logged_ += 1;
+            // Print a short hexdump (first 16B) for debugging without log explosion.
+            const size_t k = std::min<size_t>(16, nmax_file);
+            std::string got_hex, exp_hex;
+            got_hex.reserve(k * 3);
+            exp_hex.reserve(k * 3);
+            char buf[8];
+            for (size_t i = 0; i < k; ++i) {
+                std::snprintf(buf, sizeof(buf), "%02x", (unsigned)data[i]);
+                got_hex += buf;
+                if (i + 1 < k) got_hex += ' ';
+                std::snprintf(buf, sizeof(buf), "%02x", (unsigned)expect[i]);
+                exp_hex += buf;
+                if (i + 1 < k) exp_hex += ' ';
+            }
+            out_.verbose(CALL_INFO, 0, 0,
+                "BCSR_MERGE_READ_VERIFY: MISMATCH node=%u core=%u addr=0x%llx off=%" PRIu64 " n=%zu got=[%s] expect=[%s]\n",
+                node_id_param_, core_id_param_,
+                (unsigned long long)addr, off, nmax_file,
+                got_hex.c_str(), exp_hex.c_str());
+        }
+        if (byte_exact_mismatch_count_ >= byte_exact_verify_max_mismatch_) {
+            out_.fatal(CALL_INFO, -1,
+                "BCSR_MERGE_READ_VERIFY: too many mismatches node=%u core=%u mismatches=%u max=%u\n",
+                node_id_param_, core_id_param_,
+                byte_exact_mismatch_count_, byte_exact_verify_max_mismatch_);
+        }
+    }
+
+    if (offsets_sane) {
+        byte_exact_region_verified_mask_ |= (1u << static_cast<uint32_t>(region));
+    } else {
+        // Without sane offsets, we cannot certify segment coverage.
+        byte_exact_inconclusive_ = true;
+        if (byte_exact_inconclusive_reason_.empty()) byte_exact_inconclusive_reason_ = "meta_offsets_unsane_or_missing";
+    }
+    byte_exact_verified_resps_ += 1;
+}
+
+void GatherBufferIF::finishByteExact_() {
+    if (!byteExactVerifyEnabled_()) return;
+    const std::string mode_l = lowerCopy_(byte_exact_verify_mode_);
+    if (byte_exact_pass_logged_) return;
+    if (byte_exact_mismatch_count_ != 0) {
+        out_.fatal(CALL_INFO, -1,
+            "BYTE_EXACT_VERIFY: mismatches=%u (expected 0) mode=%s node=%u core=%u\n",
+            byte_exact_mismatch_count_, byte_exact_verify_mode_.c_str(), node_id_param_, core_id_param_);
+    }
+    if (mode_l == "dense_rowcol_v1") {
+        if (byte_exact_verified_frags_ == 0) {
+            // Multi-PE runs may legitimately have some PEs/cores with no local reads in a given step.
+            // Do not fail the whole simulation; the validator still requires at least one PASS marker
+            // when byte-exact is enabled (prevents false positives in 1PE).
+            if (!byte_exact_skip_logged_) {
+                out_.verbose(CALL_INFO, 0, 0,
+                    "BYTE_EXACT_VERIFY: SKIP mode=%s node=%u core=%u verified_frags=0\n",
+                    byte_exact_verify_mode_.c_str(),
+                    node_id_param_, core_id_param_);
+                byte_exact_skip_logged_ = true;
+            }
+            return;
+        }
+        out_.verbose(CALL_INFO, 0, 0,
+            "BYTE_EXACT_VERIFY: PASS mode=%s node=%u core=%u verified_frags=%" PRIu64 "\n",
+            byte_exact_verify_mode_.c_str(),
+            node_id_param_, core_id_param_,
+            byte_exact_verified_frags_);
+        byte_exact_pass_logged_ = true;
+        return;
+    }
+    if (mode_l == "raw_bcsr_v1") {
+        const bool offsets_sane =
+            (byte_exact_colidx_offset_ > byte_exact_rowptr_offset_) &&
+            (byte_exact_colidx_offset_ < byte_exact_file_size_) &&
+            (byte_exact_blockdata_offset_ > byte_exact_colidx_offset_) &&
+            (byte_exact_blockdata_offset_ < byte_exact_file_size_);
+        const uint32_t required_mask = offsets_sane ? ((1u << 0) | (1u << 1) | (1u << 2)) : 0u;
+        const int rowptr_ok = (byte_exact_region_verified_mask_ & (1u << 0)) ? 1 : 0;
+        const int colidx_ok = (byte_exact_region_verified_mask_ & (1u << 1)) ? 1 : 0;
+        const int block_ok  = (byte_exact_region_verified_mask_ & (1u << 2)) ? 1 : 0;
+        const bool regions_ok = offsets_sane && ((byte_exact_region_verified_mask_ & required_mask) == required_mask);
+
+        if (byte_exact_verified_resps_ == 0) {
+            out_.verbose(CALL_INFO, 0, 0,
+                "BCSR_MERGE_READ_VERIFY: WARN INCONCLUSIVE mode=%s node=%u core=%u verified_resps=0 reason=no_verified_resps\n",
+                byte_exact_verify_mode_.c_str(),
+                node_id_param_, core_id_param_);
+            byte_exact_pass_logged_ = true;
+            return;
+        }
+
+        if (!regions_ok || required_mask == 0u || byte_exact_inconclusive_) {
+            out_.verbose(CALL_INFO, 0, 0,
+                "BCSR_MERGE_READ_VERIFY: WARN INCONCLUSIVE mode=%s node=%u core=%u regions=rowptr=%d colidx=%d blockdata=%d verified_resps=%u sample_bytes=%u reason=%s\n",
+                byte_exact_verify_mode_.c_str(),
+                node_id_param_, core_id_param_,
+                rowptr_ok, colidx_ok, block_ok,
+                byte_exact_verified_resps_,
+                byte_exact_sample_bytes_,
+                byte_exact_inconclusive_reason_.empty() ? "insufficient_region_coverage" : byte_exact_inconclusive_reason_.c_str());
+        } else {
+            out_.verbose(CALL_INFO, 0, 0,
+                "BCSR_MERGE_READ_VERIFY: PASS mode=%s node=%u core=%u regions=rowptr=%d colidx=%d blockdata=%d verified_resps=%u sample_bytes=%u\n",
+                byte_exact_verify_mode_.c_str(),
+                node_id_param_, core_id_param_,
+                rowptr_ok, colidx_ok, block_ok,
+                byte_exact_verified_resps_,
+                byte_exact_sample_bytes_);
+        }
+        byte_exact_pass_logged_ = true;
+        return;
+    }
 }

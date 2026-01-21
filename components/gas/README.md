@@ -49,3 +49,12 @@
 
 - **依赖**：`events/GasStepBarrierEvent.h`（barrier 事件载体）
 - **典型装配**：整张 mesh **只创建 1 个** controller，并把每个 PE 的 `pe_linkX` 接到 controller 的 `pe_linkX`（它是全局共享的同步器，而不是 per-node）。
+
+---
+
+## 内存建模口径（默认 cacheline）与本目录关系
+
+本目录的组件只负责 **全局 step 同步控制**，不直接参与内存读写合并；但在做 GAS/naive 的“公平对比”时，建议统一采用 cacheline 语义（memHierarchy 默认）：
+
+- traffic 主口径以 MemController 的 `requests_received_*` 为准（L2 traffic）。
+- 粒度/over-fetch 的解释口径看 `gas_unique_*` 与 `avg_granule_bytes`（dense+cacheline 应接近 `line_size_bytes`）。

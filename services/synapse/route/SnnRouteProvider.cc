@@ -94,7 +94,7 @@ void SnnRouteProvider::fanoutFixed_(uint32_t neuron_idx,
         uint32_t target_hidden_node = target_hidden_base + (cfg_.node_id % 2) * 2 + (neuron_idx % 2);
         target_node = target_hidden_node;
         target_neuron = target_hidden_node * 16 + neuron_idx;
-        if (cfg_.out) {
+        if (cfg_.log_weight_details && cfg_.out) {
             cfg_.out->verbose(CALL_INFO, 2, 0,
                 "🔥 输入层节点%d神经元%d -> 隐藏层节点%d神经元%d\n",
                 (int)cfg_.node_id, (int)neuron_idx, (int)target_node, (int)target_neuron);
@@ -103,14 +103,14 @@ void SnnRouteProvider::fanoutFixed_(uint32_t neuron_idx,
         uint32_t target_output_node = 12 + ((cfg_.node_id - 4) / 2);
         target_node = target_output_node;
         target_neuron = target_output_node * 16 + (neuron_idx % 16);
-        if (cfg_.out) {
+        if (cfg_.log_weight_details && cfg_.out) {
             cfg_.out->verbose(CALL_INFO, 2, 0,
                 "🔥 隐藏层节点%d神经元%d -> 输出层节点%d神经元%d\n",
                 (int)cfg_.node_id, (int)neuron_idx, (int)target_node, (int)target_neuron);
         }
     } else {
         // 输出层节点不再发送
-        if (cfg_.out) {
+        if (cfg_.log_weight_details && cfg_.out) {
             cfg_.out->verbose(CALL_INFO, 2, 0,
                 "🔥 输出层节点%d神经元%d发放，不发送外部脉冲\n",
                 (int)cfg_.node_id, (int)neuron_idx);

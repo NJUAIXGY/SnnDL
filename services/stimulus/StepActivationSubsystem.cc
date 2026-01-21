@@ -258,11 +258,11 @@ void StepActivationSubsystem::injectStepActivations_(uint32_t seq, uint64_t sim_
                 }
             }
         }
-        if (rt_.log) {
+        if (rt_.log && rt_.log->getVerboseLevel() >= 2) {
             double denom_edges = (local_edges + remote_edges) ? static_cast<double>(local_edges + remote_edges) : 1.0;
             double local_ratio = static_cast<double>(local_edges) / denom_edges;
             double remote_ratio = static_cast<double>(remote_edges) / denom_edges;
-            STEP_LOG(0,
+            STEP_LOG(2,
                 "[step-activation-summary] node=%d routes_nonempty=%" PRIu64 " total_pre=%zu max_routes=%" PRIu64
                 " max_global=%" PRIu64 " local=%" PRIu64 " (%.2f) remote=%" PRIu64 " (%.2f)\n",
                 rt_.node_id, with_routes, step_routes_.size(), max_routes, max_global,
@@ -309,6 +309,8 @@ void StepActivationSubsystem::injectStepActivations_(uint32_t seq, uint64_t sim_
                     ++local_drops;
                     continue;
                 }
+                // Step-limited semantics: injected spikes are processed in this step (seq).
+                pkt->step_seq = seq;
                 if (dest_node == static_cast<uint32_t>(rt_.node_id)) {
                     const int dst_core = determineTargetUnit_(post_global);
                     if (dst_core >= 0) {
@@ -373,6 +375,8 @@ void StepActivationSubsystem::injectStepActivations_(uint32_t seq, uint64_t sim_
                         ++local_drops;
                         continue;
                     }
+                    // Step-limited semantics: injected spikes are processed in this step (seq).
+                    pkt->step_seq = seq;
                     if (dest_node == static_cast<uint32_t>(rt_.node_id)) {
                         const int dst_core = determineTargetUnit_(post_global);
                         if (dst_core >= 0) {
@@ -429,271 +433,6 @@ void StepActivationSubsystem::injectStepActivations_(uint32_t seq, uint64_t sim_
     }
 }
 
-#if 0
-// Phase5‑5.3：Stimulus 不再自持 BCSR 解析/offset 推导与文件扫描逻辑。
-// 旧实现保留作对照参考（不参与编译），reachability 构建统一委托 synapse/route/StepBcsrReachability。
-std::string StepActivationSubsystem::formatBcsrPath_(int pe, int core) const {
-    if (cfg_.bcsr_template.empty()) return std::string();
-    std::string path = cfg_.bcsr_template;
-    auto posp = path.find("{pe");
-    if (posp != std::string::npos) {
-        auto endp = path.find('}', posp);
-        if (endp == std::string::npos) return std::string();
-        int widthp = 0;
-        auto colonp = path.find(':', posp);
-        if (colonp != std::string::npos && colonp < endp) {
-            auto spec_endp = path.find_first_of("diu", colonp);
-            if (spec_endp != std::string::npos && spec_endp < endp) {
-                std::string width_str = path.substr(colonp + 1, spec_endp - colonp - 1);
-                widthp = std::atoi(width_str.c_str());
-            }
-        }
-        std::ostringstream ossp;
-        if (widthp > 0) ossp << std::setfill('0') << std::setw(widthp);
-        ossp << pe;
-        path.replace(posp, endp - posp + 1, ossp.str());
-    }
-    auto pos = path.find("{core");
-    if (pos == std::string::npos) return path;
-    auto end = path.find('}', pos);
-    if (end == std::string::npos) return std::string();
-    int width = 0;
-    auto colon = path.find(':', pos);
-    if (colon != std::string::npos && colon < end) {
-        auto spec_end = path.find_first_of("diu", colon);
-        if (spec_end != std::string::npos && spec_end < end) {
-            std::string width_str = path.substr(colon + 1, spec_end - colon - 1);
-            width = std::atoi(width_str.c_str());
-        }
-    }
-    std::ostringstream oss;
-    if (width > 0) oss << std::setfill('0') << std::setw(width);
-    oss << core;
-    path.replace(pos, end - pos + 1, oss.str());
-    return path;
-}
-
-uint64_t StepActivationSubsystem::alignUp_(uint64_t value, uint64_t align) const {
-    if (align == 0) return value;
-    uint64_t rem = value % align;
-    return rem ? (value + align - rem) : value;
-}
-
-bool StepActivationSubsystem::computeBcsrOffsets_(uint32_t n_block_rows, uint32_t total_blocks,
-                                                  uint64_t block_bytes,
-                                                  uint64_t& rowptr_offset, uint64_t& colidx_offset,
-                                                  uint64_t& blockdata_offset, uint64_t& blockids_offset) const {
-    const uint64_t align = cfg_.bcsr_align ? cfg_.bcsr_align : 64;
-    rowptr_offset = 0;
-    colidx_offset = alignUp_(rowptr_offset + (uint64_t)(n_block_rows + 1) * sizeof(uint32_t), align);
-    blockdata_offset = alignUp_(colidx_offset + (uint64_t)total_blocks * cfg_.bcsr_idx_bytes, align);
-    blockids_offset  = alignUp_(blockdata_offset + (uint64_t)total_blocks * block_bytes, align);
-    return true;
-}
-
-bool StepActivationSubsystem::checkBcsrOffsets_(uint64_t file_size, uint32_t n_block_rows,
-                                                uint32_t total_blocks, uint64_t block_bytes,
-                                                uint64_t& rowptr_offset, uint64_t& colidx_offset,
-                                                uint64_t& blockdata_offset, uint64_t& blockids_offset) const {
-    auto valid = [&](uint64_t off) { return off < file_size; };
-    if (!valid(rowptr_offset) || !valid(colidx_offset) ||
-        !valid(blockdata_offset) || !valid(blockids_offset)) {
-        computeBcsrOffsets_(n_block_rows, total_blocks, block_bytes,
-                            rowptr_offset, colidx_offset, blockdata_offset, blockids_offset);
-    }
-    if (rowptr_offset >= file_size) return false;
-    if (colidx_offset >= file_size) return false;
-    if (blockdata_offset >= file_size) return false;
-    if (blockids_offset >= file_size) return false;
-    const uint64_t need_rowptr = (uint64_t)(n_block_rows + 1) * sizeof(uint32_t);
-    const uint64_t need_colidx = (uint64_t)total_blocks * cfg_.bcsr_idx_bytes;
-    const uint64_t need_block  = (uint64_t)total_blocks * block_bytes;
-    if (rowptr_offset + need_rowptr > file_size) return false;
-    if (colidx_offset + need_colidx > file_size) return false;
-    if (blockdata_offset + need_block > file_size) return false;
-    if (blockids_offset + need_block > file_size) return false;
-    return true;
-}
-
-bool StepActivationSubsystem::buildRoutesFromBcsrFile_(const std::string& path, uint32_t pe_id, uint32_t core_index) {
-    const uint32_t rows_per_core = cfg_.bcsr_rows_per_core;
-    const uint32_t br = cfg_.bcsr_br ? cfg_.bcsr_br : 16;
-    const uint32_t bc = cfg_.bcsr_bc ? cfg_.bcsr_bc : 16;
-    const uint32_t n_block_rows = (rows_per_core + br - 1) / br;
-    const size_t floats_per_block = static_cast<size_t>(br) * static_cast<size_t>(bc);
-    const uint32_t neurons_per_pe = static_cast<uint32_t>(rt_.neurons_per_core) * static_cast<uint32_t>(rt_.num_cores);
-    const uint32_t local_pre_begin = (neurons_per_pe > 0) ? static_cast<uint32_t>(rt_.node_id) * neurons_per_pe : 0u;
-    const uint32_t local_pre_end = local_pre_begin + neurons_per_pe;
-    const uint32_t max_global = (rt_.total_nodes > 0 && neurons_per_pe > 0)
-        ? static_cast<uint32_t>(rt_.total_nodes) * neurons_per_pe
-        : 0u;
-
-    std::ifstream fin(path, std::ios::binary);
-    if (!fin.good()) {
-        STEP_LOG(0, "⚠️ 无法读取BCSR文件: %s\n", path.c_str());
-        return false;
-    }
-
-    fin.seekg(0, std::ios::end);
-    const std::streamoff file_size = fin.tellg();
-    fin.clear();
-    fin.seekg(0, std::ios::beg);
-    uint64_t rowptr_off = cfg_.bcsr_rowptr_offset;
-    uint64_t colidx_off = cfg_.bcsr_colidx_offset;
-    uint64_t blockdata_off = cfg_.bcsr_blockdata_offset;
-    uint64_t blockids_off = cfg_.bcsr_blockids_offset;
-    const uint64_t bytes_per_block_data = floats_per_block * sizeof(float);
-    const uint64_t bytes_per_block_ids  = floats_per_block * sizeof(uint32_t);
-    const uint64_t avail_rowptr_bytes = (rowptr_off < (uint64_t)file_size) ? ((uint64_t)file_size - rowptr_off) : 0ULL;
-    const uint64_t avail_colidx_bytes = (colidx_off < blockdata_off && blockdata_off <= (uint64_t)file_size)
-        ? (blockdata_off - colidx_off) : 0ULL;
-    const uint64_t avail_blockdata_bytes = (blockdata_off < (uint64_t)file_size) ? ((uint64_t)file_size - blockdata_off) : 0ULL;
-    const uint64_t avail_blockids_bytes  = (blockids_off  < (uint64_t)file_size) ? ((uint64_t)file_size - blockids_off)  : 0ULL;
-
-    fin.seekg(cfg_.bcsr_rowptr_offset, std::ios::beg);
-    const uint64_t want_rowptr_bytes = (uint64_t)(n_block_rows + 1) * sizeof(uint32_t);
-    const uint64_t take_rowptr_bytes = std::min<uint64_t>(want_rowptr_bytes, avail_rowptr_bytes);
-    const uint32_t rowptr_elems = static_cast<uint32_t>(take_rowptr_bytes / sizeof(uint32_t));
-    if (rowptr_elems < 2) {
-        STEP_LOG(0, "⚠️ rowptr区域不足: have=%" PRIu64 " need=%" PRIu64 " file=%lld\n",
-                 (uint64_t)take_rowptr_bytes, (uint64_t)want_rowptr_bytes, (long long)file_size);
-        return false;
-    }
-    std::vector<uint32_t> rowptr(rowptr_elems, 0);
-    fin.read(reinterpret_cast<char*>(rowptr.data()), rowptr_elems * sizeof(uint32_t));
-    if (!fin.good()) {
-        STEP_LOG(0, "⚠️ 读取rowptr失败: %s\n", path.c_str());
-        return false;
-    }
-    const uint32_t total_blocks_rowptr = rowptr.back();
-    const uint64_t max_blocks_colidx = (cfg_.bcsr_idx_bytes > 0)
-        ? (avail_colidx_bytes / (uint64_t)cfg_.bcsr_idx_bytes)
-        : 0ULL;
-    const uint64_t max_blocks_data = (bytes_per_block_data > 0) ? (avail_blockdata_bytes / bytes_per_block_data) : 0ULL;
-    const uint64_t max_blocks_ids  = (bytes_per_block_ids  > 0) ? (avail_blockids_bytes  / bytes_per_block_ids ) : 0ULL;
-    const uint64_t max_blocks_by_file = std::min(std::min(max_blocks_data, max_blocks_ids), max_blocks_colidx);
-    const uint32_t total_blocks = static_cast<uint32_t>(std::min<uint64_t>(total_blocks_rowptr, max_blocks_by_file));
-    if (total_blocks == 0) {
-        STEP_LOG(0, "⚠️ total_blocks=0 (rowptr=%u, by_file=%" PRIu64 ") path=%s\n",
-                 total_blocks_rowptr, max_blocks_by_file, path.c_str());
-        return false;
-    }
-    if (!checkBcsrOffsets_((uint64_t)file_size, n_block_rows, total_blocks,
-                           bytes_per_block_data,
-                           rowptr_off, colidx_off, blockdata_off, blockids_off)) {
-        if (!route_warned_) {
-            STEP_LOG(0,
-                "⚠️ BCSR offsets/size mismatch: node=%d path=%s fsize=%lld blocks(rowptr)=%u br=%u bc=%u idxB=%u valB=%u (recomputed: rowptr=%llu colidx=%llu blockdata=%llu blockids=%llu)\n",
-                rt_.node_id, path.c_str(), (long long)file_size, total_blocks_rowptr, br, bc,
-                cfg_.bcsr_idx_bytes, cfg_.bcsr_val_bytes,
-                (unsigned long long)rowptr_off, (unsigned long long)colidx_off,
-                (unsigned long long)blockdata_off, (unsigned long long)blockids_off);
-        }
-        return false;
-    }
-
-    std::vector<uint32_t> block_cols(total_blocks, 0);
-    fin.seekg(cfg_.bcsr_colidx_offset, std::ios::beg);
-    if (cfg_.bcsr_idx_bytes == 2) {
-        std::vector<uint16_t> tmp(total_blocks, 0);
-        fin.read(reinterpret_cast<char*>(tmp.data()), tmp.size() * sizeof(uint16_t));
-        if (!fin.good()) {
-            STEP_LOG(0, "⚠️ 读取colidx(2B)失败: %s blocks=%u\n", path.c_str(), total_blocks);
-            return false;
-        }
-        for (uint32_t i = 0; i < total_blocks; ++i) block_cols[i] = tmp[i];
-    } else {
-        fin.read(reinterpret_cast<char*>(block_cols.data()), block_cols.size() * sizeof(uint32_t));
-        if (!fin.good()) {
-            STEP_LOG(0, "⚠️ 读取colidx(4B)失败: %s blocks=%u\n", path.c_str(), total_blocks);
-            return false;
-        }
-    }
-
-    std::ifstream fdata(path, std::ios::binary);
-    std::ifstream fids(path, std::ios::binary);
-    fdata.seekg(cfg_.bcsr_blockdata_offset, std::ios::beg);
-    fids.seekg(cfg_.bcsr_blockids_offset, std::ios::beg);
-    std::vector<float> blockdata(floats_per_block, 0.0f);
-    std::vector<uint32_t> blockids(floats_per_block, 0u);
-
-    uint32_t block_index = 0;
-    uint64_t skipped_blocks = 0;
-    auto flush_skips = [&](uint64_t n) -> bool {
-        if (n == 0) return true;
-        const uint64_t data_skip = n * bytes_per_block_data;
-        const uint64_t ids_skip  = n * bytes_per_block_ids;
-        fdata.seekg(static_cast<std::streamoff>(data_skip), std::ios::cur);
-        fids.seekg(static_cast<std::streamoff>(ids_skip), std::ios::cur);
-        if (!fdata.good() || !fids.good()) {
-            STEP_LOG(0, "⚠️ BCSR seek skip failed: %s skip_blocks=%" PRIu64 "\n", path.c_str(), (uint64_t)n);
-            return false;
-        }
-        return true;
-    };
-
-    for (uint32_t block_row = 0; block_row < n_block_rows; ++block_row) {
-        if ((size_t)block_row + 1 >= rowptr.size()) break;
-        uint32_t begin = rowptr[block_row];
-        uint32_t end = rowptr[block_row + 1];
-        if (begin >= total_blocks) break;
-        if (end > total_blocks) end = total_blocks;
-        for (uint32_t idx = begin; idx < end; ++idx, ++block_index) {
-            if (block_index >= total_blocks) break;
-            uint32_t block_col = block_cols[idx];
-            const uint64_t pre_block_begin = static_cast<uint64_t>(block_col) * static_cast<uint64_t>(bc);
-            const uint64_t pre_block_end = pre_block_begin + static_cast<uint64_t>(bc);
-            const bool overlap_local = (neurons_per_pe > 0) &&
-                !(pre_block_end <= (uint64_t)local_pre_begin || pre_block_begin >= (uint64_t)local_pre_end);
-            if (!overlap_local) { ++skipped_blocks; continue; }
-            if (!flush_skips(skipped_blocks)) return false;
-            skipped_blocks = 0;
-
-            fdata.read(reinterpret_cast<char*>(blockdata.data()), blockdata.size() * sizeof(float));
-            fids.read(reinterpret_cast<char*>(blockids.data()), blockids.size() * sizeof(uint32_t));
-            if (!fdata.good() || !fids.good()) {
-                STEP_LOG(0, "⚠️ 读取block数据失败: %s (block_index=%u/%u, fsize=%lld)\n",
-                         path.c_str(), block_index, total_blocks, (long long)file_size);
-                return false;
-            }
-
-            if (block_col >= std::numeric_limits<uint32_t>::max() / bc) continue;
-            const uint32_t pre_base = static_cast<uint32_t>(pre_block_begin);
-            for (uint32_t rr = 0; rr < br; ++rr) {
-                uint32_t post_local = block_row * br + rr;
-                if (post_local >= rows_per_core) continue;
-                const uint64_t post_global_64 =
-                    static_cast<uint64_t>(pe_id) * static_cast<uint64_t>(neurons_per_pe) +
-                    static_cast<uint64_t>(core_index) * static_cast<uint64_t>(rows_per_core) +
-                    static_cast<uint64_t>(post_local);
-                if (max_global > 0u && post_global_64 >= static_cast<uint64_t>(max_global)) continue;
-                const uint32_t post_global = static_cast<uint32_t>(post_global_64);
-
-                for (uint32_t cc = 0; cc < bc; ++cc) {
-                    size_t off = static_cast<size_t>(rr) * bc + cc;
-                    if (blockids[off] == 0xFFFFFFFFu) continue;
-                    float weight = blockdata[off];
-                    if (std::fabs(weight) <= cfg_.bcsr_weight_epsilon) continue;
-                    uint32_t pre_global = pre_base + cc;
-                    if (pre_global < local_pre_begin || pre_global >= local_pre_end) continue;
-                    if (pre_global >= step_routes_.size()) continue;
-                    step_routes_[pre_global].push_back(post_global);
-                }
-            }
-        }
-    }
-
-    if (rt_.log && cfg_.log_enable && rt_.log->getVerboseLevel() >= 1) {
-        uint64_t edges = 0;
-        for (auto& v : step_routes_) edges += (uint64_t)v.size();
-        STEP_LOG(1,
-            "[step-activation] BCSR reachability loaded: pe=%u core=%u rows=%u br=%u bc=%u total_blocks(rowptr)=%u used=%u edges=%llu\n",
-            pe_id, core_index, rows_per_core, br, bc, total_blocks_rowptr, total_blocks,
-            static_cast<unsigned long long>(edges));
-    }
-    return true;
-}
-#endif // 0
 
 bool StepActivationSubsystem::loadBcsrReachability_() {
     if (rt_.log && cfg_.log_enable) {
@@ -761,8 +500,8 @@ bool StepActivationSubsystem::loadBcsrReachability_() {
             computeRouteRatios_();
             route_ack_logged_ = true;
         }
-        if (rt_.log && cfg_.log_enable) {
-            STEP_LOG(0, "[step-activation] node=%d loadBcsrReachability success route_vectors=%zu\n",
+        if (rt_.log && cfg_.log_enable && rt_.log->getVerboseLevel() >= 2) {
+            STEP_LOG(2, "[step-activation] node=%d loadBcsrReachability success route_vectors=%zu\n",
                      rt_.node_id, step_routes_.size());
         }
         if (rt_.total_nodes == 1 && rt_.log && cfg_.log_enable) {

@@ -7,11 +7,8 @@
 
 #include "SimpleNetworkWrapper.h"
 #include "SnnNetworkAdapter.h"
+#include "SnnDLLogging.h"
 
-// Lightweight logging helpers (file-local)
-#ifndef SNNDL_LOGPTR
-#define SNNDL_LOGPTR(ptr, lvl, ...) do { if (ptr) (ptr)->verbose(CALL_INFO, (lvl), 0, __VA_ARGS__); } while(0)
-#endif
 #ifndef WRAP_LOG
 #define WRAP_LOG(lvl, ...) SNNDL_LOGPTR(output, (lvl), __VA_ARGS__)
 #endif

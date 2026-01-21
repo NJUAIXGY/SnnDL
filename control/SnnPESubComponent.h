@@ -208,6 +208,11 @@ public:
         // GAS (windowed gather/apply/scatter): upstream totals accumulated at PE层（由 GatherBufferIF 通过 CustomResp 通知）
         {"gas_unique_reads_total", "Unique coalesced read transactions issued by GAS", "reads", 1},
         {"gas_unique_bytes_total", "Total bytes covered by unique coalesced reads (GAS)", "bytes", 1},
+        {"gas_row_window_triggers_total", "Total number of row-window bursts triggered (coarse merge)", "count", 1},
+        {"gas_row_window_bytes_total", "Total bytes issued by row-window bursts (including holes)", "bytes", 1},
+        {"gas_bursts_total", "Total number of bursts (segments) built by GAS", "count", 1},
+        {"gas_payload_bytes_total", "Total useful payload bytes requested upstream (sum of sub-reads)", "bytes", 1},
+        {"gas_gap_absorbed_bytes_total", "Total gap bytes absorbed by fine-grained gap-merge", "bytes", 1},
         // Apply/Scatter端到端统计（Phase-1）
         {"gas_apply_acc_updates_total", "Apply阶段的delta累加次数（有效子读）", "count", 1},
         {"gas_acc_posts_touched_total", "Apply阶段触达的post计数（去重）", "posts", 1},
@@ -547,6 +552,11 @@ private:
     bool merge_read_row_;
     bool merge_read_auto_ = false; // auto choose best merge strategy (default off)
     uint32_t line_size_bytes_;
+    // Dense microbench correctness: byte-exact validation (off by default).
+    bool byte_exact_verify_enable_ = false;
+    std::string byte_exact_verify_mode_;
+    uint32_t byte_exact_verify_row_scale_ = 1024;
+    uint32_t byte_exact_verify_max_mismatch_ = 8;
     // GAS control (component-driven phases)
     bool gas_enable_ = false; // enable GAS control-plane (v1: Begin/EndGather per tick)
     bool gas_window_mode_ = false; // 当为true时，不再每周期发送Begin/EndGather，由下游window驱动
@@ -662,6 +672,11 @@ private:
     // GAS totals accumulated from GatherBufferIF via CustomResp
     Statistic<uint64_t>* stat_gas_unique_reads_total_ = nullptr;
     Statistic<uint64_t>* stat_gas_unique_bytes_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_row_window_triggers_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_row_window_bytes_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_bursts_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_payload_bytes_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_gap_absorbed_bytes_total_ = nullptr;
     
     // 内部计数器用于getStatistics()方法
     uint64_t count_spikes_received_;

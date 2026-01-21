@@ -6,6 +6,11 @@
 - 纯内存访问走 `api/IMemoryAccess.h`（实现：`services/memory/StandardMemAccess`）
 - GAS 控制面的 stage/stat 事件走 `api/IGasStageSink.h` / `api/IGasCmdSender.h`
 
+## 默认内存语义（cacheline）
+
+`StdMemEndpoint`/`StandardMemAccess` 处于“对下游 memHierarchy 发起事务”的边界：默认以 **cacheline** 作为外部搬运与统计对齐的基本粒度（`memHierarchy GetS/GetX`）。
+如上层（例如 GAS）显式形成大 granule/row-streaming 读，其 overfetch 必须通过上层 granule 统计与 `effective_config.json` 闭环解释，禁止把大粒度当成默认。
+
 ---
 
 ## 主要内容

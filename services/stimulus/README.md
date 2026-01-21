@@ -6,6 +6,12 @@
 
 ---
 
+## 内存建模口径（默认 cacheline）提示
+
+Stimulus 只负责“注入时基/选源”，不定义权重读粒度；默认体系结构语义以 memHierarchy 的 cacheline 事务模型为主。若切换到 row-streaming/DMA 语义，应在模板输出中显式标注并单列结果。
+
+---
+
 ## 目录结构与组件职责
 
 ### `StepActivationSubsystem.{h,cc}`

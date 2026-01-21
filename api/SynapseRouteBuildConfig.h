@@ -33,7 +33,9 @@ struct SynapseRouteBuildConfig {
     std::string multicast_intra_policy = "manhattan_x_first";
 
     // Route inputs (keep consistent with legacy cache key semantics).
-    uint32_t rows = 0;            // per-core rows (num_neurons)
+    // NOTE: "rows" is interpreted as per-PE rows (neurons_per_pe). For per-core BCSR files,
+    // SpikeCommSubsystem will derive per-core rows via rows_hint = ceil(rows / cores_per_pe).
+    uint32_t rows = 0;
     uint32_t cols = 0;            // global cols (weights_cols)
     uint32_t total_nodes = 16;    // total PEs
     uint32_t cores_per_pe = 1;    // total_cores

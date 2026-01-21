@@ -6,6 +6,12 @@
 
 ---
 
+## 内存建模口径（默认 cacheline）提示
+
+NoC 域与内存建模正交：默认体系结构语义以 memHierarchy 的 cacheline 事务模型为主；若某实验引入 row-streaming/DMA 等显式搬运假设，必须在上层模板/元数据中标注并单列结果，避免与 cacheline 结论混算。
+
+---
+
 ## 目录结构与组件职责
 
 ### `NocSubsystem.{h,cc}`
@@ -43,8 +49,8 @@
 ### Core 发放 → 外发/本地投递
 1) `workload=snn` 内部装配的 `compute/ISnnComputeCore` 产出 fire events；
 2) `workload=snn` 调用 `services/synapse/route/SpikeCommSubsystem`；
-3) `SpikeCommSubsystem` 通过 `api/ISpikeTransport` 发出 spike（常见实现是 `services/synapse/route/SpikePacketTransport`）；
-4) `SpikePacketTransport` → `INocTransport::sendFromCore(...)`；
+3) `SpikeCommSubsystem` 通过 `api/ISpikeTransport` 发出 spike（常见实现是 `api/NocSpikeTransport`；也可使用 `services/synapse/route/SpikePacketTransport`）；
+4) `ISpikeTransport` → `INocTransport::sendFromCore(...)`；
 5) `NocSubsystem` 根据 packet 头（`dst_node/dst_endpoint`）做本 PE 内投递或外发：
    - 本 PE：`deliver_to_endpoint(core_id, NocPacketEvent*)`（由 `services/synapse/route/SpikePacketBridge` 解码并递送到 CoreShell/workload；`MultiCorePE` 仅装配回调）
    - 外部：`sendExternal(NocPacketEvent*)`（NIC 后端发送）。

@@ -13,27 +13,12 @@
 #include "SpikeEvent.h"
 #include "synapse/weights/WeightAccessor.h"
 #include "synapse/weights/WeightMemorySubsystem.h"
+#include "SnnDLLogging.h"
 
 #include <inttypes.h> // PRIu64
 
 using namespace SST;
 using namespace SST::SnnDL;
-
-// Keep logging helpers file-local (avoid expanding SnnPESubComponent.h surface area).
-#ifndef SNNDL_LOGPTR
-#define SNNDL_LOGPTR(ptr, lvl, ...) do { if (ptr) (ptr)->verbose(CALL_INFO, (lvl), 0, __VA_ARGS__); } while(0)
-#endif
-#ifndef SNNDL_LOG
-#define SNNDL_LOG(lvl, ...) SNNDL_LOGPTR(output_, (lvl), __VA_ARGS__)
-#endif
-
-#ifdef SNNDL_ENABLE_DEBUG_LOG
-#define SNNDL_DEBUG_ENABLED 1
-#define SNNDL_DEBUG_LOG(lvl, ...) SNNDL_LOG(lvl, __VA_ARGS__)
-#else
-#define SNNDL_DEBUG_ENABLED 0
-#define SNNDL_DEBUG_LOG(lvl, ...) do {} while(0)
-#endif
 
 void SnnPESubComponent::deliverSpike(SpikeEvent* spike) {
     if (!spike) return;
@@ -180,10 +165,12 @@ void SnnPESubComponent::processLocalSpike(SpikeEvent* spike_event) {
 
 #ifdef SNNDL_ENABLE_DEBUG_LOG
     if (window_read_debug_) {
-        output_->verbose(CALL_INFO, 0, 0,
+        if (output_ && output_->getVerboseLevel() >= 2) {
+            output_->verbose(CALL_INFO, 2, 0,
             "[diag-spike] core=%d stage=%d pre_g=%u post_g=%u dest_l=%u queue=%zu\n",
             core_id_, (int)gas_stage_, spike_event->getSourceNeuron(), spike_event->getDestinationNeuron(),
             target_neuron, incoming_spikes_.size());
+        }
     }
 #endif
 
@@ -204,6 +191,19 @@ void SnnPESubComponent::processLocalSpike(SpikeEvent* spike_event) {
     float weight = 0.0f;
     bool have_mem_weight = false;
     const bool logDetail = log_weight_details_ || enable_detailed_map_log_;
+    // Byte-exact/GAS correctness: edge recording is a gather-side concern; do not gate it on memory readiness.
+    {
+        const uint32_t pre_global = spike_event->getSourceNeuron();
+        const uint32_t post_global = spike_event->getDestinationNeuron();
+        uint32_t post_local = target_neuron;
+        if (spike_event->hasCachedPostLocal()) {
+            post_local = spike_event->getCachedPostLocal();
+        } else if (post_global >= global_neuron_base_ && post_global < global_neuron_base_ + num_neurons_) {
+            post_local = static_cast<uint32_t>(post_global - global_neuron_base_);
+        }
+        recordEdge_(post_local, pre_global);
+    }
+
     if (enable_weight_fetch_ && ensureMemoryReady_()) {
         uint32_t pre_global = spike_event->getSourceNeuron();
         uint32_t post_global = spike_event->getDestinationNeuron();
@@ -213,7 +213,6 @@ void SnnPESubComponent::processLocalSpike(SpikeEvent* spike_event) {
         } else if (post_global >= global_neuron_base_ && post_global < global_neuron_base_ + num_neurons_) {
             post_local = static_cast<uint32_t>(post_global - global_neuron_base_);
         }
-        recordEdge_(post_local, pre_global);
         uint32_t req_pre_param = 0;
         uint32_t req_post_param = 0;
         uint64_t cache_key = 0;
@@ -273,12 +272,14 @@ void SnnPESubComponent::processLocalSpike(SpikeEvent* spike_event) {
     } else {
 #ifdef SNNDL_ENABLE_DEBUG_LOG
         if (window_read_debug_) {
-            output_->verbose(CALL_INFO, 0, 0,
+            if (output_ && output_->getVerboseLevel() >= 2) {
+                output_->verbose(CALL_INFO, 2, 0,
                 "[diag-edge-gate] core=%d skip recordEdge: ewf=%d stdmem_ep=%d ready=%d stage=%d\n",
                 core_id_, enable_weight_fetch_ ? 1 : 0,
                 (stdmem_ep_ && stdmem_ep_->available()) ? 1 : 0,
                 memory_ready_ ? 1 : 0,
                 (int)gas_stage_);
+            }
         }
 #endif
     }

@@ -5,6 +5,9 @@
 
 #pragma once
 
+// size_t
+#include <cstddef>
+
 namespace SST { namespace SnnDL {
 
 class NocPacketEvent;
@@ -21,6 +24,11 @@ public:
 
     // 语义：外发到其他 PE，接管 packet 生命周期；成功外发应计入 external_spikes_sent
     virtual void sendExternal(NocPacketEvent* packet) = 0;
+
+    // Optional: platform quiescence hint for step-gated workloads.
+    // Default returns true to preserve legacy behavior for transports
+    // that do not expose internal queues.
+    virtual bool isIdle() const { return true; }
 };
 
 }} // namespace SST::SnnDL

@@ -58,6 +58,9 @@ public:
 	        {"verify_readback_enable", "是否启用写后读回校验(1/0，仅调试)", "0"},
 	        {"verify_readback_core", "读回校验目标 core（默认0）", "0"},
 	        {"verify_readback_bytes", "每次读回校验的字节数（默认64）", "64"},
+	        {"verify_readback_mode", "写后读回校验模式: raw_bcsr|dense_rowcol_v1（默认raw_bcsr）", "raw_bcsr"},
+	        {"verify_readback_samples", "写后读回校验抽样点数量（dense 模式有效，默认16）", "16"},
+	        {"verify_readback_seed", "写后读回校验抽样随机种子（dense 模式有效，默认314159）", "314159"},
 	        {"verify_colidx_start_index", "BCSR colidx 抽样起点（index，默认441，对齐现有diag）", "441"}
 	        ,
 	        {"strict_loader_done", "若启用：必须通过写后读回校验后才发布 loader_done_key（用于防止权重写入不可见导致读回全0）", "0"},
@@ -76,6 +79,10 @@ public:
         {"bcsr_val_bytes", "数值字节数（默认4=FP32）", "4"},
         {"bcsr_idx_bytes", "索引字节数（默认2=uint16）", "2"},
         {"bcsr_pattern", "BCSR生成模式：diag|full（默认diag，仅对fill模式）", "diag"}
+        ,
+        // Dense microbench correctness: deterministic write pattern for byte-exact validation.
+        {"write_pattern_mode", "填充权重写入模式: const|dense_rowcol_v1（默认const）", "const"},
+        {"write_pattern_row_scale", "dense_rowcol_v1 的 row_scale（默认1024）", "1024"}
     )
 
     SST_ELI_DOCUMENT_SUBCOMPONENT_SLOTS(
@@ -223,6 +230,9 @@ private:
     bool verify_readback_enable_ = false;
     int verify_readback_core_ = 0;
     uint32_t verify_readback_bytes_ = 64;
+    std::string verify_readback_mode_ = "raw_bcsr";
+    uint32_t verify_readback_samples_ = 16;
+    uint32_t verify_readback_seed_ = 314159;
 	    uint32_t verify_colidx_start_index_ = 441;
 	    bool verify_readback_issued_ = false;
     bool verify_readback_done_ = false;
@@ -230,10 +240,22 @@ private:
     bool verify_failed_ = false;
     uint32_t min_raw_bcsr_chunk_bytes_ = 4096;
 	    struct VerifyPending {
+            int core = 0;
 	        uint64_t addr = 0;
+            uint8_t region = 0; // 0=rowptr,1=colidx,2=blockdata
 	        std::string tag;
 	        std::vector<uint8_t> expect;
 	    };
+    // dense_rowcol_v1: 由于部分 StandardMem 实现的 untimed ReadResp 可能不携带 data，
+    // 我们在 setup 后通过 timed Read 完成抽样验证（仅在 verify_readback_enable=1 时启用）。
+    std::vector<VerifyPending> verify_todo_{};
+    // raw_bcsr multi-core sampling: record the actual cores included in verify_todo_.
+    std::vector<int> verify_readback_cores_used_{};
+    bool verify_readback_pass_logged_ = false;
+    bool verify_readback_inconclusive_ = false;
+    std::string verify_readback_inconclusive_reason_;
+    uint32_t verify_readback_region_required_mask_ = 0;
+    uint32_t verify_readback_region_done_mask_ = 0;
     std::unordered_map<SST::Interfaces::StandardMem::Request::id_t, VerifyPending> verify_pending_;
     void issueVerifyReadbacks_();
     void pollVerifyReadbacks_();
@@ -242,6 +264,10 @@ private:
     static bool parseMetaU64_(const std::string& meta_text, const char* key, uint64_t& out);
     static bool parseMetaU32_(const std::string& meta_text, const char* key, uint32_t& out);
     std::string resolveCorePath_(int core, bool meta) const;
+
+    // ===== deterministic fill patterns (microbench correctness) =====
+    std::string write_pattern_mode_ = "const";
+    uint32_t write_pattern_row_scale_ = 1024;
 
     // ===== 运行期单点读回探针（调试）=====
     bool diag_runtime_read_enable_ = false;

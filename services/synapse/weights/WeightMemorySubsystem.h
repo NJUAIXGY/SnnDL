@@ -94,6 +94,13 @@ public:
         bool bcsr_populate_weight_cache_enable = true;
         bool bcsr_weight_guard_enable = true;
         float bcsr_weight_abs_max = 10.0f;
+        // BCSR semantic correctness (sampled): compare runtime weights against file-backed reference.
+        // This is a debug/regression-only feature; keep max_edges small to avoid performance impact.
+        bool bcsr_semantic_verify_enable = false;
+        uint32_t bcsr_semantic_verify_max_edges = 64;
+        uint32_t bcsr_semantic_verify_max_mismatch = 8;
+        float bcsr_semantic_verify_abs_tol = 1e-6f;
+        float bcsr_semantic_verify_rel_tol = 1e-6f;
         bool readresp_zero_fallback = false;
         float init_default_weight = 0.5f;
         uint32_t num_neurons = 0;
@@ -112,6 +119,10 @@ public:
         uint32_t core_id = 0;
         std::string weights_template;
         BcsrWeightManager* bcsr_mgr = nullptr;
+        bool byte_exact_verify_enable = false;
+        std::string byte_exact_verify_mode;
+        uint32_t byte_exact_verify_row_scale = 1024;
+        uint32_t byte_exact_verify_max_mismatch = 8;
     };
 
     WeightMemorySubsystem() = default;
@@ -144,6 +155,14 @@ public:
     void configureOrchestrator(OrchestratorConfig cfg) {
         orch_ = std::move(cfg);
         ensureWindowTracking(orch_.num_neurons);
+        if (orch_.bcsr_semantic_verify_enable) {
+            bcsr_sem_verified_edges_ = 0;
+            bcsr_sem_mismatch_count_ = 0;
+            bcsr_sem_mismatch_logged_ = 0;
+            bcsr_sem_pass_logged_ = false;
+            bcsr_sem_inconclusive_ = false;
+            bcsr_sem_inconclusive_reason_.clear();
+        }
     }
 
     // Phase4-Task6.4: allow workload to rebind accumulator callback without rebuilding all orchestrator config.
@@ -293,6 +312,13 @@ public:
         block_hit_window_ = 0;
         block_miss_window_ = 0;
         resetEdgeRetire_();
+        if (byteExactVerifyEnabled_()) {
+            byte_exact_mismatch_count_ = 0;
+            byte_exact_mismatch_logged_ = 0;
+            byte_exact_verified_reads_ = 0;
+            byte_exact_verified_edges_ = 0;
+            byte_exact_pass_logged_ = false;
+        }
         // RowIndex(colidx) 预取：用于降低 window1/2 的 rowidx_miss，以及提升后续窗口命中率（不改语义，仅提前读）。
         if (orch_.use_bcsr) {
             maybeEnqueueRowIndexPrefetchPostsPrev_();
@@ -309,6 +335,14 @@ public:
         maybeAutoTuneBlockCache_();
         window_seq_ = 0;
 
+        emitByteExactPassMarker_("EndScatter", seq);
+        // When semantic verification is enabled, emit a PASS marker once we have verified enough edges.
+        if (orch_.bcsr_semantic_verify_enable &&
+            !bcsr_sem_pass_logged_ &&
+            (bcsr_sem_verified_edges_ >= static_cast<uint64_t>(orch_.bcsr_semantic_verify_max_edges))) {
+            emitBcsrSemanticVerifyMarker_("EndScatter", seq);
+        }
+
         if (!diag_debug_ || !diag_out_) return;
         if (!diag_window_active_) return;
         if (diag_window_seq_ != 0 && seq != diag_window_seq_) return;
@@ -320,6 +354,9 @@ public:
 
     // 调试兜底：在仿真结束/提前退出时输出当前窗口（可能未完成）的权重读摘要。
     void finishWindowDiag() {
+        emitByteExactPassMarker_("finish", /*seq*/0);
+        finishSemanticVerify();
+
         if (!diag_debug_ || !diag_out_) return;
         if (!diag_window_active_) return;
         dumpWindowDiagSummary_("[diag-window-weights] finish");
@@ -328,6 +365,10 @@ public:
         diag_window_seq_ = 0;
         window_seq_ = 0;
     }
+
+    // BCSR semantic correctness marker (independent of window_read_debug).
+    // Called from component finish to ensure a positive marker exists even if EndScatter never happens.
+    void finishSemanticVerify() { emitBcsrSemanticVerifyMarker_("finish", /*seq*/0); }
 
     void issueFromEdges() {
         // 防止同步回调导致的深递归/栈溢出：
@@ -662,6 +703,9 @@ private:
         while (next_retire_seq_ < edge_retire_.size()) {
             const auto& e = edge_retire_[next_retire_seq_];
             if (!e.ready) break;
+            if (byteExactVerifyEnabled_() && e.src == EdgeSrc::Dense) {
+                verifyDenseEdgeWeight_(e.pre_global, e.post_local, e.count, e.weight);
+            }
             if (orch_.acc_update) orch_.acc_update(e.post_local, e.weight * static_cast<float>(e.count));
             if (orch_.diag_edge_weight) orch_.diag_edge_weight(edgeSrcTag_(e.src), e.post_local, e.pre_global, e.weight, e.count);
             next_retire_seq_++;
@@ -718,11 +762,31 @@ private:
     uint32_t diag_window_seq_ = 0;
     WindowDiag diag_win_{};
     std::unordered_set<uint64_t> diag_req_addrs_{};
+    uint32_t byte_exact_mismatch_count_ = 0;
+    uint32_t byte_exact_mismatch_logged_ = 0;
+    uint64_t byte_exact_verified_reads_ = 0;
+    uint64_t byte_exact_verified_edges_ = 0;
+    bool byte_exact_pass_logged_ = false;
+    uint64_t bcsr_sem_verified_edges_ = 0;
+    uint32_t bcsr_sem_mismatch_count_ = 0;
+    uint32_t bcsr_sem_mismatch_logged_ = 0;
+    bool bcsr_sem_pass_logged_ = false;
+    bool bcsr_sem_inconclusive_ = false;
+    std::string bcsr_sem_inconclusive_reason_;
 
     void resetWindowDiag_() {
         diag_win_ = WindowDiag{};
         diag_req_addrs_.clear();
     }
+
+    bool byteExactVerifyEnabled_() const;
+    float expectedDenseWeight_(uint32_t row, uint32_t col) const;
+    void verifyDenseReadBytes_(uint64_t addr, size_t req_size, const std::vector<uint8_t>& bytes);
+    void verifyDenseEdgeWeight_(uint32_t pre_global, uint32_t post_local, uint32_t count, float weight);
+    void emitByteExactPassMarker_(const char* where, uint32_t seq);
+    bool bcsrSemanticVerifyEnabled_() const;
+    void verifyBcsrEdgeWeight_(uint32_t pre_global, uint32_t post_local, float weight);
+    void emitBcsrSemanticVerifyMarker_(const char* where, uint32_t seq);
 
     void dumpWindowDiagSummary_(const char* tag) {
         if (!diag_out_) return;

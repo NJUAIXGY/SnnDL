@@ -18,7 +18,9 @@
 #include "NocPacketBatchEvent.h"
 #include "GasStepBarrierEvent.h"
 #include "WorkloadConfig.h"
+#include "SnnDLLogging.h"
 #include "SnnCoreAPI.h"
+#include "multicore/MultiCorePEConfig.h"
 
 #include <fstream>
 #include <sstream>
@@ -32,14 +34,13 @@
 #include <cstdlib>
 #include <climits>
 #include <cinttypes>
+#include <cerrno>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 using namespace SST;
 using namespace SST::SnnDL;
 
-// Lightweight logging helpers (file-local)
-#ifndef SNNDL_LOGPTR
-#define SNNDL_LOGPTR(ptr, lvl, ...) do { if (ptr) (ptr)->verbose(CALL_INFO, (lvl), 0, __VA_ARGS__); } while(0)
-#endif
 #ifndef PE_LOG
 #define PE_LOG(lvl, ...) SNNDL_LOGPTR(output_, (lvl), __VA_ARGS__)
 #endif
@@ -57,53 +58,65 @@ inline uint8_t stepStageCodeFromName_(const std::string& ev) {
     if (ev == "EndScatter") return 5;
     return 0;
 }
-inline const char* stepStageCodeName_(uint8_t code) {
-    switch (code) {
+	inline const char* stepStageCodeName_(uint8_t code) {
+	    switch (code) {
         case 1: return "BeginGather";
         case 2: return "BeginApply";
         case 3: return "EndApply";
         case 4: return "BeginScatter";
         case 5: return "EndScatter";
         default: return "None";
-    }
-}
+	    }
+	}
+
+	inline std::string defaultPeOutDir_(int node_id) {
+	    char buf[32];
+	    std::snprintf(buf, sizeof(buf), "pe%02d", node_id);
+	    return std::string(buf);
+	}
+
+	inline bool ensureDirExists_(const std::string& dir) {
+	    if (dir.empty() || dir == ".") return true;
+	    struct stat st;
+	    if (::stat(dir.c_str(), &st) == 0) {
+	        return S_ISDIR(st.st_mode);
+	    }
+	    if (::mkdir(dir.c_str(), 0775) == 0) return true;
+	    return (errno == EEXIST);
+	}
 } // namespace
 
 MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
+    const MultiCorePEConfig cfg = parseMultiCorePEConfig(params);
+
     // 初始化输出对象
-    int verbose_level = params.find<int>("verbose", 0);
-    output_ = new Output("MultiCorePE[@p:@l]: ", verbose_level, 0, Output::STDOUT);
-    
-    
-    // 读取基础配置参数
-    num_cores_ = params.find<int>("num_cores", 4);
-    neurons_per_core_ = params.find<int>("neurons_per_core", 64);
+    output_ = new Output("MultiCorePE[@p:@l]: ", cfg.verbose_level, 0, Output::STDOUT);
+
+    // 读取基础配置参数（已集中解析）
+    num_cores_ = cfg.num_cores;
+    neurons_per_core_ = cfg.neurons_per_core;
     total_neurons_ = num_cores_ * neurons_per_core_;
-    neurons_per_pe_cfg_ = params.find<uint32_t>("neurons_per_pe", 0);
-    node_id_ = params.find<int>("node_id", 0);
-    total_nodes_ = params.find<int>("total_nodes", 1);
-    global_neuron_base_ = params.find<uint64_t>("global_neuron_base", 0);
-    sim_stop_ns_ = params.find<uint64_t>("sim_stop_ns", 0);
+    neurons_per_pe_cfg_ = cfg.neurons_per_pe;
+    node_id_ = cfg.node_id;
+    total_nodes_ = cfg.total_nodes;
+    global_neuron_base_ = cfg.global_neuron_base;
+    sim_stop_ns_ = cfg.sim_stop_ns;
     // NoC e2e latency histogram range (cycles) for native multicast lab.
-    noc_lat_hist_max_ = params.find<uint32_t>("noc_lat_hist_max", 131072);
-    if (noc_lat_hist_max_ < 64) noc_lat_hist_max_ = 64;
-    // Guard against accidental huge allocations (e.g., passing ns instead of cycles)
-    if (noc_lat_hist_max_ > 2000000u) noc_lat_hist_max_ = 2000000u;
+    noc_lat_hist_max_ = cfg.noc_lat_hist_max;
     noc_lat_spike_hist_.assign(static_cast<size_t>(noc_lat_hist_max_) + 2u, 0);
     noc_lat_spikekey_hist_.assign(static_cast<size_t>(noc_lat_hist_max_) + 2u, 0);
-    verbose_ = verbose_level;
+    verbose_ = cfg.verbose_level;
+    clock_freq_ = cfg.clock_freq;
     // P2: 解析 sentinel 与步级诊断参数（未设置则回退环境变量）
     {
-        // P2 Step3: 移除运行期 getenv 回退；仅由参数驱动（默认禁用）
-        int sent_p = params.find<int>("sentinel_enable", 0);
-        sentinel_enabled_ = (sent_p != 0);
-        progress_log_interval_ns_ = params.find<uint64_t>("progress_log_interval_ns", 0);
-        progress_log_node_ = params.find<int>("progress_log_node", -1);
-        step_diag_cap_cfg_ = params.find<long>("step_diag_cap", 0);
-        step_diag_enable_cfg_ = params.find<int>("step_diag_enable", 0);
+        sentinel_enabled_ = cfg.sentinel_enabled;
+        progress_log_interval_ns_ = cfg.progress_log_interval_ns;
+        progress_log_node_ = cfg.progress_log_node;
+        step_diag_cap_cfg_ = cfg.step_diag_cap;
+        step_diag_enable_cfg_ = cfg.step_diag_enable;
     }
-    weights_file_ = params.find<std::string>("weights_file", "");
-    enable_numa_ = params.find<bool>("enable_numa", true);
+    weights_file_ = cfg.weights_file;
+    enable_numa_ = cfg.enable_numa;
 
     // ===== 全局ID布局口径（fail-fast）=====
     // 统一口径：neurons_per_pe 必须等于 num_cores*neurons_per_core（禁止用其它 stride/bytes 误填）
@@ -140,22 +153,22 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
     }
     
     // 神经元参数
-    v_thresh_ = params.find<float>("v_thresh", 1.0f);
-    v_reset_ = params.find<float>("v_reset", 0.0f);
-    v_rest_ = params.find<float>("v_rest", 0.0f);
-    tau_mem_ = params.find<float>("tau_mem", 20.0f);
-    t_ref_ = params.find<int>("t_ref", 2);
+    v_thresh_ = cfg.v_thresh;
+    v_reset_ = cfg.v_reset;
+    v_rest_ = cfg.v_rest;
+    tau_mem_ = cfg.tau_mem;
+    t_ref_ = cfg.t_ref;
     
     // 测试流量参数
-    enable_test_traffic_ = params.find<bool>("enable_test_traffic", false);
-    test_target_node_ = params.find<int>("test_target_node", 0);
-    test_period_ = params.find<int>("test_period", 100);
-    test_spikes_per_burst_ = params.find<int>("test_spikes_per_burst", 4);
-    test_weight_ = params.find<float>("test_weight", 0.2f);
-    test_max_spikes_ = params.find<int>("test_max_spikes", 10);
+    enable_test_traffic_ = cfg.enable_test_traffic;
+    test_target_node_ = cfg.test_target_node;
+    test_period_ = cfg.test_period;
+    test_spikes_per_burst_ = cfg.test_spikes_per_burst;
+    test_weight_ = cfg.test_weight;
+    test_max_spikes_ = cfg.test_max_spikes;
     
     // 环形网络实现选择
-    use_optimized_ring_ = params.find<bool>("use_optimized_ring", true);
+    use_optimized_ring_ = cfg.use_optimized_ring;
     // Phase5：冻结 legacy InternalRing 分支（use_optimized_ring=0）
     // - NoC 子系统已以 OptimizedInternalRing 为唯一片上互连后端完成闭环
     // - legacy InternalRing 会引入维护成本与语义漂移风险，故在此明确禁用
@@ -164,36 +177,34 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
             "❌ 配置错误：use_optimized_ring=0 (legacy InternalRing) 已冻结/不再支持，请设置 use_optimized_ring=1\n");
     }
     // 输出控制：是否打印节点汇总
-    print_node_summary_ = params.find<bool>("print_node_summary", true);
-    primary_keepalive_ = params.find<bool>("primary_keepalive", false);
-    manual_core_drive_enable_ = params.find<bool>("manual_core_drive_enable", false);
-    manual_gas_gather_cycles_ = params.find<uint64_t>("manual_gas_gather_cycles", 200);
+    print_node_summary_ = cfg.print_node_summary;
+    primary_keepalive_ = cfg.primary_keepalive;
+    manual_core_drive_enable_ = cfg.manual_core_drive_enable;
+    manual_gas_gather_cycles_ = cfg.manual_gas_gather_cycles;
     
     // 权重验证参数
-    verify_weights_ = params.find<bool>("verify_weights", false);
-    weight_verify_samples_ = params.find<uint32_t>("weight_verify_samples", 16);
-    expected_weight_value_ = params.find<float>("expected_weight_value", 0.5f);
-    verify_log_each_sample_ = params.find<bool>("verify_log_each_sample", false);
+    verify_weights_ = cfg.verify_weights;
+    weight_verify_samples_ = cfg.weight_verify_samples;
+    expected_weight_value_ = cfg.expected_weight_value;
+    verify_log_each_sample_ = cfg.verify_log_each_sample;
     
     // 权重回退参数
-    use_event_weight_fallback_ = params.find<bool>("use_event_weight_fallback", false);
-    enable_memory_weights_ = params.find<bool>("enable_memory_weights", true);
-    write_weights_on_init_ = params.find<bool>("write_weights_on_init", true);
+    use_event_weight_fallback_ = cfg.use_event_weight_fallback;
+    enable_memory_weights_ = cfg.enable_memory_weights;
+    write_weights_on_init_ = cfg.write_weights_on_init;
 
     // 时间窗口化统计参数（默认关闭）
-    window_stats_enable_ = params.find<bool>("window_stats_enable", false);
-    window_us_ = params.find<uint64_t>("window_us", 20);
-    window_csv_ = params.find<std::string>("window_csv", "");
-    window_metrics_csv_ = params.find<std::string>("window_metrics_csv", "");
+    window_stats_enable_ = cfg.window_stats_enable;
+    window_us_ = cfg.window_us;
+    window_csv_ = cfg.window_csv;
+    window_metrics_csv_ = cfg.window_metrics_csv;
     window_ns_ = window_us_ * 1000ULL; // 1us = 1000ns（组件时钟1GHz，tick≈1ns）
-    diag_fire_log_ = params.find<bool>("diag_fire_log", false);
+    diag_fire_log_ = cfg.diag_fire_log;
 
     // Global Step/GAS barrier sync (Phase-step-sync)
-    global_step_sync_enable_ = params.find<bool>("global_step_sync_enable", false);
+    global_step_sync_enable_ = cfg.global_step_sync_enable;
     {
-        std::string pol = params.find<std::string>("global_step_done_policy", "endscatter");
-        std::transform(pol.begin(), pol.end(), pol.begin(),
-                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        std::string pol = cfg.global_step_done_policy;
         if (pol == "drain" || pol == "drain_based" || pol == "drainbased") {
             global_step_done_policy_ = GlobalStepDonePolicy::Drain;
         } else if (pol == "fixed" || pol == "fixed_cycles" || pol == "timer") {
@@ -204,58 +215,60 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
             global_step_done_policy_ = GlobalStepDonePolicy::EndScatter;
         }
     }
-    global_step_quiescent_min_cycles_ = params.find<uint64_t>("global_step_quiescent_min_cycles", 1);
-    if (global_step_quiescent_min_cycles_ == 0) global_step_quiescent_min_cycles_ = 1;
-    global_step_drain_min_cycles_ = params.find<uint64_t>("global_step_drain_min_cycles", 200);
-    if (global_step_drain_min_cycles_ == 0) global_step_drain_min_cycles_ = 1;
-    global_step_fixed_cycles_ = params.find<uint64_t>("global_step_fixed_cycles", 100000);
-    if (global_step_fixed_cycles_ == 0) global_step_fixed_cycles_ = 1;
+    global_step_quiescent_min_cycles_ = cfg.global_step_quiescent_min_cycles;
+    global_step_drain_min_cycles_ = cfg.global_step_drain_min_cycles;
+    global_step_fixed_cycles_ = cfg.global_step_fixed_cycles;
+    // Step-limited fairness: avoid starting step injection while WeightLoader/BCSR metadata is not ready.
+    // In naive_* (non-window) mode, issuing BCSR reads before loader/rowptr ready can enqueue millions of waiters.
+    loader_done_key_ = cfg.loader_done_key;
+    global_step_ready_delay_cycles_ = cfg.global_step_ready_delay_cycles;
+    wait_for_loader_done_ = (!loader_done_key_.empty());
+    loader_ready_latched_ = false;
+    loader_ready_cycle_ = 0;
+    if (wait_for_loader_done_) {
+        loader_done_shared_ = std::make_unique<SST::Shared::SharedArray<int>>();
+        loader_done_shared_->initialize(loader_done_key_, 1, 0);
+    }
 
     // Step-level random activation injection (Phase3-B): 下沉为独立子系统（MultiCorePE 仅转发 tick/阶段事件）
     {
         StepActivationSubsystem::Config step_cfg;
-        step_cfg.enable = params.find<bool>("step_activation_enable", false);
-        step_cfg.fraction = params.find<double>("step_activation_fraction", 0.0);
-        step_cfg.fanout = params.find<uint32_t>("step_activation_fanout", 0);
-        step_cfg.seed = params.find<uint64_t>("step_activation_seed", 0xdecafbadULL);
-        step_cfg.period_cycles = params.find<uint64_t>("step_activation_period_cycles", 0);
-        step_cfg.trigger_core = params.find<int>("step_activation_trigger_core", 0);
-        step_cfg.reset_mem_each_step = params.find<bool>("step_reset_mem_each_step", false);
-        step_cfg.event_weight = params.find<double>("step_activation_event_weight", 0.0);
-        step_cfg.use_bcsr_routes = params.find<bool>("step_activation_use_bcsr_routes", false);
-        step_cfg.bcsr_template = params.find<std::string>("step_activation_bcsr_template", "");
-        step_cfg.bcsr_rows_per_core = params.find<uint32_t>(
-            "step_activation_bcsr_rows_per_core", static_cast<uint32_t>(neurons_per_core_));
-        step_cfg.bcsr_br = params.find<uint32_t>("step_activation_bcsr_br", 16);
-        step_cfg.bcsr_bc = params.find<uint32_t>("step_activation_bcsr_bc", 16);
-        step_cfg.bcsr_idx_bytes = params.find<uint32_t>("step_activation_bcsr_idx_bytes", 2);
-        step_cfg.bcsr_val_bytes = params.find<uint32_t>("step_activation_bcsr_val_bytes", 4);
-        step_cfg.bcsr_rowptr_offset = params.find<uint64_t>("step_activation_bcsr_rowptr_offset", 0);
-        step_cfg.bcsr_colidx_offset = params.find<uint64_t>("step_activation_bcsr_colidx_offset", 0);
-        step_cfg.bcsr_blockdata_offset = params.find<uint64_t>("step_activation_bcsr_blockdata_offset", 0);
-        step_cfg.bcsr_blockids_offset = params.find<uint64_t>("step_activation_bcsr_blockids_offset", 0);
-        step_cfg.bcsr_weight_epsilon = params.find<double>("step_activation_bcsr_weight_epsilon", 0.0);
-        step_cfg.log_enable = params.find<bool>("step_activation_log_enable", false);
-        step_cfg.build_local_only = params.find<bool>("step_activation_build_local_only", true);
-        step_cfg.bcsr_align = params.find<uint64_t>("step_activation_bcsr_align", 64);
+        step_cfg.enable = cfg.step_activation_enable;
+        step_cfg.fraction = cfg.step_activation_fraction;
+        step_cfg.fanout = cfg.step_activation_fanout;
+        step_cfg.seed = cfg.step_activation_seed;
+        step_cfg.period_cycles = cfg.step_activation_period_cycles;
+        step_cfg.trigger_core = cfg.step_activation_trigger_core;
+        step_cfg.reset_mem_each_step = cfg.step_reset_mem_each_step;
+        step_cfg.event_weight = cfg.step_activation_event_weight;
+        step_cfg.use_bcsr_routes = cfg.step_activation_use_bcsr_routes;
+        step_cfg.bcsr_template = cfg.step_activation_bcsr_template;
+        step_cfg.bcsr_rows_per_core =
+            (cfg.step_activation_bcsr_rows_per_core > 0)
+                ? cfg.step_activation_bcsr_rows_per_core
+                : static_cast<uint32_t>(neurons_per_core_);
+        step_cfg.bcsr_br = cfg.step_activation_bcsr_br;
+        step_cfg.bcsr_bc = cfg.step_activation_bcsr_bc;
+        step_cfg.bcsr_idx_bytes = cfg.step_activation_bcsr_idx_bytes;
+        step_cfg.bcsr_val_bytes = cfg.step_activation_bcsr_val_bytes;
+        step_cfg.bcsr_rowptr_offset = cfg.step_activation_bcsr_rowptr_offset;
+        step_cfg.bcsr_colidx_offset = cfg.step_activation_bcsr_colidx_offset;
+        step_cfg.bcsr_blockdata_offset = cfg.step_activation_bcsr_blockdata_offset;
+        step_cfg.bcsr_blockids_offset = cfg.step_activation_bcsr_blockids_offset;
+        step_cfg.bcsr_weight_epsilon = cfg.step_activation_bcsr_weight_epsilon;
+        step_cfg.log_enable = cfg.step_activation_log_enable;
+        step_cfg.build_local_only = cfg.step_activation_build_local_only;
+        step_cfg.bcsr_align = cfg.step_activation_bcsr_align;
 
         // 通用 workload（例如 stream）下必须禁用 Step/Synapse 语义注入，否则会污染纯通信/纯内存负载。
         // 选择来源：优先 Params.workload_impl，其次环境变量 SNNDL_WORKLOAD_IMPL（保持脚本不改的兼容路径）。
-        {
-            std::string w = params.find<std::string>("workload_impl", "");
-            if (w.empty()) {
-                if (const char* env = workloadImplFromEnvCached()) w = std::string(env);
-            }
-            std::transform(w.begin(), w.end(), w.begin(),
-                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-            if (w == "stream" || w == "traffic") {
-                step_cfg.enable = false;
-                step_cfg.fraction = 0.0;
-                step_cfg.fanout = 0;
-                step_cfg.period_cycles = 0;
-                step_cfg.use_bcsr_routes = false;
-                step_cfg.bcsr_template.clear();
-            }
+        if (cfg.workload_impl == "stream" || cfg.workload_impl == "traffic") {
+            step_cfg.enable = false;
+            step_cfg.fraction = 0.0;
+            step_cfg.fanout = 0;
+            step_cfg.period_cycles = 0;
+            step_cfg.use_bcsr_routes = false;
+            step_cfg.bcsr_template.clear();
         }
 
         step_activation_subsys_.configure(step_cfg);
@@ -407,8 +420,8 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
         noc_subsys_.bindRuntime(noc_rt);
     }
     // 记录路径（若提供），用于派生输出目录
-    stage_events_csv_path_ = params.find<std::string>("stage_events_csv", "");
-    stats_csv_path_ = params.find<std::string>("stats_csv", "");
+    stage_events_csv_path_ = cfg.stage_events_csv_path;
+    stats_csv_path_ = cfg.stats_csv_path;
     
     // 关键修复：在构造函数中初始化网络接口，确保SST能在正确时机调用init()
     initializeNetworkInterface();
@@ -427,7 +440,7 @@ MultiCorePE::~MultiCorePE() {
 }
 
 void MultiCorePE::init(unsigned int phase) {
-    if (sentinel_enabled_ && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=%u enter\n", node_id_, phase); }
+    if (sentinel_enabled_ && output_) { output_->verbose(CALL_INFO, 2, 0, "[[sentinel-pe-init]] node=%d phase=%u enter\n", node_id_, phase); }
     if (phase == 0) {
         if (primary_keepalive_ || sim_stop_ns_ > 0) {
             registerAsPrimaryComponent();
@@ -436,10 +449,10 @@ void MultiCorePE::init(unsigned int phase) {
         // 阶段0：初始化基础组件和端口
         
         // 配置时钟
-        std::string clock_freq = "1GHz";  // 默认时钟频率
+        std::string clock_freq = clock_freq_;
         // 不需要单独的clock_handler_变量
         registerClock(clock_freq, new Clock::Handler2<MultiCorePE,&MultiCorePE::clockTick>(this));
-        if (sentinel_enabled_ && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=0 clock-registered\n", node_id_); }
+        if (sentinel_enabled_ && output_) { output_->verbose(CALL_INFO, 2, 0, "[[sentinel-pe-init]] node=%d phase=0 clock-registered\n", node_id_); }
         
         
         // 初始化统计收集
@@ -457,20 +470,20 @@ void MultiCorePE::init(unsigned int phase) {
                 output_->fatal(CALL_INFO, -1, "❌ 配置错误：global_step_sync_enable=1 但端口 gas_step_ctrl 未连接\n");
             }
         }
-        if (sentinel_enabled_ && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=0 links-configured\n", node_id_); }
+        if (sentinel_enabled_ && output_) { output_->verbose(CALL_INFO, 2, 0, "[[sentinel-pe-init]] node=%d phase=0 links-configured\n", node_id_); }
         
         
         // 初始化方向链路（用于端口代理机制）
         initializeDirectionLinks();
-        if (sentinel_enabled_ && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=0 dir-links\n", node_id_); }
+        if (sentinel_enabled_ && output_) { output_->verbose(CALL_INFO, 2, 0, "[[sentinel-pe-init]] node=%d phase=0 dir-links\n", node_id_); }
         
         // 初始化处理单元
         initializeProcessingUnits();
-        if (sentinel_enabled_ && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=0 units-initialized\n", node_id_); }
+        if (sentinel_enabled_ && output_) { output_->verbose(CALL_INFO, 2, 0, "[[sentinel-pe-init]] node=%d phase=0 units-initialized\n", node_id_); }
         
         // 初始化内部互连
         initializeInternalRing();
-        if (sentinel_enabled_ && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=0 ring-initialized\n", node_id_); }
+        if (sentinel_enabled_ && output_) { output_->verbose(CALL_INFO, 2, 0, "[[sentinel-pe-init]] node=%d phase=0 ring-initialized\n", node_id_); }
 
         // Phase4-A1.2：NoC 子系统后端装配（NIC / ring / legacy link）
         {
@@ -489,43 +502,43 @@ void MultiCorePE::init(unsigned int phase) {
         
         // 初始化多核控制器
         controller_ = new MultiCoreController(this, output_);
-        if (sentinel_enabled_ && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=0 controller-created\n", node_id_); }
+        if (sentinel_enabled_ && output_) { output_->verbose(CALL_INFO, 2, 0, "[[sentinel-pe-init]] node=%d phase=0 controller-created\n", node_id_); }
         
 
         // 将当前phase转发给所有子核心
         for (auto* core : cores_) {
             if (core) core->init(phase);
         }
-        if (sentinel_enabled_ && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=0 cores-init-done\n", node_id_); }
+        if (sentinel_enabled_ && output_) { output_->verbose(CALL_INFO, 2, 0, "[[sentinel-pe-init]] node=%d phase=0 cores-init-done\n", node_id_); }
         
         // 关键修复：转发init到网络接口
         if (external_nic_) {
             external_nic_->init(phase);
         }
-        if (sentinel_enabled_ && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=0 nic-init-done\n", node_id_); }
+        if (sentinel_enabled_ && output_) { output_->verbose(CALL_INFO, 2, 0, "[[sentinel-pe-init]] node=%d phase=0 nic-init-done\n", node_id_); }
         // 标记 Step 注入就绪（保证 NIC 已完成 init）
         step_activation_subsys_.setInjectionReady(true);
     }
     else if (phase == 1) {
-        if (sentinel_enabled_ && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=1 enter\n", node_id_); }
+        if (sentinel_enabled_ && output_) { output_->verbose(CALL_INFO, 2, 0, "[[sentinel-pe-init]] node=%d phase=1 enter\n", node_id_); }
         // 阶段1：加载权重和配置子组件
         loadAndDistributeWeights();
-        if (sentinel_enabled_ && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=1 weights-loaded\n", node_id_); }
+        if (sentinel_enabled_ && output_) { output_->verbose(CALL_INFO, 2, 0, "[[sentinel-pe-init]] node=%d phase=1 weights-loaded\n", node_id_); }
 
         // 将当前phase转发给所有子核心
         for (auto* core : cores_) {
             if (core) core->init(phase);
         }
-        if (sentinel_enabled_ && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=1 cores-init-done\n", node_id_); }
+        if (sentinel_enabled_ && output_) { output_->verbose(CALL_INFO, 2, 0, "[[sentinel-pe-init]] node=%d phase=1 cores-init-done\n", node_id_); }
         
         // 转发init到网络接口
         if (external_nic_) {
             external_nic_->init(phase);
         }
-        if (sentinel_enabled_ && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=1 nic-init-done\n", node_id_); }
+        if (sentinel_enabled_ && output_) { output_->verbose(CALL_INFO, 2, 0, "[[sentinel-pe-init]] node=%d phase=1 nic-init-done\n", node_id_); }
     }
     else {
-        if (sentinel_enabled_ && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=%u forward-only\n", node_id_, phase); }
+        if (sentinel_enabled_ && output_) { output_->verbose(CALL_INFO, 2, 0, "[[sentinel-pe-init]] node=%d phase=%u forward-only\n", node_id_, phase); }
         // 其余phase同样转发
         for (auto* core : cores_) {
             if (core) core->init(phase);
@@ -535,7 +548,7 @@ void MultiCorePE::init(unsigned int phase) {
         if (external_nic_) {
             external_nic_->init(phase);
         }
-        if (sentinel_enabled_ && output_) { output_->output("[[sentinel-pe-init]] node=%d phase=%u done\n", node_id_, phase); }
+        if (sentinel_enabled_ && output_) { output_->verbose(CALL_INFO, 2, 0, "[[sentinel-pe-init]] node=%d phase=%u done\n", node_id_, phase); }
     }
 }
 
@@ -552,7 +565,7 @@ void MultiCorePE::complete(unsigned int phase) {
 }
 
 void MultiCorePE::setup() {
-    if (sentinel_enabled_ && output_) { output_->output("[[sentinel-pe-setup]] node=%d enter\n", node_id_); }
+    if (sentinel_enabled_ && output_) { output_->verbose(CALL_INFO, 2, 0, "[[sentinel-pe-setup]] node=%d enter\n", node_id_); }
     
     // 验证所有组件初始化完成
     if (cores_.size() != static_cast<size_t>(num_cores_)) {
@@ -569,23 +582,28 @@ void MultiCorePE::setup() {
     for (auto* core : cores_) {
         if (core) core->setup();
     }
-    if (sentinel_enabled_ && output_) { output_->output("[[sentinel-pe-setup]] node=%d cores-setup\n", node_id_); }
+    if (sentinel_enabled_ && output_) { output_->verbose(CALL_INFO, 2, 0, "[[sentinel-pe-setup]] node=%d cores-setup\n", node_id_); }
     
     // 调用网络接口的setup
     if (external_nic_) {
         external_nic_->setup();
     }
-    if (sentinel_enabled_ && output_) { output_->output("[[sentinel-pe-setup]] node=%d nic-setup\n", node_id_); }
+    if (sentinel_enabled_ && output_) { output_->verbose(CALL_INFO, 2, 0, "[[sentinel-pe-setup]] node=%d nic-setup\n", node_id_); }
     
     if (!controller_) {
         output_->fatal(CALL_INFO, -1, "❌ 错误: 多核控制器未初始化\n");
     }
 
     global_step_sync_ready_ = true;
+    // Step barrier readiness:
+    // - default: send PE_READY at setup (legacy behavior)
+    // - if loader_done_key is provided: delay PE_READY until WeightLoader publishes done (prevents naive_* blowups)
     if (global_step_sync_enable_ && gas_step_ctrl_link_ && !global_step_ready_sent_) {
-        auto* ev = new GasStepBarrierEvent(GasStepBarrierOp::PeReady, /*seq*/0, static_cast<uint32_t>(node_id_));
-        gas_step_ctrl_link_->send(ev);
-        global_step_ready_sent_ = true;
+        if (!wait_for_loader_done_) {
+            auto* ev = new GasStepBarrierEvent(GasStepBarrierOp::PeReady, /*seq*/0, static_cast<uint32_t>(node_id_));
+            gas_step_ctrl_link_->send(ev);
+            global_step_ready_sent_ = true;
+        }
     }
     
     // 打印组件配置摘要
@@ -603,7 +621,7 @@ void MultiCorePE::finish() {
         global_step_active_seq_ != 0 && !global_step_done_sent_) {
         size_t done_cnt = 0;
         for (auto v : global_step_done_cores_) if (v) ++done_cnt;
-        output_->output(
+        output_->verbose(CALL_INFO, 2, 0,
             "[[sentinel-step-sync]] node=%d finish_incomplete active_seq=%u done=%zu/%d\n",
             node_id_, global_step_active_seq_, done_cnt, num_cores_);
         for (int i = 0; i < num_cores_; ++i) {
@@ -620,20 +638,28 @@ void MultiCorePE::finish() {
                 (idx < global_step_last_stage_ts_ns_.size()) ? global_step_last_stage_ts_ns_[idx] : 0;
             const uint64_t spikes =
                 (idx < global_step_last_stage_spikes_.size()) ? global_step_last_stage_spikes_[idx] : 0;
-            output_->output(
+            output_->verbose(CALL_INFO, 2, 0,
                 "[[sentinel-step-sync]] node=%d finish_core core=%d last=%s seq=%u ts_ns=%" PRIu64 " spikes=%" PRIu64 "\n",
                 node_id_, i, stepStageCodeName_(code), seq, (uint64_t)ts, (uint64_t)spikes);
         }
     }
-    // 输出 PE 级 per-window 发放聚合（与 stage_events 同目录）
-    if (!window_spikes_pe_.empty()) {
+    auto resolve_out_dir = [this]() -> std::string {
         std::string ref = stage_events_csv_path_;
         if (ref.empty()) ref = stats_csv_path_;
-        std::string dir = ".";
         if (!ref.empty()) {
             auto pos = ref.find_last_of('/');
-            dir = (pos==std::string::npos) ? std::string(".") : ref.substr(0,pos);
+            return (pos == std::string::npos) ? std::string(".") : ref.substr(0, pos);
         }
+        // No explicit output path: avoid multi-node overwrite by defaulting to per-node dir in CWD.
+        std::string dir = defaultPeOutDir_(node_id_);
+        if (!ensureDirExists_(dir)) return std::string(".");
+        return dir;
+    };
+
+    // 输出 PE 级 per-window 发放聚合（与 stage_events 同目录）
+    if (!window_spikes_pe_.empty()) {
+        std::string dir = resolve_out_dir();
+        // 文件名必须保持稳定：上游分析脚本默认查找 pe*/pe_window_spikes_db.csv
         std::string path = dir + "/pe_window_spikes_db.csv";
         std::ofstream fout(path);
         if (fout.good()) {
@@ -646,13 +672,8 @@ void MultiCorePE::finish() {
     }
     // 输出 PE 级阶段事件CSV（与 pe_window_spikes_db.csv 同目录）
     if (!stage_marks_.empty()) {
-        std::string ref = stage_events_csv_path_;
-        if (ref.empty()) ref = stats_csv_path_;
-        std::string dir = ".";
-        if (!ref.empty()) {
-            auto pos = ref.find_last_of('/');
-            dir = (pos==std::string::npos) ? std::string(".") : ref.substr(0,pos);
-        }
+        std::string dir = resolve_out_dir();
+        // 文件名必须保持稳定：上游分析脚本默认查找 pe*/pe_stage_events_db.csv
         std::string pathA = dir + "/pe_stage_events_db.csv";
         std::ofstream fout(pathA);
         if (fout.good()) {
@@ -740,8 +761,9 @@ void MultiCorePE::finish() {
         const uint64_t spike_overflow = (!noc_lat_spike_hist_.empty()) ? noc_lat_spike_hist_.back() : 0;
         const uint64_t sk_overflow = (!noc_lat_spikekey_hist_.empty()) ? noc_lat_spikekey_hist_.back() : 0;
 
+        // Noc end-to-end latency summary is a diagnostic; keep default runs quiet.
         output_->verbose(
-            CALL_INFO, 0, 0,
+            CALL_INFO, 1, 0,
             "[noc-lat] node=%d spike_cnt=%" PRIu64 " spike_lat_sum=%" PRIu64 " spike_lat_max=%" PRIu64
             " spike_avg=%.3f spike_p50=%" PRIu64 " spike_p95=%" PRIu64 " spike_p99=%" PRIu64
             " spikekey_cnt=%" PRIu64 " spikekey_lat_sum=%" PRIu64 " spikekey_lat_max=%" PRIu64
@@ -807,6 +829,58 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
         if (node_ok && current_cycle_ > 0 && (static_cast<uint64_t>(current_cycle_) % progress_log_interval_ns_ == 0)) {
             PE_LOG(0, "[progress] node=%d cyc=%" PRIu64 " extq=%zu\n",
                    node_id_, (uint64_t)current_cycle_, noc_subsys_.incomingQueueSize());
+        }
+    }
+
+    // Step barrier readiness gating (loader_done_key):
+    // Avoid starting step-limited injections before WeightLoader/BCSR rowptr prefetch can proceed.
+    if (global_step_sync_enable_ && global_step_sync_ready_ && gas_step_ctrl_link_ && !global_step_ready_sent_ && wait_for_loader_done_) {
+        // Diagnostic (targeted): if step-limited hangs under MPI partitioning, the most common cause is that
+        // WeightLoader and MultiCorePE are placed on different ranks, making SharedArray-based loader_done
+        // gating invisible. Keep this extremely low-noise: only PE0 prints, rate-limited.
+        static uint32_t diag_wait_prints = 0;
+        if (!loader_ready_latched_) {
+            const uint64_t now = static_cast<uint64_t>(current_cycle_);
+            if (output_ && node_id_ == 0 && verbose_ >= 1 && (now % 10000u) == 0u && diag_wait_prints < 16u) {
+                output_->verbose(
+                    CALL_INFO, 1, 0,
+                    "[[sentinel-step-sync]] node=%d waiting loader_done_key=%s shared_init=%d shared_ptr=%p\n",
+                    node_id_,
+                    loader_done_key_.c_str(),
+                    (loader_done_shared_ ? 1 : 0),
+                    (void*)loader_done_shared_.get());
+                diag_wait_prints += 1;
+            }
+        }
+        if (!loader_ready_latched_) {
+            if (loader_done_shared_ && loader_done_shared_->size() > 0) {
+                const int ready = loader_done_shared_->mutex_read(0);
+                if (ready != 0) {
+                    loader_ready_latched_ = true;
+                    loader_ready_cycle_ = static_cast<uint64_t>(current_cycle_);
+                    if (output_ && node_id_ == 0 && verbose_ >= 1) {
+                        output_->verbose(
+                            CALL_INFO, 1, 0,
+                            "[[sentinel-step-sync]] node=%d loader_done latched (ready=%d) at cyc=%" PRIu64 "\n",
+                            node_id_, ready, (uint64_t)loader_ready_cycle_);
+                    }
+                }
+            }
+        }
+        if (loader_ready_latched_) {
+            const uint64_t now = static_cast<uint64_t>(current_cycle_);
+            const uint64_t since = (now >= loader_ready_cycle_) ? (now - loader_ready_cycle_) : 0;
+            if (global_step_ready_delay_cycles_ == 0 || since >= global_step_ready_delay_cycles_) {
+                auto* ev = new GasStepBarrierEvent(GasStepBarrierOp::PeReady, /*seq*/0, static_cast<uint32_t>(node_id_));
+                gas_step_ctrl_link_->send(ev);
+                global_step_ready_sent_ = true;
+                if (output_ && node_id_ == 0 && verbose_ >= 1) {
+                    output_->verbose(
+                        CALL_INFO, 1, 0,
+                        "[[sentinel-step-sync]] node=%d send PE_READY after loader_done (since=%" PRIu64 " delay=%" PRIu64 ")\n",
+                        node_id_, (uint64_t)since, (uint64_t)global_step_ready_delay_cycles_);
+                }
+            }
         }
     }
 
@@ -948,7 +1022,7 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
                 global_step_done_sent_ = true;
                 if (stat_global_steps_done_total_) stat_global_steps_done_total_->addData(1);
                 if (sentinel_enabled_ && output_ && global_step_active_seq_ == 1) {
-                    output_->output(
+                    output_->verbose(CALL_INFO, 2, 0,
                         "[[sentinel-step-sync]] node=%d send PE_DONE(fixed_cycles) seq=%u since_begin=%" PRIu64 "\n",
                         node_id_, global_step_active_seq_, (uint64_t)since_begin);
                 }
@@ -1011,7 +1085,7 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
                     const uint64_t quiet_dbg = (now >= global_step_last_activity_cycle_)
                         ? (now - global_step_last_activity_cycle_)
                         : 0;
-                    output_->output(
+                    output_->verbose(CALL_INFO, 2, 0,
                         "[[sentinel-step-drain]] node=%d seq=%u injected=%d stage=%d all_es=%d noc_idle=%d inq=%zu ring=%d nic_pending=%zu quiet=%" PRIu64 " min=%" PRIu64 "\n",
                         node_id_,
                         global_step_active_seq_,
@@ -1042,7 +1116,7 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
                     global_step_done_sent_ = true;
                     if (stat_global_steps_done_total_) stat_global_steps_done_total_->addData(1);
                     if (sentinel_enabled_ && output_ && global_step_active_seq_ == 1) {
-                        output_->output(
+                        output_->verbose(CALL_INFO, 2, 0,
                             "[[sentinel-step-sync]] node=%d send PE_DONE(drain) seq=%u quiet=%" PRIu64 " (min=%" PRIu64 ")\n",
                             node_id_, global_step_active_seq_, (uint64_t)quiet, (uint64_t)global_step_drain_min_cycles_);
                     }
@@ -1073,7 +1147,7 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
                     global_step_done_sent_ = true;
                     if (stat_global_steps_done_total_) stat_global_steps_done_total_->addData(1);
                     if (sentinel_enabled_ && output_ && global_step_active_seq_ == 1) {
-                        output_->output(
+                        output_->verbose(CALL_INFO, 2, 0,
                             "[[sentinel-step-sync]] node=%d send PE_DONE(quiescent) seq=%u quiet=%" PRIu64 "\n",
                             node_id_, global_step_active_seq_, (uint64_t)quiet);
                     }
@@ -1108,7 +1182,7 @@ void MultiCorePE::handleGasStepCtrlEvent(SST::Event* ev) {
         global_step_pending_seq_ = msg->seq;
         global_step_start_pending_ = true;
         if (sentinel_enabled_ && output_ && node_id_ == 0) {
-            output_->output("[[sentinel-step-sync]] node=%d recv START_STEP seq=%u\n", node_id_, msg->seq);
+            output_->verbose(CALL_INFO, 2, 0, "[[sentinel-step-sync]] node=%d recv START_STEP seq=%u\n", node_id_, msg->seq);
         }
     }
     delete msg;
@@ -1136,9 +1210,9 @@ void MultiCorePE::beginGlobalStep_(uint32_t seq) {
         std::fill(global_step_last_stage_spikes_.begin(), global_step_last_stage_spikes_.end(), 0);
     }
 
-    // Step Random Activation：在全局 step 同步下，以 START_STEP(seq) 作为统一触发点（每 step 一次）。
-    step_activation_subsys_.onGlobalStepStart(seq, getCurrentSimTimeNano());
-
+    // 全局 step 同步：先让所有 core 进入 step（打开 Gather/窗口门控），再注入本 step 的 stimulus。
+    // 否则注入可能发生在 core 仍处于 Idle 时，导致 recordEdge 被 gate 掉（Idle 默认不记录），
+    // 进而出现 GAS 未读全权重/Apply 仅发出少量读请求（microbench 会被严重低估）。
     for (int i = 0; i < num_cores_; ++i) {
         auto* core = cores_[i];
         if (!core) {
@@ -1151,12 +1225,17 @@ void MultiCorePE::beginGlobalStep_(uint32_t seq) {
             return;
         }
         if (sentinel_enabled_ && output_ && seq == 1) {
-            output_->output("[[sentinel-step-sync]] node=%d call onGlobalStepStart core=%d seq=%u\n", node_id_, i, seq);
+            output_->verbose(CALL_INFO, 2, 0, "[[sentinel-step-sync]] node=%d call onGlobalStepStart core=%d seq=%u\n", node_id_, i, seq);
         }
         hook->onGlobalStepStart(seq);
     }
+
+    // Step Random Activation：在全局 step 同步下，以 START_STEP(seq) 作为统一触发点（每 step 一次）。
+    // 注意：必须在 core 进入 step 后再注入，确保所有触发的 spike 归属到本 step 的 Gather。
+    step_activation_subsys_.onGlobalStepStart(seq, getCurrentSimTimeNano());
+
     if (sentinel_enabled_ && output_ && seq == 1) {
-        output_->output("[[sentinel-step-sync]] node=%d beginGlobalStep seq=%u cores=%d\n", node_id_, seq, num_cores_);
+        output_->verbose(CALL_INFO, 2, 0, "[[sentinel-step-sync]] node=%d beginGlobalStep seq=%u cores=%d\n", node_id_, seq, num_cores_);
     }
 }
 
@@ -1366,7 +1445,7 @@ void MultiCorePE::notifyStageEvent(uint32_t seq, const std::string& event, uint6
         global_step_sync_enable_ &&
         seq == global_step_active_seq_ &&
         (event == "BeginGather" || event == "BeginApply" || event == "EndScatter")) {
-        output_->output(
+        output_->verbose(CALL_INFO, 2, 0,
             "[[sentinel-step-sync]] node=%d stage=%s core=%d seq=%u ts_ns=%" PRIu64 " spikes=%" PRIu64 "\n",
             node_id_, event.c_str(), core_id, seq, (uint64_t)ts_ns, (uint64_t)spikes_emitted);
     }
@@ -1390,7 +1469,7 @@ void MultiCorePE::notifyStageEvent(uint32_t seq, const std::string& event, uint6
             if (sentinel_enabled_ && output_ && seq == 1) {
                 size_t done_cnt = 0;
                 for (auto v : global_step_done_cores_) if (v) ++done_cnt;
-                output_->output(
+                output_->verbose(CALL_INFO, 2, 0,
                     "[[sentinel-step-sync]] node=%d mark EndScatter core=%d seq=%u active=%u done=%zu/%d\n",
                     node_id_, core_id, seq, global_step_active_seq_, done_cnt, num_cores_);
             }
@@ -1404,7 +1483,7 @@ void MultiCorePE::notifyStageEvent(uint32_t seq, const std::string& event, uint6
                 global_step_done_sent_ = true;
                 if (stat_global_steps_done_total_) stat_global_steps_done_total_->addData(1);
                 if (sentinel_enabled_ && output_ && seq == 1) {
-                    output_->output("[[sentinel-step-sync]] node=%d send PE_DONE seq=%u\n", node_id_, seq);
+                    output_->verbose(CALL_INFO, 2, 0, "[[sentinel-step-sync]] node=%d send PE_DONE seq=%u\n", node_id_, seq);
                 }
             }
         }
@@ -1479,10 +1558,14 @@ void MultiCorePE::initializeProcessingUnits() {
         // 创建SnnPE SubComponent参数
         Params core_params;
         core_params.insert("core_id", std::to_string(i));
-        // ★ 修正：每个核心需要能够接受整个PE的神经元范围，而不是只接受自己的4个神经元
-        // 这样可以避免"无法映射的目标神经元"错误
-        core_params.insert("num_neurons", std::to_string(num_cores_ * neurons_per_core_));
-        core_params.insert("global_neuron_base", std::to_string(global_neuron_base_));
+        // 默认口径：每个 core 只负责自身的 neurons_per_core（global_neuron_base 由 core 偏移决定）
+        core_params.insert("num_neurons", std::to_string(neurons_per_core_));
+        core_params.insert("neurons_per_pe", std::to_string(neurons_per_pe_cfg_));
+        core_params.insert("total_cores", std::to_string(num_cores_));
+        core_params.insert("total_nodes", std::to_string(total_nodes_));
+        core_params.insert(
+            "global_neuron_base",
+            std::to_string(static_cast<uint64_t>(global_neuron_base_) + static_cast<uint64_t>(i) * static_cast<uint64_t>(neurons_per_core_)));
         core_params.insert("v_thresh", std::to_string(v_thresh_));
         core_params.insert("v_reset", std::to_string(v_reset_));
         core_params.insert("v_rest", std::to_string(v_rest_));
@@ -2027,391 +2110,6 @@ void MultiCorePE::resetAllCoreMembranes() {
     }
 }
 
-#if 0
-// Phase3-B: StepActivationSubsystem 已接管 Step 注入与 BCSR 路由解析；
-// 下面的旧实现仅保留作参考，避免中途回滚时丢失上下文。
-std::string MultiCorePE::formatBcsrPath_(int pe, int core) const {
-    if (step_activation_bcsr_template_.empty()) return std::string();
-    std::string path = step_activation_bcsr_template_;
-    // replace {pe[:width]}
-    auto posp = path.find("{pe");
-    if (posp != std::string::npos) {
-        auto endp = path.find('}', posp);
-        if (endp == std::string::npos) return std::string();
-        int widthp = 0;
-        auto colonp = path.find(':', posp);
-        if (colonp != std::string::npos && colonp < endp) {
-            auto spec_endp = path.find_first_of("diu", colonp);
-            if (spec_endp != std::string::npos && spec_endp < endp) {
-                std::string width_str = path.substr(colonp + 1, spec_endp - colonp - 1);
-                widthp = std::atoi(width_str.c_str());
-            }
-        }
-        std::ostringstream ossp;
-        if (widthp > 0) {
-            ossp << std::setfill('0') << std::setw(widthp);
-        }
-        ossp << pe;
-        path.replace(posp, endp - posp + 1, ossp.str());
-    }
-    auto pos = path.find("{core");
-    if (pos == std::string::npos) return path;
-    auto end = path.find('}', pos);
-    if (end == std::string::npos) return std::string();
-    int width = 0;
-    auto colon = path.find(':', pos);
-    if (colon != std::string::npos && colon < end) {
-        auto spec_end = path.find_first_of("diu", colon);
-        if (spec_end != std::string::npos && spec_end < end) {
-            std::string width_str = path.substr(colon + 1, spec_end - colon - 1);
-            width = std::atoi(width_str.c_str());
-        }
-    }
-    std::ostringstream oss;
-    if (width > 0) {
-        oss << std::setfill('0') << std::setw(width);
-    }
-    oss << core;
-    path.replace(pos, end - pos + 1, oss.str());
-    return path;
-}
-
-bool MultiCorePE::computeBcsrOffsets_(uint32_t n_block_rows, uint32_t total_blocks,
-                                      uint64_t block_bytes,
-                                      uint64_t& rowptr_offset, uint64_t& colidx_offset,
-                                      uint64_t& blockdata_offset, uint64_t& blockids_offset) const {
-    const uint64_t align = step_activation_bcsr_align_ ? step_activation_bcsr_align_ : 64;
-    // rowptr_offset 由调用方给出（默认 0）；其余段偏移必须依赖 total_blocks，因而需要对每个 core 重新计算。
-    colidx_offset = alignUp_(rowptr_offset + (uint64_t)(n_block_rows + 1) * sizeof(uint32_t), align);
-    blockdata_offset = alignUp_(colidx_offset + (uint64_t)total_blocks * step_activation_bcsr_idx_bytes_, align);
-    blockids_offset  = alignUp_(blockdata_offset + (uint64_t)total_blocks * block_bytes, align);
-    return true;
-}
-
-bool MultiCorePE::checkBcsrOffsets_(uint64_t file_size, uint32_t n_block_rows,
-                                    uint32_t total_blocks, uint64_t block_bytes,
-                                    uint64_t& rowptr_offset, uint64_t& colidx_offset,
-                                    uint64_t& blockdata_offset, uint64_t& blockids_offset) const {
-    auto valid = [&](uint64_t off) { return off < file_size; };
-    if (!valid(rowptr_offset) || !valid(colidx_offset) ||
-        !valid(blockdata_offset) || !valid(blockids_offset)) {
-        computeBcsrOffsets_(n_block_rows, total_blocks, block_bytes,
-                            rowptr_offset, colidx_offset, blockdata_offset, blockids_offset);
-    }
-    if (rowptr_offset >= file_size) return false;
-    if (colidx_offset >= file_size) return false;
-    if (blockdata_offset >= file_size) return false;
-    if (blockids_offset >= file_size) return false;
-    const uint64_t need_rowptr = (uint64_t)(n_block_rows + 1) * sizeof(uint32_t);
-    const uint64_t need_colidx = (uint64_t)total_blocks * step_activation_bcsr_idx_bytes_;
-    const uint64_t need_block  = (uint64_t)total_blocks * block_bytes;
-    if (rowptr_offset + need_rowptr > file_size) return false;
-    if (colidx_offset + need_colidx > file_size) return false;
-    if (blockdata_offset + need_block > file_size) return false;
-    if (blockids_offset + need_block > file_size) return false;
-    return true;
-}
-
-uint64_t MultiCorePE::alignUp_(uint64_t value, uint64_t align) const {
-    if (align == 0) return value;
-    uint64_t rem = value % align;
-    return rem ? (value + align - rem) : value;
-}
-
-bool MultiCorePE::buildRoutesFromBcsrFile_(const std::string& path, uint32_t pe_id, uint32_t core_index) {
-    const uint32_t rows_per_core = step_activation_bcsr_rows_per_core_;
-    const uint32_t br = step_activation_bcsr_br_ ? step_activation_bcsr_br_ : 16;
-    const uint32_t bc = step_activation_bcsr_bc_ ? step_activation_bcsr_bc_ : 16;
-    const uint32_t n_block_rows = (rows_per_core + br - 1) / br;
-    const size_t floats_per_block = static_cast<size_t>(br) * static_cast<size_t>(bc);
-    const uint32_t neurons_per_pe = static_cast<uint32_t>(neurons_per_core_) * static_cast<uint32_t>(num_cores_);
-    const uint32_t local_pre_begin = (neurons_per_pe > 0) ? static_cast<uint32_t>(node_id_) * neurons_per_pe : 0u;
-    const uint32_t local_pre_end = local_pre_begin + neurons_per_pe;
-    const uint32_t max_global = (total_nodes_ > 0 && neurons_per_pe > 0)
-        ? static_cast<uint32_t>(total_nodes_) * neurons_per_pe
-        : 0u;
-
-    std::ifstream fin(path, std::ios::binary);
-    if (!fin.good()) {
-        output_->verbose(CALL_INFO, 0, 0, "⚠️ 无法读取BCSR文件: %s\n", path.c_str());
-        return false;
-    }
-
-    // 文件大小与可用区间检查，防止越界读取
-    fin.seekg(0, std::ios::end);
-    const std::streamoff file_size = fin.tellg();
-    fin.clear();
-    fin.seekg(0, std::ios::beg);
-    uint64_t rowptr_off = step_activation_bcsr_rowptr_offset_;
-    uint64_t colidx_off = 0;
-    uint64_t blockdata_off = 0;
-    uint64_t blockids_off = 0;
-    const uint64_t bytes_per_block_data = floats_per_block * sizeof(float);
-
-    // 读取 rowptr（必须完整读到 n_block_rows+1；total_blocks 由 rowptr.back() 给出，且每个 core 可能不同）
-    fin.seekg(static_cast<std::streamoff>(rowptr_off), std::ios::beg);
-    const uint64_t want_rowptr_bytes = (uint64_t)(n_block_rows + 1) * sizeof(uint32_t);
-    if (rowptr_off >= static_cast<uint64_t>(file_size) || rowptr_off + want_rowptr_bytes > static_cast<uint64_t>(file_size)) {
-        output_->verbose(CALL_INFO, 0, 0, "⚠️ rowptr区域不足: off=%llu need=%" PRIu64 " file=%lld path=%s\n",
-                         (unsigned long long)rowptr_off, (uint64_t)want_rowptr_bytes, (long long)file_size, path.c_str());
-        return false;
-    }
-    std::vector<uint32_t> rowptr(n_block_rows + 1, 0);
-    fin.read(reinterpret_cast<char*>(rowptr.data()), rowptr.size() * sizeof(uint32_t));
-    if (!fin.good()) {
-        output_->verbose(CALL_INFO, 0, 0, "⚠️ 读取rowptr失败: %s\n", path.c_str());
-        return false;
-    }
-    const uint32_t total_blocks_rowptr = rowptr.back();
-    const uint32_t total_blocks = total_blocks_rowptr;
-    if (total_blocks == 0u) {
-        output_->verbose(CALL_INFO, 0, 0,
-            "⚠️ total_blocks=0 (rowptr.back==0) path=%s\n",
-            path.c_str());
-        return false;
-    }
-    // 对每个 core 用 total_blocks 重新计算 offset；不要使用“全局固定 offset”（total_blocks 会随 core 波动）。
-    computeBcsrOffsets_(n_block_rows, total_blocks, bytes_per_block_data,
-                        rowptr_off, colidx_off, blockdata_off, blockids_off);
-    if (!checkBcsrOffsets_((uint64_t)file_size, n_block_rows, total_blocks,
-                           bytes_per_block_data,
-                           rowptr_off, colidx_off, blockdata_off, blockids_off)) {
-        if (!step_activation_route_warned_) {
-            output_->verbose(CALL_INFO, 0, 0,
-                "⚠️ BCSR offsets/size mismatch: node=%d path=%s fsize=%lld blocks(rowptr)=%u br=%u bc=%u idxB=%u valB=%u (recomputed: rowptr=%llu colidx=%llu blockdata=%llu blockids=%llu)\n",
-                node_id_, path.c_str(), (long long)file_size, total_blocks_rowptr, br, bc,
-                step_activation_bcsr_idx_bytes_, step_activation_bcsr_val_bytes_,
-                (unsigned long long)rowptr_off, (unsigned long long)colidx_off,
-                (unsigned long long)blockdata_off, (unsigned long long)blockids_off);
-        }
-        return false;
-    }
-
-    std::vector<uint32_t> block_cols(total_blocks, 0);
-    // 读取 colidx（按 total_blocks 截断）
-    fin.seekg(static_cast<std::streamoff>(colidx_off), std::ios::beg);
-    if (step_activation_bcsr_idx_bytes_ == 2) {
-        std::vector<uint16_t> tmp(total_blocks, 0);
-        fin.read(reinterpret_cast<char*>(tmp.data()), tmp.size() * sizeof(uint16_t));
-        if (!fin.good()) {
-            output_->verbose(CALL_INFO, 0, 0, "⚠️ 读取colidx(2B)失败: %s blocks=%u\n", path.c_str(), total_blocks);
-            return false;
-        }
-        for (uint32_t i = 0; i < total_blocks; ++i) block_cols[i] = tmp[i];
-    } else {
-        fin.read(reinterpret_cast<char*>(block_cols.data()), block_cols.size() * sizeof(uint32_t));
-        if (!fin.good()) {
-            output_->verbose(CALL_INFO, 0, 0, "⚠️ 读取colidx(4B)失败: %s blocks=%u\n", path.c_str(), total_blocks);
-            return false;
-        }
-    }
-
-    std::ifstream fdata(path, std::ios::binary);
-    std::ifstream fids(path, std::ios::binary);
-    fdata.seekg(static_cast<std::streamoff>(blockdata_off), std::ios::beg);
-    fids.seekg(static_cast<std::streamoff>(blockids_off), std::ios::beg);
-    std::vector<float> blockdata(floats_per_block, 0.0f);
-    std::vector<uint32_t> blockids(floats_per_block, 0u);
-
-    uint32_t block_index = 0;
-    uint64_t skipped_blocks = 0;
-    auto flush_skips = [&](uint64_t n) -> bool {
-        if (n == 0) return true;
-        const uint64_t data_skip = n * bytes_per_block_data;
-        const uint64_t ids_skip  = n * bytes_per_block_ids;
-        fdata.seekg(static_cast<std::streamoff>(data_skip), std::ios::cur);
-        fids.seekg(static_cast<std::streamoff>(ids_skip), std::ios::cur);
-        if (!fdata.good() || !fids.good()) {
-            output_->verbose(CALL_INFO, 0, 0,
-                "⚠️ BCSR seek skip failed: %s skip_blocks=%" PRIu64 "\n",
-                path.c_str(), (uint64_t)n);
-            return false;
-        }
-        return true;
-    };
-    for (uint32_t block_row = 0; block_row < n_block_rows; ++block_row) {
-        if ((size_t)block_row + 1 >= rowptr.size()) break;
-        uint32_t begin = rowptr[block_row];
-        uint32_t end = rowptr[block_row + 1];
-        if (begin >= total_blocks) break;
-        if (end > total_blocks) end = total_blocks;
-        for (uint32_t idx = begin; idx < end; ++idx, ++block_index) {
-            if (block_index >= total_blocks) break;
-            uint32_t block_col = block_cols[idx];
-            // 关键优化：本节点只需要本地 pre 的出边；跳过不属于本节点 pre 区间的 block，
-            // 避免对所有 block 读取 blockdata/blockids 再在内层过滤（可节省约 total_nodes 倍开销）。
-            const uint64_t pre_block_begin = static_cast<uint64_t>(block_col) * static_cast<uint64_t>(bc);
-            const uint64_t pre_block_end = pre_block_begin + static_cast<uint64_t>(bc);
-            const bool overlap_local = (neurons_per_pe > 0) &&
-                !(pre_block_end <= (uint64_t)local_pre_begin || pre_block_begin >= (uint64_t)local_pre_end);
-            if (!overlap_local) {
-                ++skipped_blocks;
-                continue;
-            }
-            if (!flush_skips(skipped_blocks)) return false;
-            skipped_blocks = 0;
-
-            fdata.read(reinterpret_cast<char*>(blockdata.data()), blockdata.size() * sizeof(float));
-            fids.read(reinterpret_cast<char*>(blockids.data()), blockids.size() * sizeof(uint32_t));
-            if (!fdata.good() || !fids.good()) {
-                output_->verbose(CALL_INFO, 0, 0,
-                    "⚠️ 读取block数据失败: %s (block_index=%u/%u, fsize=%lld)\n",
-                    path.c_str(), block_index, total_blocks, (long long)file_size);
-                return false;
-            }
-
-            // 守卫 block_col * bc + cc 不越界
-            if (block_col >= std::numeric_limits<uint32_t>::max() / bc) {
-                continue;
-            }
-            const uint32_t pre_base = static_cast<uint32_t>(pre_block_begin);
-            for (uint32_t rr = 0; rr < br; ++rr) {
-                uint32_t post_local = block_row * br + rr;
-                if (post_local >= rows_per_core) continue;
-                const uint64_t post_global_64 =
-                    static_cast<uint64_t>(pe_id) * static_cast<uint64_t>(neurons_per_pe) +
-                    static_cast<uint64_t>(core_index) * static_cast<uint64_t>(rows_per_core) +
-                    static_cast<uint64_t>(post_local);
-                if (max_global > 0u && post_global_64 >= static_cast<uint64_t>(max_global)) {
-                    continue;
-                }
-                const uint32_t post_global = static_cast<uint32_t>(post_global_64);
-                for (uint32_t cc = 0; cc < bc; ++cc) {
-                    size_t off = static_cast<size_t>(rr) * bc + cc;
-                    // blockids 作为稀疏mask：0xFFFFFFFF 表示该位置无边；非mask值不代表 post_global
-                    if (blockids[off] == 0xFFFFFFFFu) continue;
-                    // 权重阈值过滤：避免把块内填充0当作有效边
-                    float weight = blockdata[off];
-                    if (std::fabs(weight) <= step_activation_bcsr_weight_epsilon_) continue;
-                    uint32_t pre_global = pre_base + cc;
-                    // 仅收集本节点 pre 的出边（跨 PE 的 pre 由其所属节点负责）
-                    if (pre_global < local_pre_begin || pre_global >= local_pre_end) continue;
-                    if (pre_global >= step_activation_routes_.size()) continue;
-                    step_activation_routes_[pre_global].push_back(post_global);
-                }
-            }
-        }
-    }
-    // 若末尾仍有跳过块，无需继续读取，但需保持逻辑自洽（仅用于调试/健壮性）
-    // (不强制 seek 到文件尾，避免额外开销)
-    // 诊断：一次性打印装载概览（仅在显式启用日志时）
-    if (output_ && step_activation_log_enable_ && output_->getVerboseLevel() >= 1) {
-        uint64_t edges = 0;
-        for (auto &v : step_activation_routes_) edges += (uint64_t)v.size();
-        output_->verbose(CALL_INFO, 1, 0,
-            "[step-activation] BCSR reachability loaded: pe=%u core=%u rows=%u br=%u bc=%u total_blocks(rowptr)=%u used=%u edges=%llu\n",
-            pe_id, core_index, rows_per_core, br, bc, total_blocks_rowptr, total_blocks,
-            static_cast<unsigned long long>(edges));
-    }
-    return true;
-}
-
-bool MultiCorePE::loadBcsrReachability_() {
-    if (output_ && step_activation_log_enable_) {
-        output_->verbose(CALL_INFO, 0, 0,
-            "[step-activation] node=%d loadBcsrReachability enable=%d use_bcsr=%d template=%s build_local_only=%d rows_per_core=%u br=%u bc=%u\n",
-            node_id_, (int)step_activation_enable_, (int)step_activation_use_bcsr_routes_,
-            step_activation_bcsr_template_.c_str(), (int)step_activation_build_local_only_,
-            step_activation_bcsr_rows_per_core_, step_activation_bcsr_br_, step_activation_bcsr_bc_);
-    }
-    if (step_activation_bcsr_template_.empty()) {
-        if (output_ && step_activation_log_enable_) {
-            output_->verbose(CALL_INFO, 0, 0, "⚠️ 未提供 step_activation_bcsr_template，无法加载BCSR索引\n");
-        }
-        return false;
-        }
-        const uint64_t total_pre = static_cast<uint64_t>(global_neuron_base_) + static_cast<uint64_t>(total_neurons_);
-        step_activation_routes_.assign(static_cast<size_t>(total_pre), {});
-        bool success = true;
-        // 遍历所有PE的权重文件，构建“本PE本地pre”的全局出边（可跨PE）
-        int pe_begin = 0, pe_end = (total_nodes_ > 0 ? total_nodes_ : 1);
-        if (step_activation_build_local_only_) {
-            pe_begin = node_id_;
-            pe_end = node_id_ + 1;
-        }
-        for (int pe = pe_begin; pe < pe_end; ++pe) {
-            for (int core = 0; core < num_cores_; ++core) {
-                std::string path = formatBcsrPath_(pe, core);
-                if (path.empty()) { success = false; break; }
-                if (!buildRoutesFromBcsrFile_(path, static_cast<uint32_t>(pe), static_cast<uint32_t>(core))) { success = false; break; }
-            }
-            if (!success) break;
-        }
-    if (success) {
-        size_t with_routes = 0;
-        for (const auto& vec : step_activation_routes_) {
-            if (!vec.empty()) ++with_routes;
-        }
-        if (step_activation_log_enable_ && !step_activation_route_ack_logged_) {
-            output_->verbose(CALL_INFO, 1, 0,
-                "[step-activation] BCSR reachability loaded: pre_with_routes=%zu total_pre=%zu\n",
-                with_routes, step_activation_routes_.size());
-            // 每个节点仅打印一次远端/本地比例摘要，确认跨PE路由是否存在
-            computeRouteRatios_();
-            step_activation_route_ack_logged_ = true;
-        }
-        if (output_ && step_activation_log_enable_) {
-            output_->verbose(CALL_INFO, 0, 0,
-                "[step-activation] node=%d loadBcsrReachability success route_vectors=%zu\n",
-                node_id_, step_activation_routes_.size());
-        }
-        // 单 PE 场景：预先收集所有“拥有至少一条出边”的 pre_global，供注入阶段直接采样，
-        // 避免在无出边的神经元上浪费激活尝试。
-        step_activation_pre_with_routes_.clear();
-        if (total_nodes_ == 1) {
-            step_activation_pre_with_routes_.reserve(with_routes);
-            for (uint32_t pre = 0; pre < step_activation_routes_.size(); ++pre) {
-                if (!step_activation_routes_[pre].empty()) {
-                    step_activation_pre_with_routes_.push_back(pre);
-                }
-            }
-            if (output_ && step_activation_log_enable_) {
-                output_->verbose(CALL_INFO, 1, 0,
-                    "[step-activation] node=%d single-PE pre_with_routes_list size=%zu\n",
-                    node_id_, step_activation_pre_with_routes_.size());
-            }
-        }
-    } else {
-        step_activation_pre_with_routes_.clear();
-        if (step_activation_log_enable_ && !step_activation_route_warned_) {
-            output_->verbose(CALL_INFO, 0, 0,
-                "⚠️ step_activation BCSR route build failed, routes cleared; using fallback sampling\n");
-            step_activation_route_warned_ = true;
-        }
-        step_activation_routes_.clear();
-        if (output_ && step_activation_log_enable_) {
-            output_->verbose(CALL_INFO, 0, 0,
-                "[step-activation] node=%d loadBcsrReachability FAILED\n",
-                node_id_);
-        }
-    }
-    return success;
-}
-
-void MultiCorePE::computeRouteRatios_() const {
-    uint64_t local_edges = 0, remote_edges = 0, total_edges = 0;
-    const uint32_t neurons_per_pe = static_cast<uint32_t>(neurons_per_core_) * static_cast<uint32_t>(num_cores_);
-    if (neurons_per_pe > 0) {
-        for (size_t pre = 0; pre < step_activation_routes_.size(); ++pre) {
-            const auto& vec = step_activation_routes_[pre];
-            total_edges += static_cast<uint64_t>(vec.size());
-            for (auto post_global : vec) {
-                uint32_t pe_of_post = static_cast<uint32_t>(post_global / neurons_per_pe);
-                if (pe_of_post == static_cast<uint32_t>(node_id_)) ++local_edges;
-                else ++remote_edges;
-            }
-        }
-    }
-    double local_ratio = (total_edges ? (double)local_edges / (double)total_edges : 0.0);
-    double remote_ratio = (total_edges ? (double)remote_edges / (double)total_edges : 0.0);
-    if (output_ && step_activation_log_enable_) {
-        output_->verbose(CALL_INFO, 1, 0,
-            "[step-activation] route_ratio: node=%d local_edges=%" PRIu64 " remote_edges=%" PRIu64 " total=%" PRIu64 " local_ratio=%.4f remote_ratio=%.4f\n",
-            node_id_, local_edges, remote_edges, total_edges, local_ratio, remote_ratio);
-    }
-}
-
-#endif // Phase3-B legacy Step activation helpers
 
 void MultiCorePE::initializeDirectionLinks() {
     

@@ -2,6 +2,14 @@
 
 本目录存放 **与 SnnDL 设计、重构、阶段性方案相关的文档**，用于记录关键决策、口径与后续演进路线。
 
+## 默认内存语义（重要：cacheline）
+
+SnnDL 的默认体系结构建模语义是：**cacheline 粒度**作为对外搬运单位，并与 `memHierarchy` 的 `GetS/GetX` 事务统计对齐。若某条路径显式采用
+row-streaming/DMA 或更大 granule 读（例如 GAS 合并读导致 overfetch），必须：
+
+- 在 run dir 中落盘 `effective_config.json`（记录 effective 的 granularity/merge_policy/line_size 等关键参数）；
+- 同时解读 `gas_unique_bytes_total/gas_unique_reads_total`（或等价指标）与 `memctrl.bytes_est_total`，避免将逻辑请求字节数误当作 off-chip traffic。
+
 ## 当前内容
 
 - `SNNDL_HIERARCHY_AND_WORKFLOW.md`

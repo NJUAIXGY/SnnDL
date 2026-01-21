@@ -31,7 +31,7 @@ export MESH_SIM_TIME="100us"
 ./tools/run_mesh_with_time.sh
 ```
 
-切换到 `workload=stream`（不涉及 Spike/GAS/权重/BCSR，仅做 packet-first 通信 + 内存 read-after-write 校验）：
+可选：切换到 `workload=stream`（不涉及 Spike/GAS/权重/BCSR，仅做 packet-first 通信 + 内存 read-after-write 校验）：
 
 ```bash
 cd "sst_dram_si"
@@ -40,7 +40,7 @@ export MESH_SIM_TIME="100us"
 ./tools/run_mesh_with_time.sh
 ```
 
-切换到 `workload=traffic`（不建模动力学；用于通信/多播（SpikeKey）链路验证）：
+可选：切换到 `workload=traffic`（不建模动力学；用于通信/多播（SpikeKey）链路验证）：
 
 ```bash
 cd "sst_dram_si"
@@ -52,6 +52,14 @@ export MESH_SIM_TIME="100us"
 输出目录通常位于：
 - `sst_dram_si/outputs_large/paper2/dram_mesh_4x4/YYYYMMDD-HHMMSS/`
   - `essential_summary_mesh.json`：关键指标摘要（用于 100us 回归判定）。
+
+### 内存建模口径（默认 cacheline 语义）
+
+SnnDL 的默认内存建模语义与 `memHierarchy` 保持一致：**以 cacheline（例如 64B）作为系统层事务/流量的基本单位**。
+
+- 论文/报告中的“DRAM traffic”主口径建议以 `memHierarchy MemController requests_received_*`（L2 traffic）为准；
+- `memory_bytes/memory_requests` 表示上层发起的逻辑请求（L1 logical request），用于解释合并/去重形态，不应直接等价为 off-chip 流量；
+- 若切换到 row-streaming/DMA 假设，必须显式标注并单列结果（不得与 cacheline 模式混算）。
 
 ---
 
@@ -73,13 +81,15 @@ SnnDL 支持一条“原生多播（native multicast）”路径：以 `SpikeKey
 
 ## 目录结构（按边界划分）
 
-> 每个子目录都有自己的 README，优先以子目录 README 为准。
+> 说明：以“源码子目录”为准（忽略 `.deps/.libs` 等构建产物目录）。每个源码子目录都应有自己的 README，优先以子目录 README 为准。
 
 ```
 SnnDL/
 ├── api/            # 跨层稳定接口（窄抽象）
 ├── events/         # 事件与数据载体（Spike/Gating 等）
 ├── components/     # SST 组件装配壳（ELI 注册对象）
+│   ├── gather/     # GatherBufferIF 构造期参数解析收敛（不新增运行期组件）
+│   ├── multicore/  # MultiCorePE 构造期参数解析收敛（不新增运行期组件）
 ├── control/        # 通用 CoreShell（只做装配/分发/统计汇聚；业务逻辑在 workload）
 ├── compute/        # 可替换 compute core（神经动力学/学习/验证）
 ├── services/       # 可复用事务子系统（按子域拆分）
@@ -88,6 +98,7 @@ SnnDL/
 │   ├── synapse/    # 突触语义域（weights/route/gas 事务闭环）
 │   ├── stimulus/   # Stimulus 域（Step 注入/外部刺激）
 │   ├── workload/   # Workload 插件域（snn/stream 等）
+│   │   ├── layout/ # Workload neuron layout 口径归一化（num_neurons/neurons_per_pe/base）
 │   └── legacy/     # 历史遗留/参考实现（默认不进主链路）
 ├── docs/           # 设计与阶段性方案文档
 └── tests/          # include 自检等轻量测试

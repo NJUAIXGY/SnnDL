@@ -74,6 +74,7 @@ private:
     enum class GasStage { Idle=0, Gather=1, Apply=2, Scatter=3 };
 
     uint64_t nowNs_() const;
+    void normalizeLayout_();
     bool isWindowWorkload_() const { return apply_acc_enable_ && gas_window_mode_; }
     bool processReadySpikes_(uint64_t now_ns);
     void processLocalSpike_(SpikeEvent* spike);
@@ -100,9 +101,20 @@ private:
     // Compute core owned by workload=snn.
     std::unique_ptr<ISnnComputeCore> compute_core_;
     std::string compute_core_impl_ = "default";
+    // NOTE: num_neurons_ / global_neuron_base_ are normalized to "per-core" semantics in bindRuntime().
+    // - num_neurons_        : neurons_per_core
+    // - global_neuron_base_ : core-local global base (node_base + core_id * neurons_per_core)
     uint32_t num_neurons_ = 0;
     uint64_t global_neuron_base_ = 0;
+    // Raw (as provided by scripts/configs); may be per-core or per-PE depending on config style.
+    uint32_t num_neurons_param_ = 0;
+    uint32_t neurons_per_pe_param_ = 0;
+    uint64_t global_neuron_base_param_ = 0;
+    uint64_t node_neuron_base_ = 0;
+    bool layout_normalized_ = false;
     uint32_t neurons_per_pe_cfg_ = 0;
+    uint32_t cores_per_pe_cfg_ = 1;
+    uint32_t neurons_per_core_cfg_ = 0;
     uint32_t total_nodes_cfg_ = 16;
     bool apply_acc_enable_ = false;
     bool gas_window_mode_ = false;

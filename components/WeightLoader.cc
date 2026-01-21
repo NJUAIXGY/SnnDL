@@ -12,11 +12,22 @@
 #include <inttypes.h>
 #include <cctype>
 #include <iterator>
+#include <random>
 
 #include "WorkloadConfig.h"
 
 using namespace SST;
 using namespace SST::SnnDL;
+
+namespace {
+static std::string lowerCopy_(const std::string& s) {
+    std::string out = s;
+    for (auto& ch : out) {
+        if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+    }
+    return out;
+}
+} // namespace
 
 std::string WeightLoader::hexDump_(const std::vector<uint8_t>& buf, size_t max_bytes) {
     const size_t n = std::min(max_bytes, buf.size());
@@ -87,53 +98,265 @@ std::string WeightLoader::resolveCorePath_(int core, bool meta) const {
 void WeightLoader::issueVerifyReadbacks_() {
     if (!verify_readback_enable_ || verify_readback_issued_ || verify_readback_done_) return;
     if (!memory_) return;
+    const std::string mode = lowerCopy_(verify_readback_mode_.empty() ? "raw_bcsr" : verify_readback_mode_);
+
+    // dense byte-exact: compare against deterministic expected bytes (no files involved).
+    if (mode == "dense_rowcol_v1") {
+        const int core = verify_readback_core_;
+        if (core < 0 || core >= num_cores_) return;
+        const uint32_t R = rows_per_core_;
+        const uint32_t C = cols_per_core_;
+        if (R == 0 || C == 0) return;
+
+        const uint64_t base = base_addr_start_ + static_cast<uint64_t>(core) * per_core_stride_;
+        const uint64_t total_floats = static_cast<uint64_t>(R) * static_cast<uint64_t>(C);
+        const uint64_t floats_per_sample = std::max<uint64_t>(1, (static_cast<uint64_t>(verify_readback_bytes_) + 3ull) / 4ull);
+        if (total_floats < floats_per_sample) return;
+
+        auto make_expect = [&](uint64_t start_float, size_t want_bytes) -> std::vector<uint8_t> {
+            const size_t nbytes = want_bytes;
+            std::vector<uint8_t> out;
+            out.resize(nbytes, 0);
+            const size_t nflt = (nbytes + 3u) / 4u;
+            for (size_t i = 0; i < nflt; ++i) {
+                const uint64_t idx = start_float + static_cast<uint64_t>(i);
+                const uint32_t row = static_cast<uint32_t>(idx / static_cast<uint64_t>(C));
+                const uint32_t col = static_cast<uint32_t>(idx % static_cast<uint64_t>(C));
+                const float v = static_cast<float>(static_cast<uint64_t>(row) * static_cast<uint64_t>(write_pattern_row_scale_) +
+                                                   static_cast<uint64_t>(col));
+                std::memcpy(out.data() + i * 4u, &v, std::min<size_t>(4u, nbytes - i * 4u));
+            }
+            return out;
+        };
+
+        struct Sample { const char* tag; uint64_t start_float; };
+        const Sample fixed[] = {
+            {"dense@row0_col0", 0},
+            {"dense@row0_col_end4", static_cast<uint64_t>(0) * C + (C >= 4 ? (C - 4) : 0)},
+            {"dense@row1_col0", (R >= 2 ? static_cast<uint64_t>(1) * C : 0)},
+            {"dense@last_row_col0", (R ? static_cast<uint64_t>(R - 1u) * C : 0)},
+        };
+
+        std::vector<uint64_t> starts;
+        starts.reserve(static_cast<size_t>(verify_readback_samples_) + 8u);
+        for (const auto& s : fixed) {
+            if (s.start_float + floats_per_sample <= total_floats) starts.push_back(s.start_float);
+        }
+
+        const uint32_t want = std::max<uint32_t>(starts.empty() ? 1u : 0u, verify_readback_samples_);
+        std::mt19937 rng(verify_readback_seed_);
+        std::uniform_int_distribution<uint64_t> dist(0ull, total_floats - floats_per_sample);
+        while (starts.size() < static_cast<size_t>(want)) {
+            starts.push_back(dist(rng));
+        }
+
+        verify_todo_.clear();
+        verify_todo_.reserve(starts.size());
+        for (size_t i = 0; i < starts.size(); ++i) {
+            const uint64_t start = starts[i];
+            const uint64_t addr = base + start * 4ull;
+            const size_t remain_bytes = static_cast<size_t>((total_floats - start) * 4ull);
+            const size_t want_bytes = std::min<size_t>(verify_readback_bytes_, remain_bytes);
+            if (want_bytes == 0) continue;
+            std::vector<uint8_t> expect = make_expect(start, want_bytes);
+            VerifyPending vp;
+            vp.addr = addr;
+            {
+                std::ostringstream oss;
+                oss << "dense@" << i << "/start=" << start;
+                vp.tag = oss.str();
+            }
+            vp.expect = std::move(expect);
+            verify_todo_.push_back(std::move(vp));
+        }
+        // NOTE: We intentionally defer the actual reads to timed simulation (setup/clock tick),
+        // because some StandardMem backends do not return data for untimed ReadResp.
+        verify_readback_issued_ = false;
+        return;
+    }
+
+    // raw_bcsr: compare against file slices (legacy diagnostic path).
     if (!raw_mode_ || !bcsr_enable_) return;
 
-    const int core = verify_readback_core_;
-    if (core < 0 || core >= num_cores_) return;
-    const std::string bin_path = resolveCorePath_(core, /*meta=*/false);
-    const std::string meta_path = resolveCorePath_(core, /*meta=*/true);
-    if (bin_path.empty() || meta_path.empty()) return;
+    // Reset coverage state per issuance.
+    verify_readback_inconclusive_ = false;
+    verify_readback_inconclusive_reason_.clear();
+    verify_readback_region_required_mask_ = 0;
+    verify_readback_region_done_mask_ = 0;
+    verify_readback_cores_used_.clear();
 
-    std::ifstream mf(meta_path);
-    if (!mf.good()) return;
-    std::string mt((std::istreambuf_iterator<char>(mf)), std::istreambuf_iterator<char>());
-    uint64_t colidx_off = 0;
-    uint32_t idx_bytes = 0;
-    if (!parseMetaU64_(mt, "\"colidx_offset\"", colidx_off)) return;
-    if (!parseMetaU32_(mt, "\"idx_bytes\"", idx_bytes)) idx_bytes = bcsr_idx_bytes_;
-    if (idx_bytes == 0) idx_bytes = bcsr_idx_bytes_;
-    const uint64_t base = base_addr_start_ + static_cast<uint64_t>(core) * per_core_stride_;
+    static constexpr uint32_t kRegionRowptrMask = 1u << 0;
+    static constexpr uint32_t kRegionColidxMask = 1u << 1;
+    static constexpr uint32_t kRegionBlockdataMask = 1u << 2;
 
-    struct Sample { const char* tag; uint64_t file_off; uint64_t mem_addr; };
-    const uint64_t s1 = colidx_off;
-    const uint64_t s2 = colidx_off + static_cast<uint64_t>(verify_colidx_start_index_) * static_cast<uint64_t>(idx_bytes);
-    const Sample samples[] = {
-        {"colidx@0", s1, base + s1},
-        {"colidx@start", s2, base + s2},
+    // Build anchors into verify_todo_ (later issued as timed reads).
+    verify_todo_.clear();
+    verify_todo_.reserve(64);
+
+    // Deterministic multi-core sampling:
+    // - Always include verify_readback_core_ (default core0).
+    // - Also include mid + last core to catch base_addr/stride bugs.
+    std::vector<int> cores;
+    cores.reserve(4);
+    auto add_core = [&](int c) {
+        if (c < 0 || c >= num_cores_) return;
+        if (std::find(cores.begin(), cores.end(), c) != cores.end()) return;
+        cores.push_back(c);
     };
+    add_core(verify_readback_core_);
+    if (num_cores_ > 1) add_core(num_cores_ - 1);
+    if (num_cores_ > 2) add_core(num_cores_ / 2);
+    if (cores.empty()) return;
+    verify_readback_cores_used_ = cores;
 
-    for (const auto& s : samples) {
-        std::vector<uint8_t> expect;
-        if (!readFileSlice_(bin_path, s.file_off, verify_readback_bytes_, expect)) continue;
-        auto* r = new SST::Interfaces::StandardMem::Read(s.mem_addr, expect.size());
-        const auto id = r->getID();
-        VerifyPending vp;
-        vp.addr = s.mem_addr;
-        vp.tag = s.tag;
-        vp.expect = std::move(expect);
-        verify_pending_[id] = std::move(vp);
-        memory_->sendUntimedData(r);
-        if (output_) {
-            output_->verbose(CALL_INFO, 0, 0,
-                "[WL-verify-issue] core=%d tag=%s addr=0x%llx bytes=%zu file_off=0x%llx\n",
-                core, s.tag,
-                (unsigned long long)s.mem_addr,
-                verify_pending_[id].expect.size(),
-                (unsigned long long)s.file_off);
+    for (int core : cores) {
+        if (core < 0 || core >= num_cores_) continue;
+        const std::string bin_path = resolveCorePath_(core, /*meta=*/false);
+        const std::string meta_path = resolveCorePath_(core, /*meta=*/true);
+        if (bin_path.empty() || meta_path.empty()) {
+            verify_readback_inconclusive_ = true;
+            if (verify_readback_inconclusive_reason_.empty()) verify_readback_inconclusive_reason_ = "missing_core_paths";
+            continue;
+        }
+
+        std::ifstream mf(meta_path);
+        if (!mf.good()) {
+            verify_readback_inconclusive_ = true;
+            if (verify_readback_inconclusive_reason_.empty()) verify_readback_inconclusive_reason_ = "meta_read_failed";
+            continue;
+        }
+        std::string mt((std::istreambuf_iterator<char>(mf)), std::istreambuf_iterator<char>());
+
+        uint64_t rowptr_off = 0;
+        uint64_t colidx_off = 0;
+        uint64_t blockdata_off = 0;
+        uint64_t meta_file_size = 0;
+        uint32_t idx_bytes = 0;
+        // NOTE: colidx_offset is required for meaningful region definition in BCSR.
+        if (!parseMetaU64_(mt, "\"colidx_offset\"", colidx_off)) {
+            verify_readback_inconclusive_ = true;
+            if (verify_readback_inconclusive_reason_.empty()) verify_readback_inconclusive_reason_ = "missing_colidx_offset";
+            continue;
+        }
+        // Optional fields for stronger anchors/coverage.
+        parseMetaU64_(mt, "\"rowptr_offset\"", rowptr_off);
+        parseMetaU64_(mt, "\"blockdata_offset\"", blockdata_off);
+        parseMetaU64_(mt, "\"file_size\"", meta_file_size);
+        if (!parseMetaU32_(mt, "\"idx_bytes\"", idx_bytes)) idx_bytes = bcsr_idx_bytes_;
+        if (idx_bytes == 0) idx_bytes = bcsr_idx_bytes_;
+
+        const uint64_t base = base_addr_start_ + static_cast<uint64_t>(core) * per_core_stride_;
+
+        // Determine file size (prefer meta, fallback to actual file).
+        uint64_t bin_file_size = 0;
+        {
+            std::ifstream fin(bin_path, std::ios::binary);
+            if (fin.good()) {
+                fin.seekg(0, std::ios::end);
+                std::streamoff sz = fin.tellg();
+                if (sz > 0) bin_file_size = static_cast<uint64_t>(sz);
+            }
+        }
+        const uint64_t file_size = (meta_file_size > 0) ? meta_file_size : bin_file_size;
+        if (file_size == 0) {
+            verify_readback_inconclusive_ = true;
+            if (verify_readback_inconclusive_reason_.empty()) verify_readback_inconclusive_reason_ = "file_size_zero";
+            continue;
+        }
+
+        auto regionForOff = [&](uint64_t off) -> uint8_t {
+            // Default ordering: rowptr [0, colidx), colidx [colidx, blockdata), blockdata [blockdata, file_size)
+            if (blockdata_off > 0 && off >= blockdata_off) return 2;
+            if (colidx_off > 0 && off >= colidx_off) return 1;
+            return 0;
+        };
+
+        // Define "required coverage": 3 segments when offsets look sane; otherwise degrade and mark inconclusive.
+        const bool offsets_sane =
+            (colidx_off > rowptr_off) &&
+            (colidx_off < file_size) &&
+            (blockdata_off > colidx_off) &&
+            (blockdata_off < file_size);
+        if (offsets_sane) {
+            verify_readback_region_required_mask_ |= kRegionRowptrMask | kRegionColidxMask | kRegionBlockdataMask;
+        } else {
+            // We can still validate correctness, but cannot guarantee segment coverage semantics.
+            verify_readback_inconclusive_ = true;
+            if (verify_readback_inconclusive_reason_.empty()) verify_readback_inconclusive_reason_ = "meta_offsets_unsane_or_missing";
+            if (colidx_off > 0 && colidx_off < file_size) {
+                verify_readback_region_required_mask_ |= kRegionRowptrMask | kRegionColidxMask;
+            }
+            if (blockdata_off > 0 && blockdata_off < file_size) {
+                verify_readback_region_required_mask_ |= kRegionBlockdataMask;
+            }
+        }
+
+        auto add_anchor = [&](const char* tag, uint64_t file_off) -> void {
+            if (file_off >= file_size) {
+                verify_readback_inconclusive_ = true;
+                if (verify_readback_inconclusive_reason_.empty()) verify_readback_inconclusive_reason_ = "anchor_out_of_range";
+                return;
+            }
+            // de-dup by absolute address (small N -> linear scan ok)
+            for (const auto& e : verify_todo_) {
+                if (e.addr == base + file_off) return;
+            }
+            std::vector<uint8_t> expect;
+            if (!readFileSlice_(bin_path, file_off, verify_readback_bytes_, expect) || expect.empty()) {
+                verify_readback_inconclusive_ = true;
+                if (verify_readback_inconclusive_reason_.empty()) verify_readback_inconclusive_reason_ = "file_read_failed";
+                return;
+            }
+            VerifyPending vp;
+            vp.core = core;
+            vp.addr = base + file_off;
+            vp.region = regionForOff(file_off);
+            {
+                std::ostringstream oss;
+                oss << "c" << core << ":" << tag;
+                vp.tag = oss.str();
+            }
+            vp.expect = std::move(expect);
+            verify_todo_.push_back(std::move(vp));
+        };
+
+        // Anchor set (coverage-driven):
+        // - rowptr
+        add_anchor("rowptr@0", rowptr_off);
+        if (colidx_off >= verify_readback_bytes_) add_anchor("rowptr@end", colidx_off - verify_readback_bytes_);
+        // - colidx
+        add_anchor("colidx@0", colidx_off);
+        {
+            const uint64_t s2 = colidx_off + static_cast<uint64_t>(verify_colidx_start_index_) * static_cast<uint64_t>(idx_bytes);
+            if (s2 < file_size) add_anchor("colidx@start", s2);
+        }
+        if (blockdata_off > colidx_off && blockdata_off >= verify_readback_bytes_) add_anchor("colidx@end", blockdata_off - verify_readback_bytes_);
+        // - blockdata
+        if (blockdata_off > 0) add_anchor("blockdata@0", blockdata_off);
+        if (blockdata_off > 0 && file_size > blockdata_off + verify_readback_bytes_) {
+            uint64_t mid = blockdata_off + (file_size - blockdata_off) / 2u;
+            if (mid >= verify_readback_bytes_) mid = (mid / verify_readback_bytes_) * verify_readback_bytes_;
+            if (mid < file_size) add_anchor("blockdata@mid", mid);
+        }
+        // - EOF tail (best-effort)
+        if (file_size >= verify_readback_bytes_) add_anchor("eof@-bytes", file_size - verify_readback_bytes_);
+    }
+
+    if (verify_todo_.empty()) return;
+
+    // IMPORTANT: some StandardMem implementations do not return data for untimed ReadResp.
+    // So for raw_bcsr we also defer verification reads to timed simulation (setup/clock tick),
+    // same as dense_rowcol_v1, to ensure rr->data is populated.
+    if (output_) {
+        for (const auto& vp : verify_todo_) {
+            output_->verbose(CALL_INFO, 2, 0,
+                "[WL-verify-defer] core=%d tag=%s region=%u addr=0x%llx bytes=%zu\n",
+                vp.core, vp.tag.c_str(), (unsigned)vp.region,
+                (unsigned long long)vp.addr,
+                vp.expect.size());
         }
     }
-    verify_readback_issued_ = !verify_pending_.empty();
+    verify_readback_issued_ = false;
 }
 
 void WeightLoader::pollVerifyReadbacks_() {
@@ -178,7 +401,7 @@ void WeightLoader::pollVerifyReadbacks_() {
             }
         }
         if (output_) {
-            output_->verbose(CALL_INFO, 0, 0,
+            output_->verbose(CALL_INFO, 2, 0,
                 "[WL-verify-resp] tag=%s addr=0x%llx got=%zu expect=%zu mismatch=%zu head_got=[%s] head_expect=[%s]\n",
                 it->second.tag.c_str(),
                 (unsigned long long)it->second.addr,
@@ -231,8 +454,13 @@ WeightLoader::WeightLoader(ComponentId_t id, Params& params)
     verify_readback_enable_ = params.find<int>("verify_readback_enable", 0) != 0;
     verify_readback_core_ = params.find<int>("verify_readback_core", 0);
     verify_readback_bytes_ = params.find<uint32_t>("verify_readback_bytes", 64);
+    verify_readback_mode_ = params.find<std::string>("verify_readback_mode", "raw_bcsr");
+    verify_readback_samples_ = params.find<uint32_t>("verify_readback_samples", 16);
+    verify_readback_seed_ = params.find<uint32_t>("verify_readback_seed", 314159);
     verify_colidx_start_index_ = params.find<uint32_t>("verify_colidx_start_index", 441);
     strict_loader_done_ = params.find<int>("strict_loader_done", 0) != 0;
+    write_pattern_mode_ = params.find<std::string>("write_pattern_mode", "const");
+    write_pattern_row_scale_ = params.find<uint32_t>("write_pattern_row_scale", 1024);
     min_raw_bcsr_chunk_bytes_ = params.find<uint32_t>("min_raw_bcsr_chunk_bytes", 4096);
     if (min_raw_bcsr_chunk_bytes_ != 0 && min_raw_bcsr_chunk_bytes_ < 64) {
         min_raw_bcsr_chunk_bytes_ = 64;
@@ -252,11 +480,13 @@ WeightLoader::WeightLoader(ComponentId_t id, Params& params)
 
     output_ = new Output("WeightLoader[@p:@l]: ", verbose_, 0, Output::STDOUT);
     // 无条件记录构造基本配置，便于确认是否实际创建
-    output_->verbose(CALL_INFO, 0, 0,
-        "[WL-diag-init] verbose=%d weight_file=%s file_tmpl=%s single_file=%s base=0x%llx stride=0x%llx num_cores=%d rows=%u cols=%u fill=%.3f raw=%d bcsr=%d\n",
+    output_->verbose(CALL_INFO, 2, 0,
+        "[WL-diag-init] verbose=%d weight_file=%s file_tmpl=%s single_file=%s base=0x%llx stride=0x%llx num_cores=%d rows=%u cols=%u fill=%.3f raw=%d bcsr=%d pat=%s pat_row_scale=%u verify=%d verify_mode=%s verify_samples=%u verify_seed=%u\n",
         verbose_, weight_file_.c_str(), file_template_.c_str(), single_file_.c_str(),
         (unsigned long long)base_addr_start_, (unsigned long long)per_core_stride_,
-        num_cores_, rows_per_core_, cols_per_core_, fill_value_, raw_mode_ ? 1 : 0, bcsr_enable_ ? 1 : 0);
+        num_cores_, rows_per_core_, cols_per_core_, fill_value_, raw_mode_ ? 1 : 0, bcsr_enable_ ? 1 : 0,
+        write_pattern_mode_.c_str(), write_pattern_row_scale_,
+        verify_readback_enable_ ? 1 : 0, verify_readback_mode_.c_str(), verify_readback_samples_, verify_readback_seed_);
 
     // 通用 workload（例如 stream）下禁止 WeightLoader 写入任何权重数据，
     // 否则会覆盖通用 workload 的内存测试区域并造成误判/误崩溃。
@@ -271,7 +501,7 @@ WeightLoader::WeightLoader(ComponentId_t id, Params& params)
             runtime_load_needed_ = false;
             verify_readback_enable_ = false;
             strict_loader_done_ = false;
-            output_->verbose(CALL_INFO, 0, 0,
+            output_->verbose(CALL_INFO, 1, 0,
                 "[WL-disabled] workload_impl=%s -> skip all weight writes\n",
                 workload_impl.c_str());
         }
@@ -372,6 +602,25 @@ void WeightLoader::setup() {
     if (!loaded_) {
         output_->fatal(CALL_INFO, -1, "❌ WeightLoader setup 阶段检测到未完成的权重加载（expected in init）。");
     }
+
+    // Correctness markers: when verify_readback_enable=1, emit an unambiguous PASS marker proving
+    // the verification actually ran. We run readbacks in timed simulation (see onClockTick),
+    // because some StandardMem backends do not return data for untimed ReadResp.
+    if (verify_readback_enable_) {
+        const std::string mode = lowerCopy_(verify_readback_mode_.empty() ? "raw_bcsr" : verify_readback_mode_);
+        if (!verify_readback_done_ && verify_todo_.empty()) {
+            output_->fatal(CALL_INFO, -1,
+                "❌ WeightLoader verify_readback_enable=1 但未准备任何读回校验样本（mode=%s）。"
+                "请确认：dense_rowcol_v1 已设置 rows/cols；raw_bcsr 已启用 per_core_files/file_template 且 *.meta.json 可读。\n",
+                mode.c_str());
+        }
+        if (!verify_readback_done_ && !verify_todo_.empty() && !clock_registered_) {
+            registerClock("1GHz", new SST::Clock::Handler2<WeightLoader, &WeightLoader::onClockTick>(this));
+            clock_registered_ = true;
+        }
+        // PASS marker will be printed once timed verification completes.
+    }
+
     if (strict_loader_done_) {
         if (verify_failed_) {
             output_->fatal(CALL_INFO, -1, "❌ WeightLoader strict_loader_done: 写后读回校验失败，拒绝发布 loader_done。\n");
@@ -400,6 +649,24 @@ void WeightLoader::finish() {
 
 bool WeightLoader::onClockTick(SST::Cycle_t cycle) {
     current_cycle_ = cycle;
+    if (verify_readback_enable_ && !verify_readback_done_ && !verify_readback_issued_) {
+        if (!verify_todo_.empty() && memory_) {
+            for (auto& s : verify_todo_) {
+                auto* r = new SST::Interfaces::StandardMem::Read(s.addr, s.expect.size());
+                const auto id = r->getID();
+                verify_pending_[id] = std::move(s);
+                memory_->send(r);
+            }
+            verify_todo_.clear();
+            verify_readback_issued_ = !verify_pending_.empty();
+            if (output_) {
+                output_->verbose(CALL_INFO, 2, 0,
+                    "[WL-verify-timed-issue] mode=%s core=%d samples=%zu bytes=%u\n",
+                    (verify_readback_mode_.empty() ? "raw_bcsr" : verify_readback_mode_.c_str()),
+                    verify_readback_core_, verify_pending_.size(), verify_readback_bytes_);
+            }
+        }
+    }
     if (diag_runtime_read_enable_ && !diag_runtime_read_issued_) {
         if (!memory_) return false;
         auto* r = new SST::Interfaces::StandardMem::Read(diag_runtime_read_addr_, diag_runtime_read_bytes_);
@@ -407,7 +674,7 @@ bool WeightLoader::onClockTick(SST::Cycle_t cycle) {
         diag_runtime_read_issued_ = true;
         memory_->send(r);
         if (output_) {
-            output_->verbose(CALL_INFO, 0, 0,
+            output_->verbose(CALL_INFO, 2, 0,
                 "[WL-diag-timed-read-issue] core=%d addr=0x%llx bytes=%u\n",
                 diag_runtime_read_core_,
                 (unsigned long long)diag_runtime_read_addr_,
@@ -435,17 +702,102 @@ void WeightLoader::handleMemoryResponse(SST::Interfaces::StandardMem::Request* r
         return;
     }
 
+    // Timed verify readbacks (dense_rowcol_v1): validate returned bytes against expected pattern.
+    if (verify_readback_enable_ && !verify_pending_.empty()) {
+        auto* rr = dynamic_cast<SST::Interfaces::StandardMem::ReadResp*>(req);
+        if (rr) {
+            auto it = verify_pending_.find(rr->getID());
+            if (it != verify_pending_.end()) {
+                const auto& expect = it->second.expect;
+                const auto& got = rr->data;
+                const size_t n = std::min(expect.size(), got.size());
+                size_t mismatch = 0;
+                for (size_t i = 0; i < n; ++i) {
+                    if (expect[i] != got[i]) mismatch++;
+                }
+                const bool size_ok = got.size() == expect.size();
+                const bool ok = size_ok && (mismatch == 0);
+                if (!ok) {
+                    verify_failed_ = true;
+                    if (output_) {
+                        output_->fatal(CALL_INFO, -1,
+                            "❌ WeightLoader verify_readback 失败: mode=%s tag=%s addr=0x%llx got=%zu expect=%zu mismatch=%zu head_got=[%s] head_expect=[%s]\n",
+                            verify_readback_mode_.c_str(),
+                            it->second.tag.c_str(),
+                            (unsigned long long)it->second.addr,
+                            got.size(), expect.size(), mismatch,
+                            hexDump_(got, 16).c_str(),
+                            hexDump_(expect, 16).c_str());
+                    }
+                }
+                verify_readback_region_done_mask_ |= (1u << static_cast<uint32_t>(it->second.region));
+                verify_pending_.erase(it);
+                delete req;
+                if (verify_pending_.empty() && verify_readback_issued_) {
+                    verify_readback_done_ = true;
+                    if (!verify_failed_ && !verify_readback_pass_logged_ && output_) {
+                        const std::string mode = lowerCopy_(verify_readback_mode_.empty() ? "raw_bcsr" : verify_readback_mode_);
+                        if (mode != "raw_bcsr") {
+                            // Dense microbench (synthetic pattern): PASS marker only (no BCSR segment semantics).
+                            output_->verbose(CALL_INFO, 0, 0,
+                                "WEIGHT_LOADER_READBACK: PASS mode=%s core=%d bytes=%u samples=%u seed=%u\n",
+                                mode.c_str(),
+                                verify_readback_core_,
+                                verify_readback_bytes_,
+                                verify_readback_samples_,
+                                verify_readback_seed_);
+                        } else {
+                            const bool have_required = (verify_readback_region_required_mask_ != 0);
+                            const bool regions_ok = have_required &&
+                                ((verify_readback_region_done_mask_ & verify_readback_region_required_mask_) == verify_readback_region_required_mask_);
+                            const int rowptr_ok = (verify_readback_region_done_mask_ & (1u << 0)) ? 1 : 0;
+                            const int colidx_ok = (verify_readback_region_done_mask_ & (1u << 1)) ? 1 : 0;
+                            const int block_ok  = (verify_readback_region_done_mask_ & (1u << 2)) ? 1 : 0;
+                            std::string cores_s;
+                            if (!verify_readback_cores_used_.empty()) {
+                                for (size_t i = 0; i < verify_readback_cores_used_.size(); ++i) {
+                                    if (i) cores_s.push_back(',');
+                                    cores_s += std::to_string(verify_readback_cores_used_[i]);
+                                }
+                            }
+                            if (!regions_ok || !have_required || verify_readback_inconclusive_) {
+                                output_->verbose(CALL_INFO, 0, 0,
+                                    "WEIGHT_LOADER_READBACK: WARN INCONCLUSIVE mode=%s core=%d cores=%s bytes=%u regions=rowptr=%d colidx=%d blockdata=%d reason=%s\n",
+                                    mode.c_str(),
+                                    verify_readback_core_,
+                                    cores_s.empty() ? "?" : cores_s.c_str(),
+                                    verify_readback_bytes_,
+                                    rowptr_ok, colidx_ok, block_ok,
+                                    verify_readback_inconclusive_reason_.empty() ? "insufficient_coverage" : verify_readback_inconclusive_reason_.c_str());
+                            } else {
+                                output_->verbose(CALL_INFO, 0, 0,
+                                    "WEIGHT_LOADER_READBACK: PASS mode=%s core=%d cores=%s bytes=%u regions=rowptr=%d colidx=%d blockdata=%d\n",
+                                    mode.c_str(),
+                                    verify_readback_core_,
+                                    cores_s.empty() ? "?" : cores_s.c_str(),
+                                    verify_readback_bytes_,
+                                    rowptr_ok, colidx_ok, block_ok);
+                            }
+                        }
+                        verify_readback_pass_logged_ = true;
+                    }
+                }
+                return;
+            }
+        }
+    }
+
     // 运行期单点读回探针：打印 timed ReadResp 的首字节（对齐文件预期）
     if (diag_runtime_read_enable_ && diag_runtime_read_issued_ && req->getID() == diag_runtime_read_id_) {
         auto* rr = dynamic_cast<SST::Interfaces::StandardMem::ReadResp*>(req);
         if (!rr) {
-            output_->verbose(CALL_INFO, 0, 0,
+            output_->verbose(CALL_INFO, 2, 0,
                 "[WL-diag-timed-read-resp] id=%" PRIu64 " (non-ReadResp)\n",
                 req->getID());
             delete req;
             return;
         }
-        output_->verbose(CALL_INFO, 0, 0,
+        output_->verbose(CALL_INFO, 2, 0,
             "[WL-diag-timed-read-resp] id=%" PRIu64 " addr=0x%llx got=%zu head=[%s]\n",
             rr->getID(),
             (unsigned long long)rr->pAddr,
@@ -543,15 +895,24 @@ void WeightLoader::issueWritesFill(float value) {
     const uint32_t R = rows_per_core_;
     const uint32_t C = cols_per_core_;
     const uint32_t chunk = std::max<uint32_t>(16, chunk_size_bytes_); // 下限保护
+    const std::string pat = lowerCopy_(write_pattern_mode_);
 
     uint64_t total_writes = 0;
     for (int core = 0; core < num_cores_; ++core) {
         const uint64_t base = base_addr_start_ + static_cast<uint64_t>(core) * per_core_stride_;
-        // 构造一行的连续字节缓冲
-        std::vector<float> row_vals(C, value);
-        const uint8_t* row_bytes = reinterpret_cast<const uint8_t*>(row_vals.data());
         const size_t row_bytes_len = static_cast<size_t>(C) * sizeof(float);
         for (uint32_t row = 0; row < R; ++row) {
+            // 构造一行的连续字节缓冲（避免跨 row 的语义偏差；dense_rowcol_v1 需逐行生成）。
+            std::vector<float> row_vals;
+            row_vals.resize(C, value);
+            if (pat == "dense_rowcol_v1") {
+                const uint64_t base_row = static_cast<uint64_t>(row) * static_cast<uint64_t>(write_pattern_row_scale_);
+                for (uint32_t col = 0; col < C; ++col) {
+                    row_vals[col] = static_cast<float>(base_row + static_cast<uint64_t>(col));
+                }
+            }
+            const uint8_t* row_bytes = reinterpret_cast<const uint8_t*>(row_vals.data());
+
             const uint64_t row_base_addr = base + static_cast<uint64_t>(row) * static_cast<uint64_t>(C) * sizeof(float);
             // 分块按 cacheline/chunk 写入
             size_t off = 0;
@@ -835,7 +1196,7 @@ void WeightLoader::issueWritesRaw(int core, const std::vector<uint8_t>& data, bo
             if (parseU64("\"blockdata_offset\"", tmp)) { diag_blockdata_off = tmp; diag_meta_ok = true; }
         }
         if (!diag_meta_logged_) {
-            output_->verbose(CALL_INFO, 0, 0,
+            output_->verbose(CALL_INFO, 2, 0,
                 "[WL-diag-meta] core=%d meta_path=%s ok=%d rp=0x%llx ci=0x%llx bd=0x%llx\n",
                 core, meta_path.c_str(), diag_meta_ok ? 1 : 0,
                 (unsigned long long)diag_rowptr_off,
@@ -848,7 +1209,7 @@ void WeightLoader::issueWritesRaw(int core, const std::vector<uint8_t>& data, bo
     // 无条件记录 Raw 写入的地址区间和首个非零字节
     uint8_t sample_nz = 0;
     for (auto b : data) { if (b != 0) { sample_nz = b; break; } }
-    output_->verbose(CALL_INFO, 0, 0,
+    output_->verbose(CALL_INFO, 2, 0,
         "[WL-raw] core=%d base=0x%llx end=0x%llx stride=0x%llx bytes=0x%zx sample_nz=0x%02x timed=%d\n",
         core,
         (unsigned long long)base,
@@ -876,7 +1237,8 @@ void WeightLoader::issueWritesRaw(int core, const std::vector<uint8_t>& data, bo
                 for (size_t i=0;i<dump;++i){ char t[8]; std::snprintf(t,sizeof(t),"%02x", buf[i]); if(i) s.push_back(' '); s += t; }
                 return s;
             };
-            output_->output("WeightLoader[issueWritesRaw]: [WL-diag-chunk] core=%d chunk_addr=0x%llx len=%zu rowptr_off=0x%llx colidx_off=0x%llx blockdata_off=0x%llx hex=[%s]\n",
+            output_->verbose(CALL_INFO, 2, 0,
+                "WeightLoader[issueWritesRaw]: [WL-diag-chunk] core=%d chunk_addr=0x%llx len=%zu rowptr_off=0x%llx colidx_off=0x%llx blockdata_off=0x%llx hex=[%s]\n",
                 core,
                 (unsigned long long)(base + off), len,
                 (unsigned long long)diag_rowptr_off,
@@ -894,7 +1256,7 @@ void WeightLoader::issueWritesRaw(int core, const std::vector<uint8_t>& data, bo
                 return s;
             };
             if (addr_start <= base + diag_colidx_off && addr_end > base + diag_colidx_off) {
-                output_->verbose(CALL_INFO, 0, 0,
+                output_->verbose(CALL_INFO, 2, 0,
                     "[WL-diag-chunk] core=%d chunk_addr=0x%llx len=%zu overlaps colidx_off=0x%llx rowptr_off=0x%llx blockdata_off=0x%llx hex=[%s]\n",
                     core,
                     (unsigned long long)addr_start, len,
@@ -964,7 +1326,7 @@ void WeightLoader::issueWritesForCoreFloatsImpl(int core, const std::vector<floa
             if (wbuf[i] != 0.0f) { sample_nonzero = wbuf[i]; break; }
         }
         uint64_t end_addr = base + static_cast<uint64_t>(R) * static_cast<uint64_t>(C) * sizeof(float);
-        output_->verbose(CALL_INFO, 0, 0,
+        output_->verbose(CALL_INFO, 2, 0,
             "[WL-diag] core=%d base=0x%llx end=0x%llx stride=0x%llx rows=%u cols=%u sample_nonzero=%.6f\n",
             core, (unsigned long long)base, (unsigned long long)end_addr,
             (unsigned long long)per_core_stride_, R, C, sample_nonzero);
@@ -1003,7 +1365,7 @@ void WeightLoader::issueWritesForCoreFloats(int core, const std::vector<float>& 
 }
 
 bool WeightLoader::loadSingleFileAllCores(const std::string& path, const std::string& fmt) {
-    output_->verbose(CALL_INFO, 0, 0, "[WL-diag] loadSingleFileAllCores path=%s fmt=%s raw=%d\n",
+    output_->verbose(CALL_INFO, 2, 0, "[WL-diag] loadSingleFileAllCores path=%s fmt=%s raw=%d\n",
         path.c_str(), fmt.c_str(), raw_mode_ ? 1 : 0);
     if (raw_mode_) {
         std::vector<uint8_t> raw;
@@ -1053,7 +1415,7 @@ bool WeightLoader::loadSingleFileAllCores(const std::string& path, const std::st
 }
 
 bool WeightLoader::loadPerCoreFiles(const std::string& tmpl, const std::string& fmt) {
-    output_->verbose(CALL_INFO, 0, 0, "[WL-diag] loadPerCoreFiles tmpl=%s fmt=%s raw=%d\n",
+    output_->verbose(CALL_INFO, 2, 0, "[WL-diag] loadPerCoreFiles tmpl=%s fmt=%s raw=%d\n",
         tmpl.c_str(), fmt.c_str(), raw_mode_ ? 1 : 0);
     const uint32_t R = rows_per_core_;
     const uint32_t C = cols_per_core_;
@@ -1195,7 +1557,7 @@ bool WeightLoader::loadPerCoreFilesRuntime(const std::string& tmpl, const std::s
                 if (parseU64("\"colidx_offset\"", tmp)) { diag_colidx_off = tmp; diag_meta_ok = true; }
                 if (parseU64("\"blockdata_offset\"", tmp)) { diag_blockdata_off = tmp; diag_meta_ok = true; }
                 if (parseU64("\"blockids_offset\"", tmp)) { diag_blockids_off = tmp; diag_meta_ok = true; }
-                output_->verbose(CALL_INFO, 0, 0,
+                output_->verbose(CALL_INFO, 2, 0,
                     "[WL-diag-meta-timed] core=%d meta=%s ok=%d rp=0x%llx ci=0x%llx bd=0x%llx ids=0x%llx\n",
                     core, meta_path.c_str(), diag_meta_ok ? 1 : 0,
                     (unsigned long long)diag_rowptr_off,
@@ -1207,7 +1569,7 @@ bool WeightLoader::loadPerCoreFilesRuntime(const std::string& tmpl, const std::s
             uint8_t sample_nz = 0;
             for (auto b : raw) { if (b != 0) { sample_nz = b; break; } }
             uint64_t base = base_addr_start_ + static_cast<uint64_t>(core) * per_core_stride_;
-            output_->verbose(CALL_INFO, 0, 0,
+            output_->verbose(CALL_INFO, 2, 0,
                 "[WL-timed-enqueue] core=%d base=0x%llx end=0x%llx stride=0x%llx bytes=0x%zx sample_nz=0x%02x meta_ok=%d\n",
                 core,
                 (unsigned long long)base,

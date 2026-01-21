@@ -8,19 +8,15 @@
 #include <sst/core/sst_config.h>
 #include "SnnPE.h"
 #include "SnnNeuronModel.h"
+#include "SnnDLLogging.h"
 
 #include <fstream>
 #include <sstream>
-#include <iostream>
 #include <cmath>
 
 using namespace SST;
 using namespace SST::SnnDL;
 
-// Lightweight logging helpers (file-local)
-#ifndef SNNDL_LOGPTR
-#define SNNDL_LOGPTR(ptr, lvl, ...) do { if (ptr) (ptr)->verbose(CALL_INFO, (lvl), 0, __VA_ARGS__); } while(0)
-#endif
 #ifndef PE_LOG
 #define PE_LOG(lvl, ...) SNNDL_LOGPTR(output, (lvl), __VA_ARGS__)
 #endif
@@ -291,7 +287,9 @@ void SnnPE::setup() {
         // 加载跨核权重文件
         if (!weights_file_path.empty()) {
             PE_LOG(1, "开始加载权重文件: %s\n", weights_file_path.c_str());
-            PE_LOG(1, "🔥🔥🔥 ABOUT_TO_CALL_LOADWEIGHTS: 即将调用loadWeights函数\n");
+#ifdef SNNDL_ENABLE_DEBUG_LOG
+            PE_LOG(2, "[debug] about to call loadWeights()\n");
+#endif
             
             if (loadWeights(weights_file_path)) {
                 PE_LOG(1, "成功加载权重文件: %s\n", weights_file_path.c_str());
@@ -645,7 +643,9 @@ bool SnnPE::loadWeights(const std::string& file_path) {
         return false;
     }
     
-    PE_LOG(1, "🔥 DEBUG: 新版本loadWeights正在运行！权重文件头: 总连接=%u, 本地连接=%u\n", total_connections, local_connections);
+#ifdef SNNDL_ENABLE_DEBUG_LOG
+    PE_LOG(2, "[debug] loadWeights header: total=%u local=%u\n", total_connections, local_connections);
+#endif
     
     uint32_t connections_loaded = 0;
     uint32_t cross_core_connections = 0;
@@ -748,8 +748,10 @@ void SnnPE::checkAndFireSpike(uint32_t neuron_idx) {
         recursion_depth++;  // 增加递归计数
 
         // 发放脉冲
-        PE_LOG(2, "🔥 神经元%u发放脉冲! (v_mem=%.6f >= v_thresh=%.6f)\n",
-                       neuron_idx, neurons[neuron_idx].v_mem, v_thresh);
+#ifdef SNNDL_ENABLE_DEBUG_LOG
+        PE_LOG(3, "[fire] neuron=%u v_mem=%.6f v_thresh=%.6f\n",
+               neuron_idx, neurons[neuron_idx].v_mem, v_thresh);
+#endif
 
         // 立即重置神经元状态，防止在递归中重复触发
         if (neuron_model_) {
@@ -776,8 +778,10 @@ void SnnPE::checkAndFireSpike(uint32_t neuron_idx) {
         uint64_t row_end = csr_row_ptr[neuron_idx + 1];
         
         // DEBUG: 验证行边界的合法性
-        PE_LOG(2, "DEBUG: 神经元%u CSR访问 - 行边界[%lu, %lu), csr_col_indices.size()=%zu, csr_weights.size()=%zu\n", 
-                       neuron_idx, row_start, row_end, csr_col_indices.size(), csr_weights.size());
+#ifdef SNNDL_ENABLE_DEBUG_LOG
+        PE_LOG(3, "[debug] neuron=%u csr row=[%lu,%lu) col=%zu w=%zu\n",
+               neuron_idx, row_start, row_end, csr_col_indices.size(), csr_weights.size());
+#endif
         
         if (row_end > csr_col_indices.size() || row_end > csr_weights.size()) {
             PE_LOG(1, "错误: 神经元%u的行边界[%lu, %lu)超出CSR数据范围\n", 

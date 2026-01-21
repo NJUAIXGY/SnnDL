@@ -8,6 +8,7 @@
 #include "SnnPESubComponent.h"
 #include "synapse/weights/WeightMemorySubsystem.h"
 #include "synapse/weights/SnnBcsrWeightManager.h"
+#include "SnnDLLogging.h"
 
 #include <fstream>
 #include <sstream>
@@ -20,23 +21,13 @@
 using namespace SST;
 using namespace SST::SnnDL;
 
-// Lightweight logging helpers (file-local). Keep consistent with SnnPESubComponent.cc.
-#ifndef SNNDL_LOGPTR
-#define SNNDL_LOGPTR(ptr, lvl, ...) do { if (ptr) (ptr)->verbose(CALL_INFO, (lvl), 0, __VA_ARGS__); } while(0)
-#endif
-#ifndef SNNDL_LOG
-#define SNNDL_LOG(lvl, ...) SNNDL_LOGPTR(output_, (lvl), __VA_ARGS__)
-#endif
-
-#ifdef SNNDL_ENABLE_DEBUG_LOG
-#define SNNDL_DEBUG_ENABLED 1
-#define SNNDL_DEBUG_LOG(lvl, ...) SNNDL_LOG(lvl, __VA_ARGS__)
-#define SNNDL_DEBUG_BLOCK(stmt) do { stmt; } while(0)
-#else
-#define SNNDL_DEBUG_ENABLED 0
-#define SNNDL_DEBUG_LOG(lvl, ...) do {} while(0)
-#define SNNDL_DEBUG_BLOCK(stmt) do {} while(0)
-#endif
+// NOTE(Universal-core experiments):
+// Globally disable all BCSR optimizations in legacy control helpers as well:
+// - rowIndex cache
+// - block cache
+// - populate dense weight cache from BCSR blocks
+// BCSR remains a storage format/addressing scheme only.
+static constexpr bool kEnableLegacyBcsrOptimizations = false;
 
 namespace {
 bool extractUnsigned(const std::string& text, const char* key, uint64_t& value) {
@@ -61,7 +52,7 @@ bool SnnPESubComponent::BcsrLayout::validate(uint64_t base, Output* out, bool de
     const uint64_t max_off = maxOffset();
     const bool stride_ok = (stride == 0) ? true : (max_off < stride);
     if (debug && out) {
-        out->verbose(CALL_INFO, 0, 0,
+        out->verbose(CALL_INFO, 2, 0,
             "[diag-bcsr-base] node=%u core=%u base=0x%lx rp=0x%lx ci=0x%lx bd=0x%lx ids=0x%lx stride=%" PRIu64 " stride_ok=%d align64=%d mono=%d br=%u bc=%u idx=%u val=%u\n",
             node_id, core_id,
             (unsigned long)base,
@@ -77,7 +68,7 @@ bool SnnPESubComponent::BcsrLayout::validate(uint64_t base, Output* out, bool de
             idx_bytes ? idx_bytes : 0,
             val_bytes ? val_bytes : 0);
         if (!aligned64 || !monotonic || !stride_ok) {
-            out->verbose(CALL_INFO, 0, 0,
+            out->verbose(CALL_INFO, 2, 0,
                 "[diag-bcsr-base] offsets suspect (aligned64=%d monotonic=%d stride_ok=%d max_off=0x%llx stride=0x%llx)\n",
                 aligned64 ? 1 : 0, monotonic ? 1 : 0, stride_ok ? 1 : 0,
                 (unsigned long long)max_off, (unsigned long long)stride);
@@ -154,6 +145,7 @@ float SnnPESubComponent::readBcsrWeightFromFile_(uint32_t post_local, uint32_t p
 }
 
 bool SnnPESubComponent::bcsrRowIndexGet_(uint32_t block_row, std::vector<uint32_t>& out) {
+    if (!kEnableLegacyBcsrOptimizations) return false;
     auto it = bcsr_row_index_cache_.find(block_row);
     if (it == bcsr_row_index_cache_.end()) return false;
     out = it->second;
@@ -162,6 +154,8 @@ bool SnnPESubComponent::bcsrRowIndexGet_(uint32_t block_row, std::vector<uint32_
 }
 
 void SnnPESubComponent::bcsrRowIndexPut_(uint32_t block_row, std::vector<uint32_t>& data) {
+    if (!kEnableLegacyBcsrOptimizations) return;
+    if (bcsr_row_index_cache_cap_ == 0) return; // avoid UB: erase(begin()) on empty map
     if (bcsr_row_index_cache_.size() >= bcsr_row_index_cache_cap_) {
         auto it = bcsr_row_index_cache_.begin();
         bcsr_row_index_cache_.erase(it);
@@ -170,6 +164,7 @@ void SnnPESubComponent::bcsrRowIndexPut_(uint32_t block_row, std::vector<uint32_
 }
 
 bool SnnPESubComponent::bcsrBlockGet_(uint32_t block_row, uint32_t block_col, std::vector<float>& out) {
+    if (!kEnableLegacyBcsrOptimizations) return false;
     uint64_t key = ((uint64_t)block_row << 32) | block_col;
     auto it = bcsr_block_cache_.find(key);
     if (it == bcsr_block_cache_.end()) return false;
@@ -179,6 +174,8 @@ bool SnnPESubComponent::bcsrBlockGet_(uint32_t block_row, uint32_t block_col, st
 }
 
 void SnnPESubComponent::bcsrBlockPut_(uint32_t block_row, uint32_t block_col, std::vector<float>& data) {
+    if (!kEnableLegacyBcsrOptimizations) return;
+    if (bcsr_block_cache_cap_ == 0) return; // avoid UB: erase(begin()) on empty map
     uint64_t key = ((uint64_t)block_row << 32) | block_col;
     auto it = bcsr_block_cache_.find(key);
     if (it != bcsr_block_cache_.end()) {
@@ -210,6 +207,7 @@ void SnnPESubComponent::requestWeightBCSR(uint32_t pre_global, uint32_t post_loc
 }
 
 void SnnPESubComponent::bcsrPopulateWeightCache_(uint32_t block_row, uint32_t block_col, const std::vector<float>& blk) {
+    if (!kEnableLegacyBcsrOptimizations) return;
     if (!use_bcsr_) return;
     if (blk.empty()) return;
     uint32_t br = (bcsr_br_>0? bcsr_br_:16);
@@ -241,7 +239,7 @@ size_t SnnPESubComponent::expectedRowptrBytes_() const {
 
 bool SnnPESubComponent::installRowptrFromBytes_(const uint8_t* data, size_t bytes, const char* source, bool count_stats) {
     if (!bcsr_weights_->installRowptrFromBytes(data, bytes, num_neurons_)) {
-        SNNDL_DEBUG_LOG(0,
+        SNNDL_DEBUG_LOG(2,
             "[diag-bcsr] core=%u rowptr install failed source=%s bytes=%zu expect=%zu\n",
             core_id_, source ? source : "-", bytes, expectedRowptrBytes_());
         return false;
@@ -250,9 +248,9 @@ bool SnnPESubComponent::installRowptrFromBytes_(const uint8_t* data, size_t byte
         bcsr_count_row_reads_++;
         bcsr_bytes_idx_ += bytes;
     }
-    if (window_read_debug_ && output_) {
+    if (window_read_debug_ && output_ && output_->getVerboseLevel() >= 2) {
         const auto& rp = bcsr_weights_->rowptrHost();
-        output_->verbose(CALL_INFO, 0, 0,
+        output_->verbose(CALL_INFO, 2, 0,
             "[diag-bcsr] core=%u rowptr ready entries=%zu first=%u second=%u\n",
             core_id_, rp.size(),
             rp.empty()?0u:rp[0],
@@ -270,12 +268,12 @@ bool SnnPESubComponent::loadBcsrRowptrFromFile_() {
     uint64_t rowptr_off = 0, colidx_off = 0, blockdata_off = 0, blockids_off = 0;
     if (!parseBcsrMeta(meta_path, rows, cols, br, bc, idx_bytes, val_bytes,
                        rowptr_off, colidx_off, blockdata_off, blockids_off, total_blocks)) {
-        SNNDL_DEBUG_LOG(0, "[diag-bcsr] core=%u fallback meta parse failed %s\n", core_id_, meta_path.c_str());
+        SNNDL_DEBUG_LOG(2, "[diag-bcsr] core=%u fallback meta parse failed %s\n", core_id_, meta_path.c_str());
         return false;
     }
     std::ifstream fin(bin_path, std::ios::binary);
     if (!fin.good()) {
-        SNNDL_DEBUG_LOG(0, "[diag-bcsr] core=%u fallback open failed %s\n", core_id_, bin_path.c_str());
+        SNNDL_DEBUG_LOG(2, "[diag-bcsr] core=%u fallback open failed %s\n", core_id_, bin_path.c_str());
         return false;
     }
     size_t bytes = expectedRowptrBytes_();
@@ -283,7 +281,7 @@ bool SnnPESubComponent::loadBcsrRowptrFromFile_() {
     fin.seekg(static_cast<std::streamoff>(rowptr_off), std::ios::beg);
     fin.read(reinterpret_cast<char*>(buffer.data()), bytes);
     if (!fin.good()) {
-        SNNDL_DEBUG_LOG(0,
+        SNNDL_DEBUG_LOG(2,
             "[diag-bcsr] core=%u fallback read failed %s rowptr_off=%" PRIu64 " bytes=%zu\n",
             core_id_, bin_path.c_str(), rowptr_off, bytes);
         return false;
@@ -306,8 +304,8 @@ void SnnPESubComponent::ensureRowptrReadyOrFatal_(const char* reason) {
             "BCSR rowptr load failed (%s) and fallback weight file could not be loaded (core=%u node=%u).\n",
             msg, core_id_, node_id_);
     }
-    if (window_read_debug_ && output_) {
-        output_->verbose(CALL_INFO, 0, 0,
+    if (window_read_debug_ && output_ && output_->getVerboseLevel() >= 2) {
+        output_->verbose(CALL_INFO, 2, 0,
             "[diag-bcsr] core=%u rowptr fallback applied (%s)\n",
             core_id_, msg);
     }

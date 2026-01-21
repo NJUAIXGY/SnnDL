@@ -180,12 +180,15 @@ am__dirstamp = $(am__leading_dot)dirstamp
 am_libSnnDL_la_OBJECTS = events/SimpleTestEvent.lo \
 	events/SpikeEventWrapper.lo \
 	components/gas/GlobalGasStepController.lo \
-	components/GatherBufferIF.lo components/GatingPE.lo \
-	components/MemKCalBench.lo components/MultiCorePE.lo \
-	components/SnnNIC.lo components/SnnPE.lo \
-	components/stimulus/SpikeSource.lo components/WeightLoader.lo \
-	components/mpi/MPIMultiCorePE.lo components/mpi/MPITypes.lo \
-	control/SnnPESubComponent.lo control/SnnPESubComponent_bcsr.lo \
+	components/CachelineFragmentMemIF.lo \
+	components/GatherBufferIF.lo \
+	components/gather/GatherBufferIFConfig.lo \
+	components/GatingPE.lo components/MemKCalBench.lo \
+	components/multicore/MultiCorePEConfig.lo \
+	components/MultiCorePE.lo components/SnnNIC.lo \
+	components/SnnPE.lo components/stimulus/SpikeSource.lo \
+	components/WeightLoader.lo control/SnnPESubComponent.lo \
+	control/SnnPESubComponent_bcsr.lo \
 	control/SnnPESubComponent_routing.lo \
 	control/SnnPESubComponent_scheme1.lo \
 	control/SnnPESubComponent_spike.lo \
@@ -217,6 +220,7 @@ am_libSnnDL_la_OBJECTS = events/SimpleTestEvent.lo \
 	services/synapse/route/SpikeCommSubsystem.lo \
 	services/synapse/route/SpikePacketBridge.lo \
 	services/workload/CoreWorkloadFactory.lo \
+	services/workload/layout/NormalizedNeuronLayout.lo \
 	services/workload/snn/SnnWorkload.lo \
 	services/workload/stream/StreamWorkload.lo \
 	services/workload/traffic/TrafficWorkload.lo \
@@ -244,15 +248,18 @@ am__v_at_1 =
 DEFAULT_INCLUDES = -I.@am__isrc@ -I$(top_builddir)/src
 depcomp = $(SHELL) $(top_srcdir)/config/depcomp
 am__maybe_remake_depfiles = depfiles
-am__depfiles_remade = components/$(DEPDIR)/GatherBufferIF.Plo \
+am__depfiles_remade = components/$(DEPDIR)/CachelineFragmentMemIF.Plo \
+	components/$(DEPDIR)/GatherBufferIF.Plo \
 	components/$(DEPDIR)/GatingPE.Plo \
 	components/$(DEPDIR)/MemKCalBench.Plo \
 	components/$(DEPDIR)/MultiCorePE.Plo \
 	components/$(DEPDIR)/SnnNIC.Plo components/$(DEPDIR)/SnnPE.Plo \
 	components/$(DEPDIR)/WeightLoader.Plo \
 	components/gas/$(DEPDIR)/GlobalGasStepController.Plo \
-	components/mpi/$(DEPDIR)/MPIMultiCorePE.Plo \
-	components/mpi/$(DEPDIR)/MPITypes.Plo \
+	components/gather/$(DEPDIR)/GatherBufferIFConfig.Plo \
+	components/multicore/$(DEPDIR)/MultiCorePEConfig.Plo \
+	components/noc/$(DEPDIR)/MulticastNIC.Plo \
+	components/noc/$(DEPDIR)/MulticastRouter.Plo \
 	components/noc/$(DEPDIR)/SimpleNetworkWrapper.Plo \
 	components/noc/$(DEPDIR)/SnnNetworkAdapter.Plo \
 	components/stimulus/$(DEPDIR)/SpikeSource.Plo \
@@ -290,8 +297,10 @@ am__depfiles_remade = components/$(DEPDIR)/GatherBufferIF.Plo \
 	services/synapse/weights/$(DEPDIR)/WeightCacheOps.Plo \
 	services/synapse/weights/$(DEPDIR)/WeightMemorySubsystem.Plo \
 	services/workload/$(DEPDIR)/CoreWorkloadFactory.Plo \
+	services/workload/layout/$(DEPDIR)/NormalizedNeuronLayout.Plo \
 	services/workload/snn/$(DEPDIR)/SnnWorkload.Plo \
-	services/workload/stream/$(DEPDIR)/StreamWorkload.Plo
+	services/workload/stream/$(DEPDIR)/StreamWorkload.Plo \
+	services/workload/traffic/$(DEPDIR)/TrafficWorkload.Plo
 am__mv = mv -f
 CXXCOMPILE = $(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) \
 	$(AM_CPPFLAGS) $(CPPFLAGS) $(AM_CXXFLAGS) $(CXXFLAGS)
@@ -362,8 +371,7 @@ AMTAR = @AMTAR@
 AM_CFLAGS = @AM_CFLAGS@
 AM_CPPFLAGS = @AM_CPPFLAGS@ -I$(top_srcdir)/src -I$(srcdir) \
 	-I$(srcdir)/api -I$(srcdir)/events -I$(srcdir)/components \
-	-I$(srcdir)/components/mpi -I$(srcdir)/control \
-	-I$(srcdir)/compute -I$(srcdir)/services \
+	-I$(srcdir)/control -I$(srcdir)/compute -I$(srcdir)/services \
 	-I/home/xgy/remote/sst_install/include
 AM_CXXFLAGS = @AM_CXXFLAGS@
 AM_DEFAULT_VERBOSITY = @AM_DEFAULT_VERBOSITY@
@@ -638,6 +646,7 @@ libSnnDL_la_SOURCES = \
 	api/ISynapseRoute.h \
 	api/SynapseRouteBuildConfig.h \
 	api/SnnWeightReader.h \
+	api/SnnDLLogging.h \
 	events/GatingDecisionEvent.h \
 	events/GasStepBarrierEvent.h \
 	events/SimpleTestEvent.cc \
@@ -648,12 +657,18 @@ libSnnDL_la_SOURCES = \
 	events/SpikePacket.h \
 	components/gas/GlobalGasStepController.cc \
 	components/gas/GlobalGasStepController.h \
+	components/CachelineFragmentMemIF.cc \
+	components/CachelineFragmentMemIF.h \
 	components/GatherBufferIF.cc \
 	components/GatherBufferIF.h \
+	components/gather/GatherBufferIFConfig.cc \
+	components/gather/GatherBufferIFConfig.h \
 	components/GatingPE.cc \
 	components/GatingPE.h \
 	components/MemKCalBench.cc \
 	components/MemKCalBench.h \
+	components/multicore/MultiCorePEConfig.cc \
+	components/multicore/MultiCorePEConfig.h \
 	components/MultiCorePE.cc \
 	components/MultiCorePE.h \
 	components/SnnNIC.cc \
@@ -664,10 +679,6 @@ libSnnDL_la_SOURCES = \
 	components/stimulus/SpikeSource.h \
 	components/WeightLoader.cc \
 	components/WeightLoader.h \
-	components/mpi/MPIMultiCorePE.cc \
-	components/mpi/MPIMultiCorePE.h \
-	components/mpi/MPITypes.cc \
-	components/mpi/MPITypes.h \
 	control/SnnPESubComponent.cc \
 	control/SnnPESubComponent.h \
 	control/SnnPESubComponent_impl.h \
@@ -737,6 +748,8 @@ libSnnDL_la_SOURCES = \
 	services/synapse/route/SpikePacketBridge.cc \
 	services/synapse/route/SpikePacketBridge.h \
 	services/workload/CoreWorkloadFactory.cc \
+	services/workload/layout/NormalizedNeuronLayout.cc \
+	services/workload/layout/NormalizedNeuronLayout.h \
 	services/workload/snn/SnnWorkload.cc \
 	services/workload/snn/SnnWorkload.h \
 	services/workload/stream/StreamWorkload.cc \
@@ -844,12 +857,32 @@ components/$(am__dirstamp):
 components/$(DEPDIR)/$(am__dirstamp):
 	@$(MKDIR_P) components/$(DEPDIR)
 	@: > components/$(DEPDIR)/$(am__dirstamp)
+components/CachelineFragmentMemIF.lo: components/$(am__dirstamp) \
+	components/$(DEPDIR)/$(am__dirstamp)
 components/GatherBufferIF.lo: components/$(am__dirstamp) \
 	components/$(DEPDIR)/$(am__dirstamp)
+components/gather/$(am__dirstamp):
+	@$(MKDIR_P) components/gather
+	@: > components/gather/$(am__dirstamp)
+components/gather/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) components/gather/$(DEPDIR)
+	@: > components/gather/$(DEPDIR)/$(am__dirstamp)
+components/gather/GatherBufferIFConfig.lo:  \
+	components/gather/$(am__dirstamp) \
+	components/gather/$(DEPDIR)/$(am__dirstamp)
 components/GatingPE.lo: components/$(am__dirstamp) \
 	components/$(DEPDIR)/$(am__dirstamp)
 components/MemKCalBench.lo: components/$(am__dirstamp) \
 	components/$(DEPDIR)/$(am__dirstamp)
+components/multicore/$(am__dirstamp):
+	@$(MKDIR_P) components/multicore
+	@: > components/multicore/$(am__dirstamp)
+components/multicore/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) components/multicore/$(DEPDIR)
+	@: > components/multicore/$(DEPDIR)/$(am__dirstamp)
+components/multicore/MultiCorePEConfig.lo:  \
+	components/multicore/$(am__dirstamp) \
+	components/multicore/$(DEPDIR)/$(am__dirstamp)
 components/MultiCorePE.lo: components/$(am__dirstamp) \
 	components/$(DEPDIR)/$(am__dirstamp)
 components/SnnNIC.lo: components/$(am__dirstamp) \
@@ -867,16 +900,6 @@ components/stimulus/SpikeSource.lo:  \
 	components/stimulus/$(DEPDIR)/$(am__dirstamp)
 components/WeightLoader.lo: components/$(am__dirstamp) \
 	components/$(DEPDIR)/$(am__dirstamp)
-components/mpi/$(am__dirstamp):
-	@$(MKDIR_P) components/mpi
-	@: > components/mpi/$(am__dirstamp)
-components/mpi/$(DEPDIR)/$(am__dirstamp):
-	@$(MKDIR_P) components/mpi/$(DEPDIR)
-	@: > components/mpi/$(DEPDIR)/$(am__dirstamp)
-components/mpi/MPIMultiCorePE.lo: components/mpi/$(am__dirstamp) \
-	components/mpi/$(DEPDIR)/$(am__dirstamp)
-components/mpi/MPITypes.lo: components/mpi/$(am__dirstamp) \
-	components/mpi/$(DEPDIR)/$(am__dirstamp)
 control/$(am__dirstamp):
 	@$(MKDIR_P) control
 	@: > control/$(am__dirstamp)
@@ -967,6 +990,10 @@ services/synapse/weights/SnnWeightDiagnostics.lo:  \
 	services/synapse/weights/$(DEPDIR)/$(am__dirstamp)
 components/noc/SnnNetworkAdapter.lo: components/noc/$(am__dirstamp) \
 	components/noc/$(DEPDIR)/$(am__dirstamp)
+components/noc/MulticastRouter.lo: components/noc/$(am__dirstamp) \
+	components/noc/$(DEPDIR)/$(am__dirstamp)
+components/noc/MulticastNIC.lo: components/noc/$(am__dirstamp) \
+	components/noc/$(DEPDIR)/$(am__dirstamp)
 services/synapse/route/$(am__dirstamp):
 	@$(MKDIR_P) services/synapse/route
 	@: > services/synapse/route/$(am__dirstamp)
@@ -1023,6 +1050,15 @@ services/workload/$(DEPDIR)/$(am__dirstamp):
 services/workload/CoreWorkloadFactory.lo:  \
 	services/workload/$(am__dirstamp) \
 	services/workload/$(DEPDIR)/$(am__dirstamp)
+services/workload/layout/$(am__dirstamp):
+	@$(MKDIR_P) services/workload/layout
+	@: > services/workload/layout/$(am__dirstamp)
+services/workload/layout/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) services/workload/layout/$(DEPDIR)
+	@: > services/workload/layout/$(DEPDIR)/$(am__dirstamp)
+services/workload/layout/NormalizedNeuronLayout.lo:  \
+	services/workload/layout/$(am__dirstamp) \
+	services/workload/layout/$(DEPDIR)/$(am__dirstamp)
 services/workload/snn/$(am__dirstamp):
 	@$(MKDIR_P) services/workload/snn
 	@: > services/workload/snn/$(am__dirstamp)
@@ -1041,6 +1077,15 @@ services/workload/stream/$(DEPDIR)/$(am__dirstamp):
 services/workload/stream/StreamWorkload.lo:  \
 	services/workload/stream/$(am__dirstamp) \
 	services/workload/stream/$(DEPDIR)/$(am__dirstamp)
+services/workload/traffic/$(am__dirstamp):
+	@$(MKDIR_P) services/workload/traffic
+	@: > services/workload/traffic/$(am__dirstamp)
+services/workload/traffic/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) services/workload/traffic/$(DEPDIR)
+	@: > services/workload/traffic/$(DEPDIR)/$(am__dirstamp)
+services/workload/traffic/TrafficWorkload.lo:  \
+	services/workload/traffic/$(am__dirstamp) \
+	services/workload/traffic/$(DEPDIR)/$(am__dirstamp)
 services/memory/$(am__dirstamp):
 	@$(MKDIR_P) services/memory
 	@: > services/memory/$(am__dirstamp)
@@ -1059,8 +1104,10 @@ mostlyclean-compile:
 	-rm -f components/*.lo
 	-rm -f components/gas/*.$(OBJEXT)
 	-rm -f components/gas/*.lo
-	-rm -f components/mpi/*.$(OBJEXT)
-	-rm -f components/mpi/*.lo
+	-rm -f components/gather/*.$(OBJEXT)
+	-rm -f components/gather/*.lo
+	-rm -f components/multicore/*.$(OBJEXT)
+	-rm -f components/multicore/*.lo
 	-rm -f components/noc/*.$(OBJEXT)
 	-rm -f components/noc/*.lo
 	-rm -f components/stimulus/*.$(OBJEXT)
@@ -1087,14 +1134,19 @@ mostlyclean-compile:
 	-rm -f services/synapse/weights/*.lo
 	-rm -f services/workload/*.$(OBJEXT)
 	-rm -f services/workload/*.lo
+	-rm -f services/workload/layout/*.$(OBJEXT)
+	-rm -f services/workload/layout/*.lo
 	-rm -f services/workload/snn/*.$(OBJEXT)
 	-rm -f services/workload/snn/*.lo
 	-rm -f services/workload/stream/*.$(OBJEXT)
 	-rm -f services/workload/stream/*.lo
+	-rm -f services/workload/traffic/*.$(OBJEXT)
+	-rm -f services/workload/traffic/*.lo
 
 distclean-compile:
 	-rm -f *.tab.c
 
+@AMDEP_TRUE@@am__include@ @am__quote@components/$(DEPDIR)/CachelineFragmentMemIF.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@components/$(DEPDIR)/GatherBufferIF.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@components/$(DEPDIR)/GatingPE.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@components/$(DEPDIR)/MemKCalBench.Plo@am__quote@ # am--include-marker
@@ -1103,8 +1155,10 @@ distclean-compile:
 @AMDEP_TRUE@@am__include@ @am__quote@components/$(DEPDIR)/SnnPE.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@components/$(DEPDIR)/WeightLoader.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@components/gas/$(DEPDIR)/GlobalGasStepController.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@components/mpi/$(DEPDIR)/MPIMultiCorePE.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@components/mpi/$(DEPDIR)/MPITypes.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@components/gather/$(DEPDIR)/GatherBufferIFConfig.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@components/multicore/$(DEPDIR)/MultiCorePEConfig.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@components/noc/$(DEPDIR)/MulticastNIC.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@components/noc/$(DEPDIR)/MulticastRouter.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@components/noc/$(DEPDIR)/SimpleNetworkWrapper.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@components/noc/$(DEPDIR)/SnnNetworkAdapter.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@components/stimulus/$(DEPDIR)/SpikeSource.Plo@am__quote@ # am--include-marker
@@ -1142,8 +1196,10 @@ distclean-compile:
 @AMDEP_TRUE@@am__include@ @am__quote@services/synapse/weights/$(DEPDIR)/WeightCacheOps.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@services/synapse/weights/$(DEPDIR)/WeightMemorySubsystem.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@services/workload/$(DEPDIR)/CoreWorkloadFactory.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@services/workload/layout/$(DEPDIR)/NormalizedNeuronLayout.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@services/workload/snn/$(DEPDIR)/SnnWorkload.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@services/workload/stream/$(DEPDIR)/StreamWorkload.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@services/workload/traffic/$(DEPDIR)/TrafficWorkload.Plo@am__quote@ # am--include-marker
 
 $(am__depfiles_remade):
 	@$(MKDIR_P) $(@D)
@@ -1182,7 +1238,8 @@ clean-libtool:
 	-rm -rf .libs _libs
 	-rm -rf components/.libs components/_libs
 	-rm -rf components/gas/.libs components/gas/_libs
-	-rm -rf components/mpi/.libs components/mpi/_libs
+	-rm -rf components/gather/.libs components/gather/_libs
+	-rm -rf components/multicore/.libs components/multicore/_libs
 	-rm -rf components/noc/.libs components/noc/_libs
 	-rm -rf components/stimulus/.libs components/stimulus/_libs
 	-rm -rf compute/.libs compute/_libs
@@ -1196,8 +1253,10 @@ clean-libtool:
 	-rm -rf services/synapse/stdmem/.libs services/synapse/stdmem/_libs
 	-rm -rf services/synapse/weights/.libs services/synapse/weights/_libs
 	-rm -rf services/workload/.libs services/workload/_libs
+	-rm -rf services/workload/layout/.libs services/workload/layout/_libs
 	-rm -rf services/workload/snn/.libs services/workload/snn/_libs
 	-rm -rf services/workload/stream/.libs services/workload/stream/_libs
+	-rm -rf services/workload/traffic/.libs services/workload/traffic/_libs
 snippets-local: 
 
 ID: $(am__tagged_files)
@@ -1321,8 +1380,10 @@ distclean-generic:
 	-rm -f components/$(am__dirstamp)
 	-rm -f components/gas/$(DEPDIR)/$(am__dirstamp)
 	-rm -f components/gas/$(am__dirstamp)
-	-rm -f components/mpi/$(DEPDIR)/$(am__dirstamp)
-	-rm -f components/mpi/$(am__dirstamp)
+	-rm -f components/gather/$(DEPDIR)/$(am__dirstamp)
+	-rm -f components/gather/$(am__dirstamp)
+	-rm -f components/multicore/$(DEPDIR)/$(am__dirstamp)
+	-rm -f components/multicore/$(am__dirstamp)
 	-rm -f components/noc/$(DEPDIR)/$(am__dirstamp)
 	-rm -f components/noc/$(am__dirstamp)
 	-rm -f components/stimulus/$(DEPDIR)/$(am__dirstamp)
@@ -1349,10 +1410,14 @@ distclean-generic:
 	-rm -f services/synapse/weights/$(am__dirstamp)
 	-rm -f services/workload/$(DEPDIR)/$(am__dirstamp)
 	-rm -f services/workload/$(am__dirstamp)
+	-rm -f services/workload/layout/$(DEPDIR)/$(am__dirstamp)
+	-rm -f services/workload/layout/$(am__dirstamp)
 	-rm -f services/workload/snn/$(DEPDIR)/$(am__dirstamp)
 	-rm -f services/workload/snn/$(am__dirstamp)
 	-rm -f services/workload/stream/$(DEPDIR)/$(am__dirstamp)
 	-rm -f services/workload/stream/$(am__dirstamp)
+	-rm -f services/workload/traffic/$(DEPDIR)/$(am__dirstamp)
+	-rm -f services/workload/traffic/$(am__dirstamp)
 
 maintainer-clean-generic:
 	@echo "This command is intended for maintainers to use"
@@ -1363,7 +1428,8 @@ clean-am: clean-compLTLIBRARIES clean-generic clean-libtool \
 	mostlyclean-am
 
 distclean: distclean-am
-		-rm -f components/$(DEPDIR)/GatherBufferIF.Plo
+		-rm -f components/$(DEPDIR)/CachelineFragmentMemIF.Plo
+	-rm -f components/$(DEPDIR)/GatherBufferIF.Plo
 	-rm -f components/$(DEPDIR)/GatingPE.Plo
 	-rm -f components/$(DEPDIR)/MemKCalBench.Plo
 	-rm -f components/$(DEPDIR)/MultiCorePE.Plo
@@ -1371,8 +1437,10 @@ distclean: distclean-am
 	-rm -f components/$(DEPDIR)/SnnPE.Plo
 	-rm -f components/$(DEPDIR)/WeightLoader.Plo
 	-rm -f components/gas/$(DEPDIR)/GlobalGasStepController.Plo
-	-rm -f components/mpi/$(DEPDIR)/MPIMultiCorePE.Plo
-	-rm -f components/mpi/$(DEPDIR)/MPITypes.Plo
+	-rm -f components/gather/$(DEPDIR)/GatherBufferIFConfig.Plo
+	-rm -f components/multicore/$(DEPDIR)/MultiCorePEConfig.Plo
+	-rm -f components/noc/$(DEPDIR)/MulticastNIC.Plo
+	-rm -f components/noc/$(DEPDIR)/MulticastRouter.Plo
 	-rm -f components/noc/$(DEPDIR)/SimpleNetworkWrapper.Plo
 	-rm -f components/noc/$(DEPDIR)/SnnNetworkAdapter.Plo
 	-rm -f components/stimulus/$(DEPDIR)/SpikeSource.Plo
@@ -1410,8 +1478,10 @@ distclean: distclean-am
 	-rm -f services/synapse/weights/$(DEPDIR)/WeightCacheOps.Plo
 	-rm -f services/synapse/weights/$(DEPDIR)/WeightMemorySubsystem.Plo
 	-rm -f services/workload/$(DEPDIR)/CoreWorkloadFactory.Plo
+	-rm -f services/workload/layout/$(DEPDIR)/NormalizedNeuronLayout.Plo
 	-rm -f services/workload/snn/$(DEPDIR)/SnnWorkload.Plo
 	-rm -f services/workload/stream/$(DEPDIR)/StreamWorkload.Plo
+	-rm -f services/workload/traffic/$(DEPDIR)/TrafficWorkload.Plo
 	-rm -f Makefile
 distclean-am: clean-am distclean-compile distclean-generic \
 	distclean-tags
@@ -1457,7 +1527,8 @@ install-ps-am:
 installcheck-am:
 
 maintainer-clean: maintainer-clean-am
-		-rm -f components/$(DEPDIR)/GatherBufferIF.Plo
+		-rm -f components/$(DEPDIR)/CachelineFragmentMemIF.Plo
+	-rm -f components/$(DEPDIR)/GatherBufferIF.Plo
 	-rm -f components/$(DEPDIR)/GatingPE.Plo
 	-rm -f components/$(DEPDIR)/MemKCalBench.Plo
 	-rm -f components/$(DEPDIR)/MultiCorePE.Plo
@@ -1465,8 +1536,10 @@ maintainer-clean: maintainer-clean-am
 	-rm -f components/$(DEPDIR)/SnnPE.Plo
 	-rm -f components/$(DEPDIR)/WeightLoader.Plo
 	-rm -f components/gas/$(DEPDIR)/GlobalGasStepController.Plo
-	-rm -f components/mpi/$(DEPDIR)/MPIMultiCorePE.Plo
-	-rm -f components/mpi/$(DEPDIR)/MPITypes.Plo
+	-rm -f components/gather/$(DEPDIR)/GatherBufferIFConfig.Plo
+	-rm -f components/multicore/$(DEPDIR)/MultiCorePEConfig.Plo
+	-rm -f components/noc/$(DEPDIR)/MulticastNIC.Plo
+	-rm -f components/noc/$(DEPDIR)/MulticastRouter.Plo
 	-rm -f components/noc/$(DEPDIR)/SimpleNetworkWrapper.Plo
 	-rm -f components/noc/$(DEPDIR)/SnnNetworkAdapter.Plo
 	-rm -f components/stimulus/$(DEPDIR)/SpikeSource.Plo
@@ -1504,8 +1577,10 @@ maintainer-clean: maintainer-clean-am
 	-rm -f services/synapse/weights/$(DEPDIR)/WeightCacheOps.Plo
 	-rm -f services/synapse/weights/$(DEPDIR)/WeightMemorySubsystem.Plo
 	-rm -f services/workload/$(DEPDIR)/CoreWorkloadFactory.Plo
+	-rm -f services/workload/layout/$(DEPDIR)/NormalizedNeuronLayout.Plo
 	-rm -f services/workload/snn/$(DEPDIR)/SnnWorkload.Plo
 	-rm -f services/workload/stream/$(DEPDIR)/StreamWorkload.Plo
+	-rm -f services/workload/traffic/$(DEPDIR)/TrafficWorkload.Plo
 	-rm -f Makefile
 maintainer-clean-am: distclean-am maintainer-clean-generic
 

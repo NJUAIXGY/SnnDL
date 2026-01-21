@@ -15,8 +15,8 @@ bool GasEdgeCollector::prevEmpty() const { return prev.empty(); }
 void GasEdgeCollector::clearWarnings() { record_stage_warned = record_cond_warned = false; }
 
 void GasEdgeCollector::flipForApply(bool debug, Output* out, int, uint32_t seq) {
-    if (debug && out) {
-        out->verbose(CALL_INFO, 0, 0,
+    if (debug && out && out->getVerboseLevel() >= 2) {
+        out->verbose(CALL_INFO, 2, 0,
             "[diag-edges] BeginApply seq=%u edges_curr=%zu\n",
             seq, curr.size());
     }
@@ -29,8 +29,8 @@ void GasEdgeCollector::flipForApply(bool debug, Output* out, int, uint32_t seq) 
     // insertion order differs (critical for strict-GAS reproducibility under -n multi-thread).
     std::sort(prev.begin(), prev.end(),
               [](const auto& a, const auto& b) { return a.first < b.first; });
-    if (debug && out) {
-        out->verbose(CALL_INFO, 0, 0,
+    if (debug && out && out->getVerboseLevel() >= 2) {
+        out->verbose(CALL_INFO, 2, 0,
             "[diag-edges] BeginApply seq=%u edges_prev=%zu\n",
             seq, prev.size());
     }

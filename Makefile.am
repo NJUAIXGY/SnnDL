@@ -4,7 +4,6 @@ AM_CPPFLAGS += \
 	-I$(srcdir)/api \
 	-I$(srcdir)/events \
 	-I$(srcdir)/components \
-	-I$(srcdir)/components/mpi \
 	-I$(srcdir)/control \
 	-I$(srcdir)/compute \
 	-I$(srcdir)/services \
@@ -40,6 +39,7 @@ libSnnDL_la_SOURCES = \
 	api/ISynapseRoute.h \
 	api/SynapseRouteBuildConfig.h \
 	api/SnnWeightReader.h \
+	api/SnnDLLogging.h \
 	events/GatingDecisionEvent.h \
 	events/GasStepBarrierEvent.h \
 	events/SimpleTestEvent.cc \
@@ -50,12 +50,18 @@ libSnnDL_la_SOURCES = \
 	events/SpikePacket.h \
 	components/gas/GlobalGasStepController.cc \
 	components/gas/GlobalGasStepController.h \
+	components/CachelineFragmentMemIF.cc \
+	components/CachelineFragmentMemIF.h \
 	components/GatherBufferIF.cc \
 	components/GatherBufferIF.h \
+	components/gather/GatherBufferIFConfig.cc \
+	components/gather/GatherBufferIFConfig.h \
 	components/GatingPE.cc \
 	components/GatingPE.h \
 	components/MemKCalBench.cc \
 	components/MemKCalBench.h \
+	components/multicore/MultiCorePEConfig.cc \
+	components/multicore/MultiCorePEConfig.h \
 	components/MultiCorePE.cc \
 	components/MultiCorePE.h \
 	components/SnnNIC.cc \
@@ -66,10 +72,6 @@ libSnnDL_la_SOURCES = \
 	components/stimulus/SpikeSource.h \
 	components/WeightLoader.cc \
 	components/WeightLoader.h \
-	components/mpi/MPIMultiCorePE.cc \
-	components/mpi/MPIMultiCorePE.h \
-	components/mpi/MPITypes.cc \
-	components/mpi/MPITypes.h \
 	control/SnnPESubComponent.cc \
 	control/SnnPESubComponent.h \
 	control/SnnPESubComponent_impl.h \
@@ -139,6 +141,8 @@ libSnnDL_la_SOURCES = \
 	services/synapse/route/SpikePacketBridge.cc \
 	services/synapse/route/SpikePacketBridge.h \
 	services/workload/CoreWorkloadFactory.cc \
+	services/workload/layout/NormalizedNeuronLayout.cc \
+	services/workload/layout/NormalizedNeuronLayout.h \
 	services/workload/snn/SnnWorkload.cc \
 	services/workload/snn/SnnWorkload.h \
 	services/workload/stream/StreamWorkload.cc \

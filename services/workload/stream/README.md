@@ -4,6 +4,11 @@
 
 > 约束：该 workload 不依赖 `SpikeEvent`、不依赖 `services/synapse/*`、不依赖 `services/stimulus/*`。
 
+## 默认内存语义（cacheline）
+
+StreamWorkload 的目标是验证“平台核”的通用能力，因此其内存行为默认遵循平台的体系结构口径：**cacheline 粒度**作为对外搬运与 `memHierarchy GetS/GetX` 统计对齐的基本单位。
+若进行 row-streaming/DMA 等更强假设的实验，应使用其他 workload/配置，并在输出中显式标注，避免混入通用核验收结论。
+
 ---
 
 ## 主要文件

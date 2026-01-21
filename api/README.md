@@ -28,6 +28,17 @@
 - `ISpikeWorkload.h` / `ISnnSpikeCommWorkload.h`
   - Spike 相关的 workload 可选接口（例如 SNN workload 暴露“本地注入/统计/通信”协作点）。
 
+---
+
+## 内存建模口径（默认 cacheline）
+
+SnnDL 的“通用 DRAM + memHierarchy”默认建模语义是 **cacheline（例如 64B）**：
+
+- `api/IMemoryAccess.h` 只承诺 `addr + size ↔ bytes`，不承诺“行/矩阵 row”语义。
+- 论文/报告的 traffic 主口径建议以 memHierarchy 的 MemController 事务统计（`requests_received_*`）为准；
+  上层 `memory_bytes` 仅代表逻辑请求（L1），不等价于 off-chip 流量（L2）。
+- row-streaming/DMA 属于显式架构假设，必须单列结果，避免与 cacheline 结论混算。
+
 ### NoC（纯传输：packet-first）
 - `INocTransport.h`
   - NoC 抽象接口：`sendFromCore/injectLocal/sendExternal` 等。

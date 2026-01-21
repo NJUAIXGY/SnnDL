@@ -17,6 +17,7 @@
 #include "SynapseRouteBuildConfig.h"
 #include "ISpikeTransport.h"
 #include "NocSpikeTransport.h"
+#include "workload/layout/NormalizedNeuronLayout.h"
 
 #include <sst/core/output.h>
 #include <sst/core/params.h>
@@ -53,8 +54,15 @@ void SnnWorkload::configureFromParams(const SST::Params& params) {
     // Phase4 Task6.1: cache params for compute core creation/config.
     params_ = std::make_unique<SST::Params>(/*copy*/params);
     compute_core_impl_ = params.find<std::string>("compute_core_impl", "default");
-    num_neurons_ = params.find<uint32_t>("num_neurons", 64);
-    global_neuron_base_ = params.find<uint64_t>("global_neuron_base", 0);
+    // Layout params are normalized in bindRuntime() because different scripts historically
+    // used different "num_neurons/global_neuron_base" conventions (per-core vs per-PE).
+    num_neurons_param_ = params.find<uint32_t>("num_neurons", 64);
+    global_neuron_base_param_ = params.find<uint64_t>("global_neuron_base", 0);
+    neurons_per_pe_param_ = params.find<uint32_t>("neurons_per_pe", 0);
+    num_neurons_ = num_neurons_param_;
+    global_neuron_base_ = global_neuron_base_param_;
+    node_neuron_base_ = 0;
+    layout_normalized_ = false;
     total_nodes_cfg_ = params.find<uint32_t>("total_nodes", 16);
     apply_acc_enable_ = params.find<int>("apply_acc_enable", 0) != 0;
     gas_window_mode_ = params.find<int>("gas_window_mode", 0) != 0;
@@ -68,14 +76,17 @@ void SnnWorkload::configureFromParams(const SST::Params& params) {
         (index_mode_str == "csr_post_row");
     use_bcsr_ = (index_mode_str == "bcsr_post_row");
 
-    // Phase10: strict window-read path is now the default when workload=snn runs GAS/window mode.
-    // (Opt-in param still supported for experimentation.)
+    // Phase10: GAS/window 模式下默认启用 strict window-read spike input（由 workload 直接记录 edge/touch）。
+    // 兼容性：某些环境可能会把未显式设置的参数默认注入为 0，此时不应“误关掉”窗口路径，因此将 0 视为 auto。
     const int wsi = params.find<int>("workload_spike_input_enable", -1);
-    if (wsi >= 0) {
-        workload_spike_input_enable_ = (wsi != 0);
+    const bool auto_enable =
+        (apply_acc_enable_ && gas_window_mode_ && window_read_enable_ && !scheme1_enable_);
+    if (wsi > 0) {
+        workload_spike_input_enable_ = true;
+    } else if (wsi == 0) {
+        workload_spike_input_enable_ = auto_enable;
     } else {
-        workload_spike_input_enable_ =
-            (apply_acc_enable_ && gas_window_mode_ && window_read_enable_ && !scheme1_enable_);
+        workload_spike_input_enable_ = auto_enable;
     }
 
     enable_weight_fetch_ = params.find<int>("enable_weight_fetch", 0) != 0;
@@ -85,10 +96,11 @@ void SnnWorkload::configureFromParams(const SST::Params& params) {
     record_edge_idle_enable_ = params.find<int>("record_edge_idle_enable", 0) != 0;
     record_edge_scatter_enable_ = params.find<int>("record_edge_scatter_enable", 0) != 0;
 
-    const uint32_t cores_per_pe = params.find<uint32_t>("total_cores", 8);
-    const uint32_t computed_neurons_per_pe = cores_per_pe * num_neurons_;
-    const uint32_t np_from_params = params.find<uint32_t>("neurons_per_pe", 0);
-    neurons_per_pe_cfg_ = (np_from_params > 0) ? np_from_params : computed_neurons_per_pe;
+    cores_per_pe_cfg_ = params.find<uint32_t>("total_cores", 8);
+    if (cores_per_pe_cfg_ == 0) cores_per_pe_cfg_ = 1;
+    // Defer neurons_per_core/neurons_per_pe derivation to normalizeLayout_().
+    neurons_per_core_cfg_ = 0;
+    neurons_per_pe_cfg_ = neurons_per_pe_param_;
 
     // WeightLoader barrier (shared signal): allow memory readers to defer until loader is done.
     loader_done_key_ = params.find<std::string>("loader_done_key", "");
@@ -117,6 +129,23 @@ void SnnWorkload::configureFromParams(const SST::Params& params) {
 
 void SnnWorkload::bindRuntime(const Runtime& rt) {
     rt_ = rt;
+    normalizeLayout_();
+    if (cores_per_pe_cfg_ == 0 || neurons_per_core_cfg_ == 0 || neurons_per_pe_cfg_ == 0 ||
+        (neurons_per_pe_cfg_ % cores_per_pe_cfg_) != 0 ||
+        static_cast<uint64_t>(neurons_per_pe_cfg_) !=
+            static_cast<uint64_t>(cores_per_pe_cfg_) * static_cast<uint64_t>(neurons_per_core_cfg_)) {
+        if (rt_.log) {
+            rt_.log->fatal(CALL_INFO, -1,
+                           "SnnWorkload fatal: 全局布局口径不一致: total_cores=%u neurons_per_core=%u neurons_per_pe=%u (raw: num_neurons=%u neurons_per_pe=%u base=0x%" PRIx64 ")\n",
+                           cores_per_pe_cfg_,
+                           neurons_per_core_cfg_,
+                           neurons_per_pe_cfg_,
+                           num_neurons_param_,
+                           neurons_per_pe_param_,
+                           static_cast<uint64_t>(global_neuron_base_param_));
+        }
+        std::abort();
+    }
     if (weight_mem_subsystem_) {
         weight_mem_subsystem_->bindMemory(rt_.mem);
     }
@@ -141,8 +170,7 @@ void SnnWorkload::bindRuntime(const Runtime& rt) {
         if (!noc_spike_transport_) noc_spike_transport_ = std::make_unique<NocSpikeTransport>();
         noc_spike_transport_->setNocTransport(rt_.noc);
         noc_spike_transport_->setSourceCore(static_cast<int>(rt_.core_id));
-        const uint32_t cores_per_pe = params_ ? params_->find<uint32_t>("total_cores", 1) : 1;
-        noc_spike_transport_->configureLayout(total_nodes_cfg_, cores_per_pe, num_neurons_);
+        noc_spike_transport_->configureLayout(total_nodes_cfg_, cores_per_pe_cfg_, neurons_per_core_cfg_);
         transport = noc_spike_transport_.get();
         SpikeCommRuntimeConfig crt{};
         crt.log = rt_.log;
@@ -153,6 +181,42 @@ void SnnWorkload::bindRuntime(const Runtime& rt) {
         crt.synapse_route = synapse_route_.get();
         crt.global_neuron_base = global_neuron_base_;
         spike_comm_->bindRuntime(crt);
+    }
+}
+
+void SnnWorkload::normalizeLayout_() {
+    if (layout_normalized_) return;
+    layout_normalized_ = true;
+
+    uint32_t weights_cols = 0;
+    if (params_) weights_cols = params_->find<uint32_t>("weights_cols", 0);
+
+    const auto n =
+        normalizeNeuronLayout(static_cast<uint32_t>(rt_.node_id),
+                              static_cast<uint32_t>(rt_.core_id),
+                              total_nodes_cfg_,
+                              cores_per_pe_cfg_,
+                              num_neurons_param_,
+                              neurons_per_pe_param_,
+                              global_neuron_base_param_,
+                              weights_cols);
+
+    total_nodes_cfg_ = n.total_nodes;
+    cores_per_pe_cfg_ = n.cores_per_pe;
+    neurons_per_core_cfg_ = n.neurons_per_core;
+    neurons_per_pe_cfg_ = n.neurons_per_pe;
+    node_neuron_base_ = n.node_neuron_base;
+    num_neurons_ = neurons_per_core_cfg_;
+
+    const uint64_t base_param = static_cast<uint64_t>(global_neuron_base_param_);
+    global_neuron_base_ = n.core_neuron_base;
+    if (n.base_match_score == 0 && rt_.log) {
+        rt_.log->verbose(CALL_INFO, 1, 0,
+                         "⚠️ SnnWorkload layout normalize: global_neuron_base(0x%" PRIx64 ") 与推导不一致，回退到 core_base=0x%" PRIx64 " (node=%u core=%u)\n",
+                         base_param,
+                         static_cast<uint64_t>(global_neuron_base_),
+                         static_cast<uint32_t>(rt_.node_id),
+                         static_cast<uint32_t>(rt_.core_id));
     }
 }
 
@@ -192,7 +256,7 @@ bool SnnWorkload::ensureLoaderReady_() {
     if (ready != 0) {
         loader_ready_latched_ = true;
         if (window_read_debug_ && !loader_ready_logged_ && rt_.log) {
-            rt_.log->verbose(CALL_INFO, 0, 0,
+            rt_.log->verbose(CALL_INFO, 2, 0,
                              "[diag-loader] workload=snn core=%u weights_ready at cycle=%" PRIu64 "\n",
                              static_cast<uint32_t>(rt_.core_id),
                              static_cast<uint64_t>(now_cycle_cached_));
@@ -205,6 +269,7 @@ bool SnnWorkload::ensureLoaderReady_() {
 
 void SnnWorkload::ensureWeightReaderOwned_() {
     if (weight_reader_) return;
+    normalizeLayout_();
 
     if (!params_) {
         if (rt_.log) rt_.log->fatal(CALL_INFO, -1, "SnnWorkload missing cached Params (configureFromParams not called?)\n");
@@ -263,7 +328,7 @@ void SnnWorkload::ensureWeightReaderOwned_() {
                 br_eff ? ((num_neurons_ + br_eff - 1u) / br_eff) : static_cast<uint32_t>(num_neurons_);
             if (n_block_rows > 0 && row_cap < n_block_rows) {
                 if (rt_.log) {
-                    rt_.log->verbose(CALL_INFO, 0, 0,
+                    rt_.log->verbose(CALL_INFO, 2, 0,
                                      "[bcsr] auto-fit row_index_cache_cap %u -> %u (node=%u core=%u rows=%u br=%u)\n",
                                      row_cap,
                                      n_block_rows,
@@ -364,6 +429,11 @@ void SnnWorkload::ensureWeightReaderOwned_() {
     ocfg.bcsr_rowptr_file_fallback_enable = params_->find<int>("bcsr_rowptr_file_fallback_enable", 0) != 0;
     ocfg.bcsr_weight_guard_enable = params_->find<int>("bcsr_weight_guard_enable", 1) != 0;
     ocfg.bcsr_weight_abs_max = params_->find<float>("bcsr_weight_abs_max", 10.0f);
+    ocfg.bcsr_semantic_verify_enable = params_->find<int>("bcsr_semantic_verify_enable", 0) != 0;
+    ocfg.bcsr_semantic_verify_max_edges = params_->find<uint32_t>("bcsr_semantic_verify_max_edges", 64);
+    ocfg.bcsr_semantic_verify_max_mismatch = params_->find<uint32_t>("bcsr_semantic_verify_max_mismatch", 8);
+    ocfg.bcsr_semantic_verify_abs_tol = params_->find<float>("bcsr_semantic_verify_abs_tol", 1e-6f);
+    ocfg.bcsr_semantic_verify_rel_tol = params_->find<float>("bcsr_semantic_verify_rel_tol", 1e-6f);
     ocfg.readresp_zero_fallback = params_->find<int>("readresp_zero_fallback", 0) != 0;
     ocfg.init_default_weight = params_->find<float>("init_default_weight", 0.5f);
     ocfg.num_neurons = num_neurons_;
@@ -376,6 +446,10 @@ void SnnWorkload::ensureWeightReaderOwned_() {
     ocfg.merge_read_row = params_->find<int>("merge_read_row", 0) != 0;
     ocfg.merge_read_auto = params_->find<int>("merge_read_auto", 0) != 0;
     ocfg.line_size_bytes = params_->find<uint32_t>("line_size_bytes", 64);
+    ocfg.byte_exact_verify_enable = params_->find<int>("byte_exact_verify_enable", 0) != 0;
+    ocfg.byte_exact_verify_mode = params_->find<std::string>("byte_exact_verify_mode", "");
+    ocfg.byte_exact_verify_row_scale = params_->find<uint32_t>("byte_exact_verify_row_scale", 1024);
+    ocfg.byte_exact_verify_max_mismatch = params_->find<uint32_t>("byte_exact_verify_max_mismatch", 8);
     ocfg.memory_warmup_cycles = params_->find<uint64_t>("memory_warmup_cycles", 0);
     ocfg.loader_barrier_cycles = params_->find<uint64_t>("loader_barrier_cycles", 0);
     ocfg.node_id = rt_.node_id;
@@ -421,6 +495,7 @@ void SnnWorkload::ensureWeightReaderOwned_() {
 
 void SnnWorkload::ensureComputeCoreConfigured_() {
     if (compute_configured_) return;
+    normalizeLayout_();
     if (!params_) {
         if (rt_.log) {
             rt_.log->fatal(CALL_INFO, -1,
@@ -433,7 +508,7 @@ void SnnWorkload::ensureComputeCoreConfigured_() {
         compute_core_ = createComputeCoreByName(compute_core_impl_);
         if (!compute_core_) {
             if (rt_.log) {
-                rt_.log->verbose(CALL_INFO, 0, 0,
+                rt_.log->verbose(CALL_INFO, 1, 0,
                                  "⚠️ 未知 compute_core_impl='%s'，回退到 default\n",
                                  compute_core_impl_.c_str());
             }
@@ -470,6 +545,7 @@ bool SnnWorkload::windowScatterModeActive_() const {
 
 void SnnWorkload::ensureSpikeCommConfigured_() {
     if (spike_comm_configured_) return;
+    normalizeLayout_();
     if (!params_) {
         if (rt_.log) rt_.log->fatal(CALL_INFO, -1, "SnnWorkload missing cached Params for route/comm configure\n");
         std::abort();
@@ -493,10 +569,10 @@ void SnnWorkload::ensureSpikeCommConfigured_() {
     cfg.log_weight_details = params_->find<int>("log_weight_details", 0) != 0;
     cfg.verify_routing_weights = params_->find<int>("verify_routing_weights", 0) != 0;
     cfg.route_summary_enable = params_->find<int>("route_summary_enable", 0) != 0;
-    cfg.rows = num_neurons_;
+    cfg.rows = neurons_per_pe_cfg_;
     cfg.cols = weights_cols;
     cfg.total_nodes = total_nodes_cfg_;
-    cfg.cores_per_pe = params_->find<uint32_t>("total_cores", 1);
+    cfg.cores_per_pe = cores_per_pe_cfg_;
     cfg.neurons_per_pe = neurons_per_pe_cfg_;
     cfg.use_post_row_pre_col = use_post_row_pre_col;
     cfg.weights_template = weights_template;
@@ -562,7 +638,7 @@ void SnnWorkload::ensureSpikeCommConfigured_() {
     if (!noc_spike_transport_) noc_spike_transport_ = std::make_unique<NocSpikeTransport>();
     noc_spike_transport_->setNocTransport(rt_.noc);
     noc_spike_transport_->setSourceCore(static_cast<int>(rt_.core_id));
-    noc_spike_transport_->configureLayout(total_nodes_cfg_, cfg.cores_per_pe, num_neurons_);
+    noc_spike_transport_->configureLayout(total_nodes_cfg_, cfg.cores_per_pe, neurons_per_core_cfg_);
     ISpikeTransport* transport = noc_spike_transport_.get();
 
     spike_comm_->configure();
@@ -627,8 +703,15 @@ bool SnnWorkload::onClockTick(uint64_t now_cycle) {
         rt_.reporting.request_gas_end_gather) {
         const uint64_t since_begin =
             (now_cycle_cached_ >= gather_begin_cycle_) ? (now_cycle_cached_ - gather_begin_cycle_) : 0;
-        const uint64_t quiet =
+        uint64_t quiet =
             (now_cycle_cached_ >= gather_last_activity_cycle_) ? (now_cycle_cached_ - gather_last_activity_cycle_) : 0;
+        // In step-gated mode, spikes for this step may still be in flight even if this core
+        // hasn't received any yet. Treat NoC non-idle as "activity" to avoid ending Gather
+        // before the network has drained enough for inputs to arrive.
+        if (rt_.noc && !rt_.noc->isIdle()) {
+            gather_last_activity_cycle_ = now_cycle_cached_;
+            quiet = 0;
+        }
         if (since_begin >= static_cast<uint64_t>(gather_min_cycles_) &&
             quiet >= static_cast<uint64_t>(gather_quiesce_cycles_) &&
             incoming_spikes_.empty()) {
@@ -1015,6 +1098,9 @@ void SnnWorkload::onFinish() {
     // dump the in-flight window's weight-read summary for root-cause analysis.
     if (window_read_debug_ && weight_mem_subsystem_) {
         weight_mem_subsystem_->finishWindowDiag();
+    }
+    if (weight_mem_subsystem_) {
+        weight_mem_subsystem_->finishSemanticVerify();
     }
     if (compute_core_) compute_core_->onFinish();
 }

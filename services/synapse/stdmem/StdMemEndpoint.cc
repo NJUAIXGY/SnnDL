@@ -113,6 +113,7 @@ void StdMemEndpoint::handleResponseOpaque(void* req) {
                 sev.payload_bytes = st->payload_bytes;
                 sev.window_inflight_peak = st->window_inflight_peak;
                 sev.window_buffer_max_bytes = st->window_buffer_max_bytes;
+                sev.gap_absorbed_bytes = st->gap_absorbed_bytes;
                 rt_.gas_stage_sink->onGasStatEvent(sev);
             }
             delete stdmem_req;

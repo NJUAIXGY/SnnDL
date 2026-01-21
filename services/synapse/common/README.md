@@ -4,6 +4,12 @@
 
 > 边界原则：`common/` 只放“小而稳定”的 helper/结构体（通常是 header-only），不承载任何事务状态机与 I/O 编排。
 
+## 默认内存语义（cacheline）与显式搬运假设
+
+- SnnDL 平台核默认以 **cacheline** 作为对外搬运/统计单位（对齐 `memHierarchy` 的 `GetS/GetX`）。
+- BCSR meta/offset 的存在并不意味着必须按“整行/大块”搬运：任何 row-streaming/DMA 或更大 granule 读都必须被当作“显式架构假设”单列，并在输出中通过
+  `effective_config.json` 与 granule 统计闭环验证。
+
 ---
 
 ## 主要内容
@@ -24,4 +30,3 @@
 
 - **禁止**：在 `common/` 中引入 StandardMem/NoC/控制层私有对象。
 - **建议**：所有 BCSR offset 口径统一从 `.meta.json` 注入，并优先通过 `validateBcsrMetaAgainstFile()` 做范围校验，避免静默读取 0/截断导致的发放归零问题。
-

@@ -5,6 +5,12 @@
 
 using namespace SST::SnnDL;
 
+// NOTE(Universal-core experiments):
+// We globally disable all BCSR *optimizations* (rowIndex cache, block cache, etc.).
+// BCSR remains as a storage format/addressing scheme only.
+// This avoids accidentally mixing BCSR-level optimizations into GAS experiments.
+static constexpr bool kEnableBcsrOptimizations = false;
+
 void BcsrWeightManager::configure(uint64_t rowptr_addr,
                                   uint64_t colidx_addr,
                                   uint64_t blockdata_addr,
@@ -28,32 +34,18 @@ void BcsrWeightManager::configure(uint64_t rowptr_addr,
 }
 
 void BcsrWeightManager::setRowIndexCacheCapacity(uint32_t cap) {
-    row_index_cache_cap_ = cap;
-    if (row_index_cache_cap_ == 0) {
-        row_index_cache_.clear();
-        return;
-    }
-    while (row_index_cache_.size() > row_index_cache_cap_) {
-        row_index_cache_.erase(row_index_cache_.begin());
-    }
+    (void)cap;
+    // Global hard-disable to prevent experiments from accidentally enabling cache effects.
+    row_index_cache_cap_ = kEnableBcsrOptimizations ? cap : 0;
+    row_index_cache_.clear();
 }
 
 void BcsrWeightManager::setBlockCacheCapacity(uint32_t cap) {
-    block_cache_cap_ = cap;
-    if (block_cache_cap_ == 0) {
-        block_cache_order_.clear();
-        block_cache_.clear();
-        return;
-    }
-    const bool evict_front =
-        (block_cache_policy_ == BlockCachePolicy::FIFO) ||
-        (block_cache_policy_ == BlockCachePolicy::LegacyUnordered);
-    while (block_cache_.size() > block_cache_cap_ && !block_cache_order_.empty()) {
-        const uint64_t victim = evict_front ? block_cache_order_.front() : block_cache_order_.back();
-        if (evict_front) block_cache_order_.pop_front();
-        else block_cache_order_.pop_back();
-        block_cache_.erase(victim);
-    }
+    (void)cap;
+    // Global hard-disable to prevent experiments from accidentally enabling cache effects.
+    block_cache_cap_ = kEnableBcsrOptimizations ? cap : 0;
+    block_cache_order_.clear();
+    block_cache_.clear();
 }
 
 void BcsrWeightManager::setBlockCachePolicy(BlockCachePolicy policy) {
@@ -144,6 +136,7 @@ bool BcsrWeightManager::installRowptrFromBytes(const uint8_t* data, size_t bytes
 }
 
 bool BcsrWeightManager::rowIndexGet(uint32_t block_row, std::vector<uint32_t>& out) const {
+    if (!kEnableBcsrOptimizations) return false;
     auto it = row_index_cache_.find(block_row);
     if (it == row_index_cache_.end()) return false;
     out = it->second;
@@ -151,12 +144,14 @@ bool BcsrWeightManager::rowIndexGet(uint32_t block_row, std::vector<uint32_t>& o
 }
 
 void BcsrWeightManager::rowIndexPut(uint32_t block_row, std::vector<uint32_t>&& cols) {
+    if (!kEnableBcsrOptimizations) return;
     if (row_index_cache_cap_ == 0) return;
     evictRowIndexIfNeeded(block_row);
     row_index_cache_[block_row] = std::move(cols);
 }
 
 bool BcsrWeightManager::blockGet(uint32_t block_row, uint32_t block_col, std::vector<float>& out) {
+    if (!kEnableBcsrOptimizations) return false;
     const uint64_t key = makeBlockKey(block_row, block_col);
     auto it = block_cache_.find(key);
     if (it == block_cache_.end()) return false;
@@ -170,6 +165,7 @@ bool BcsrWeightManager::blockGet(uint32_t block_row, uint32_t block_col, std::ve
 }
 
 void BcsrWeightManager::blockPut(uint32_t block_row, uint32_t block_col, std::vector<float>&& data) {
+    if (!kEnableBcsrOptimizations) return;
     if (block_cache_cap_ == 0) return;
     const uint64_t key = makeBlockKey(block_row, block_col);
     auto it = block_cache_.find(key);
@@ -209,6 +205,7 @@ void BcsrWeightManager::blockPut(uint32_t block_row, uint32_t block_col, std::ve
 }
 
 bool BcsrWeightManager::hasBlock(uint32_t block_row, uint32_t block_col) const {
+    if (!kEnableBcsrOptimizations) return false;
     const uint64_t key = makeBlockKey(block_row, block_col);
     return block_cache_.find(key) != block_cache_.end();
 }

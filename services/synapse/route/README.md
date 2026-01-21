@@ -4,6 +4,11 @@
 
 > 边界原则：Route 域负责 “从 source neuron 到目的集合的选择与发送事务”，但不负责“网络传输细节”（NoC）与“权重字节解析”（Weights）。
 
+## 默认内存语义（cacheline）
+
+Route 域本身不发起 DRAM 访问，但与实验结果口径相关的默认体系结构语义应保持一致：平台默认以 **cacheline** 作为对外搬运/统计单位（对齐 `memHierarchy` 的
+`GetS/GetX`）。任何 row-streaming/DMA 假设必须由上层 synapse/weights 或 workload 显式启用并单列结果，禁止由路由构建侧隐式引入。
+
 ---
 
 ## 目录结构与组件职责
@@ -36,7 +41,7 @@
   - `emitNeuronFire()`：compute core 报告 neuron_idx 后触发 fanout，并构造 `SpikeEvent` 逐条发送；
   - `applyGatingDecision()`：将 gating 决策转发给 Synapse/Route 子系统（缓存并生效）。
 - **说明**：
-  - `SpikeCommSubsystem` 通过 `api/ISpikeTransport` 发出事件；常见情况下该 transport 是 `services/synapse/route/SpikePacketTransport`（把 SpikeEvent 编码为 packet 并映射为 `INocTransport::sendFromCore`）。
+  - `SpikeCommSubsystem` 通过 `api/ISpikeTransport` 发出事件；常见情况下该 transport 是 `api/NocSpikeTransport`（workload 侧持有并映射为 `INocTransport::sendFromCore`），也可使用 `services/synapse/route/SpikePacketTransport`。
   - 当 `multicast_enable=1` 且 Synapse/Route 已构建 multicast targets 时，`SpikeCommSubsystem` 会优先走 **SpikeKey native multicast**：
     - 通过 `computeMulticastTargets(...)` 得到 per-block 目标集合；
     - 为每个目标 block 构造 `NocPacketEvent(kind=SpikeKey)`，payload 使用 `SpikeNocCodec::WireSpikeKeyV2`（固定大小，带 `block_w_h` 与 `core_mask[64]`）；
@@ -60,6 +65,11 @@
 5) `ISpikeTransport` 的具体实现（通常由 NoC 域承载）完成实际发送与本地投递。
 
 ---
+
+## neuron layout 口径要求（P0：影响路由与投递）
+
+- **dest_node 推导分母必须是 `neurons_per_pe`**：权重驱动路由中 `dest_node = dest_global / neurons_per_pe`，因此 `SynapseRouteSubsystem/SnnRouteProvider` 接收的 `neurons_per_pe_cfg` 必须是 *per-PE* 口径。
+- **source_global 推导 base 必须是“本 core base”**：`SpikeCommSubsystem` 使用 `source_global = global_neuron_base + neuron_idx`，因此 `global_neuron_base` 必须是 *per-core* base（不是 node base）。
 
 ## Native Multicast（SpikeKey / blocked multicast）要点
 

@@ -4,6 +4,14 @@
 
 > 目标：CoreShell（`control/`）只做 time/packet/stat；SNN 的业务状态机全部下沉到 workload 插件，避免语义上浮。
 
+## 默认内存语义（cacheline）与结果解读
+
+- 平台默认的体系结构语义为 **cacheline 粒度**（对齐 `memHierarchy GetS/GetX`）。
+- SNN workload 的 GAS/BCSR 路径可能形成大于 cacheline 的合并读（overfetch）；在分析结果时，必须同时查看：
+  - `memctrl.bytes_est_total = requests_received_GetS * line_size_bytes`（off-chip traffic 主口径）
+  - `gas_unique_bytes_total/gas_unique_reads_total`（GAS 合并覆盖口径；dense microbench 默认应接近 cacheline）
+  - `effective_config.json`（记录 effective 的 merge_policy/line_size/granularity，防止配置文件与实际行为漂移）
+
 ---
 
 ## 主要文件
@@ -18,6 +26,14 @@
     - `compute/*`（`ISnnComputeCore`：动力学/学习/输出事件）
 
 ---
+
+## neuron layout 口径（P0：错位会直接导致路由/投递错误）
+
+`SnnWorkload` 在 `bindRuntime()` 时会对布局做归一化与 fail-fast 校验（实现见 `services/workload/layout/NormalizedNeuronLayout`）：
+
+- `num_neurons`：每 core 的 neuron 行数（`neurons_per_core`）
+- `neurons_per_pe`：每 PE 的 neuron 总数（`cores_per_pe * neurons_per_core`）
+- `global_neuron_base`：本 core 的 global base（用于 `source_global = base + neuron_idx`）
 
 ## 输入/输出边界
 

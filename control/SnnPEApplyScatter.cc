@@ -20,8 +20,9 @@ uint64_t SnnPESubComponent::applyAccumulatedWindowAndScatter_() {
         acc_ops_->collectSortedPairs(pairs);
     }
 
-    // 诊断：只在目标核 window_read_debug=1 时输出，避免全网日志爆炸
-    if (output_ && window_read_debug_ && scatter_diag_limit_ > 0 && scatter_diag_count_ < scatter_diag_limit_) {
+    // 诊断：仅在目标核 window_read_debug=1 且 verbose>=2 时输出，避免全网日志爆炸/性能损耗
+    if (output_ && output_->getVerboseLevel() >= 2 && window_read_debug_ &&
+        scatter_diag_limit_ > 0 && scatter_diag_count_ < scatter_diag_limit_) {
         const uint32_t issued = windowStateIssued_();
         const uint32_t ostd = windowStateOutstanding_();
         double dv_sum = 0.0;
@@ -38,7 +39,7 @@ uint64_t SnnPESubComponent::applyAccumulatedWindowAndScatter_() {
                     if (std::fabs(dv) > std::fabs(dv_max)) dv_max = dv;
                 }
             }
-            output_->verbose(CALL_INFO, 0, 0,
+            output_->verbose(CALL_INFO, 2, 0,
                 "[diag-scatter] core=%d seq=%u pairs=%zu dv_sum=%.6f dv_abs_sum=%.6f dv_nonzero=%u dv_max=%.6f acc_updates=%" PRIu64 " posts_touched=%" PRIu64 " WMS(issued=%u ostd=%u) first(post=%u,dv=%.6f) last(post=%u,dv=%.6f)\n",
                 core_id_, curr_stage_seq_,
                 pairs.size(), dv_sum, dv_abs_sum, dv_nonzero, (double)dv_max,
@@ -47,7 +48,7 @@ uint64_t SnnPESubComponent::applyAccumulatedWindowAndScatter_() {
                 pairs.front().first, pairs.front().second,
                 pairs.back().first, pairs.back().second);
         } else {
-            output_->verbose(CALL_INFO, 0, 0,
+            output_->verbose(CALL_INFO, 2, 0,
                 "[diag-scatter] core=%d seq=%u pairs=0 acc_updates=%" PRIu64 " posts_touched=%" PRIu64 " WMS(issued=%u ostd=%u)\n",
                 core_id_, curr_stage_seq_,
                 (uint64_t)acc_updates_count_, (uint64_t)acc_posts_touched_count_,

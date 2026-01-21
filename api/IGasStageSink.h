@@ -29,6 +29,7 @@ struct GasStatEvent {
     uint64_t payload_bytes = 0;
     uint64_t window_inflight_peak = 0;
     uint64_t window_buffer_max_bytes = 0;
+    uint64_t gap_absorbed_bytes = 0;
 };
 
 class IGasStageSink {
@@ -40,4 +41,3 @@ public:
 };
 
 }} // namespace SST::SnnDL
-

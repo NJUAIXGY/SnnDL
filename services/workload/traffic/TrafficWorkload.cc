@@ -20,6 +20,7 @@
 #include "api/MulticastLimits.h"
 #include "api/NocSpikeTransport.h"
 #include "events/NocPacketEvent.h"
+#include "workload/layout/NormalizedNeuronLayout.h"
 #include "synapse/route/SpikeNocCodec.h"
 #include "services/synapse/route/SpikeCommSubsystem.h"
 #include "services/synapse/route/SynapseRouteSubsystem.h"
@@ -465,10 +466,40 @@ void TrafficWorkload::ensureCommReady_() {
 
     SpikeCommRoutingConfig cfg{};
     cfg.routing_weight_driven = (params_->find<std::string>("routing_mode", "fixed") == "weight_driven");
-    cfg.rows = params_->find<uint32_t>("num_neurons", 0);
     cfg.total_nodes = params_->find<uint32_t>("total_nodes", rt_.total_nodes);
     cfg.cores_per_pe = params_->find<uint32_t>("total_cores", 1);
+    const uint32_t neurons_per_core = params_->find<uint32_t>("num_neurons", 0);
     cfg.neurons_per_pe = params_->find<uint32_t>("neurons_per_pe", 0);
+    if (cfg.neurons_per_pe == 0 && neurons_per_core > 0 && cfg.cores_per_pe > 0) {
+        const uint64_t npp64 =
+            static_cast<uint64_t>(neurons_per_core) * static_cast<uint64_t>(cfg.cores_per_pe);
+        cfg.neurons_per_pe = (npp64 > 0xffffffffull) ? 0u : static_cast<uint32_t>(npp64);
+    }
+    // IMPORTANT: for BCSR routing, cfg.rows is treated as "rows per PE" and then split by cores_per_pe
+    // (see SpikeCommSubsystem.cc::buildWeightDrivenRoutesFromBcsr_()). Keep consistent with SnnWorkload.
+    // Keep cache-key stable even when not reading dense weights.
+    cfg.cols = params_->find<uint32_t>("weights_cols", 0);
+    if (cfg.cols == 0 && cfg.total_nodes > 0 && cfg.neurons_per_pe > 0) {
+        const uint64_t cols64 =
+            static_cast<uint64_t>(cfg.total_nodes) * static_cast<uint64_t>(cfg.neurons_per_pe);
+        cfg.cols = (cols64 > 0xffffffffull) ? 0u : static_cast<uint32_t>(cols64);
+    }
+
+    // Normalize: keep "per-core" num_neurons + explicit neurons_per_pe as the canonical view.
+    const uint64_t base_param = params_->find<uint64_t>("global_neuron_base", 0);
+    const auto n =
+        normalizeNeuronLayout(rt_.node_id,
+                              rt_.core_id,
+                              cfg.total_nodes,
+                              cfg.cores_per_pe,
+                              neurons_per_core,
+                              cfg.neurons_per_pe,
+                              base_param,
+                              cfg.cols);
+    cfg.total_nodes = n.total_nodes;
+    cfg.cores_per_pe = n.cores_per_pe;
+    cfg.neurons_per_pe = n.neurons_per_pe;
+    cfg.rows = n.neurons_per_pe;
     cfg.use_post_row_pre_col = true; // irrelevant for edges_csv; keep stable
 
     cfg.weights_template = params_->find<std::string>("weights_template", "");
@@ -500,7 +531,7 @@ void TrafficWorkload::ensureCommReady_() {
     synapse_route_->bindRuntime(rt_.log,
                                 rt_.node_id,
                                 rt_.core_id,
-                                cfg.rows,
+                                n.neurons_per_core,
                                 cfg.neurons_per_pe,
                                 rt_.sinks.stat_routes_entries_total);
     synapse_route_->bindFanoutStat(rt_.sinks.stat_fanout_per_spike_total);
@@ -509,7 +540,7 @@ void TrafficWorkload::ensureCommReady_() {
     if (!noc_spike_transport_) noc_spike_transport_ = std::make_unique<NocSpikeTransport>();
     noc_spike_transport_->setNocTransport(rt_.noc);
     noc_spike_transport_->setSourceCore(static_cast<int>(rt_.core_id));
-    noc_spike_transport_->configureLayout(cfg.total_nodes, cfg.cores_per_pe, cfg.rows);
+    noc_spike_transport_->configureLayout(cfg.total_nodes, cfg.cores_per_pe, n.neurons_per_core);
 
     spike_comm_->configure();
     SpikeCommRuntimeConfig crt{};
@@ -519,7 +550,8 @@ void TrafficWorkload::ensureCommReady_() {
     crt.src_core = static_cast<int>(rt_.core_id);
     crt.node_id = rt_.node_id;
     crt.synapse_route = synapse_route_.get();
-    crt.global_neuron_base = params_->find<uint64_t>("global_neuron_base", 0);
+    // SpikeCommSubsystem 的 global_neuron_base 必须是“本 core 的 base”（而不是 node base），否则 core_id>0 时 source_global 会错位。
+    crt.global_neuron_base = n.core_neuron_base;
     spike_comm_->bindRuntime(crt);
     spike_comm_->initRouting();
 

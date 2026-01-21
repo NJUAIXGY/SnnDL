@@ -32,6 +32,10 @@ public:
     uint16_t dst_endpoint = 0;
     uint16_t kind = static_cast<uint16_t>(NocPacketKind::Unknown);
     uint16_t hop_count = 0;
+    // Global step sequencing (optional; 0 means "no step tag").
+    // Semantics: packet should be *processed* in step_seq (not necessarily *sent* in that step).
+    // Used to disable within-step cascading in step-limited experiments (naive_raw baseline).
+    uint32_t step_seq = 0;
     uint64_t timestamp = 0;  // 由上层定义（ns/cycle），NoC 不解释
     std::vector<uint8_t> payload;
 
@@ -60,6 +64,7 @@ public:
         ev->dst_endpoint = dst_endpoint;
         ev->kind = kind;
         ev->hop_count = hop_count;
+        ev->step_seq = step_seq;
         ev->timestamp = timestamp;
         ev->payload = payload;
         return ev;
@@ -75,6 +80,7 @@ public:
         SST_SER(dst_endpoint);
         SST_SER(kind);
         SST_SER(hop_count);
+        SST_SER(step_seq);
         SST_SER(timestamp);
         SST_SER(payload);
     }
