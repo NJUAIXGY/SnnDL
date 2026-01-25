@@ -7,7 +7,7 @@ AM_CPPFLAGS += \
 	-I$(srcdir)/control \
 	-I$(srcdir)/compute \
 	-I$(srcdir)/services \
-	-I/home/xgy/remote/sst_install/include
+	-I$(SST_PREFIX)/include
 
 # 可选的MPI支持 - 不影响现有构建
 # 暂时注释掉，等待configure.ac配置完成
@@ -166,4 +166,4 @@ libSnnDL_la_LDFLAGS = -module -avoid-version
 
 .PHONY: test-compile
 test-compile:
-	$(CXXCOMPILE) -c $(srcdir)/tests/test_includes.cc -o tests/test_includes.o
+	$(CXXCOMPILE) -c $(srcdir)/tests/test_includes.cc -o $(builddir)/test_includes.o

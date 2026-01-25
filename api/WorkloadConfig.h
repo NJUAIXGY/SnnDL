@@ -7,10 +7,18 @@
 
 #pragma once
 
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <string>
+
+#include <sst/core/params.h>
+
+#include "SnnDLStringUtil.h"
 
 namespace SST { namespace SnnDL {
+
+inline uint64_t clampNonZeroU64(uint64_t v) { return v ? v : 1ull; }
 
 inline const char* workloadImplFromEnvCached() {
     static const char* cached = []() -> const char* {
@@ -21,10 +29,38 @@ inline const char* workloadImplFromEnvCached() {
     return cached;
 }
 
+inline std::string workloadImplFromParamsOrEnv(const SST::Params& params, const std::string& default_impl = "snn") {
+    std::string w = params.find<std::string>("workload_impl", "");
+    if (w.empty()) {
+        if (const char* env = workloadImplFromEnvCached()) w = std::string(env);
+    }
+    w = toLowerCopy(std::move(w));
+    if (w.empty()) w = default_impl;
+    return w;
+}
+
+// Compatibility path: env overrides params when SNNDL_WORKLOAD_IMPL is set.
+// Use this only where legacy scripts relied on global env to switch workload_impl without editing configs.
+inline std::string workloadImplFromParamsOrEnvOverride(const SST::Params& params, const std::string& default_impl = "snn") {
+    std::string w = params.find<std::string>("workload_impl", default_impl);
+    if (const char* env = workloadImplFromEnvCached()) w = std::string(env);
+    w = toLowerCopy(std::move(w));
+    if (w.empty()) w = default_impl;
+    return w;
+}
+
+inline std::string execModeFromParams(const SST::Params& params, const std::string& default_mode = "gas") {
+    std::string e = params.find<std::string>("exec_mode", "");
+    e = toLowerCopy(std::move(e));
+    if (e == "naive_opt") e = "naive_raw";
+    if (e.empty()) e = default_mode;
+    return e;
+}
+
 inline bool isStreamWorkloadEnv() {
     const char* v = workloadImplFromEnvCached();
-    return v && std::strcmp(v, "stream") == 0;
+    if (!v || !*v) return false;
+    return toLowerCopy(std::string(v)) == "stream";
 }
 
 }} // namespace SST::SnnDL
-

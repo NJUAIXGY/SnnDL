@@ -14,9 +14,11 @@
 #include "ICoreControlHooks.h"
 #include "ICoreMemoryLink.h"
 #include "IGlobalStepHooks.h"
+#include "ILoaderReadyHooks.h"
 #include "NocPacketEvent.h"
 #include "NocPacketBatchEvent.h"
 #include "GasStepBarrierEvent.h"
+#include "LoaderDoneEvent.h"
 #include "WorkloadConfig.h"
 #include "SnnDLLogging.h"
 #include "SnnCoreAPI.h"
@@ -200,6 +202,8 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
     window_metrics_csv_ = cfg.window_metrics_csv;
     window_ns_ = window_us_ * 1000ULL; // 1us = 1000ns（组件时钟1GHz，tick≈1ns）
     diag_fire_log_ = cfg.diag_fire_log;
+    exec_mode_ = cfg.exec_mode;
+    is_stream_workload_ = (cfg.workload_impl == "stream" || cfg.workload_impl == "traffic");
 
     // Global Step/GAS barrier sync (Phase-step-sync)
     global_step_sync_enable_ = cfg.global_step_sync_enable;
@@ -222,6 +226,7 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
     // In naive_* (non-window) mode, issuing BCSR reads before loader/rowptr ready can enqueue millions of waiters.
     loader_done_key_ = cfg.loader_done_key;
     global_step_ready_delay_cycles_ = cfg.global_step_ready_delay_cycles;
+    loader_done_timeout_cycles_ = params.find<uint64_t>("loader_done_timeout_cycles", 0);
     wait_for_loader_done_ = (!loader_done_key_.empty());
     loader_ready_latched_ = false;
     loader_ready_cycle_ = 0;
@@ -314,6 +319,10 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
         brt.num_cores = num_cores_;
         brt.layout = &global_layout_;
         brt.noc = &noc_subsys_;
+        if (exec_mode_ == "naive_raw" && global_step_sync_enable_) {
+            brt.active_step_seq = &global_step_active_seq_;
+            brt.step_seq_offset = 1;
+        }
         spike_packet_bridge_.bindRuntime(brt);
     }
     
@@ -414,6 +423,10 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
         noc_rt.nic = nullptr;  // init 后再注入
         noc_rt.optimized_ring = nullptr;  // init 后再注入
         noc_rt.external_spike_output_link = nullptr;  // init(phase0) link configured 后再注入
+        if (exec_mode_ == "naive_raw" && global_step_sync_enable_) {
+            noc_rt.active_step_seq = &global_step_active_seq_;
+            noc_rt.step_seq_offset = 1;
+        }
         noc_rt.deliver_to_endpoint = [this](int endpoint_id, NocPacketEvent* pkt) {
             deliverPacketToEndpoint_(endpoint_id, pkt);
         };
@@ -428,7 +441,8 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
 }
 
 MultiCorePE::~MultiCorePE() {
-    
+    clearAllDeferredPackets_();
+
     // 清理SnnPE SubComponent核心（SST会自动管理SubComponent的生命周期）
     cores_.clear();
     
@@ -441,6 +455,16 @@ MultiCorePE::~MultiCorePE() {
 
 void MultiCorePE::init(unsigned int phase) {
     if (sentinel_enabled_ && output_) { output_->verbose(CALL_INFO, 2, 0, "[[sentinel-pe-init]] node=%d phase=%u enter\n", node_id_, phase); }
+
+    // WeightLoader -> MultiCorePE loader_done bridge uses untimed data during init/setup.
+    // We must actively drain recvUntimedData(); a timed handler will not be invoked.
+    if (loader_done_link_) {
+        SST::Event* ev = loader_done_link_->recvUntimedData();
+        while (ev) {
+            handleLoaderDoneEvent(ev);
+            ev = loader_done_link_->recvUntimedData();
+        }
+    }
     if (phase == 0) {
         if (primary_keepalive_ || sim_stop_ns_ > 0) {
             registerAsPrimaryComponent();
@@ -462,6 +486,16 @@ void MultiCorePE::init(unsigned int phase) {
             new Event::Handler2<MultiCorePE,&MultiCorePE::handleExternalSpikeEvent>(this));
         external_spike_output_link_ = configureLink("external_spike_output");
         mem_link_ = configureLink("mem_link");
+        loader_done_link_ = configureLink(
+            "loader_done",
+            new Event::Handler2<MultiCorePE, &MultiCorePE::handleLoaderDoneEvent>(this));
+        if (loader_done_link_) {
+            SST::Event* ev = loader_done_link_->recvUntimedData();
+            while (ev) {
+                handleLoaderDoneEvent(ev);
+                ev = loader_done_link_->recvUntimedData();
+            }
+        }
         if (global_step_sync_enable_) {
             gas_step_ctrl_link_ = configureLink(
                 "gas_step_ctrl",
@@ -494,6 +528,10 @@ void MultiCorePE::init(unsigned int phase) {
             noc_rt.nic = external_nic_;
             noc_rt.optimized_ring = optimized_ring_;
             noc_rt.external_spike_output_link = external_spike_output_link_;
+            if (exec_mode_ == "naive_raw" && global_step_sync_enable_) {
+                noc_rt.active_step_seq = &global_step_active_seq_;
+                noc_rt.step_seq_offset = 1;
+            }
             noc_rt.deliver_to_endpoint = [this](int endpoint_id, NocPacketEvent* pkt) {
                 deliverPacketToEndpoint_(endpoint_id, pkt);
             };
@@ -566,6 +604,15 @@ void MultiCorePE::complete(unsigned int phase) {
 
 void MultiCorePE::setup() {
     if (sentinel_enabled_ && output_) { output_->verbose(CALL_INFO, 2, 0, "[[sentinel-pe-setup]] node=%d enter\n", node_id_); }
+
+    // Drain any remaining untimed loader_done events (e.g. strict_loader_done publishes in setup).
+    if (loader_done_link_) {
+        SST::Event* ev = loader_done_link_->recvUntimedData();
+        while (ev) {
+            handleLoaderDoneEvent(ev);
+            ev = loader_done_link_->recvUntimedData();
+        }
+    }
     
     // 验证所有组件初始化完成
     if (cores_.size() != static_cast<size_t>(num_cores_)) {
@@ -615,6 +662,12 @@ void MultiCorePE::finish() {
     updateStatistics();
     // 报告总仿真周期（单实例）
     if (stat_sim_cycles_total_) stat_sim_cycles_total_->addData(current_cycle_);
+
+    // Experiment observability: if global step sync is enabled but we finish mid-step,
+    // record it (do not fatal; matrix scripts may mark INCONCLUSIVE).
+    if (global_step_sync_enable_ && global_step_active_seq_ != 0 && !global_step_done_sent_) {
+        if (stat_compat_finish_incomplete_total_) stat_compat_finish_incomplete_total_->addData(1);
+    }
 
     // Global Step barrier：若仿真结束时本 PE 尚未完成 active step，输出每核卡点快照（仅 debug/sentinel 模式）
     if (global_step_sync_enable_ && sentinel_enabled_ && output_ &&
@@ -803,6 +856,91 @@ void MultiCorePE::finish() {
     // 已由 clockTick() 在阈值处触发 OKToEndSim。
 }
 
+void MultiCorePE::maybeInjectTestTraffic_(Cycle_t current_cycle) {
+    // 0b. 测试注入：在首个有效周期从 core0 向 core1 注入一个跨核脉冲（仅当启用测试流量时）
+    if (!(enable_test_traffic_ && !test_injected_ && num_cores_ > 1 && current_cycle == 5000)) return;
+
+    // 构造一个从本PE core0 -> core1 的跨核脉冲（使用全局ID口径）
+    const uint32_t src_global = static_cast<uint32_t>(global_neuron_base_);
+    const uint32_t dst_global =
+        static_cast<uint32_t>(static_cast<uint64_t>(global_neuron_base_) + static_cast<uint64_t>(neurons_per_core_));
+    SpikeEvent* test_spike = new SpikeEvent(src_global, dst_global, static_cast<uint32_t>(node_id_), 0.5f, current_cycle_);
+    int src_core = determineTargetUnit(static_cast<int>(src_global));
+    int dst_core = determineTargetUnit(static_cast<int>(dst_global));
+    if (src_core >= 0 && dst_core >= 0 && src_core != dst_core) {
+        spike_packet_bridge_.sendAuto(test_spike);
+        PE_LOG(1, "🧪 注入跨核脉冲: 核心%d->核心%d\n", src_core, dst_core);
+        test_injected_ = true;
+    } else {
+        delete test_spike;
+        test_injected_ = true;
+    }
+}
+
+void MultiCorePE::driveCoresManually_(Cycle_t current_cycle) {
+    // 2. SubComponent时钟由SST自动管理，无需手动调用tick
+    // 若子组件未被SST调度（某些环境组合下可能发生），则回退为手动驱动一拍，确保窗口推进与队列消费
+    if (!manual_core_drive_enable_) return;
+
+    for (int i = 0; i < num_cores_; i++) {
+        if (cores_[i] == nullptr) continue;
+        if (auto* hooks = dynamic_cast<ICoreControlHooks*>(cores_[i])) {
+            hooks->driveOneCycle();
+        }
+    }
+}
+
+void MultiCorePE::refreshProcessingUnitStates_() {
+    // 更新处理单元状态统计（从SnnPE SubComponent获取实际数据）
+    for (int i = 0; i < num_cores_; i++) {
+        if (cores_[i] != nullptr) {
+            std::map<std::string, uint64_t> core_stats;
+            cores_[i]->getStatistics(core_stats);
+            auto it_sp = core_stats.find("spikes_received");
+            auto it_nf = core_stats.find("neurons_fired");
+            auto it_sm_w = core_stats.find("stream_mem_writes_issued_total");
+            auto it_sm_r = core_stats.find("stream_mem_reads_issued_total");
+            auto it_sm_bw = core_stats.find("stream_mem_bytes_written_total");
+            auto it_sm_br = core_stats.find("stream_mem_bytes_read_total");
+            auto it_sm_vp = core_stats.find("stream_mem_verify_pass_total");
+            auto it_sm_vf = core_stats.find("stream_mem_verify_fail_total");
+            auto it_pkt_s = core_stats.find("stream_pkt_sent_total");
+            auto it_pkt_r = core_stats.find("stream_pkt_recv_total");
+            auto it_pkt_bc = core_stats.find("stream_pkt_bad_crc_total");
+            auto it_pkt_bm = core_stats.find("stream_pkt_bad_magic_total");
+            uint64_t old_spikes = unit_states_[i].spikes_processed;
+            uint64_t new_spikes = (it_sp != core_stats.end()) ? it_sp->second : 0;
+            unit_states_[i].spikes_processed = new_spikes;
+            unit_states_[i].neurons_fired = (it_nf != core_stats.end()) ? it_nf->second : 0;
+            unit_states_[i].stream_mem_writes_issued_total = (it_sm_w != core_stats.end()) ? it_sm_w->second : 0;
+            unit_states_[i].stream_mem_reads_issued_total = (it_sm_r != core_stats.end()) ? it_sm_r->second : 0;
+            unit_states_[i].stream_mem_bytes_written_total = (it_sm_bw != core_stats.end()) ? it_sm_bw->second : 0;
+            unit_states_[i].stream_mem_bytes_read_total = (it_sm_br != core_stats.end()) ? it_sm_br->second : 0;
+            unit_states_[i].stream_mem_verify_pass_total = (it_sm_vp != core_stats.end()) ? it_sm_vp->second : 0;
+            unit_states_[i].stream_mem_verify_fail_total = (it_sm_vf != core_stats.end()) ? it_sm_vf->second : 0;
+            unit_states_[i].stream_pkt_sent_total = (it_pkt_s != core_stats.end()) ? it_pkt_s->second : 0;
+            unit_states_[i].stream_pkt_recv_total = (it_pkt_r != core_stats.end()) ? it_pkt_r->second : 0;
+            unit_states_[i].stream_pkt_bad_crc_total = (it_pkt_bc != core_stats.end()) ? it_pkt_bc->second : 0;
+            unit_states_[i].stream_pkt_bad_magic_total = (it_pkt_bm != core_stats.end()) ? it_pkt_bm->second : 0;
+            unit_states_[i].utilization = cores_[i]->getUtilization();
+            unit_states_[i].is_active = cores_[i]->hasWork();
+
+            // 调试：跟踪统计数据变化 (已禁用避免过多输出)
+            // if (new_spikes != old_spikes) {
+            //     printf("DEBUG: 核心%d统计更新，节点%d - 旧值:%lu -> 新值:%lu (来自getStatistics)\n",
+            //            i, node_id_, old_spikes, new_spikes);
+            //     fflush(stdout);
+            // }
+            (void)old_spikes;
+        } else {
+            unit_states_[i].spikes_processed = 0;
+            unit_states_[i].neurons_fired = 0;
+            unit_states_[i].utilization = 0.0;
+            unit_states_[i].is_active = false;
+        }
+    }
+}
+
 bool MultiCorePE::clockTick(Cycle_t current_cycle) {
     current_cycle_ = current_cycle;
     // 当启用组件主控停止时，到达阈值立刻OKToEndSim并停止本组件时钟
@@ -839,8 +977,12 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
         // WeightLoader and MultiCorePE are placed on different ranks, making SharedArray-based loader_done
         // gating invisible. Keep this extremely low-noise: only PE0 prints, rate-limited.
         static uint32_t diag_wait_prints = 0;
+        const uint64_t now = static_cast<uint64_t>(current_cycle_);
         if (!loader_ready_latched_) {
-            const uint64_t now = static_cast<uint64_t>(current_cycle_);
+            if (!loader_wait_started_) {
+                loader_wait_started_ = true;
+                loader_wait_start_cycle_ = now;
+            }
             if (output_ && node_id_ == 0 && verbose_ >= 1 && (now % 10000u) == 0u && diag_wait_prints < 16u) {
                 output_->verbose(
                     CALL_INFO, 1, 0,
@@ -867,8 +1009,27 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
                 }
             }
         }
+        if (!loader_ready_latched_ && loader_done_timeout_cycles_ > 0 && !loader_ready_forced_) {
+            if (!loader_wait_started_) {
+                loader_wait_started_ = true;
+                loader_wait_start_cycle_ = now;
+            }
+            const uint64_t waited = (now >= loader_wait_start_cycle_) ? (now - loader_wait_start_cycle_) : 0;
+            if (waited >= loader_done_timeout_cycles_) {
+                auto* ev = new GasStepBarrierEvent(GasStepBarrierOp::PeReady, /*seq*/0, static_cast<uint32_t>(node_id_));
+                gas_step_ctrl_link_->send(ev);
+                global_step_ready_sent_ = true;
+                loader_ready_forced_ = true;
+                if (stat_loader_done_timeout_fallback_total_) stat_loader_done_timeout_fallback_total_->addData(1);
+                if (output_) {
+                    output_->verbose(
+                        CALL_INFO, 0, 0,
+                        "WARN: node=%d loader_done_key=%s timeout waited=%" PRIu64 " cycles, send PE_READY fallback\n",
+                        node_id_, loader_done_key_.c_str(), (uint64_t)waited);
+                }
+            }
+        }
         if (loader_ready_latched_) {
-            const uint64_t now = static_cast<uint64_t>(current_cycle_);
             const uint64_t since = (now >= loader_ready_cycle_) ? (now - loader_ready_cycle_) : 0;
             if (global_step_ready_delay_cycles_ == 0 || since >= global_step_ready_delay_cycles_) {
                 auto* ev = new GasStepBarrierEvent(GasStepBarrierOp::PeReady, /*seq*/0, static_cast<uint32_t>(node_id_));
@@ -886,100 +1047,27 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
 
     // Global Step barrier: 当收到 START_STEP(seq) 时，在时钟边界打开所有 core 的新窗口
     if (global_step_sync_enable_ && global_step_sync_ready_ && global_step_start_pending_) {
-        beginGlobalStep_(global_step_pending_seq_);
-        global_step_start_pending_ = false;
+        const bool can_start = (global_step_active_seq_ == 0) || global_step_done_sent_;
+        if (can_start) {
+            beginGlobalStep_(global_step_pending_seq_);
+            global_step_start_pending_ = false;
+        }
     }
     
     // 0a. Step 注入调度（Phase3-B 下沉为 StepActivationSubsystem）
     step_activation_subsys_.tick(static_cast<uint64_t>(current_cycle_));
 
     // 0b. 测试注入：在首个有效周期从 core0 向 core1 注入一个跨核脉冲（仅当启用测试流量时）
-		    if (enable_test_traffic_ && !test_injected_ && num_cores_ > 1 && current_cycle_ == 5000) {
-		        // 构造一个从本PE core0 -> core1 的跨核脉冲（使用全局ID口径）
-		        const uint32_t src_global = static_cast<uint32_t>(global_neuron_base_);
-		        const uint32_t dst_global =
-		            static_cast<uint32_t>(static_cast<uint64_t>(global_neuron_base_) + static_cast<uint64_t>(neurons_per_core_));
-		        SpikeEvent* test_spike = new SpikeEvent(src_global, dst_global, static_cast<uint32_t>(node_id_), 0.5f, current_cycle_);
-		        int src_core = determineTargetUnit(static_cast<int>(src_global));
-		        int dst_core = determineTargetUnit(static_cast<int>(dst_global));
-		        if (src_core >= 0 && dst_core >= 0 && src_core != dst_core) {
-		            spike_packet_bridge_.sendAuto(test_spike);
-		            PE_LOG(1, "🧪 注入跨核脉冲: 核心%d->核心%d\n", src_core, dst_core);
-		            test_injected_ = true;
-		        } else {
-		            delete test_spike;
-		            test_injected_ = true;
-		        }
-		    }
+    maybeInjectTestTraffic_(current_cycle_);
     
     // 1. 处理外部脉冲队列（Phase4-A1.1：下沉至 NoC 子系统）
     noc_subsys_.drainIncomingQueue(static_cast<uint64_t>(current_cycle_));
     
     // 2. SubComponent时钟由SST自动管理，无需手动调用tick
     // 若子组件未被SST调度（某些环境组合下可能发生），则回退为手动驱动一拍，确保窗口推进与队列消费
-    if (manual_core_drive_enable_) {
-        for (int i = 0; i < num_cores_; i++) {
-            if (cores_[i] != nullptr) {
-	                if (auto* hooks = dynamic_cast<ICoreControlHooks*>(cores_[i])) {
-	                    hooks->driveOneCycle();
-	                    if (manual_gas_gather_cycles_ > 0 && (current_cycle_ % manual_gas_gather_cycles_) == 0) {
-	                        PE_LOG(2, "[diag-PE] forceEndGather: core=%d cyc=%" PRIu64 " period=%" PRIu64 "\n",
-	                               i, (uint64_t)current_cycle_, (uint64_t)manual_gas_gather_cycles_);
-	                        if (auto* snn = dynamic_cast<SnnCoreAPI*>(cores_[i])) {
-	                            snn->forceEndGather();
-	                        }
-	                    }
-	                }
-	            }
-	        }
-	    }
+    driveCoresManually_(current_cycle_);
     // 更新处理单元状态统计（从SnnPE SubComponent获取实际数据）
-    for (int i = 0; i < num_cores_; i++) {
-        if (cores_[i] != nullptr) {
-            std::map<std::string, uint64_t> core_stats;
-            cores_[i]->getStatistics(core_stats);
-            auto it_sp = core_stats.find("spikes_received");
-            auto it_nf = core_stats.find("neurons_fired");
-            auto it_sm_w = core_stats.find("stream_mem_writes_issued_total");
-            auto it_sm_r = core_stats.find("stream_mem_reads_issued_total");
-            auto it_sm_bw = core_stats.find("stream_mem_bytes_written_total");
-            auto it_sm_br = core_stats.find("stream_mem_bytes_read_total");
-            auto it_sm_vp = core_stats.find("stream_mem_verify_pass_total");
-            auto it_sm_vf = core_stats.find("stream_mem_verify_fail_total");
-            auto it_pkt_s = core_stats.find("stream_pkt_sent_total");
-            auto it_pkt_r = core_stats.find("stream_pkt_recv_total");
-            auto it_pkt_bc = core_stats.find("stream_pkt_bad_crc_total");
-            auto it_pkt_bm = core_stats.find("stream_pkt_bad_magic_total");
-            uint64_t old_spikes = unit_states_[i].spikes_processed;
-            uint64_t new_spikes = (it_sp != core_stats.end()) ? it_sp->second : 0;
-            unit_states_[i].spikes_processed = new_spikes;
-            unit_states_[i].neurons_fired = (it_nf != core_stats.end()) ? it_nf->second : 0;
-            unit_states_[i].stream_mem_writes_issued_total = (it_sm_w != core_stats.end()) ? it_sm_w->second : 0;
-            unit_states_[i].stream_mem_reads_issued_total = (it_sm_r != core_stats.end()) ? it_sm_r->second : 0;
-            unit_states_[i].stream_mem_bytes_written_total = (it_sm_bw != core_stats.end()) ? it_sm_bw->second : 0;
-            unit_states_[i].stream_mem_bytes_read_total = (it_sm_br != core_stats.end()) ? it_sm_br->second : 0;
-            unit_states_[i].stream_mem_verify_pass_total = (it_sm_vp != core_stats.end()) ? it_sm_vp->second : 0;
-            unit_states_[i].stream_mem_verify_fail_total = (it_sm_vf != core_stats.end()) ? it_sm_vf->second : 0;
-            unit_states_[i].stream_pkt_sent_total = (it_pkt_s != core_stats.end()) ? it_pkt_s->second : 0;
-            unit_states_[i].stream_pkt_recv_total = (it_pkt_r != core_stats.end()) ? it_pkt_r->second : 0;
-            unit_states_[i].stream_pkt_bad_crc_total = (it_pkt_bc != core_stats.end()) ? it_pkt_bc->second : 0;
-            unit_states_[i].stream_pkt_bad_magic_total = (it_pkt_bm != core_stats.end()) ? it_pkt_bm->second : 0;
-            unit_states_[i].utilization = cores_[i]->getUtilization();
-            unit_states_[i].is_active = cores_[i]->hasWork();
-            
-            // 调试：跟踪统计数据变化 (已禁用避免过多输出)
-            // if (new_spikes != old_spikes) {
-            //     printf("DEBUG: 核心%d统计更新，节点%d - 旧值:%lu -> 新值:%lu (来自getStatistics)\n", 
-            //            i, node_id_, old_spikes, new_spikes);
-            //     fflush(stdout);
-            // }
-        } else {
-            unit_states_[i].spikes_processed = 0;
-            unit_states_[i].neurons_fired = 0;
-            unit_states_[i].utilization = 0.0;
-            unit_states_[i].is_active = false;
-        }
-    }
+    refreshProcessingUnitStates_();
     
     // 3. 内部互连（ring）时钟滴答（Phase4-A1.1：由 NoC 子系统编排）
     noc_subsys_.tickRing(static_cast<uint64_t>(current_cycle));
@@ -1037,25 +1125,30 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
             if (!noc_idle) active = true;
 
             // 3) step 语义等价：优先用“阶段事件已到 EndScatter(seq)”作为完成判定（避免把 BCSR/预取等后台事务算进 step）。
+            // 注意：仅当 *所有 core* 都在该 seq 上报过阶段事件时，才使用 EndScatter 判定；
+            // 否则属于混合/非窗口 workload（或误配置），回退为 hasWork()，避免“任一 core 上报→强制所有 core 等 EndScatter”导致卡死。
             bool uses_stage_events = false;
             bool all_end_scatter = false;
             if (global_step_last_stage_code_.size() == static_cast<size_t>(num_cores_) &&
                 global_step_last_stage_seq_.size() == static_cast<size_t>(num_cores_)) {
+                bool all_have_stage = true;
                 for (int i = 0; i < num_cores_; ++i) {
                     const size_t idx = static_cast<size_t>(i);
-                    if (global_step_last_stage_seq_[idx] == global_step_active_seq_ &&
-                        global_step_last_stage_code_[idx] != 0) {
-                        uses_stage_events = true;
+                    const bool have_stage =
+                        (global_step_last_stage_seq_[idx] == global_step_active_seq_) &&
+                        (global_step_last_stage_code_[idx] != 0);
+                    if (!have_stage) {
+                        all_have_stage = false;
                         break;
                     }
                 }
+                uses_stage_events = all_have_stage;
                 if (uses_stage_events) {
                     all_end_scatter = true;
                     for (int i = 0; i < num_cores_; ++i) {
                         const size_t idx = static_cast<size_t>(i);
-                        const bool seq_ok = (global_step_last_stage_seq_[idx] == global_step_active_seq_);
                         const bool es_ok = (global_step_last_stage_code_[idx] == 5 /*EndScatter*/);
-                        if (!(seq_ok && es_ok)) {
+                        if (!es_ok) {
                             all_end_scatter = false;
                             break;
                         }
@@ -1066,7 +1159,7 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
             if (uses_stage_events) {
                 if (!all_end_scatter) active = true;
             } else {
-                // 非 window/GAS workload：回退为 core 的 hasWork() 语义
+                // 非 window/GAS workload（或混合模式）：回退为 core 的 hasWork() 语义
                 for (int i = 0; i < num_cores_; ++i) {
                     if (cores_[i] && cores_[i]->hasWork()) {
                         active = true;
@@ -1171,6 +1264,34 @@ void MultiCorePE::handleExternalSpikeEvent(SST::Event* ev) {
     noc_subsys_.onExternalPortEvent(ev);
 }
 
+void MultiCorePE::handleLoaderDoneEvent(SST::Event* ev) {
+    if (!ev) return;
+    auto* msg = dynamic_cast<LoaderDoneEvent*>(ev);
+    if (msg) {
+        // Cross-rank bridge:
+        // - SharedArray(loader_done_key) 在 MPI 多 rank 下不具备运行期一致性；
+        // - 该事件作为权重就绪的权威信号：MultiCorePE 侧先 latch，再镜像写入本 rank 的 SharedArray
+        //   以复用 core/workload 现有 ensureLoaderReady_ 逻辑（避免引入新接口/破坏兼容）。
+        loader_ready_latched_ = true;
+        // current_cycle_ 仅在 clockTick() 里更新；init/setup 阶段可能尚未进入时钟。
+        loader_ready_cycle_ = first_tick_logged_ ? static_cast<uint64_t>(current_cycle_) : 0;
+        // 注意：SharedArray 仅允许在 init 阶段写入；跨 rank 运行期镜像写入会触发 SST fatal。
+        // 因此：通过 ILoaderReadyHooks 将“就绪”信号下发到各 core 的本地 latch，避免依赖 SharedArray 的一致性。
+        for (auto* core : cores_) {
+            if (!core) continue;
+            if (auto* hook = dynamic_cast<ILoaderReadyHooks*>(core)) {
+                hook->onLoaderReady();
+            }
+        }
+        if (sentinel_enabled_ && output_ && verbose_ >= 1) {
+            output_->verbose(CALL_INFO, 1, 0,
+                             "[[sentinel-step-sync]] node=%d recv LoaderDoneEvent(src_node=%u) latch loader_ready\n",
+                             node_id_, msg->src_node);
+        }
+    }
+    delete ev;
+}
+
 void MultiCorePE::handleGasStepCtrlEvent(SST::Event* ev) {
     if (!ev) return;
     auto* msg = dynamic_cast<GasStepBarrierEvent*>(ev);
@@ -1179,10 +1300,51 @@ void MultiCorePE::handleGasStepCtrlEvent(SST::Event* ev) {
         return;
     }
     if (msg->operation() == GasStepBarrierOp::StartStep) {
-        global_step_pending_seq_ = msg->seq;
-        global_step_start_pending_ = true;
-        if (sentinel_enabled_ && output_ && node_id_ == 0) {
-            output_->verbose(CALL_INFO, 2, 0, "[[sentinel-step-sync]] node=%d recv START_STEP seq=%u\n", node_id_, msg->seq);
+        const uint32_t seq = msg->seq;
+        const uint32_t active = global_step_active_seq_;
+        const uint32_t pending = global_step_start_pending_ ? global_step_pending_seq_ : 0;
+        const uint32_t last_seen = std::max(global_step_last_seen_seq_, std::max(active, pending));
+        const uint32_t expected_next = (pending != 0) ? pending : ((active != 0) ? (active + 1u) : 0u);
+        if (seq == 0) {
+            global_step_start_stale_total_ += 1;
+            if (output_) {
+                output_->verbose(
+                    CALL_INFO, 0, 0,
+                    "WARN: node=%d recv START_STEP seq=0 ignored stale_total=%" PRIu64 "\n",
+                    node_id_, (uint64_t)global_step_start_stale_total_);
+            }
+        } else if (seq == active || (pending != 0 && seq == pending)) {
+            global_step_start_dup_total_ += 1;
+            if (output_) {
+                output_->verbose(
+                    CALL_INFO, 0, 0,
+                    "WARN: node=%d recv START_STEP dup seq=%" PRIu32 " active=%" PRIu32 " pending=%" PRIu32 " dup_total=%" PRIu64 "\n",
+                    node_id_, seq, active, pending, (uint64_t)global_step_start_dup_total_);
+            }
+        } else if (last_seen != 0 && seq < last_seen) {
+            global_step_start_stale_total_ += 1;
+            if (output_) {
+                output_->verbose(
+                    CALL_INFO, 0, 0,
+                    "WARN: node=%d recv START_STEP stale seq=%" PRIu32 " last_seen=%" PRIu32 " stale_total=%" PRIu64 "\n",
+                    node_id_, seq, last_seen, (uint64_t)global_step_start_stale_total_);
+            }
+        } else {
+            if (expected_next != 0 && seq > expected_next) {
+                global_step_start_jump_total_ += 1;
+                if (output_) {
+                    output_->verbose(
+                        CALL_INFO, 0, 0,
+                        "WARN: node=%d recv START_STEP jump seq=%" PRIu32 " expected=%" PRIu32 " jump_total=%" PRIu64 "\n",
+                        node_id_, seq, expected_next, (uint64_t)global_step_start_jump_total_);
+                }
+            }
+            global_step_pending_seq_ = seq;
+            global_step_start_pending_ = true;
+            global_step_last_seen_seq_ = seq;
+            if (sentinel_enabled_ && output_ && node_id_ == 0) {
+                output_->verbose(CALL_INFO, 2, 0, "[[sentinel-step-sync]] node=%d recv START_STEP seq=%u\n", node_id_, seq);
+            }
         }
     }
     delete msg;
@@ -1230,6 +1392,9 @@ void MultiCorePE::beginGlobalStep_(uint32_t seq) {
         hook->onGlobalStepStart(seq);
     }
 
+    // naive_raw baseline：flush 上一 step 产生的“下一 step spike”，确保跨步传播但禁止步内级联。
+    flushDeferredPacketsForSeq_(seq);
+
     // Step Random Activation：在全局 step 同步下，以 START_STEP(seq) 作为统一触发点（每 step 一次）。
     // 注意：必须在 core 进入 step 后再注入，确保所有触发的 spike 归属到本 step 的 Gather。
     step_activation_subsys_.onGlobalStepStart(seq, getCurrentSimTimeNano());
@@ -1237,6 +1402,30 @@ void MultiCorePE::beginGlobalStep_(uint32_t seq) {
     if (sentinel_enabled_ && output_ && seq == 1) {
         output_->verbose(CALL_INFO, 2, 0, "[[sentinel-step-sync]] node=%d beginGlobalStep seq=%u cores=%d\n", node_id_, seq, num_cores_);
     }
+}
+
+void MultiCorePE::flushDeferredPacketsForSeq_(uint32_t seq) {
+    if (deferred_packets_by_seq_.empty()) return;
+    auto it = deferred_packets_by_seq_.find(seq);
+    if (it == deferred_packets_by_seq_.end()) return;
+
+    auto packets = std::move(it->second);
+    deferred_packets_by_seq_.erase(it);
+
+    for (auto& d : packets) {
+        if (!d.pkt) continue;
+        deliverPacketToEndpoint_(d.endpoint_id, d.pkt);
+    }
+}
+
+void MultiCorePE::clearAllDeferredPackets_() {
+    for (auto& kv : deferred_packets_by_seq_) {
+        for (auto& d : kv.second) {
+            delete d.pkt;
+            d.pkt = nullptr;
+        }
+    }
+    deferred_packets_by_seq_.clear();
 }
 
 void MultiCorePE::handleExternalSpike(SpikeEvent* spike) {
@@ -1310,6 +1499,11 @@ void MultiCorePE::initializeStatistics() {
     stat_stream_pkt_recv_total_ = registerStatistic<uint64_t>("stream_pkt_recv_total");
     stat_stream_pkt_bad_crc_total_ = registerStatistic<uint64_t>("stream_pkt_bad_crc_total");
     stat_stream_pkt_bad_magic_total_ = registerStatistic<uint64_t>("stream_pkt_bad_magic_total");
+    // Experiment profile observability counters (do not change behavior)
+    stat_compat_unexpected_stream_activity_total_ = registerStatistic<uint64_t>("compat_unexpected_stream_activity_total");
+    stat_compat_naive_gas_stage_events_total_ = registerStatistic<uint64_t>("compat_naive_gas_stage_events_total");
+    stat_compat_finish_incomplete_total_ = registerStatistic<uint64_t>("compat_finish_incomplete_total");
+    stat_loader_done_timeout_fallback_total_ = registerStatistic<uint64_t>("loader_done_timeout_fallback_total");
     // Batch-A: 注册组件级直方图统计（具体类型由Python侧设置为Histogram）
     stat_mem_read_latency_cycles_ = registerStatistic<uint64_t>("mem_read_latency_cycles");
     stat_mem_read_latency_cycles_weights_ = registerStatistic<uint64_t>("mem_read_latency_cycles_weights");
@@ -1382,8 +1576,7 @@ void MultiCorePE::accumulateGasStatsExt(uint64_t unique_bytes, uint64_t unique_r
                                         uint64_t bursts, uint64_t payload_bytes,
                                         uint64_t window_inflight_peak,
                                         uint64_t window_buffer_max_bytes) {
-    if (unique_reads && stat_gas_unique_reads_total_) stat_gas_unique_reads_total_->addData(unique_reads);
-    if (unique_bytes && stat_gas_unique_bytes_total_) stat_gas_unique_bytes_total_->addData(unique_bytes);
+    accumulateGasStats(unique_bytes, unique_reads);
     if (rowwin_triggers && stat_gas_rowwin_triggers_total_) stat_gas_rowwin_triggers_total_->addData(rowwin_triggers);
     if (rowwin_bytes && stat_gas_rowwin_bytes_total_) stat_gas_rowwin_bytes_total_->addData(rowwin_bytes);
     if (bursts && stat_gas_total_bursts_) stat_gas_total_bursts_->addData(bursts);
@@ -1426,6 +1619,14 @@ void MultiCorePE::notifyStageEvent(uint32_t seq, const std::string& event, uint6
         if (m.bs == 0 || ts_ns > m.bs) m.bs = ts_ns;
     } else if (event == "EndScatter") {
         if (m.es == 0 || ts_ns > m.es) m.es = ts_ns;
+    }
+
+    // Experiment observability: naive_raw must not execute GAS Apply/Scatter stages.
+    // Note: BeginGather/EndScatter may be used as generic step boundary markers in some modes;
+    // only flag stages unique to GAS/window pipeline to avoid false positives.
+    if (exec_mode_ == "naive_raw" &&
+        (event == "BeginApply" || event == "EndApply" || event == "BeginScatter")) {
+        if (stat_compat_naive_gas_stage_events_total_) stat_compat_naive_gas_stage_events_total_->addData(1);
     }
 
     // Global Step 诊断：记录每核在 active_seq 内的最后阶段，用于 finish() 输出卡点
@@ -1652,6 +1853,18 @@ void MultiCorePE::initializeProcessingUnits() {
         PE_LOG(3, "   ✅ SnnPE核心%d: 神经元ID范围[%d, %d)\n",
                         i, neuron_id_start, neuron_id_start + neurons_per_core_);
     }
+
+    // loader_done 事件可能在 init(phase0) 的 link 配置完成后、core 创建之前到达并被 drain，
+    // 此时 handleLoaderDoneEvent() 无法下发到 core（cores_ 仍为空）。
+    // 在 core 创建完成后，若 loader_ready 已被 latch，则补发一次本地就绪回调，确保 core 侧 latch 不丢失。
+    if (loader_ready_latched_) {
+        for (auto* core : cores_) {
+            if (!core) continue;
+            if (auto* hook = dynamic_cast<ILoaderReadyHooks*>(core)) {
+                hook->onLoaderReady();
+            }
+        }
+    }
     
     
     // 添加权重配置摘要
@@ -1787,6 +2000,21 @@ void MultiCorePE::updateStatistics() {
         }
     }
     
+    const bool stream_activity =
+        (stream_mem_verify_fail_delta |
+         stream_mem_verify_pass_delta |
+         stream_mem_writes_issued_delta |
+         stream_mem_reads_issued_delta |
+         stream_mem_bytes_written_delta |
+         stream_mem_bytes_read_delta |
+         stream_pkt_sent_delta |
+         stream_pkt_recv_delta |
+         stream_pkt_bad_crc_delta |
+         stream_pkt_bad_magic_delta) != 0;
+    if (stream_activity && !is_stream_workload_) {
+        if (stat_compat_unexpected_stream_activity_total_) stat_compat_unexpected_stream_activity_total_->addData(1);
+    }
+
     // 更新统计信息
     if (stat_spikes_processed_) stat_spikes_processed_->addData(total_spikes);
     stat_neurons_fired_->addData(total_fired);
@@ -2036,6 +2264,18 @@ void MultiCorePE::requestMemoryAccess(uint64_t address, size_t size,
 
 void MultiCorePE::deliverPacketToEndpoint_(int endpoint_id, NocPacketEvent* pkt) {
     if (!pkt) return;
+
+    // step_seq 门控（naive_raw baseline）：禁用“步内级联”，将 future-step spike 暂存到对应 step 再投递。
+    if (exec_mode_ == "naive_raw" &&
+        global_step_sync_enable_ &&
+        global_step_active_seq_ != 0 &&
+        (pkt->packetKind() == NocPacketKind::Spike || pkt->packetKind() == NocPacketKind::SpikeKey)) {
+        const uint32_t target_seq = pkt->step_seq;
+        if (target_seq != 0 && target_seq > global_step_active_seq_) {
+            deferred_packets_by_seq_[target_seq].push_back(DeferredNocPacket{endpoint_id, pkt});
+            return;
+        }
+    }
 
     // NoC e2e latency (cycles): measured at PE drain boundary (after mesh + local delivery).
     {

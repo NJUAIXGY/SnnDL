@@ -5,6 +5,7 @@
 #include "SnnNIC.h"
 #include "SnnInterface.h"
 #include "GatingDecisionEvent.h"
+#include "GatingPEConfig.h"
 
 using namespace SST;
 using namespace SST::SnnDL;
@@ -12,18 +13,28 @@ using namespace SST::SnnDL;
 GatingPE::GatingPE(ComponentId_t id, Params& params)
     : Component(id)
 {
-    total_nodes_  = params.find<uint32_t>("total_nodes", 16);
-    rows_per_pe_  = params.find<uint32_t>("rows_per_pe", 16);
-    top_k_        = params.find<uint32_t>("top_k", 4);
-    weight_value_ = params.find<float>("weight_value", 1.0f);
-    transitions_  = params.find<std::string>("transitions", "0-3:4-7,4-7:8-11,8-11:12-15");
-    edges_path_   = params.find<std::string>("edges_output_file", "");
-    csv_header_   = params.find<int>("csv_header", 1) != 0;
-    selection_    = params.find<std::string>("selection", "round_robin");
-    seed_         = params.find<uint32_t>("seed", 42);
+    const GatingPEConfig cfg = parseGatingPEConfig(params);
+    total_nodes_  = cfg.total_nodes;
+    rows_per_pe_  = cfg.rows_per_pe;
+    top_k_        = cfg.top_k;
+    weight_value_ = cfg.weight_value;
+    transitions_  = cfg.transitions;
+    edges_path_   = cfg.edges_output_file;
+    csv_header_   = cfg.csv_header;
+    selection_    = cfg.selection;
+    seed_         = cfg.seed;
 
-    int verbose = params.find<int>("verbose", 0);
-    out_ = new Output("GatingPE[@p:@l]: ", verbose, 0, Output::STDOUT);
+    gate_targets_ = cfg.gate_targets;
+    emit_period_ns_ = cfg.emit_period_ns;
+    emit_count_ = cfg.emit_count;
+    nic_node_id_ = cfg.node_id;
+    nic_vns_ = cfg.virtual_channels;
+    nic_vn_control_ = cfg.vn_control;
+    nic_link_bw_ = cfg.link_bw;
+    nic_in_buf_ = cfg.input_buf_size;
+    nic_out_buf_ = cfg.output_buf_size;
+
+    out_ = new Output("GatingPE[@p:@l]: ", cfg.verbose, 0, Output::STDOUT);
 
     // stats
     stat_tokens_ = registerStatistic<uint64_t>("gating_tokens");

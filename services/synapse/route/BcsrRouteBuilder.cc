@@ -18,6 +18,7 @@
 #include <sst/core/output.h>
 
 #include "synapse/common/BcsrMeta.h"
+#include "SnnDLStringUtil.h"
 
 namespace SST { namespace SnnDL {
 
@@ -52,29 +53,7 @@ bool parseBcsrMetaJson(const std::string& meta_path,
 
 std::string resolveBcsrTemplate(const std::string& tmpl, uint32_t pe, int core) {
     if (tmpl.empty()) return "";
-    std::string path = tmpl;
-    auto replaceIndexed = [&](const std::string& marker, uint32_t value, int width) {
-        size_t pos = 0;
-        while ((pos = path.find(marker, pos)) != std::string::npos) {
-            char buf[32];
-            std::snprintf(buf, sizeof(buf), "%0*u", width, value);
-            path.replace(pos, marker.size(), buf);
-            pos += static_cast<size_t>(width);
-        }
-    };
-    auto replaceSimple = [&](const std::string& marker, uint32_t value) {
-        size_t pos = 0;
-        std::string text = std::to_string(value);
-        while ((pos = path.find(marker, pos)) != std::string::npos) {
-            path.replace(pos, marker.size(), text);
-            pos += text.size();
-        }
-    };
-    replaceIndexed("{pe:02d}", pe, 2);
-    replaceSimple("{pe}", pe);
-    replaceIndexed("{core:02d}", static_cast<uint32_t>(core), 2);
-    replaceSimple("{core}", static_cast<uint32_t>(core));
-    return path;
+    return resolvePeCoreTemplate(tmpl, pe, static_cast<uint32_t>(core));
 }
 
 bool appendRoutesFromBcsrFile(const SynapseRouteBuildConfig& cfg,

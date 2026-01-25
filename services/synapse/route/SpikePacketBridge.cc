@@ -53,6 +53,9 @@ void SpikePacketBridge::sendFromCore(int src_core, SpikeEvent* spike) {
     if (!pkt) return;
 
     pkt->src_endpoint = static_cast<uint16_t>(src_core);
+    if (rt_.active_step_seq && *rt_.active_step_seq != 0) {
+        pkt->step_seq = (*rt_.active_step_seq) + rt_.step_seq_offset;
+    }
     rt_.noc->sendFromCore(src_core, pkt);
 }
 
@@ -72,6 +75,9 @@ void SpikePacketBridge::sendAuto(SpikeEvent* spike) {
 
     // 保守：以注入端 core_id 覆盖 src_endpoint，避免上层未按 global_id 口径填充导致偏差。
     pkt->src_endpoint = static_cast<uint16_t>(src_core);
+    if (rt_.active_step_seq && *rt_.active_step_seq != 0) {
+        pkt->step_seq = (*rt_.active_step_seq) + rt_.step_seq_offset;
+    }
     rt_.noc->sendFromCore(src_core, pkt);
 }
 
@@ -84,6 +90,9 @@ void SpikePacketBridge::sendExternal(SpikeEvent* spike) {
     NocPacketEvent* pkt = SpikeNocCodec::encode(*spike, *rt_.layout);
     delete spike;
     if (!pkt) return;
+    if (rt_.active_step_seq && *rt_.active_step_seq != 0) {
+        pkt->step_seq = (*rt_.active_step_seq) + rt_.step_seq_offset;
+    }
     rt_.noc->sendExternal(pkt);
 }
 

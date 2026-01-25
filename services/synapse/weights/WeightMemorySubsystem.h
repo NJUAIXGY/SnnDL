@@ -425,8 +425,7 @@ private:
 
             if (orch_.use_bcsr) {
                 if (orch_.bcsr_force_file_read && orch_.read_bcsr_from_file) {
-                    float resolved = orch_.read_bcsr_from_file(post_local, pre_global);
-                    if (orch_.readresp_zero_fallback && resolved == 0.0f) resolved = orch_.init_default_weight;
+                    float resolved = applyWeightGuards_(orch_.read_bcsr_from_file(post_local, pre_global));
                     setEdgeRetireReady_(seq, resolved, EdgeSrc::BCSRFile);
                     tryRetireEdges_();
                     continue;
@@ -437,8 +436,7 @@ private:
                         diag_core_id_, pre_global, post_local, diag_seq_, seq);
                 }
                 auto cb = [this, seq](float w) {
-                    float resolved = w;
-                    if (orch_.readresp_zero_fallback && resolved == 0.0f) resolved = orch_.init_default_weight;
+                    float resolved = applyReadRespZeroFallback_(w);
                     setEdgeRetireReady_(seq, resolved, EdgeSrc::BCSR);
                     tryRetireEdges_();
                     issueFromEdges();
@@ -461,7 +459,7 @@ private:
             const bool cache_hit = orch_.cache_try ? orch_.cache_try(cache_key, cached)
                                                    : (cache_try_fn_ ? cache_try_fn_(cache_key, cached) : false);
             if (cache_hit) {
-                if (orch_.readresp_zero_fallback && cached == 0.0f) cached = orch_.init_default_weight;
+                cached = applyReadRespZeroFallback_(cached);
                 setEdgeRetireReady_(seq, cached, EdgeSrc::Cache);
                 tryRetireEdges_();
                 if (orch_.report_cache_access) orch_.report_cache_access(true);
@@ -472,8 +470,7 @@ private:
             noteIssue();
             if (orch_.update_pending_peak) orch_.update_pending_peak(outstanding());
             auto miss_cb = [this, seq, cache_key](float w) {
-                float resolved = w;
-                if (orch_.readresp_zero_fallback && resolved == 0.0f) resolved = orch_.init_default_weight;
+                float resolved = applyReadRespZeroFallback_(w);
                 if (orch_.cache_put) orch_.cache_put(cache_key, resolved);
                 else if (cache_put_fn_) cache_put_fn_(cache_key, resolved);
                 setEdgeRetireReady_(seq, resolved, EdgeSrc::Miss);
@@ -617,6 +614,14 @@ public:
     }
 
 private:
+    float applyReadRespZeroFallback_(float w) const {
+        if (orch_.readresp_zero_fallback && w == 0.0f) return orch_.init_default_weight;
+        return w;
+    }
+
+    float applyWeightGuards_(float w) const;
+    SST::Output* diagOutOrFallback_() const;
+
     bool canIssueMoreReads_() const {
         if (canIssue(/*n*/1, /*count_budget*/true)) return true;
         if (diag_debug_ && diag_out_) {

@@ -13,43 +13,42 @@
 #include <iostream>
 #include <algorithm>
 
+#include "SpikeSourceConfig.h"
+
 using namespace SST;
 using namespace SST::SnnDL;
 
 // ===== 构造函数 =====
 SpikeSource::SpikeSource(ComponentId_t id, Params& params) : Component(id) {
-    
+    const SpikeSourceConfig cfg = parseSpikeSourceConfig(params);
+
     // 初始化输出对象
-    int verbose_level = params.find<int>("verbose", 0);
-    output = new Output("SpikeSource[@p:@l]: ", verbose_level, 0, Output::STDOUT);
+    output = new Output("SpikeSource[@p:@l]: ", cfg.verbose, 0, Output::STDOUT);
     
     output->verbose(CALL_INFO, 1, 0, "初始化SpikeSource组件 (ID: %" PRIu64 ")\n", id);
     
     // 读取配置参数
-    dataset_path = params.find<std::string>("dataset_path", "");
+    dataset_path = cfg.dataset_path;
     if (dataset_path.empty()) {
         output->fatal(CALL_INFO, -1, "错误: dataset_path参数是必需的\n");
     }
     
-    dataset_format = params.find<std::string>("dataset_format", "TEXT");
-    time_scale = params.find<float>("time_scale", 1.0f);
-    start_time_us_ = (uint64_t) params.find<uint64_t>("start_time_us", 0);
-    neuron_offset = params.find<uint32_t>("neuron_offset", 0);
-    max_events = params.find<uint32_t>("max_events", 0);
+    dataset_format = cfg.dataset_format;
+    time_scale = cfg.time_scale;
+    start_time_us_ = cfg.start_time_us;
+    neuron_offset = cfg.neuron_offset;
+    max_events = cfg.max_events;
     
     // 可选的神经元映射参数（用于推断目标节点）
-    neurons_per_core = params.find<uint32_t>("neurons_per_core", 0);
-    num_cores = params.find<uint32_t>("num_cores", 0);
-    neurons_per_pe = params.find<uint32_t>("neurons_per_pe", 0);
-    if (neurons_per_pe == 0 && neurons_per_core > 0 && num_cores > 0) {
-        neurons_per_pe = neurons_per_core * num_cores;
-    }
+    neurons_per_core = cfg.neurons_per_core;
+    num_cores = cfg.num_cores;
+    neurons_per_pe = cfg.neurons_per_pe;
     
-    event_weight = params.find<float>("event_weight", 1.0f);
-    segmented_release_ = params.find<int>("segmented_release", 0) != 0;
-    slices_per_superstep_ = params.find<uint32_t>("slices_per_superstep", 8);
-    uint64_t slice_window_us = (uint64_t) params.find<uint64_t>("slice_window_us", 5);
-    uint64_t slice_gap_us    = (uint64_t) params.find<uint64_t>("slice_gap_us", 5);
+    event_weight = cfg.event_weight;
+    segmented_release_ = cfg.segmented_release;
+    slices_per_superstep_ = cfg.slices_per_superstep;
+    uint64_t slice_window_us = cfg.slice_window_us;
+    uint64_t slice_gap_us    = cfg.slice_gap_us;
     slice_window_cycles_ = slice_window_us; // 1MHz -> 1us per cycle
     slice_gap_cycles_    = slice_gap_us;
 
@@ -116,13 +115,15 @@ void SpikeSource::setup() {
 void SpikeSource::finish() {
     output->verbose(CALL_INFO, 1, 0, "进入finish阶段\n");
     
-    // 允许主组件结束（确保不会阻塞仿真收尾）
-    primaryComponentOKToEndSim();
+    // 注意：当仿真由 SST 引擎 stop-at 结束时，在 finish() 中调用 primaryComponentOKToEndSim()
+    // 可能导致 Exit 事件在收尾阶段被调度，从而触发引擎侧退出阶段双重释放/崩溃（见 MultiCorePE 同类规避）。
+    // SpikeSource 作为数据源不应在 finish() 里触发 OKToEndSim（此时仿真已在收尾流程中）。
 
     // 输出最终统计信息
-    output->output("=== SpikeSource最终统计 ===\n");
-    output->output("加载事件数: %" PRIu64 "\n", events_loaded_count);
-    output->output("发送事件数: %" PRIu64 "\n", events_sent_count);
+    // 注意：避免使用 Output::output() 造成默认刷屏；统一走 verbose 门控
+    output->verbose(CALL_INFO, 1, 0, "=== SpikeSource最终统计 ===\n");
+    output->verbose(CALL_INFO, 1, 0, "加载事件数: %" PRIu64 "\n", events_loaded_count);
+    output->verbose(CALL_INFO, 1, 0, "发送事件数: %" PRIu64 "\n", events_sent_count);
     
     // 更新统计对象
     stat_events_loaded->addData(events_loaded_count);

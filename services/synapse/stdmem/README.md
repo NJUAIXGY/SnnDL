@@ -23,6 +23,7 @@
     1) **数据面**：分发到 `services/memory/StandardMemAccess`（纯 `addr→bytes`）
     2) **控制面**：分发到 `api/IGasStageSink`（BeginGather/BeginApply/... 的 stage/stat 载体）
   - 实现 `api/IGasCmdSender`：用于向 GatherBufferIF 发送 GAS stage custom cmd
+  - 已弃用：`api/IManualWindowDrive.h` 仅保留兼容入口；StdMemEndpoint 不再暴露手动窗口驱动，窗口推进由 GatherBufferIF 的 clock 驱动
   - **fail-fast**：遇到 `stdmem-untracked`（回包无法匹配任何 pending）直接 `fatal`，用于尽早暴露重复回包/错配等严重问题。
 
 ### `SnnPESubComponent_mem.cc`

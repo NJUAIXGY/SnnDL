@@ -8,12 +8,12 @@
 #include <sst/core/sst_config.h>
 #include "SnnPESubComponent.h"
 #include "SnnPESubComponent_impl.h"
+#include "SnnPESubComponentConfig.h"
 #include <fstream>
 #include "synapse/gas/GasCustomCmd.h"
 #include "synapse/gas/GasPhaseController.h"
 #include "synapse/gas/AccumulatorOps.h"
 #include "IPeAggregation.h"
-#include "IManualWindowDrive.h"
 #include "IGasStepGate.h"
 #include "ISnnComputeCore.h"
 #include "synapse/stdmem/StdMemEndpoint.h"
@@ -276,6 +276,11 @@ bool SnnPESubComponent::ensureLoaderReady_() {
     return false;
 }
 
+void SnnPESubComponent::onLoaderReady() {
+    if (!wait_for_loader_done_) return;
+    loader_ready_latched_ = true;
+}
+
 bool SnnPESubComponent::ensureMemoryReady_() const {
     return stdmem_ep_ && stdmem_ep_->available() && memory_ready_;
 }
@@ -363,13 +368,11 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     : SnnCoreAPI(id, params),
       output_(nullptr),
       memory_link_(nullptr) {
+    const SnnPESubComponentConfig cfg = parseSnnPESubComponentConfig(params);
+
     // 构造期最早哨兵（P2：参数优先，未设置回退到环境变量，以保持兼容）。
     // 避免直接使用 stdout，统一走 SST Output。
-    const bool kSentinelOn = [&params](){
-        // P2 Step3：仅参数驱动，默认0=禁用
-        int sent_p = params.find<int>("sentinel_enable", 0);
-        return sent_p != 0;
-    }();
+    const bool kSentinelOn = cfg.sentinel_enable;
     // 提前构建一个最低等级的输出对象，避免后续早期初始化路径使用 output_ 时发生空指针
     // 真实 verbose 等级稍后在解析完参数后再生效（此处仅用于早期诊断与防护）
     if (!output_) {
@@ -382,7 +385,7 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     // 注意：其余子模块初始化挪到参数解析之后，避免早期未初始化成员被使用
     
     // 读取配置参数
-    core_id_ = params.find<int>("core_id", 0);
+    core_id_ = cfg.core_id;
     // Phase5.2：将实现类型改为指针持有，避免在 control 头文件中包含 synapse 实现头
     if (!stdmem_ep_) stdmem_ep_ = std::make_unique<StdMemEndpoint>();
     if (!bcsr_weights_) bcsr_weights_ = std::make_unique<BcsrWeightManager>();
@@ -390,27 +393,23 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
         SNNDL_LOG(2, "[[sentinel-core-ctor]] core_ctor enter\n");
         SNNDL_LOG(2, "[[sentinel-core-ctor]] after params: core_id=%d\n", core_id_);
     }
-    total_cores_ = params.find<int>("total_cores", 8);
-    global_neuron_base_ = params.find<uint64_t>("global_neuron_base", 0);
-    num_neurons_ = params.find<uint32_t>("num_neurons", 64);
-    base_addr_ = params.find<uint64_t>("base_addr", 0);
-    node_id_ = params.find<uint32_t>("node_id", 0);
-    verbose_ = params.find<int>("verbose", 0);
-    enable_extended_diagnostics_ = params.find<int>("enable_extended_diagnostics", 0) != 0;
-    total_nodes_cfg_ = params.find<uint32_t>("total_nodes", 1);
+    total_cores_ = cfg.total_cores;
+    global_neuron_base_ = cfg.global_neuron_base;
+    num_neurons_ = cfg.num_neurons;
+    base_addr_ = cfg.base_addr;
+    node_id_ = cfg.node_id;
+    verbose_ = cfg.verbose;
+    enable_extended_diagnostics_ = cfg.enable_extended_diagnostics;
+    total_nodes_cfg_ = cfg.total_nodes;
+    if (output_) {
+        output_->setVerboseLevel(verbose_ < 0 ? 0u : static_cast<uint32_t>(verbose_));
+    }
 
     // Phase6：workload 选择（优先 Params，其次环境变量）
     // 约定：默认 "snn" 仍走 legacy 主链路；仅当显式选择 stream/traffic 时才启用 workload_。
-    std::string w = params.find<std::string>("workload_impl", "snn");
-    if (const char* env = workloadImplFromEnvCached()) {
-        // 兼容：允许用环境变量覆盖（README 中用于 stream/traffic 回归切换）
-        w = std::string(env);
-    }
-    std::transform(w.begin(), w.end(), w.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    if (w == "stream") {
+    if (cfg.workload_impl == "stream") {
         workload_impl_ = WorkloadImpl::Stream;
-    } else if (w == "traffic") {
+    } else if (cfg.workload_impl == "traffic") {
         workload_impl_ = WorkloadImpl::Traffic;
     } else {
         workload_impl_ = WorkloadImpl::Snn;
@@ -435,8 +434,8 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
         SNNDL_LOG(2, "[[sentinel-core-ctor]] after params2: node_id=%u num_neurons=%u base_addr=%" PRIu64 "\n",
                 node_id_, num_neurons_, (uint64_t)base_addr_);
     }
-    enable_weight_fetch_ = params.find<int>("enable_weight_fetch", 0) != 0;
-    workload_spike_input_enable_ = params.find<int>("workload_spike_input_enable", 0) != 0;
+    enable_weight_fetch_ = cfg.enable_weight_fetch;
+    workload_spike_input_enable_ = cfg.workload_spike_input_enable;
     // Phase5.2-A1：StageEventHub 吸收到 Impl（不再单独编译 control/StageEventHub.*）
     if (!impl_) impl_ = std::make_unique<Impl>();
     impl_->init(this);
@@ -449,14 +448,14 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
         SNNDL_DEBUG_LOG(1, "[diag-init] core=%d enable_weight_fetch=%d\n", core_id_, enable_weight_fetch_ ? 1 : 0);
     }
 #endif
-    write_weights_on_init_ = params.find<int>("write_weights_on_init", 1) != 0;
-    memory_warmup_cycles_ = params.find<uint64_t>("memory_warmup_cycles", 1000);
-    init_default_weight_ = params.find<float>("init_default_weight", 0.5f);
-    readresp_zero_fallback_ = params.find<int>("readresp_zero_fallback", 0) != 0;
-    max_outstanding_requests_ = params.find<uint32_t>("max_outstanding_requests", 16);
-    const uint32_t max_cache_entries = params.find<uint32_t>("max_cache_entries", 65536);
-    const bool use_clock_weight_cache = params.find<int>("use_clock_weight_cache", 0) != 0;
-    const bool disable_weight_cache = params.find<int>("disable_weight_cache", 0) != 0;
+    write_weights_on_init_ = cfg.write_weights_on_init;
+    memory_warmup_cycles_ = cfg.memory_warmup_cycles;
+    init_default_weight_ = cfg.init_default_weight;
+    readresp_zero_fallback_ = cfg.readresp_zero_fallback;
+    max_outstanding_requests_ = cfg.max_outstanding_requests;
+    const uint32_t max_cache_entries = cfg.max_cache_entries;
+    const bool use_clock_weight_cache = cfg.use_clock_weight_cache;
+    const bool disable_weight_cache = cfg.disable_weight_cache;
     {
         WeightCacheOps::Config cache_cfg{};
         cache_cfg.max_entries = max_cache_entries;
@@ -469,36 +468,39 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
         });
         weight_cache_ops_->reserve(cache_cfg.max_entries ? cache_cfg.max_entries : 1);
     }
-    use_event_weight_fallback_ = params.find<int>("use_event_weight_fallback", 0) != 0;
+    use_event_weight_fallback_ = cfg.use_event_weight_fallback;
     event_weight_fallback_warned_ = false;
-    merge_read_cacheline_ = params.find<int>("merge_read_cacheline", 1) != 0;
-    merge_read_row_ = params.find<int>("merge_read_row", 0) != 0;
-    gas_enable_ = params.find<int>("gas_enable", 0) != 0; // 默认关闭
-    gas_window_mode_ = params.find<int>("gas_window_mode", 0) != 0; // 当为true时采用GatherBufferIF的window驱动
-    // Deprecate manual window driving: read param for compatibility but force-disable
-    bool manual_drive_param = params.find<int>("gas_manual_window_drive", 0) != 0;
-    gas_manual_window_drive_ = false;
+    route_summary_enable_ = cfg.route_summary_enable;
+    merge_read_cacheline_ = cfg.merge_read_cacheline;
+    merge_read_row_ = cfg.merge_read_row;
+    gas_enable_ = cfg.gas_enable; // 默认关闭
+    gas_window_mode_ = cfg.gas_window_mode; // 当为true时采用GatherBufferIF的window驱动
+    // 已弃用：保留参数解析以兼容旧配置，但运行期强制忽略
+    bool manual_drive_param = cfg.gas_manual_window_drive_requested;
     if (manual_drive_param && output_ && output_->getVerboseLevel() >= 2) {
         output_->verbose(CALL_INFO, 2, 0,
             "[diag-gas-config] core=%d gas_manual_window_drive 已弃用，仍将使用自动窗口驱动\n",
             core_id_);
     }
-    manual_gas_gather_cycles_cfg_ = params.find<uint64_t>("gas_window_cycles_gather", 200);
-    if (manual_gas_gather_cycles_cfg_ == 0) manual_gas_gather_cycles_cfg_ = 1;
     // 方案1（slice顺序执行）
-    scheme1_enable_ = params.find<int>("scheme1_enable", 0) != 0;
-    scheme1_slices_ = params.find<uint32_t>("scheme1_slices", 8);
-    scheme1_gather_cycles_cfg_ = params.find<uint64_t>("scheme1_gather_cycles", 100);
-    scheme1_slice_gap_cycles_ = params.find<uint64_t>("scheme1_slice_gap_cycles", 0);
-    scheme1_scatter_cycles_ = params.find<uint64_t>("scheme1_scatter_cycles", 1);
-    scheme1_partition_mod_ = params.find<int>("scheme1_partition_mod", 0) != 0;
-    merge_read_auto_ = params.find<int>("merge_read_auto", 0) != 0; // default off
-    line_size_bytes_ = params.find<uint32_t>("line_size_bytes", 64);
-    byte_exact_verify_enable_ = params.find<int>("byte_exact_verify_enable", 0) != 0;
-    byte_exact_verify_mode_ = params.find<std::string>("byte_exact_verify_mode", "");
-    byte_exact_verify_row_scale_ = params.find<uint32_t>("byte_exact_verify_row_scale", 1024);
-    byte_exact_verify_max_mismatch_ = params.find<uint32_t>("byte_exact_verify_max_mismatch", 8);
-    loader_done_key_ = params.find<std::string>("loader_done_key", "");
+    scheme1_enable_ = cfg.scheme1_enable;
+    scheme1_slices_ = cfg.scheme1_slices;
+    scheme1_gather_cycles_cfg_ = cfg.scheme1_gather_cycles;
+    scheme1_slice_gap_cycles_ = cfg.scheme1_slice_gap_cycles;
+    scheme1_scatter_cycles_ = cfg.scheme1_scatter_cycles;
+    scheme1_partition_mod_ = cfg.scheme1_partition_mod;
+    merge_read_auto_ = cfg.merge_read_auto; // default off
+    line_size_bytes_ = cfg.line_size_bytes;
+    byte_exact_verify_enable_ = cfg.byte_exact_verify_enable;
+    byte_exact_verify_mode_ = cfg.byte_exact_verify_mode;
+    byte_exact_verify_row_scale_ = cfg.byte_exact_verify_row_scale;
+    byte_exact_verify_max_mismatch_ = cfg.byte_exact_verify_max_mismatch;
+    bcsr_semantic_verify_enable_ = cfg.bcsr_semantic_verify_enable;
+    bcsr_semantic_verify_max_edges_ = cfg.bcsr_semantic_verify_max_edges;
+    bcsr_semantic_verify_max_mismatch_ = cfg.bcsr_semantic_verify_max_mismatch;
+    bcsr_semantic_verify_abs_tol_ = cfg.bcsr_semantic_verify_abs_tol;
+    bcsr_semantic_verify_rel_tol_ = cfg.bcsr_semantic_verify_rel_tol;
+    loader_done_key_ = cfg.loader_done_key;
     wait_for_loader_done_ = !loader_done_key_.empty();
     if (wait_for_loader_done_) {
         loader_done_shared_.initialize(loader_done_key_, 1, 0);
@@ -509,17 +511,16 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
                 core_id_, loader_done_key_.c_str());
         }
     }
-    window_read_enable_ = params.find<int>("window_read_enable", 0) != 0;
-    window_read_debug_ = params.find<int>("window_read_debug", 0) != 0;
-    scatter_diag_limit_ = params.find<uint32_t>("scatter_diag_limit", 0);
+    window_read_enable_ = cfg.window_read_enable;
+    window_read_debug_ = cfg.window_read_debug;
+    scatter_diag_limit_ = cfg.scatter_diag_limit;
     scatter_diag_count_ = 0;
-    route_summary_enable_ = params.find<int>("route_summary_enable", 0) != 0;
     if (impl_ && impl_->gas_ctrl_) impl_->gas_ctrl_->setDebug(window_read_debug_, enable_extended_diagnostics_);
-    window_read_budget_ = params.find<uint32_t>("window_read_budget", 1024);
+    window_read_budget_ = cfg.window_read_budget;
     windowStateConfigure_();
-    read_force_single_ = params.find<int>("read_force_single", 0) != 0;
+    read_force_single_ = cfg.read_force_single;
     // 边集合容量上限（极端保护）
-    edge_collector_max_capacity_ = static_cast<size_t>(params.find<uint64_t>("edge_collector_max_capacity", 1000000));
+    edge_collector_max_capacity_ = static_cast<size_t>(cfg.edge_collector_max_capacity);
     if (window_read_enable_) {
         reserveWindowContainers_();
     if (!record_edge_idle_enable_ && !record_edge_scatter_enable_ && window_read_debug_ &&
@@ -532,10 +533,10 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
             "[diag-record-edge] core=%d window_read_enable=0 => 忽略 window_read_debug", core_id_);
     }
     // 全网读取扩展参数
-    weights_cols_ = params.find<uint32_t>("weights_cols", 0);
-    std::string index_mode_str = params.find<std::string>("index_mode", "pre_row_post_col");
+    weights_cols_ = cfg.weights_cols;
+    std::string index_mode_str = cfg.index_mode;
     // 神经元状态布局参数已下沉到 compute core（控制层不再持有）
-    verify_routing_weights_ = params.find<int>("verify_routing_weights", 0) != 0;
+    verify_routing_weights_ = cfg.verify_routing_weights;
     use_post_row_pre_col_ = (index_mode_str == "post_row_pre_col");
     if (index_mode_str == "bcsr_post_row") {
         use_bcsr_ = true;
@@ -560,21 +561,21 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
         uint64_t bytes = static_cast<uint64_t>(num_neurons_) * static_cast<uint64_t>(weights_cols_) * static_cast<uint64_t>(sizeof(float));
         weight_region_end_ = base_addr_ + bytes;
     }
-    enable_detailed_map_log_ = params.find<int>("enable_detailed_map_log", 0) != 0;
-    log_weight_details_ = params.find<int>("log_weight_details", 0) != 0;
-    loader_barrier_cycles_ = params.find<uint64_t>("loader_barrier_cycles", 0);
+    enable_detailed_map_log_ = cfg.enable_detailed_map_log;
+    log_weight_details_ = cfg.log_weight_details;
+    loader_barrier_cycles_ = cfg.loader_barrier_cycles;
     // BCSR 参数
     bcsr_layout_.rows = num_neurons_;
-    bcsr_layout_.cols = params.find<uint32_t>("weights_cols", num_neurons_);
-    bcsr_layout_.block_rows = params.find<uint32_t>("bcsr_block_rows", 16);
-    bcsr_layout_.block_cols = params.find<uint32_t>("bcsr_block_cols", 16);
-    bcsr_layout_.idx_bytes = params.find<uint32_t>("bcsr_idx_bytes", 2);
-    bcsr_layout_.val_bytes = params.find<uint32_t>("bcsr_val_bytes", 4);
-    bcsr_layout_.rowptr_offset = params.find<uint64_t>("bcsr_rowptr_offset", 0);
-    bcsr_layout_.colidx_offset = params.find<uint64_t>("bcsr_colidx_offset", 0);
-    bcsr_layout_.blockdata_offset = params.find<uint64_t>("bcsr_blockdata_offset", 0);
-    bcsr_layout_.blockids_offset = params.find<uint64_t>("bcsr_blockids_offset", 0);
-    bcsr_layout_.per_core_stride = params.find<uint64_t>("per_core_stride", 0);
+    bcsr_layout_.cols = cfg.bcsr_cols;
+    bcsr_layout_.block_rows = cfg.bcsr_block_rows;
+    bcsr_layout_.block_cols = cfg.bcsr_block_cols;
+    bcsr_layout_.idx_bytes = cfg.bcsr_idx_bytes;
+    bcsr_layout_.val_bytes = cfg.bcsr_val_bytes;
+    bcsr_layout_.rowptr_offset = cfg.bcsr_rowptr_offset;
+    bcsr_layout_.colidx_offset = cfg.bcsr_colidx_offset;
+    bcsr_layout_.blockdata_offset = cfg.bcsr_blockdata_offset;
+    bcsr_layout_.blockids_offset = cfg.bcsr_blockids_offset;
+    bcsr_layout_.per_core_stride = cfg.per_core_stride;
     bcsr_layout_.validate(base_addr_, output_, (window_read_debug_ || enable_extended_diagnostics_), core_id_, node_id_);
     bcsr_br_ = bcsr_layout_.block_rows;
     bcsr_bc_ = bcsr_layout_.block_cols;
@@ -591,36 +592,35 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
         bcsr_blockids_addr_,
         bcsr_br_, bcsr_bc_, bcsr_idx_bytes_, bcsr_val_bytes_);
     // Revert: 默认值恢复为 64/256，避免影响发放路径；如需禁用由脚本显式传入 0
-    bcsr_row_index_cache_cap_ = params.find<uint32_t>("bcsr_row_index_cache_cap", 64);
-    bcsr_block_cache_cap_ = params.find<uint32_t>("bcsr_block_cache_cap", 256);
+    bcsr_row_index_cache_cap_ = cfg.bcsr_row_index_cache_cap;
+    bcsr_block_cache_cap_ = cfg.bcsr_block_cache_cap;
     // GAS Apply/Scatter Phase‑1
-    apply_acc_enable_ = params.find<int>("apply_acc_enable", 0) != 0;
-    acc_hwm_bytes_cfg_ = params.find<uint64_t>("acc_high_watermark_bytes", 16*1024*1024);
-    acc_spill_enable_cfg_ = params.find<int>("acc_spill_enable", 1) != 0;
-    stage_events_csv_ = params.find<std::string>("stage_events_csv", "");
+    apply_acc_enable_ = cfg.apply_acc_enable;
+    acc_hwm_bytes_cfg_ = cfg.acc_high_watermark_bytes;
+    acc_spill_enable_cfg_ = cfg.acc_spill_enable;
+    stage_events_csv_ = cfg.stage_events_csv;
     if (impl_ && impl_->gas_ctrl_) impl_->gas_ctrl_->setStageEventsCsv(stage_events_csv_);
     // aosoa_block_rows 默认推导已转移至 compute core
     // CSR 参数已移除
-    bcsr_prefetch_all_ = params.find<int>("bcsr_prefetch_all", 0) != 0;
+    bcsr_prefetch_all_ = cfg.bcsr_prefetch_all;
     // 权重验证开关（具体采样/文件配置由 compute core 解析并执行）
-    verify_weights_ = params.find<int>("verify_weights", 0) != 0;
-    bcsr_force_file_read_ = params.find<int>("bcsr_force_file_read", 0) != 0;
-    bcsr_rowptr_file_fallback_enable_ = params.find<int>("bcsr_rowptr_file_fallback_enable", 0) != 0;
-    quiet_finish_logs_ = params.find<int>("quiet_finish_logs", 0) != 0;
-    const int record_apply_default = (gas_window_mode_ && apply_acc_enable_) ? 1 : 0;
-    record_edge_apply_enable_ = params.find<int>("record_edge_apply_enable", record_apply_default) != 0;
-    record_edge_idle_enable_ = params.find<int>("record_edge_idle_enable", 0) != 0;
+    verify_weights_ = cfg.verify_weights;
+    bcsr_force_file_read_ = cfg.bcsr_force_file_read;
+    bcsr_rowptr_file_fallback_enable_ = cfg.bcsr_rowptr_file_fallback_enable;
+    quiet_finish_logs_ = cfg.quiet_finish_logs;
+    record_edge_apply_enable_ = cfg.record_edge_apply_enable;
+    record_edge_idle_enable_ = cfg.record_edge_idle_enable;
     if (record_edge_idle_enable_ && output_ && enable_extended_diagnostics_ && output_->getVerboseLevel() >= 2) {
         output_->verbose(CALL_INFO, 2, 0,
             "[diag-gas-config] core=%d 已启用 record_edge_idle（诊断配置，回归默认关闭）\n",
             core_id_);
     }
-    record_edge_scatter_enable_ = params.find<int>("record_edge_scatter_enable", 0) != 0;
+    record_edge_scatter_enable_ = cfg.record_edge_scatter_enable;
 
     // ---- Profiling init (optional; minimal overhead when disabled) ----
 #ifdef SNNDL_ENABLE_PROFILING
-    profiler_enabled_ = params.find<int>("enable_profiler", 0) != 0;
-    profiler_csv_prefix_ = params.find<std::string>("profiler_csv_prefix", "");
+    profiler_enabled_ = cfg.profiler_enable;
+    profiler_csv_prefix_ = cfg.profiler_csv_prefix;
     if (profiler_enabled_) {
         try {
             profiler_ = new SST::SnnDL::Profiler(std::string("SnnPESubComponent_Core") + std::to_string(core_id_));
@@ -631,12 +631,8 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     }
 #endif
     // 默认启用致密累加器（与头文件参数表一致）
-    const bool dense_acc_enable = params.find<int>("apply_dense_acc_enable", 1) != 0;
-    // P3: 影子验证开关仅由参数决定（dense 模式才有意义）
-    const bool shadow_verify_enable =
-        dense_acc_enable && (params.find<int>("acc_shadow_verify_enable", 0) != 0);
-    acc_dense_enable_cfg_ = dense_acc_enable;
-    acc_shadow_verify_enable_cfg_ = shadow_verify_enable;
+    acc_dense_enable_cfg_ = cfg.apply_dense_acc_enable;
+    acc_shadow_verify_enable_cfg_ = cfg.acc_shadow_verify_enable;
     // 构建窗口累加器（所有状态收敛到 AccumulatorOps）
     {
         AccumulatorOpsConfig acc_cfg{};
@@ -659,10 +655,10 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     }
 
     // Weights template is used by both synapse/weights (BCSR) and synapse/route; keep cached here.
-    weights_template_ = params.find<std::string>("weights_template", "");
+    weights_template_ = cfg.weights_template;
 
     // neurons_per_pe：默认按 total_cores*num_neurons 推导；但允许脚本显式覆盖（保持兼容）
-    uint32_t np_from_params = params.find<uint32_t>("neurons_per_pe", 0);
+    uint32_t np_from_params = cfg.neurons_per_pe;
     uint32_t computed_neurons_per_pe = static_cast<uint32_t>(total_cores_) * static_cast<uint32_t>(num_neurons_);
     if (np_from_params > 0) {
         neurons_per_pe_cfg_ = np_from_params;
@@ -676,7 +672,7 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     }
 
     // 获取权重文件路径（由 WeightLoader 负责加载；控制层仅缓存以便日志/兼容）
-    weights_file_path_ = params.find<std::string>("weights_file", "");
+    weights_file_path_ = cfg.weights_file;
 
     if (!isStreamWorkload_()) {
         // Phase4 Task6.1：compute core 创建/配置下沉到 workload=snn；
@@ -1106,7 +1102,7 @@ void SnnPESubComponent::onGasStatEvent(const GasStatEvent& st) {
     }
 }
 
-void SnnPESubComponent::configureWeightReaderSubsystem_(const Params& params) {
+void SnnPESubComponent::configureWeightReaderSubsystem_(const Params& /*params*/) {
     // 构建权重读取子系统（Phase E：内存子系统闭环，控制层不再持有 pending/解析）
     if (!weight_reader_adapter_) {
         auto mem = std::make_unique<WeightMemorySubsystem>();
@@ -1157,11 +1153,11 @@ void SnnPESubComponent::configureWeightReaderSubsystem_(const Params& params) {
             ocfg.bcsr_prefetch_all = bcsr_prefetch_all_;
             ocfg.bcsr_weight_guard_enable = bcsr_weight_guard_enable_;
             ocfg.bcsr_weight_abs_max = bcsr_weight_abs_max_;
-            ocfg.bcsr_semantic_verify_enable = params.find<int>("bcsr_semantic_verify_enable", 0) != 0;
-            ocfg.bcsr_semantic_verify_max_edges = params.find<uint32_t>("bcsr_semantic_verify_max_edges", 64);
-            ocfg.bcsr_semantic_verify_max_mismatch = params.find<uint32_t>("bcsr_semantic_verify_max_mismatch", 8);
-            ocfg.bcsr_semantic_verify_abs_tol = params.find<float>("bcsr_semantic_verify_abs_tol", 1e-6f);
-            ocfg.bcsr_semantic_verify_rel_tol = params.find<float>("bcsr_semantic_verify_rel_tol", 1e-6f);
+            ocfg.bcsr_semantic_verify_enable = bcsr_semantic_verify_enable_;
+            ocfg.bcsr_semantic_verify_max_edges = bcsr_semantic_verify_max_edges_;
+            ocfg.bcsr_semantic_verify_max_mismatch = bcsr_semantic_verify_max_mismatch_;
+            ocfg.bcsr_semantic_verify_abs_tol = bcsr_semantic_verify_abs_tol_;
+            ocfg.bcsr_semantic_verify_rel_tol = bcsr_semantic_verify_rel_tol_;
             ocfg.readresp_zero_fallback = readresp_zero_fallback_;
             ocfg.init_default_weight = init_default_weight_;
             ocfg.num_neurons = num_neurons_;
@@ -1369,69 +1365,7 @@ bool SnnPESubComponent::clockTick(Cycle_t current_cycle) {
     return false;
 }
 
-bool SnnPESubComponent::legacyClockTickInternal_(Cycle_t current_cycle) {
-    (void)current_cycle;
-    // Phase4-Task6.1：compute core 的 per-tick 驱动已下沉到 workload=snn（SnnWorkload）。
-    bool has_activity = false;
-    if (!clock_tick_logged_ && window_read_debug_ && output_ && output_->getVerboseLevel() >= 2) {
-        output_->verbose(CALL_INFO, 2, 0,
-            "[diag-gas] 核心%d clockTick start stage=%d gas_enable=%d window_mode=%d manual_drive=%d\n",
-            core_id_, (int)gas_stage_, gas_enable_ ? 1 : 0, gas_window_mode_ ? 1 : 0,
-            gas_manual_window_drive_ ? 1 : 0);
-        clock_tick_logged_ = true;
-    }
-    // 不在时钟顶层阻断loader，允许deliver/recordEdge提前进行；
-    // 在发起权重读取时（issueFromEdges_）再检查 loader 是否就绪。
-    // 方案1：优先处理 slice 顺序执行路径；若启用则该函数接管整个周期流程
-    if (scheme1_enable_) {
-        if (scheme1Tick_()) return false; // 已完成本周期
-    }
-    // GAS: mark gather window start for this cycle (barrier-based)
-    if (gas_enable_ && !gas_window_mode_ && ensureMemoryReady_()) {
-        stdmem_ep_->sendGasCmd(GasOp::BeginGather, /*ss*/0, /*slice*/0, /*tot*/1);
-    }
-    if (gas_enable_ && gas_window_mode_ && gas_manual_window_drive_) {
-        auto* drive = (stdmem_ep_ && stdmem_ep_->available()) ? stdmem_ep_->manualWindowDrive() : nullptr;
-        if (!drive) {
-            if (window_read_debug_ && output_ && !manual_window_tick_logged_ && output_->getVerboseLevel() >= 2) {
-                output_->verbose(CALL_INFO, 2, 0,
-                    "[diag-gas] core=%d manual window drive requested but unavailable (IManualWindowDrive not provided by stdmem)\n",
-                    core_id_);
-                manual_window_tick_logged_ = true;
-            }
-        } else {
-            drive->manualWindowTick();
-            manual_gas_counter_++;
-            if (!manual_tick_sampled_ && manual_gas_counter_ <= manual_gas_gather_cycles_cfg_ &&
-                window_read_debug_ && output_ && output_->getVerboseLevel() >= 2) {
-                output_->verbose(CALL_INFO, 2, 0,
-                    "[diag-gas] 核心%d manual_tick stage=%d counter=%" PRIu64 " threshold=%" PRIu64 "\n",
-                    core_id_, (int)gas_stage_, manual_gas_counter_, manual_gas_gather_cycles_cfg_);
-                if (manual_gas_counter_ >= manual_gas_gather_cycles_cfg_) manual_tick_sampled_ = true;
-            }
-            if (manual_gas_counter_ >= manual_gas_gather_cycles_cfg_) {
-                stdmem_ep_->sendGasCmd(GasOp::EndGather, /*ss*/0, /*slice*/0, /*tot*/1);
-                if (window_read_debug_ && output_ && output_->getVerboseLevel() >= 2) {
-                    output_->verbose(CALL_INFO, 2, 0,
-                    "[diag-gas] 核心%d手动发出 EndGather (stage=%d cnt=%" PRIu64 ")\n",
-                    core_id_, (int)gas_stage_, manual_gas_counter_);
-                }
-                manual_gas_counter_ = 0;
-                manual_tick_sampled_ = false;
-            }
-        }
-    }
-    // 学习窗口边界由 compute core 驱动
-    
-    // 调试权重验证状态 (仅在前几个周期输出)
-    /*
-    if (verify_weights_ && total_cycles_ < 10) {
-        output_->verbose(CALL_INFO, 2, 0, "🔍 核心%d状态检查: verify_weights=%d, memory_link=%s, memory_ready=%d, cycles=%lu, warmup=%lu\n",
-                        core_id_, verify_weights_ ? 1 : 0, memory_link_ ? "yes" : "no", memory_ready_ ? 1 : 0, 
-                        total_cycles_, memory_warmup_cycles_);
-    }
-    */
-    
+bool SnnPESubComponent::drainIncomingSpikesDeterministic_() {
     // 处理输入脉冲队列：为避免与同周期 GAS 阶段切换事件产生“先后次序竞态”，
     // 仅处理时间戳严格早于当前仿真时间的脉冲；同周期到达的脉冲延后到下一tick处理。
     //
@@ -1446,6 +1380,7 @@ bool SnnPESubComponent::legacyClockTickInternal_(Cycle_t current_cycle) {
             "this indicates an unintended fallback to legacy spike queueing.\n",
             core_id_);
     }
+
     const uint64_t now_ns = getCurrentSimTimeNano();
     std::vector<SpikeEvent*> ready_spikes;
     ready_spikes.reserve(std::min<size_t>(incoming_spikes_.size(), 256));
@@ -1484,11 +1419,40 @@ bool SnnPESubComponent::legacyClockTickInternal_(Cycle_t current_cycle) {
                       return wa < wb;
                   });
     }
+
+    bool has_activity = false;
     for (auto* spike : ready_spikes) {
         processLocalSpike(spike);
         has_activity = true;
         delete spike;
     }
+    return has_activity;
+}
+
+bool SnnPESubComponent::legacyClockTickInternal_(Cycle_t current_cycle) {
+    (void)current_cycle;
+    // Phase4-Task6.1：compute core 的 per-tick 驱动已下沉到 workload=snn（SnnWorkload）。
+    bool has_activity = false;
+    if (!clock_tick_logged_ && window_read_debug_ && output_ && output_->getVerboseLevel() >= 2) {
+        output_->verbose(CALL_INFO, 2, 0,
+            "[diag-gas] 核心%d clockTick start stage=%d gas_enable=%d window_mode=%d manual_drive=%d\n",
+            core_id_, (int)gas_stage_, gas_enable_ ? 1 : 0, gas_window_mode_ ? 1 : 0,
+            0);
+        clock_tick_logged_ = true;
+    }
+    // 不在时钟顶层阻断loader，允许deliver/recordEdge提前进行；
+    // 在发起权重读取时（issueFromEdges_）再检查 loader 是否就绪。
+    // 方案1：优先处理 slice 顺序执行路径；若启用则该函数接管整个周期流程
+    if (scheme1_enable_) {
+        if (scheme1Tick_()) return false; // 已完成本周期
+    }
+    // GAS: mark gather window start for this cycle (barrier-based)
+    if (gas_enable_ && !gas_window_mode_ && ensureMemoryReady_()) {
+        stdmem_ep_->sendGasCmd(GasOp::BeginGather, /*ss*/0, /*slice*/0, /*tot*/1);
+    }
+    // 学习窗口边界由 compute core 驱动
+
+    has_activity |= drainIncomingSpikesDeterministic_();
 
     // Apply窗口内的机会式发起：若BeginApply时未能捕获到上一窗集合，
     // 但在本窗内由于deliverSpike处理使得 prev/curr 集合非空，则本窗内立即发起读取。
@@ -1497,237 +1461,6 @@ bool SnnPESubComponent::legacyClockTickInternal_(Cycle_t current_cycle) {
     
     // test-only 延迟读取示例已移除：权重通路由 compute core + 控制层窗口读编排负责
     // 权重验证与 BCSR 探针已下沉到 compute core（DefaultSnnComputeCore::onClockTick）
-#if 0
-    // 权重正确性验证：在暖机完成后进行固定次数采样读取，对比 expected_weight_value_
-    if (verify_weights_ && memory_ && memory_ready_ && total_cycles_ >= memory_warmup_cycles_ &&
-        (loader_barrier_cycles_ == 0 || total_cycles_ >= loader_barrier_cycles_)) {
-        if (!verify_started_) {
-            verify_started_ = true;
-            // 降低默认日志级别
-            output_->verbose(CALL_INFO, 3, 0, "🎯 核心%d权重验证启动: 周期=%lu, 暖机阈值=%lu\n", 
-                            core_id_, total_cycles_, memory_warmup_cycles_);
-        }
-        // 每个周期发起至多一个样本，避免拥塞
-        if (verify_completed_ < weight_verify_samples_ && verify_requested_ - verify_completed_ < max_outstanding_requests_) {
-            uint32_t sample_idx = verify_requested_;
-            // 采样若干 (row, col)
-            uint32_t row;
-            uint32_t col;
-            if (verify_cluster_enable_) {
-                // 将前weight_verify_samples_个样本聚类到同一cacheline：固定行0，列在一个cacheline范围内循环
-                uint32_t fpl = std::max<uint32_t>(1, line_size_bytes_ / (uint32_t)sizeof(float));
-                row = 0;
-                col = (sample_idx % fpl);
-                if (use_post_row_pre_col_) {
-                    // 新模式 col 表示 pre_global；为了命中同一CL，选取一小段连续 pre_global
-                    // 这里使用全局列 0..fpl-1，足够验证命中
-                } else {
-                    // 旧模式 col=post_local，同样聚到同一CL
-                }
-            } else {
-                row = (sample_idx * 13) % num_neurons_;                // 本地目标行
-                col = use_post_row_pre_col_ ? ((sample_idx * 7) % std::max<uint32_t>(1, weights_cols_))
-                                             : ((sample_idx * 7) % num_neurons_);
-            }
-            // 新模式传参：(pre_global=col, post_local=row)；旧模式：(pre_local=row, post_local=col)
-            uint32_t arg0 = use_post_row_pre_col_ ? col : row;
-            uint32_t arg1 = use_post_row_pre_col_ ? row : col;
-            requestWeight(arg0, arg1, [this, row, col](float w){
-                verify_completed_++;
-                verify_sum_ += static_cast<double>(w);
-                bool mismatch = false;
-                if (verify_against_file_ && verify_file_loaded_) {
-                    // 使用文件中的期望值（row-major: row*weights_cols_ + col）
-                    uint64_t idx = static_cast<uint64_t>(row) * static_cast<uint64_t>(weights_cols_) + static_cast<uint64_t>(col);
-                    float expected = 0.0f;
-                    if (idx < verify_file_buf_.size()) expected = verify_file_buf_[idx];
-                    mismatch = (std::fabs(w - expected) > verify_epsilon_);
-                    if (verify_log_each_sample_) {
-                        output_->verbose(CALL_INFO, 1, 0,
-                            "🔎 权重样本(FILE): row=%u col=%u value=%.6f expected=%.6f diff=%.6f %s\n",
-                            row, col, w, expected, std::fabs(w-expected), (mismatch?"MISMATCH":"OK"));
-                    }
-                } else {
-                    // 回退到常数期望（兼容旧行为）
-                    mismatch = (std::fabs(w - expected_weight_value_) > verify_epsilon_);
-                    if (verify_log_each_sample_) {
-                        output_->verbose(CALL_INFO, 1, 0,
-                            "🔎 权重样本(CONST): row=%u col=%u value=%.6f expected=%.6f diff=%.6f %s\n",
-                            row, col, w, expected_weight_value_, std::fabs(w-expected_weight_value_), (mismatch?"MISMATCH":"OK"));
-                    }
-                }
-                if (mismatch) verify_mismatch_count_++;
-                // 详细调试权重读取值（禁用默认回调日志；仅当逐样本日志开启时输出）
-                if (verify_log_each_sample_) {
-                    output_->verbose(CALL_INFO, 2, 0,
-                        "🔎 权重验证回调: core=%d row=%u col=%u value=%.6f sum=%.6f count=%u\n",
-                        core_id_, row, col, w, verify_sum_, verify_completed_);
-                }
-                if (stat_weights_verify_count_) stat_weights_verify_count_->addData(1);
-                if (verify_mismatch_count_ && stat_weights_mismatch_count_) stat_weights_mismatch_count_->addData(1);
-                if (stat_weights_verify_sum_) stat_weights_verify_sum_->addData(verify_sum_);
-            });
-            verify_requested_++;
-        }
-    }
-
-    // BCSR探针：尽力在同一窗口发起一次按边读，扫描一个块内的列，促成 1.0 样本出现（仅诊断；不影响GAS语义）
-    if (verify_weights_ && use_bcsr_ && ensureMemoryReady_() && bcsr_weights_->isRowptrReady() &&
-        total_cycles_ >= memory_warmup_cycles_ && (loader_barrier_cycles_ == 0 || total_cycles_ >= loader_barrier_cycles_)) {
-        if (!verify_bcsr_done_ && !verify_bcsr_inflight_) {
-            uint32_t br = (bcsr_br_>0? bcsr_br_:16);
-            uint32_t bc = (bcsr_bc_>0? bcsr_bc_:16);
-            uint32_t nBlockRows = (num_neurons_ + br - 1) / br;
-            if (!verify_bcsr_started_) {
-                const auto& rp = bcsr_weights_->rowptrHost();
-                for (uint32_t r = 0; r < nBlockRows; ++r) {
-                    if (r + 1 >= rp.size()) break;
-                    uint32_t start = rp[r];
-                    uint32_t end   = rp[r+1];
-                    if (end > start) { verify_bcsr_post_local_ = r * br; verify_bcsr_block_col_ = 0; verify_bcsr_intra_col_ = 0; verify_bcsr_started_ = true; if (output_) output_->verbose(CALL_INFO, 1, 0, "[VERIFY][init-bcsr] core=%d post_local=%u rowptr=(%u,%u)\n", core_id_, verify_bcsr_post_local_, start, end); break; }
-                }
-                if (!verify_bcsr_started_) verify_bcsr_done_ = true;
-            }
-            if (verify_bcsr_started_ && !verify_bcsr_done_) {
-                uint32_t r = verify_bcsr_post_local_ / br;
-                // 若该行的colidx已缓存，解析出第一个block_col；否则先触发一次colidx读取
-                if (!verify_bcsr_block_resolved_) {
-                    std::vector<uint32_t> cols;
-                    if (bcsrRowIndexGet_(r, cols) && !cols.empty()) {
-                        verify_bcsr_block_col_ = cols[0];
-                        verify_bcsr_block_resolved_ = true;
-                        if (output_) output_->verbose(CALL_INFO, 1, 0, "[VERIFY][bcsr-colidx] core=%d row=%u first_block_col=%u\n", core_id_, r, verify_bcsr_block_col_);
-                    } else {
-                        // 文件直读一次，解析该行第一个块并且定位块内首个非零位置（诊断用途）
-                        std::string bin_path = resolveWeightTemplate(node_id_, core_id_);
-                        if (!bin_path.empty()) {
-                            uint32_t rows=0, colsN=0, brM=0, bcM=0, idxB=0, valB=0, totalB=0;
-                            uint64_t rp_off=0, ci_off=0, bd_off=0, id_off=0;
-                            std::string meta_path = bin_path + ".meta.json";
-                            if (parseBcsrMeta(meta_path, rows, colsN, brM, bcM, idxB, valB, rp_off, ci_off, bd_off, id_off, totalB)) {
-                                std::ifstream fin(bin_path, std::ios::binary);
-                                if (fin.good()) {
-                                    const auto& rp = bcsr_weights_->rowptrHost();
-                                    uint32_t start = (r+1 < rp.size() ? rp[r] : 0);
-                                    uint32_t end   = (r+1 < rp.size() ? rp[r+1] : start);
-                                    uint32_t brEff = (brM? brM : 1), bcEff = (bcM? bcM : 16);
-                                    size_t blk_bytes = (size_t)brEff * (size_t)bcEff * (size_t)valB;
-                                    uint32_t nblocks = (end > start ? (end - start) : 0);
-                                    for (uint32_t j = 0; j < nblocks && !verify_bcsr_block_resolved_; ++j) {
-                                        // 读第 j 个块列值
-                                        fin.seekg(static_cast<std::streamoff>(ci_off + (size_t)(start + j) * idxB), std::ios::beg);
-                                        uint32_t blk_col = 0; if (idxB == 2) { uint16_t v=0; fin.read(reinterpret_cast<char*>(&v), 2); blk_col = v; } else { fin.read(reinterpret_cast<char*>(&blk_col), 4); }
-                                        if (!fin.good()) break;
-                                        // 读该块数据
-                                        fin.seekg(static_cast<std::streamoff>(bd_off + (uint64_t)(start + j) * blk_bytes), std::ios::beg);
-                                        std::vector<float> blk(brEff*bcEff, 0.0f);
-                                        if (valB == 4) fin.read(reinterpret_cast<char*>(blk.data()), blk_bytes);
-                                        if (!fin.good()) break;
-                                        for (uint32_t cc = 0; cc < bcEff; ++cc) {
-                                            if (std::fabs(blk[cc]) > verify_epsilon_) { verify_bcsr_block_col_ = blk_col; verify_bcsr_intra_col_ = cc; verify_bcsr_block_resolved_ = true; break; }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                uint32_t intra = verify_bcsr_intra_col_;
-                uint32_t pre_global = (verify_bcsr_block_resolved_ ? (verify_bcsr_block_col_ * bc + intra) : intra);
-                uint32_t post_local = verify_bcsr_post_local_;
-                verify_bcsr_inflight_ = true;
-                uint32_t block_row = verify_bcsr_post_local_ / br;
-                uint32_t bc_eff = (bcsr_bc_>0? bcsr_bc_:16);
-                uint32_t blk_col = (bc_eff? (pre_global / bc_eff) : 0);
-                size_t block_bytes = (size_t)(bcsr_br_>0?bcsr_br_:1) * (size_t)bc_eff * (size_t)bcsr_val_bytes_;
-                uint32_t start = 0;
-                uint64_t block_addr = 0;
-                const auto& rp = bcsr_weights_->rowptrHost();
-                if (block_row + 1 < rp.size()) {
-                    start = rp[block_row];
-                    block_addr = bcsr_blockdata_addr_ + (uint64_t)(start + verify_bcsr_block_col_) * block_bytes;
-                }
-                if (output_) {
-                    if (output_->getVerboseLevel() >= 2) {
-                        output_->verbose(CALL_INFO, 2, 0,
-                        "[VERIFY][mem-addr] core=%d post=%u pre=%u blk_row=%u blk_col=%u block_addr=0x%llx rowptr_start=%u block_bytes=%zu\n",
-                        core_id_, post_local, pre_global, block_row, blk_col,
-                        (unsigned long long)block_addr, start, block_bytes);
-                    }
-                }
-                requestWeightBCSR(pre_global, post_local, [this, post_local, pre_global](float w){
-                    if (output_) {
-                        output_->verbose(CALL_INFO, 1, 0, "[VERIFY][probe-bcsr] post=%u pre=%u value=%.6f\n", post_local, pre_global, w);
-                    }
-                    verify_completed_++;
-                    verify_sum_ += static_cast<double>(w);
-                    // 仅诊断：读取文件中的同一位置，打印文件权重（不改变语义）
-                    do {
-                        std::string bin_path = resolveWeightTemplate(node_id_, core_id_);
-                        if (bin_path.empty()) break;
-                        uint32_t rows=0, colsN=0, brM=0, bcM=0, idxB=0, valB=0, totalB=0;
-                        uint64_t rp_off=0, ci_off=0, bd_off=0, id_off=0;
-                        std::string meta_path = bin_path + ".meta.json";
-                        if (!parseBcsrMeta(meta_path, rows, colsN, brM, bcM, idxB, valB, rp_off, ci_off, bd_off, id_off, totalB)) break;
-                        std::ifstream fin(bin_path, std::ios::binary);
-                        if (!fin.good()) break;
-                        uint32_t brEff = (brM? brM : 1), bcEff = (bcM? bcM : 16);
-                        uint32_t r = (brEff? (post_local / brEff) : 0);
-                        // 直接从文件读取 rowptr
-                        fin.seekg(static_cast<std::streamoff>(rp_off + (size_t)r * sizeof(uint32_t)), std::ios::beg);
-                        uint32_t start=0, end=0; fin.read(reinterpret_cast<char*>(&start), 4); fin.read(reinterpret_cast<char*>(&end), 4);
-                        if (!fin.good() || end <= start) break;
-                        uint32_t total_blocks = end - start;
-                        if (total_blocks > 1'000'000) break; // 防止异常数据
-                        uint32_t blk_col_target = (bcEff? (pre_global / bcEff) : 0);
-                        int idx_in_row = -1;
-                        for (uint32_t j=0; j < total_blocks; ++j) {
-                            fin.seekg(static_cast<std::streamoff>(ci_off + (size_t)(start + j) * idxB), std::ios::beg);
-                            uint32_t blk_col = 0; if (idxB == 2) { uint16_t v=0; fin.read(reinterpret_cast<char*>(&v), 2); blk_col = v; } else { fin.read(reinterpret_cast<char*>(&blk_col), 4); }
-                            if (!fin.good()) break;
-                            if (blk_col == blk_col_target) { idx_in_row = (int)j; break; }
-                        }
-                        if (idx_in_row < 0) break;
-                        // 读该块数据并取 intra 列值
-                        size_t blk_bytes = (size_t)brEff * (size_t)bcEff * (size_t)valB;
-                        fin.seekg(static_cast<std::streamoff>(bd_off + (uint64_t)(start + (uint32_t)idx_in_row) * blk_bytes), std::ios::beg);
-                        std::vector<float> blk(brEff*bcEff, 0.0f);
-                        if (valB == 4) fin.read(reinterpret_cast<char*>(blk.data()), blk_bytes);
-                        if (!fin.good()) break;
-                        uint32_t intra = (bcEff? (pre_global % bcEff) : 0);
-                        float fv = (intra < blk.size()? blk[intra] : 0.0f);
-                        if (output_) output_->verbose(CALL_INFO, 1, 0, "[VERIFY][file-probe] post=%u pre=%u file_value=%.6f mem_value=%.6f\n", post_local, pre_global, fv, w);
-                    } while(0);
-                    if (std::fabs(w) > verify_epsilon_) {
-                        verify_bcsr_done_ = true;
-                    } else {
-                        uint32_t bc = (bcsr_bc_>0? bcsr_bc_:16);
-                        if (verify_bcsr_intra_col_ + 1 < bc) {
-                            // 立即尝试下一列
-                            verify_bcsr_intra_col_++;
-                            uint32_t next_pre = (verify_bcsr_block_resolved_ ? (verify_bcsr_block_col_ * bc + verify_bcsr_intra_col_) : verify_bcsr_intra_col_);
-                            requestWeightBCSR(next_pre, post_local, [this, post_local, next_pre](float w2){
-                                if (output_) output_->verbose(CALL_INFO, 1, 0, "[VERIFY][probe-bcsr] post=%u pre=%u value=%.6f\n", post_local, next_pre, w2);
-                                verify_completed_++;
-                                verify_sum_ += static_cast<double>(w2);
-                                if (std::fabs(w2) > verify_epsilon_) {
-                                    verify_bcsr_done_ = true;
-                                } else {
-                                    // 若仍未命中，则留给下一tick继续
-                                }
-                                verify_bcsr_inflight_ = false;
-                            });
-                            return; // 由内层回调负责清理 inflight
-                        } else {
-                            verify_bcsr_done_ = true;
-                        }
-                    }
-                    verify_bcsr_inflight_ = false;
-                });
-            }
-        }
-    }
-#endif // legacy verify/probe path (moved to compute core)
 
     // Phase4-Task6.3：非 window 模式下的 “endCycle->drain->route/comm” 闭环已迁入 workload=snn（SnnWorkload::onClockTick）。
     // 控制层仅保留 GAS/window/阶段编排等 control-plane 逻辑，避免重复推进导致行为漂移。
@@ -1824,11 +1557,8 @@ void SnnPESubComponent::legacySnnGetStatistics(std::map<std::string, uint64_t>& 
 }
 
 void SnnPESubComponent::forceEndGather() {
-    if (!(gas_enable_ && gas_window_mode_ && gas_manual_window_drive_ && ensureMemoryReady_())) return;
-    stdmem_ep_->sendGasCmd(GasOp::EndGather, /*ss*/0, /*slice*/0, /*tot*/1);
-    if (window_read_debug_ && output_ && output_->getVerboseLevel() >= 2) {
-        output_->verbose(CALL_INFO, 2, 0, "[diag-gas] 核心%d 手动触发 EndGather\n", core_id_);
-    }
+    // 已弃用：手动窗口驱动不再支持；保持接口为兼容 no-op。
+    return;
 }
 
 void SnnPESubComponent::orchestrateBeginGatherWindowSetup() {

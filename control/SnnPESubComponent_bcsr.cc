@@ -9,6 +9,7 @@
 #include "synapse/weights/WeightMemorySubsystem.h"
 #include "synapse/weights/SnnBcsrWeightManager.h"
 #include "SnnDLLogging.h"
+#include "synapse/common/BcsrMeta.h"
 
 #include <fstream>
 #include <sstream>
@@ -28,22 +29,6 @@ using namespace SST::SnnDL;
 // - populate dense weight cache from BCSR blocks
 // BCSR remains a storage format/addressing scheme only.
 static constexpr bool kEnableLegacyBcsrOptimizations = false;
-
-namespace {
-bool extractUnsigned(const std::string& text, const char* key, uint64_t& value) {
-    auto pos = text.find(key);
-    if (pos == std::string::npos) return false;
-    pos = text.find(':', pos);
-    if (pos == std::string::npos) return false;
-    ++pos;
-    while (pos < text.size() && (std::isspace(static_cast<unsigned char>(text[pos])) || text[pos] == '"')) ++pos;
-    size_t end = pos;
-    while (end < text.size() && (std::isdigit(static_cast<unsigned char>(text[end])) || text[end] == 'x' || text[end] == 'X')) ++end;
-    if (end <= pos) return false;
-    value = std::strtoull(text.substr(pos, end - pos).c_str(), nullptr, 0);
-    return true;
-}
-} // namespace
 
 bool SnnPESubComponent::BcsrLayout::validate(uint64_t base, Output* out, bool debug, uint32_t core_id, uint32_t node_id) const {
     const bool monotonic = (colidx_offset >= rowptr_offset) && (blockdata_offset >= colidx_offset);
@@ -88,17 +73,17 @@ bool SnnPESubComponent::parseBcsrMeta(const std::string& meta_path, uint32_t& ro
     std::string text((std::istreambuf_iterator<char>(meta)), std::istreambuf_iterator<char>());
     uint64_t value = 0;
     bool ok = false;
-    if (extractUnsigned(text, "\"rows\"", value)) { rows_out = static_cast<uint32_t>(value); ok = true; }
-    if (extractUnsigned(text, "\"cols\"", value)) { cols_out = static_cast<uint32_t>(value); ok = true; }
-    if (extractUnsigned(text, "\"br\"", value)) { br_out = static_cast<uint32_t>(value); ok = true; }
-    if (extractUnsigned(text, "\"bc\"", value)) { bc_out = static_cast<uint32_t>(value); ok = true; }
-    if (extractUnsigned(text, "\"idx_bytes\"", value)) { idx_bytes_out = static_cast<uint32_t>(value); ok = true; }
-    if (extractUnsigned(text, "\"val_bytes\"", value)) { val_bytes_out = static_cast<uint32_t>(value); ok = true; }
-    if (extractUnsigned(text, "\"rowptr_offset\"", value)) { rowptr_off_out = value; ok = true; }
-    if (extractUnsigned(text, "\"colidx_offset\"", value)) { colidx_off_out = value; ok = true; }
-    if (extractUnsigned(text, "\"blockdata_offset\"", value)) { blockdata_off_out = value; ok = true; }
-    if (extractUnsigned(text, "\"blockids_offset\"", value)) { blockids_off_out = value; ok = true; }
-    if (extractUnsigned(text, "\"total_blocks\"", value)) { total_blocks_out = static_cast<uint32_t>(value); ok = true; }
+    if (bcsrExtractUnsignedJson(text, "\"rows\"", value)) { rows_out = static_cast<uint32_t>(value); ok = true; }
+    if (bcsrExtractUnsignedJson(text, "\"cols\"", value)) { cols_out = static_cast<uint32_t>(value); ok = true; }
+    if (bcsrExtractUnsignedJson(text, "\"br\"", value)) { br_out = static_cast<uint32_t>(value); ok = true; }
+    if (bcsrExtractUnsignedJson(text, "\"bc\"", value)) { bc_out = static_cast<uint32_t>(value); ok = true; }
+    if (bcsrExtractUnsignedJson(text, "\"idx_bytes\"", value)) { idx_bytes_out = static_cast<uint32_t>(value); ok = true; }
+    if (bcsrExtractUnsignedJson(text, "\"val_bytes\"", value)) { val_bytes_out = static_cast<uint32_t>(value); ok = true; }
+    if (bcsrExtractUnsignedJson(text, "\"rowptr_offset\"", value)) { rowptr_off_out = value; ok = true; }
+    if (bcsrExtractUnsignedJson(text, "\"colidx_offset\"", value)) { colidx_off_out = value; ok = true; }
+    if (bcsrExtractUnsignedJson(text, "\"blockdata_offset\"", value)) { blockdata_off_out = value; ok = true; }
+    if (bcsrExtractUnsignedJson(text, "\"blockids_offset\"", value)) { blockids_off_out = value; ok = true; }
+    if (bcsrExtractUnsignedJson(text, "\"total_blocks\"", value)) { total_blocks_out = static_cast<uint32_t>(value); ok = true; }
     return ok;
 }
 

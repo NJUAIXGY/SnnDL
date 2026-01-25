@@ -21,6 +21,7 @@
 #include <sst/core/statapi/stataccumulator.h>
 
 #include "synapse/route/BcsrRouteBuilder.h"
+#include "SnnDLStringUtil.h"
 
 namespace SST { namespace SnnDL {
 
@@ -442,14 +443,8 @@ bool buildWeightDrivenRoutesDense_(const SynapseRouteBuildConfig& cfg,
 
     for (uint32_t pe = 0; pe < total_nodes; ++pe) {
         std::string path = cfg.weights_template;
-        size_t pos = path.find("{pe:02d}");
-        if (pos != std::string::npos) {
-            char buf[16]; std::snprintf(buf, sizeof(buf), "%02u", pe);
-            path.replace(pos, 8, buf);
-        } else {
-            pos = path.find("{pe}");
-            if (pos != std::string::npos) path.replace(pos, 4, std::to_string(pe));
-        }
+        replaceAllIndexed(path, "{pe:02d}", pe, 2);
+        replaceAll(path, "{pe}", std::to_string(pe));
         std::ifstream fin(path, std::ios::binary);
         if (!fin.good()) {
             if (out) out->verbose(CALL_INFO, 1, 0, "⚠️ 路由构建：无法读取权重文件 %s\n", path.c_str());

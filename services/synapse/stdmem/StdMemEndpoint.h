@@ -23,7 +23,6 @@ namespace SST { namespace SnnDL {
 class IGasStageSink;
 class IGasStepGate;
 class IMemoryAccess;
-class IManualWindowDrive;
 
 // 约束：本头文件不包含 stdMem.h，也不暴露 StandardMem 类型。
 class StdMemEndpoint final : public IGasCmdSender {
@@ -60,7 +59,6 @@ public:
     bool available() const { return mem_access_ != nullptr; }
     IMemoryAccess* memoryAccess() const { return mem_access_; }
     IGasStepGate* stepGate() const { return step_gate_; }
-    IManualWindowDrive* manualWindowDrive() const { return manual_drive_; }
 
     void init(unsigned int phase);
     void complete(unsigned int phase);
@@ -85,7 +83,6 @@ private:
     // Non-owning handles for callers (filled after bindRuntime()).
     IMemoryAccess* mem_access_ = nullptr;
     IGasStepGate* step_gate_ = nullptr;
-    IManualWindowDrive* manual_drive_ = nullptr;
 };
 
 }} // namespace SST::SnnDL

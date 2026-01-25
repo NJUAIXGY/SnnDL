@@ -42,6 +42,10 @@ struct MultiCorePEConfig {
 
     // Workload selector (for disabling StepActivation under non-SNN workloads)
     std::string workload_impl;  // normalized lowercase; empty means "snn"
+    // Execution mode hint (experiment observability only)
+    // - gas: default SNN GAS/window pipeline
+    // - naive_raw: immediate per-spike reads (no GAS/window); still may use global step sync controller
+    std::string exec_mode;  // normalized lowercase; empty means "gas"
 
     // Files / toggles
     std::string weights_file;

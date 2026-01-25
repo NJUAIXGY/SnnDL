@@ -9,6 +9,7 @@
 #include "WeightMemorySubsystem.h"
 
 #include "SnnBcsrWeightManager.h"
+#include "SnnDLStringUtil.h"
 
 #include <sst/core/output.h>
 
@@ -59,29 +60,7 @@ static inline void prepareAlignedRead(uint64_t addr, size_t size, uint32_t line_
 
 static std::string resolveWeightsTemplatePath(const std::string& tmpl, uint32_t pe, uint32_t core) {
     if (tmpl.empty()) return "";
-    std::string path = tmpl;
-    auto replaceIndexed = [&](const std::string& marker, uint32_t value, int width) {
-        size_t pos = 0;
-        while ((pos = path.find(marker, pos)) != std::string::npos) {
-            char buf[32];
-            std::snprintf(buf, sizeof(buf), "%0*u", width, value);
-            path.replace(pos, marker.size(), buf);
-            pos += static_cast<size_t>(width);
-        }
-    };
-    auto replaceSimple = [&](const std::string& marker, uint32_t value) {
-        size_t pos = 0;
-        const std::string text = std::to_string(value);
-        while ((pos = path.find(marker, pos)) != std::string::npos) {
-            path.replace(pos, marker.size(), text);
-            pos += text.size();
-        }
-    };
-    replaceIndexed("{pe:02d}", pe, 2);
-    replaceSimple("{pe}", pe);
-    replaceIndexed("{core:02d}", core, 2);
-    replaceSimple("{core}", core);
-    return path;
+    return resolvePeCoreTemplate(tmpl, pe, core);
 }
 
 static bool readFileSlice(const std::string& path, uint64_t offset, size_t bytes, std::vector<uint8_t>& out) {
@@ -105,14 +84,6 @@ void WeightMemorySubsystem::onClockTick(uint64_t now_cycle) {
     drainRowIndexPrefetch_();
     drainPendingDirectReads_();
     drainPendingBcsrRowptrWaiters_();
-}
-
-static std::string lowerCopy_(const std::string& s) {
-    std::string out = s;
-    for (auto& ch : out) {
-        if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
-    }
-    return out;
 }
 
 WeightMemorySubsystem::IssueStatus
@@ -347,7 +318,7 @@ void WeightMemorySubsystem::maybeEnqueueRowIndexPrefetchAllRows_() {
     if (!orch_.use_bcsr || !orch_.bcsr_mgr) return;
     if (!orch_.bcsr_mgr->isRowptrReady()) return;
 
-    std::string mode = lowerCopy_(orch_.bcsr_row_index_prefetch_mode);
+    std::string mode = toLowerCopy(orch_.bcsr_row_index_prefetch_mode);
     if (mode.empty()) mode = "auto";
     if (mode == "off") return;
 
@@ -381,7 +352,7 @@ void WeightMemorySubsystem::maybeEnqueueRowIndexPrefetchPostsPrev_() {
     if (!orch_.use_bcsr || !orch_.bcsr_mgr) return;
     if (!orch_.bcsr_mgr->isRowptrReady()) return;
 
-    std::string mode = lowerCopy_(orch_.bcsr_row_index_prefetch_mode);
+    std::string mode = toLowerCopy(orch_.bcsr_row_index_prefetch_mode);
     if (mode.empty()) mode = "auto";
     if (mode == "off") return;
 
@@ -425,7 +396,7 @@ void WeightMemorySubsystem::drainRowIndexPrefetch_() {
     if (!orch_.use_bcsr || !orch_.bcsr_mgr) return;
     if (!orch_.bcsr_mgr->isRowptrReady()) return;
 
-    std::string mode = lowerCopy_(orch_.bcsr_row_index_prefetch_mode);
+    std::string mode = toLowerCopy(orch_.bcsr_row_index_prefetch_mode);
     if (mode.empty()) mode = "auto";
     if (mode == "off") return;
 
@@ -759,14 +730,18 @@ void WeightMemorySubsystem::requestDense_(uint32_t pre, uint32_t post, std::func
     issueDenseResolved_(row_idx, col_idx, /*cb_col*/col_idx, std::move(cb));
 }
 
-static float applyWeightGuards(const WeightMemorySubsystem::OrchestratorConfig& orch, float w) {
-    if (orch.bcsr_weight_guard_enable) {
-        if (!std::isfinite(w) || std::fabs(w) > orch.bcsr_weight_abs_max) {
+float WeightMemorySubsystem::applyWeightGuards_(float w) const {
+    if (orch_.bcsr_weight_guard_enable) {
+        if (!std::isfinite(w) || std::fabs(w) > orch_.bcsr_weight_abs_max) {
             return 0.0f;
         }
     }
-    if (orch.readresp_zero_fallback && w == 0.0f) return orch.init_default_weight;
-    return w;
+    return applyReadRespZeroFallback_(w);
+}
+
+SST::Output* WeightMemorySubsystem::diagOutOrFallback_() const {
+    static SST::Output fallback("WeightMemorySubsystem[@p:@l]: ", 0, 0, SST::Output::STDERR);
+    return diag_out_ ? diag_out_ : &fallback;
 }
 
 void WeightMemorySubsystem::enqueueBcsrBlockReadCoalesced_(uint32_t win_seq,
@@ -836,7 +811,7 @@ void WeightMemorySubsystem::requestBCSR_(uint32_t pre_global, uint32_t post_loca
     }
     if (orch_.bcsr_force_file_read && orch_.read_bcsr_from_file) {
         float w = orch_.read_bcsr_from_file(post_local, pre_global);
-        if (cb) cb(applyWeightGuards(orch_, w));
+        if (cb) cb(applyWeightGuards_(w));
         return;
     }
     if (orch_.ensure_loader_ready && !orch_.ensure_loader_ready()) {
@@ -1215,7 +1190,7 @@ void WeightMemorySubsystem::handleReadResp_(uint64_t req_id, uint64_t addr, Pend
                     }
 
                     // Optional: keep all row-index metadata resident (format metadata); preload all colidx once.
-                    std::string mode = lowerCopy_(orch_.bcsr_row_index_prefetch_mode);
+                    std::string mode = toLowerCopy(orch_.bcsr_row_index_prefetch_mode);
                     if (mode.empty()) mode = "auto";
                     if (ok && !bcsr_rowidx_file_preloaded_ && mode == "all_rows" && orch_.bcsr_mgr->rowIndexCacheCapacity() > 0) {
                         const uint32_t idx_bytes = orch_.bcsr_mgr->effectiveIdxBytes();
@@ -1595,14 +1570,14 @@ void WeightMemorySubsystem::handleReadResp_(uint64_t req_id, uint64_t addr, Pend
                 for (auto& w : waiters) {
                     const uint32_t off = w.intra_row * bc + w.intra_col;
                     const float ww = (off < blk.size()) ? blk[off] : 0.0f;
-                    const float guarded = applyWeightGuards(orch_, ww);
+                    const float guarded = applyWeightGuards_(ww);
                     verifyBcsrEdgeWeight_(w.pre_global, w.post_local, guarded);
                     if (w.cb) w.cb(guarded);
                 }
             } else if (meta.has_single_cb && meta.single_cb) {
                 const uint32_t off = meta.bcsr_intra_row * bc + meta.bcsr_intra_col;
                 float w = (off < blk.size()) ? blk[off] : 0.0f;
-                const float guarded = applyWeightGuards(orch_, w);
+                const float guarded = applyWeightGuards_(w);
                 verifyBcsrEdgeWeight_(
                     /*pre_global=*/meta.bcsr_target_block_col * bc + meta.bcsr_intra_col,
                     /*post_local=*/meta.bcsr_block_row * br + meta.bcsr_intra_row,
@@ -1628,7 +1603,7 @@ void WeightMemorySubsystem::handleReadResp_(uint64_t req_id, uint64_t addr, Pend
                     if (orch_.read_bcsr_from_file) {
                         ww = orch_.read_bcsr_from_file(w.post_local, w.pre_global);
                     }
-                    if (w.cb) w.cb(applyWeightGuards(orch_, ww));
+                    if (w.cb) w.cb(applyWeightGuards_(ww));
                 }
                 return;
             }
@@ -1641,7 +1616,7 @@ void WeightMemorySubsystem::handleReadResp_(uint64_t req_id, uint64_t addr, Pend
                     const uint32_t pre_global = meta.bcsr_target_block_col * bc + meta.bcsr_intra_col;
                     w = orch_.read_bcsr_from_file(post_local, pre_global);
                 }
-                meta.single_cb(applyWeightGuards(orch_, w));
+                meta.single_cb(applyWeightGuards_(w));
             }
         }
         return;
@@ -1653,8 +1628,7 @@ void WeightMemorySubsystem::handleReadResp_(uint64_t req_id, uint64_t addr, Pend
         for (size_t i = 0; i < float_count; ++i) {
             const uint32_t col_idx = meta.post_start + static_cast<uint32_t>(i);
             if (col_idx >= width) break;
-            float w = fptr[i];
-            if (orch_.readresp_zero_fallback && w == 0.0f) w = orch_.init_default_weight;
+            float w = applyReadRespZeroFallback_(fptr[i]);
             const uint64_t key = static_cast<uint64_t>(meta.pre) * static_cast<uint64_t>(width) +
                                  static_cast<uint64_t>(col_idx);
             if (orch_.cache_put) orch_.cache_put(key, w);
@@ -1670,14 +1644,13 @@ void WeightMemorySubsystem::handleReadResp_(uint64_t req_id, uint64_t addr, Pend
             target_col < width) {
             w = fptr[static_cast<size_t>(target_col - meta.post_start)];
         }
-        if (orch_.readresp_zero_fallback && w == 0.0f) w = orch_.init_default_weight;
-        meta.single_cb(w);
+        meta.single_cb(applyReadRespZeroFallback_(w));
     }
 }
 
 bool WeightMemorySubsystem::byteExactVerifyEnabled_() const {
     if (!orch_.byte_exact_verify_enable) return false;
-    return lowerCopy_(orch_.byte_exact_verify_mode) == "dense_rowcol_v1";
+    return toLowerCopy(orch_.byte_exact_verify_mode) == "dense_rowcol_v1";
 }
 
 float WeightMemorySubsystem::expectedDenseWeight_(uint32_t row, uint32_t col) const {
@@ -1697,8 +1670,7 @@ void WeightMemorySubsystem::verifyDenseReadBytes_(uint64_t addr, size_t req_size
     if (orch_.base_addr == 0) return;
     if (addr < orch_.base_addr) return;
 
-    static SST::Output fallback("WeightMemorySubsystem[@p:@l]: ", 0, 0, SST::Output::STDERR);
-    SST::Output* out = diag_out_ ? diag_out_ : &fallback;
+    SST::Output* out = diagOutOrFallback_();
 
     if (bytes.size() != req_size) {
         byte_exact_mismatch_count_ += 1;
@@ -1779,8 +1751,7 @@ void WeightMemorySubsystem::verifyDenseEdgeWeight_(uint32_t pre_global, uint32_t
     if (orch_.use_bcsr) return;
     if (!orch_.accessor) return;
 
-    static SST::Output fallback("WeightMemorySubsystem[@p:@l]: ", 0, 0, SST::Output::STDERR);
-    SST::Output* out = diag_out_ ? diag_out_ : &fallback;
+    SST::Output* out = diagOutOrFallback_();
 
     uint32_t req_pre = 0;
     uint32_t req_post = 0;
@@ -1836,8 +1807,7 @@ void WeightMemorySubsystem::emitByteExactPassMarker_(const char* where, uint32_t
     if (!byteExactVerifyEnabled_()) return;
     if (byte_exact_pass_logged_) return;
 
-    static SST::Output fallback("WeightMemorySubsystem[@p:@l]: ", 0, 0, SST::Output::STDERR);
-    SST::Output* out = diag_out_ ? diag_out_ : &fallback;
+    SST::Output* out = diagOutOrFallback_();
 
     if (byte_exact_mismatch_count_ != 0) {
         out->fatal(CALL_INFO, -1,
@@ -1874,8 +1844,7 @@ void WeightMemorySubsystem::verifyBcsrEdgeWeight_(uint32_t pre_global, uint32_t 
     if (orch_.bcsr_semantic_verify_max_edges == 0) return;
     if (bcsr_sem_verified_edges_ >= static_cast<uint64_t>(orch_.bcsr_semantic_verify_max_edges)) return;
 
-    static SST::Output fallback("WeightMemorySubsystem[@p:@l]: ", 0, 0, SST::Output::STDERR);
-    SST::Output* out = diag_out_ ? diag_out_ : &fallback;
+    SST::Output* out = diagOutOrFallback_();
 
     bool have_ref = false;
     float ref_raw = 0.0f;
@@ -1952,7 +1921,7 @@ void WeightMemorySubsystem::verifyBcsrEdgeWeight_(uint32_t pre_global, uint32_t 
         if (bcsr_sem_inconclusive_reason_.empty()) bcsr_sem_inconclusive_reason_ = "missing_ref_reader";
         return;
     }
-    const float ref = applyWeightGuards(orch_, ref_raw);
+    const float ref = applyWeightGuards_(ref_raw);
 
     const float abs_tol = orch_.bcsr_semantic_verify_abs_tol;
     const float rel_tol = orch_.bcsr_semantic_verify_rel_tol;
@@ -1985,8 +1954,7 @@ void WeightMemorySubsystem::emitBcsrSemanticVerifyMarker_(const char* where, uin
     if (!bcsrSemanticVerifyEnabled_()) return;
     if (bcsr_sem_pass_logged_) return;
 
-    static SST::Output fallback("WeightMemorySubsystem[@p:@l]: ", 0, 0, SST::Output::STDERR);
-    SST::Output* out = diag_out_ ? diag_out_ : &fallback;
+    SST::Output* out = diagOutOrFallback_();
 
     if (bcsr_sem_mismatch_count_ != 0) {
         out->fatal(CALL_INFO, -1,

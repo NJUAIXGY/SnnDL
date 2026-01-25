@@ -9,7 +9,6 @@
 #include "SnnPESubComponent.h"
 #include "SnnPESubComponent_impl.h"
 #include "IPeAggregation.h"
-#include "IManualWindowDrive.h"
 #include "synapse/stdmem/StdMemEndpoint.h"
 #include "synapse/weights/SnnBcsrWeightManager.h"
 #include "synapse/weights/WeightMemorySubsystem.h"
@@ -62,23 +61,6 @@ void SnnPESubComponent::initStdMemPhase0_() {
     if (stdmem_ep_ && stdmem_ep_->available()) {
         // 若已成功加载 StandardMem 子组件，则认为内存就绪（即使未显式提供 memory_link_）
         memory_ready_ = true;
-        if (gas_manual_window_drive_) {
-            auto* drive = stdmem_ep_->manualWindowDrive();
-                if (!drive) {
-                    if (output_) {
-                    output_->verbose(CALL_INFO, 1, 0,
-                        "⚠️ 核心%d启用gas_manual_window_drive但memory不支持IManualWindowDrive，降级为自动窗口\n",
-                        core_id_);
-                    }
-                    gas_manual_window_drive_ = false;
-                } else {
-                    if (output_) {
-                    output_->verbose(CALL_INFO, 2, 0,
-                        "[diag-gas] 核心%d启用manual窗口驱动 (IManualWindowDrive) gather_cycles=%" PRIu64 "\n",
-                        core_id_, manual_gas_gather_cycles_cfg_);
-                    }
-                }
-        }
     } else {
         memory_ready_ = false;
     }

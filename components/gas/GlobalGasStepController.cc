@@ -8,19 +8,35 @@
 #include <string>
 
 #include "GasStepBarrierEvent.h"
+#include "gas/GlobalGasStepControllerConfig.h"
 
 namespace SST { namespace SnnDL {
 
 GlobalGasStepController::GlobalGasStepController(SST::ComponentId_t id, SST::Params& params)
     : SST::Component(id)
 {
-    verbose_ = params.find<int>("verbose", 0);
+    const GlobalGasStepControllerConfig cfg = parseGlobalGasStepControllerConfig(params);
+    verbose_ = cfg.verbose;
     out_ = new SST::Output("GlobalGasStepController[@p:@l]: ", verbose_, 0, SST::Output::STDOUT);
 
-    start_seq_ = params.find<uint32_t>("start_seq", 1);
-    max_steps_ = params.find<uint32_t>("max_steps", 0);
-    require_all_ready_ = params.find<int>("require_all_ready", 1) != 0;
-    strict_seq_check_ = params.find<int>("strict_seq_check", 1) != 0;
+    clock_freq_ = params.find<std::string>("clock", "1GHz");
+    start_seq_ = cfg.start_seq;
+    max_steps_ = cfg.max_steps;
+    require_all_ready_ = cfg.require_all_ready;
+    strict_seq_check_ = cfg.strict_seq_check;
+    if (start_seq_ == 0) {
+        if (strict_seq_check_) {
+            if (out_) {
+                out_->fatal(CALL_INFO, -1, "GlobalGasStepController fatal: start_seq=0 is invalid (expected >=1)\n");
+            }
+        } else {
+            if (out_) {
+                out_->verbose(CALL_INFO, 1, 0, "[step-warn] start_seq=0 invalid, clamp to 1\n");
+            }
+            ++warn_count_;
+            start_seq_ = 1;
+        }
+    }
 
     // 仅在 step-limited 模式下注册为 primary，避免影响默认的 time-based stop-at 回归口径。
     primary_keepalive_ = (max_steps_ > 0);
@@ -45,6 +61,33 @@ GlobalGasStepController::GlobalGasStepController(SST::ComponentId_t id, SST::Par
         port = prefix + std::to_string(idx);
     }
 
+    const int first_gap = idx;
+    if (first_gap > 0) {
+        const int kGapProbe = 8;
+        int found = -1;
+        for (int probe = first_gap + 1; probe <= first_gap + kGapProbe; ++probe) {
+            const std::string probe_port = prefix + std::to_string(probe);
+            if (isPortConnected(probe_port)) {
+                found = probe;
+                break;
+            }
+        }
+        if (found >= 0) {
+            if (strict_seq_check_) {
+                out_->fatal(CALL_INFO, -1,
+                            "GlobalGasStepController fatal: port gap detected (pe_link%d missing, but pe_link%d connected)\n",
+                            first_gap, found);
+            } else {
+                if (out_) {
+                    out_->verbose(CALL_INFO, 1, 0,
+                                  "[step-warn] port gap: pe_link%d missing while pe_link%d connected; higher ports ignored\n",
+                                  first_gap, found);
+                }
+                ++warn_count_;
+            }
+        }
+    }
+
     if (pe_links_.empty()) {
         out_->fatal(CALL_INFO, -1, "GlobalGasStepController fatal: no PE links connected (expected pe_link0..)\n");
     }
@@ -58,7 +101,14 @@ GlobalGasStepController::~GlobalGasStepController() {
 }
 
 void GlobalGasStepController::init(unsigned int /*phase*/) {
-    // no-op
+    // Threading robustness:
+    // - When running with multiple SST threads, this controller may be placed on a different thread than PEs.
+    // - If the controller has no clock/self events, its thread can remain at time 0 and miss cross-thread barrier events.
+    // - Register a lightweight clock to ensure the owning thread participates in time advancement.
+    if (!clock_registered_) {
+        registerClock(clock_freq_, new SST::Clock::Handler2<GlobalGasStepController, &GlobalGasStepController::clockTick_>(this));
+        clock_registered_ = true;
+    }
 }
 
 void GlobalGasStepController::setup() {
@@ -71,6 +121,21 @@ void GlobalGasStepController::finish() {
     size_t done = 0;
     for (auto v : pe_ready_) if (v) ++ready;
     for (auto v : pe_done_) if (v) ++done;
+    if (warn_count_ > 0) {
+        out_->verbose(
+            CALL_INFO, 0, 0,
+            "[step-warn] finish: warn_count=%u started=%d current_seq=%u max_steps=%u completed=%u ready=%zu/%zu done=%zu/%zu\n",
+            warn_count_,
+            started_ ? 1 : 0,
+            current_seq_,
+            max_steps_,
+            steps_completed_,
+            ready,
+            pe_ready_.size(),
+            done,
+            pe_done_.size());
+        return;
+    }
     out_->verbose(
         CALL_INFO, 1, 0,
         "[step-sync] finish: started=%d current_seq=%u max_steps=%u completed=%u ready=%zu/%zu done=%zu/%zu\n",
@@ -138,6 +203,13 @@ void GlobalGasStepController::handleBarrierEvent_(SST::Event* ev, int pe_index) 
         if (!started_) {
             if (strict_seq_check_) {
                 if (out_) out_->fatal(CALL_INFO, -1, "GlobalGasStepController fatal: PE_DONE before started (pe=%d)\n", pe_index);
+            } else {
+                if (out_) {
+                    out_->verbose(CALL_INFO, 1, 0,
+                                  "[step-warn] PE_DONE before started ignored (pe=%d src_node=%u seq=%u)\n",
+                                  pe_index, src_node, seq);
+                }
+                ++warn_count_;
             }
             delete msg;
             return;
@@ -151,8 +223,9 @@ void GlobalGasStepController::handleBarrierEvent_(SST::Event* ev, int pe_index) 
             } else {
                 if (out_) out_->verbose(
                     CALL_INFO, 1, 0,
-                    "[step-sync] ignore PE_DONE seq=%u current_seq=%u (pe=%d)\n",
-                    seq, current_seq_, pe_index);
+                    "[step-warn] unexpected PE_DONE seq=%u current_seq=%u (pe=%d src_node=%u) ignored\n",
+                    seq, current_seq_, pe_index, src_node);
+                ++warn_count_;
             }
             delete msg;
             return;
@@ -188,12 +261,24 @@ void GlobalGasStepController::handleBarrierEvent_(SST::Event* ev, int pe_index) 
     if (op == GasStepBarrierOp::StartStep) {
         if (strict_seq_check_ && out_) {
             out_->fatal(CALL_INFO, -1, "GlobalGasStepController fatal: unexpected START_STEP from PE (pe=%d)\n", pe_index);
+        } else {
+            if (out_) {
+                out_->verbose(CALL_INFO, 1, 0,
+                              "[step-warn] unexpected START_STEP from PE ignored (pe=%d src_node=%u seq=%u)\n",
+                              pe_index, src_node, seq);
+            }
+            ++warn_count_;
         }
         delete msg;
         return;
     }
 
     delete msg;
+}
+
+bool GlobalGasStepController::clockTick_(SST::Cycle_t /*cycle*/) {
+    // keep ticking
+    return false;
 }
 
 }} // namespace SST::SnnDL

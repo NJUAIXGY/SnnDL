@@ -12,22 +12,13 @@
 #include <mutex>
 
 #include "gather/GatherBufferIFConfig.h"
+#include "SnnDLStringUtil.h"
 
 using namespace SST;
 using namespace SST::Interfaces;
 using namespace SST::SnnDL;
 
 // P2: 移除TU级别的 getenv 依赖；改为构造期解析的成员 debug/diag 标志
-
-namespace {
-static std::string lowerCopy_(const std::string& s) {
-    std::string out = s;
-    for (auto& ch : out) {
-        if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
-    }
-    return out;
-}
-} // namespace
 
 GatherBufferIF::GatherBufferIF(ComponentId_t id, Params& params, TimeConverter* time, HandlerBase* handler)
     : StandardMem(id, params, time, handler), time_(time), upstream_handler_(handler)
@@ -44,21 +35,21 @@ GatherBufferIF::GatherBufferIF(ComponentId_t id, Params& params, TimeConverter* 
     out_.init("GatherBufferIF[@p:@l]: ", cfg.verbose, 0, Output::STDOUT);
 
     // Dense microbench correctness: byte-exact verification (optional).
-    byte_exact_verify_enable_ = params.find<int>("byte_exact_verify_enable", 0) != 0;
-    byte_exact_verify_mode_ = params.find<std::string>("byte_exact_verify_mode", "");
-    byte_exact_verify_row_scale_ = params.find<uint32_t>("byte_exact_verify_row_scale", 1024);
-    byte_exact_verify_max_mismatch_ = params.find<uint32_t>("byte_exact_verify_max_mismatch", 8);
-    byte_exact_base_addr_ = params.find<uint64_t>("byte_exact_verify_base_addr", 0);
-    byte_exact_rows_ = params.find<uint32_t>("byte_exact_verify_rows", 0);
-    byte_exact_cols_ = params.find<uint32_t>("byte_exact_verify_cols", 0);
-    byte_exact_file_path_ = params.find<std::string>("byte_exact_verify_file_path", "");
-    byte_exact_sample_bytes_ = params.find<uint32_t>("byte_exact_verify_sample_bytes", 64);
-    byte_exact_max_resps_ = params.find<uint32_t>("byte_exact_verify_max_resps", 8);
-    byte_exact_owner_node_ = params.find<int>("byte_exact_verify_owner_node", -1);
-    byte_exact_owner_core_ = params.find<int>("byte_exact_verify_owner_core", -1);
-    byte_exact_rowptr_offset_ = params.find<uint64_t>("byte_exact_verify_rowptr_offset", 0);
-    byte_exact_colidx_offset_ = params.find<uint64_t>("byte_exact_verify_colidx_offset", 0);
-    byte_exact_blockdata_offset_ = params.find<uint64_t>("byte_exact_verify_blockdata_offset", 0);
+    byte_exact_verify_enable_ = cfg.byte_exact_verify_enable;
+    byte_exact_verify_mode_ = cfg.byte_exact_verify_mode;
+    byte_exact_verify_row_scale_ = cfg.byte_exact_verify_row_scale;
+    byte_exact_verify_max_mismatch_ = cfg.byte_exact_verify_max_mismatch;
+    byte_exact_base_addr_ = cfg.byte_exact_verify_base_addr;
+    byte_exact_rows_ = cfg.byte_exact_verify_rows;
+    byte_exact_cols_ = cfg.byte_exact_verify_cols;
+    byte_exact_file_path_ = cfg.byte_exact_verify_file_path;
+    byte_exact_sample_bytes_ = cfg.byte_exact_verify_sample_bytes;
+    byte_exact_max_resps_ = cfg.byte_exact_verify_max_resps;
+    byte_exact_owner_node_ = cfg.byte_exact_verify_owner_node;
+    byte_exact_owner_core_ = cfg.byte_exact_verify_owner_core;
+    byte_exact_rowptr_offset_ = cfg.byte_exact_verify_rowptr_offset;
+    byte_exact_colidx_offset_ = cfg.byte_exact_verify_colidx_offset;
+    byte_exact_blockdata_offset_ = cfg.byte_exact_verify_blockdata_offset;
     if (byte_exact_verify_enable_) {
         out_.verbose(CALL_INFO, 1, 0,
             "[byte-exact] GatherBufferIF enabled=1 mode=%s base=0x%llx rows=%u cols=%u row_scale=%u max_mismatch=%u\n",
@@ -68,7 +59,7 @@ GatherBufferIF::GatherBufferIF(ComponentId_t id, Params& params, TimeConverter* 
             byte_exact_verify_row_scale_, byte_exact_verify_max_mismatch_);
     }
     // raw_bcsr_v1: open file early (best-effort validation is still gated later).
-    if (byte_exact_verify_enable_ && lowerCopy_(byte_exact_verify_mode_) == "raw_bcsr_v1") {
+    if (byte_exact_verify_enable_ && toLowerCopy(byte_exact_verify_mode_) == "raw_bcsr_v1") {
         // Default behavior: allow enabling on a single target node/core via owner filters.
         if ((byte_exact_owner_node_ >= 0 && (int)cfg.node_id != byte_exact_owner_node_) ||
             (byte_exact_owner_core_ >= 0 && (int)cfg.core_id != byte_exact_owner_core_)) {
@@ -135,7 +126,6 @@ GatherBufferIF::GatherBufferIF(ComponentId_t id, Params& params, TimeConverter* 
     step_gate_enable_ = cfg.step_gate_enable;
     // Deprecate manual_window_drive: keep param for compatibility but force-disable
     (void)cfg.manual_window_drive_ignored;
-    manual_window_drive_ = false;
     win_cyc_gather_ = cfg.window_cycles_gather;
     win_cyc_apply_  = cfg.window_cycles_apply;
     win_cyc_scatter_= cfg.window_cycles_scatter;
@@ -144,6 +134,14 @@ GatherBufferIF::GatherBufferIF(ComponentId_t id, Params& params, TimeConverter* 
     clock_freq_ = cfg.clock;
     emit_stage_events_ = cfg.emit_stage_events;
     emit_lenient_ = cfg.emit_stage_events_lenient;
+    if (step_gate_enable_ && !emit_stage_events_) {
+        out_.fatal(CALL_INFO, -1,
+                   "GatherBufferIF fatal: step_gate_enable=1 requires emit_stage_events=1 (needed for global step synchronization)\n");
+    }
+    if (step_gate_enable_ && emit_lenient_) {
+        out_.fatal(CALL_INFO, -1,
+                   "GatherBufferIF fatal: step_gate_enable=1 forbids emit_stage_events_lenient=1 (would allow step to advance with inflight traffic)\n");
+    }
     stage_cycles_csv_ = cfg.stage_cycles_csv;
     stage_cycles_export_enable_ = !stage_cycles_csv_.empty();
     probe_csv_path_ = cfg.probe_gas_csv;
@@ -236,7 +234,7 @@ void GatherBufferIF::init(unsigned int phase) {
     if (sentinel_enable_) {
         out_.verbose(CALL_INFO, 2, 0,
             "[[sentinel-gbi-init]] phase=%u window_auto=%d manual=%d clock=%s win_cyc_g=%" PRIu64 " win_cyc_a=%" PRIu64 " win_cyc_s=%" PRIu64 " auto_bytes=%" PRIu64 " auto_reads=%" PRIu64 " defer=%d\n",
-            phase, window_auto_ ? 1 : 0, manual_window_drive_ ? 1 : 0, clock_freq_.c_str(),
+            phase, window_auto_ ? 1 : 0, 0, clock_freq_.c_str(),
             win_cyc_gather_, win_cyc_apply_, win_cyc_scatter_,
             gather_auto_end_bytes_, gather_auto_end_reads_, defer_issue_until_apply_ ? 1 : 0);
     }
@@ -381,19 +379,8 @@ void GatherBufferIF::openStep(uint32_t seq) {
 	                }
 	                sz = (uint32_t)sz_u64;
 	            }
-	            uint64_t key = (base << 32) ^ (uint64_t)sz;
-		            auto& g = sb_[gather_buf_index_].granules[key];
-		            if (g.subs.empty()) {
-		                g.base = base;
-		                g.size = sz;
-		                g.window_id = current_gather_id_;
-	                g.payload_bytes = 0;
-	                sb_[gather_buf_index_].required_set.insert(key);
-                        sb_[gather_buf_index_].issue_order_dirty = true;
-	                if (stat_coalesce_granule_size_) {
-		                    stat_coalesce_granule_size_->addData((uint64_t)sz);
-		                }
-		            }
+	            GranuleKey key = makeGranuleKey_(base, sz);
+	            auto& g = ensureGranule_(gather_buf_index_, key);
 	            if (off + (uint64_t)r->size > (uint64_t)g.size) {
 	                out_.fatal(CALL_INFO, -1,
 	                           "GatherBufferIF fatal: openStep sub-read out of granule bounds (seq=%u merge=%d use_row=%d base=0x%lx sz=%u addr=0x%lx size=%zu off=%" PRIu64 ")\n",
@@ -446,11 +433,25 @@ void GatherBufferIF::send(Request* req) {
                 }
 
                 if (data->op == GasOp::EndScatter) {
-                    // Tolerant in mixed modes: if Scatter already ended (cycle fallback), ignore late EndScatter.
-                    if (stage_ != Stage::Scatter) { delete req; return; }
                     if (data->superstep == 0 || static_cast<uint64_t>(data->superstep) != current_gather_id_) {
                         delete req;
                         return;
+                    }
+                    // Ignore late EndScatter after we already returned to Idle.
+                    if (stage_ == Stage::Idle) { delete req; return; }
+                    if (end_scatter_req_pending_ && end_scatter_req_seq_ == data->superstep) {
+                        delete req;
+                        return;
+                    }
+                    // Latch early EndScatter and consume when Scatter stage is reached.
+                    if (stage_ != Stage::Scatter) {
+                        end_scatter_early_count_++;
+                        if (!warned_end_scatter_early_) {
+                            warned_end_scatter_early_ = true;
+                            out_.verbose(CALL_INFO, 0, 0,
+                                "[warn-gbi] step_gate EndScatter arrived early (stage=%d); latched for Scatter (count=%" PRIu64 ")\n",
+                                (int)stage_, (uint64_t)end_scatter_early_count_);
+                        }
                     }
                     // Latch and let clockTick emit EndScatter + advance (avoid recursive callbacks).
                     end_scatter_req_pending_ = true;
@@ -462,7 +463,7 @@ void GatherBufferIF::send(Request* req) {
             if (out_.getVerboseLevel() >= 1) {
                 out_.verbose(CALL_INFO, 1, 0,
                     "[diag-gbi] CustomReq op=%d (manual=%d) stage=%d gid=%" PRIu64 "\n",
-                    (int)data->op, manual_window_drive_ ? 1 : 0, (int)stage_, current_gather_id_);
+                    (int)data->op, 0, (int)stage_, current_gather_id_);
             }
             switch (data->op) {
                 case GasOp::BeginGather:
@@ -495,19 +496,8 @@ void GatherBufferIF::send(Request* req) {
 	                                }
 	                                sz = (uint32_t)sz_u64;
 	                            }
-	                            uint64_t key = (base << 32) ^ (uint64_t)sz;
-		                            auto& g = sb_[gather_buf_index_].granules[key];
-		                            if (g.subs.empty()) {
-		                                g.base = base;
-		                                g.size = sz;
-		                                g.window_id = current_gather_id_;
-		                                g.payload_bytes = 0;
-		                                sb_[gather_buf_index_].required_set.insert(key);
-                                        sb_[gather_buf_index_].issue_order_dirty = true;
-		                                if (stat_coalesce_granule_size_) {
-		                                    stat_coalesce_granule_size_->addData((uint64_t)sz);
-		                                }
-		                            }
+	                            GranuleKey key = makeGranuleKey_(base, sz);
+	                            auto& g = ensureGranule_(gather_buf_index_, key);
 	                            if (off + (uint64_t)r->size > (uint64_t)g.size) {
 	                                out_.fatal(CALL_INFO, -1,
 	                                           "GatherBufferIF fatal: manual BeginGather sub-read out of granule bounds (merge=%d use_row=%d base=0x%lx sz=%u addr=0x%lx size=%zu off=%" PRIu64 ")\n",
@@ -576,10 +566,20 @@ void GatherBufferIF::send(Request* req) {
             // - Gather stage: always safe to stage when enabled.
             // - Apply stage: stage is also allowed in window_auto mode, but we MUST ensure clockTick()
             //   will drain staging_reads into granules; otherwise Apply could deadlock.
+            const bool allow_staging_in_apply = window_auto_;
             const bool take_staging_path =
                 defer_issue_until_apply_ &&
                 (gap_merge_enable_ || row_window_enable_) &&
-                (stage_ == Stage::Gather || stage_ == Stage::Apply);
+                (stage_ == Stage::Gather || (stage_ == Stage::Apply && allow_staging_in_apply));
+            if (defer_issue_until_apply_ && (gap_merge_enable_ || row_window_enable_) &&
+                stage_ == Stage::Apply && !window_auto_) {
+                static bool warned_defer_apply_requires_clock = false;
+                if (!warned_defer_apply_requires_clock) {
+                    warned_defer_apply_requires_clock = true;
+                    out_.verbose(CALL_INFO, 0, 0,
+                        "[warn-gbi] defer_issue_until_apply=1 with window_auto=0: Apply-stage Read cannot be staged; forcing immediate issue for forward progress\n");
+                }
+            }
             out_.verbose(CALL_INFO, 2, 0,
                 "[diag-gbi] send() Read: stage=%d tgt_buf=%d gap_merge=%d defer=%d -> path=%s\n",
                 (int)stage_, tgt, (int)gap_merge_enable_, (int)defer_issue_until_apply_,
@@ -613,19 +613,8 @@ void GatherBufferIF::send(Request* req) {
 	                    }
 	                    sz = (uint32_t)sz_u64;
 	                }
-	                uint64_t key = (base << 32) ^ (uint64_t)sz; // compact key
-		                auto& g = sb_[tgt].granules[key];
-		                if (g.subs.empty()) {
-		                    g.base = base;
-		                    g.size = sz;
-		                    g.window_id = current_gather_id_;
-	                    g.payload_bytes = 0;
-	                    sb_[tgt].required_set.insert(key);
-                            sb_[tgt].issue_order_dirty = true;
-	                    if (stat_coalesce_granule_size_) {
-	                        stat_coalesce_granule_size_->addData((uint64_t)sz);
-		                    }
-		                }
+	                GranuleKey key = makeGranuleKey_(base, sz);
+	                auto& g = ensureGranule_(tgt, key);
 	                if (off + (uint64_t)rd->size > (uint64_t)g.size) {
 	                    out_.fatal(CALL_INFO, -1,
 	                               "GatherBufferIF fatal: sub-read out of granule bounds (stage=%d buf=%d merge=%d use_row=%d base=0x%lx sz=%u addr=0x%lx size=%zu off=%" PRIu64 ")\n",
@@ -657,9 +646,9 @@ void GatherBufferIF::send(Request* req) {
         // Invalidate overlapping blocks for both SBs
         for (int b=0;b<2;++b) {
             if (!sb_[b].sram_blocks.empty()) {
-                std::vector<uint64_t> toErase;
+                std::vector<GranuleKey> toErase;
                 for (auto& kv : sb_[b].sram_blocks) {
-                    uint64_t base = kv.first >> 32; uint32_t sz = (uint32_t)(kv.first & 0xffffffffu);
+                    uint64_t base = kv.first.base; uint32_t sz = kv.first.size;
                     if (!(wr->pAddr + wr->size <= base || wr->pAddr >= base + sz)) toErase.push_back(kv.first);
                 }
                 for (auto k : toErase) { sb_[b].sram_blocks.erase(k); }
@@ -691,6 +680,35 @@ GatherBufferIF::Sort GatherBufferIF::parseSort(const std::string& s) const {
     return Sort::Row;
 }
 
+GatherBufferIF::GranuleKey GatherBufferIF::makeGranuleKey_(uint64_t base, uint32_t size) const {
+    return GranuleKey{base, size};
+}
+
+GatherBufferIF::Granule& GatherBufferIF::ensureGranule_(int buf, const GranuleKey& key) {
+    auto& S = sb_[buf];
+    auto it = S.granules.find(key);
+    if (it == S.granules.end()) {
+        auto res = S.granules.emplace(key, Granule{});
+        it = res.first;
+        auto& g = it->second;
+        g.base = key.base;
+        g.size = key.size;
+        g.window_id = current_gather_id_;
+        g.payload_bytes = 0;
+        S.required_set.insert(key);
+        S.issue_order_dirty = true;
+        if (stat_coalesce_granule_size_) {
+            stat_coalesce_granule_size_->addData((uint64_t)key.size);
+        }
+    }
+    return it->second;
+}
+
+bool GatherBufferIF::granuleKeyLess_(const GranuleKey& a, const GranuleKey& b) {
+    if (a.base != b.base) return a.base < b.base;
+    return a.size < b.size;
+}
+
 uint64_t GatherBufferIF::ensureSortKey_(Granule& g) {
     if (!g.sort_key_valid) {
         if (sort_ == Sort::Addr) {
@@ -713,9 +731,9 @@ void GatherBufferIF::rebuildIssueOrder_(int buf) {
         S.issue_order.emplace_back(ensureSortKey_(kv.second), kv.first);
     }
     std::sort(S.issue_order.begin(), S.issue_order.end(),
-              [](const auto& a, const auto& b){
+              [this](const auto& a, const auto& b){
                   if (a.first != b.first) return a.first < b.first;
-                  return a.second < b.second;
+                  return granuleKeyLess_(a.second, b.second);
               });
     S.issue_cursor = 0;
     S.issue_order_dirty = false;
@@ -732,7 +750,7 @@ void GatherBufferIF::issueMoreUnissuedFromOrder_(int buf) {
     while ((inflight_counts_[0] + inflight_counts_[1]) < max_inflight_reads_) {
         // Skip already-issued / erased granules.
         while (S.issue_cursor < S.issue_order.size()) {
-            const uint64_t key = S.issue_order[S.issue_cursor].second;
+            const GranuleKey& key = S.issue_order[S.issue_cursor].second;
             auto it = S.granules.find(key);
             if (it == S.granules.end() || it->second.issued) {
                 ++S.issue_cursor;
@@ -761,6 +779,30 @@ void GatherBufferIF::issueMoreUnissuedFromOrder_(int buf) {
     }
 }
 
+void GatherBufferIF::issueUnissuedGranulesDeterministic_(int buf) {
+    auto& S = sb_[buf];
+    auto& gmap = S.granules;
+    if (gmap.empty()) return;
+
+    std::vector<std::pair<uint64_t, GranuleKey>> sorted;
+    sorted.reserve(gmap.size());
+    for (auto& kv : gmap) {
+        if (kv.second.issued) continue;
+        sorted.emplace_back(ensureSortKey_(kv.second), kv.first);
+    }
+    std::sort(sorted.begin(), sorted.end(),
+              [this](const auto& a, const auto& b){
+                  if (a.first != b.first) return a.first < b.first;
+                  return granuleKeyLess_(a.second, b.second);
+              });
+    for (auto& p : sorted) {
+        auto it = gmap.find(p.second);
+        if (it != gmap.end() && !it->second.issued) {
+            issueGranuleBuf_(buf, p.second, it->second);
+        }
+    }
+}
+
 uint64_t GatherBufferIF::granuleSize() const {
     // Use downstream line size if available for cacheline policy
     auto ls = backend_ ? backend_->getLineSize() : 64;
@@ -768,7 +810,7 @@ uint64_t GatherBufferIF::granuleSize() const {
     return (uint64_t)ls;
 }
 
-void GatherBufferIF::issueGranuleBuf_(int buf, uint64_t key, Granule& g) {
+void GatherBufferIF::issueGranuleBuf_(int buf, const GranuleKey& key, Granule& g) {
     // 关键：memHierarchy.Cache（尤其 Incoherent L1）无法正确处理一次性 size>cache_line 的 GetS payload。
     // 这里将一个 granule 的下游读拆分为 cacheline 级分片并在 SRAM 中拼接，避免权重读出脏/非确定性。
     const uint64_t gsz_u64 = granuleSize();
@@ -788,8 +830,8 @@ void GatherBufferIF::issueGranuleBuf_(int buf, uint64_t key, Granule& g) {
             g.issue_ns = getCurrentSimTimeNano();
             if (diagEnabled_(1)) {
                 out_.verbose(CALL_INFO, 1, 0,
-                    "[diag-gbi-issue] node=%u core=%u buf=%d key=0x%lx base=0x%lx size=%u frags=%u frag_bytes=%u window=%" PRIu64 "\n",
-                    node_id_param_, core_id_param_, buf, (unsigned long)key, (unsigned long)g.base, g.size,
+                    "[diag-gbi-issue] node=%u core=%u buf=%d base=0x%llx size=%u frags=%u frag_bytes=%u window=%" PRIu64 "\n",
+                    node_id_param_, core_id_param_, buf, (unsigned long long)g.base, g.size,
                     g.frags_total, g.frag_bytes, (uint64_t)current_gather_id_);
             }
         }
@@ -833,20 +875,21 @@ void GatherBufferIF::onDownstreamResp_(Request* r) {
             return;
         }
         if (diagEnabled_(1)) {
-            uint64_t key_dbg = (it != inflight_down_.end()) ? it->second.key : 0;
+            GranuleKey key_dbg = (it != inflight_down_.end()) ? it->second.key : GranuleKey{0, 0};
             int buf_dbg = (it != inflight_down_.end()) ? it->second.buf : -1;
             out_.verbose(CALL_INFO, 1, 0,
-                "[diag-gbi] ReadResp id=%" PRIu64 " bytes=%zu buf=%d key=0x%lx node=%u core=%u\n",
-                (uint64_t)rr->getID(), rr->data.size(), buf_dbg, (unsigned long)key_dbg, node_id_param_, core_id_param_);
+                "[diag-gbi] ReadResp id=%" PRIu64 " bytes=%zu buf=%d base=0x%llx size=%u node=%u core=%u\n",
+                (uint64_t)rr->getID(), rr->data.size(), buf_dbg,
+                (unsigned long long)key_dbg.base, key_dbg.size, node_id_param_, core_id_param_);
         }
-        if (it != inflight_down_.end()) {
-            const int buf_index = it->second.buf;
-            const uint64_t key = it->second.key;
-            const uint32_t frag_off = it->second.off;
-            const uint32_t frag_sz = it->second.size;
-            inflight_down_.erase(it);
-            if (buf_index >=0 && buf_index < 2) {
-                auto& sb = sb_[buf_index];
+	        if (it != inflight_down_.end()) {
+	            const int buf_index = it->second.buf;
+	            const GranuleKey key = it->second.key;
+	            const uint32_t frag_off = it->second.off;
+	            const uint32_t frag_sz = it->second.size;
+	            inflight_down_.erase(it);
+	            if (buf_index >=0 && buf_index < 2) {
+	                auto& sb = sb_[buf_index];
                 auto git = sb.granules.find(key);
                 if (git != sb.granules.end()) {
                 auto& g = git->second;
@@ -863,13 +906,13 @@ void GatherBufferIF::onDownstreamResp_(Request* r) {
                 if (frag_sz > 0) {
                     if (rr->data.size() < frag_sz) {
                         out_.fatal(CALL_INFO, -1,
-                            "[gbi-assert] node=%u core=%u buf=%d key=0x%lx base=0x%lx frag_off=%u frag_sz=%u resp_bytes=%zu -- payload truncated, potential cache payload corruption\n",
-                            node_id_param_, core_id_param_, buf_index, (unsigned long)key,
-                            (unsigned long)g.base, frag_off, frag_sz, rr->data.size());
+                            "[gbi-assert] node=%u core=%u buf=%d base=0x%llx size=%u frag_off=%u frag_sz=%u resp_bytes=%zu -- payload truncated, potential cache payload corruption\n",
+                            node_id_param_, core_id_param_, buf_index,
+                            (unsigned long long)g.base, g.size, frag_off, frag_sz, rr->data.size());
                     }
                 }
                 if (byteExactVerifyEnabled_()) {
-                    const std::string mode_l = lowerCopy_(byte_exact_verify_mode_);
+                    const std::string mode_l = toLowerCopy(byte_exact_verify_mode_);
                     if (mode_l == "dense_rowcol_v1") {
                         verifyByteExactDenseRowcol_(g.base + frag_off, rr->data);
                     } else if (mode_l == "raw_bcsr_v1") {
@@ -898,17 +941,17 @@ void GatherBufferIF::onDownstreamResp_(Request* r) {
                         float f0_store = 0.0f;
                         std::memcpy(&f0_store, sram.data(), std::min<size_t>(sizeof(float), sram.size()));
                         out_.verbose(CALL_INFO, 1, 0,
-                            "[diag-sram-store] node=%u core=%u buf=%d key=0x%lx base=0x%lx size=%zu f0=%.6f\n",
-                            node_id_param_, core_id_param_, buf_index, (unsigned long)key,
-                            (unsigned long)g.base, sram.size(), f0_store);
+                            "[diag-sram-store] node=%u core=%u buf=%d base=0x%llx size=%zu f0=%.6f\n",
+                            node_id_param_, core_id_param_, buf_index,
+                            (unsigned long long)g.base, sram.size(), f0_store);
                         ++diag_sram_store;
                     }
                     touchLRU_(buf_index, key);
                     g.ready = true;
                     if (out_.getVerboseLevel() >= 1) {
                         out_.verbose(CALL_INFO, 1, 0,
-                            "[diag-gbi] mark ready buf=%d key=0x%lx subs=%zu\n",
-                            buf_index, (unsigned long)key, (size_t)g.subs.size());
+                            "[diag-gbi] mark ready buf=%d base=0x%llx size=%u subs=%zu\n",
+                            buf_index, (unsigned long long)g.base, g.size, (size_t)g.subs.size());
                     }
                     if (stat_unique_reads_) stat_unique_reads_->addData(1);
                     if (stat_unique_bytes_) stat_unique_bytes_->addData(g.size);
@@ -975,34 +1018,7 @@ void GatherBufferIF::onDownstreamResp_(Request* r) {
                     // 非延后模式：Apply 阶段也需要继续补发未发的 granule，
                     // 否则在高压力/小 inflight 下可能出现“未发→inflight=0→窗口提前结束”的丢读问题。
                     if (!defer_issue_until_apply_) {
-                        auto& gmap = sb_[apply_buf_index_].granules;
-                        std::vector<std::pair<uint64_t,uint64_t>> sorted;
-                        sorted.reserve(gmap.size());
-                        for (auto& kv : gmap) {
-                            if (kv.second.issued) continue;
-                            if (!kv.second.sort_key_valid) {
-                                if (sort_ == Sort::Addr) {
-                                    kv.second.cached_sort_key = kv.second.base;
-                                } else if (sort_ == Sort::BankRow) {
-                                    kv.second.cached_sort_key = bankRowIndex(kv.second.base);
-                                } else {
-                                    kv.second.cached_sort_key = rowIndex(kv.second.base);
-                                }
-                                kv.second.sort_key_valid = true;
-                            }
-                            sorted.emplace_back(kv.second.cached_sort_key, kv.first);
-                        }
-                        std::sort(sorted.begin(), sorted.end(),
-                                  [](const auto& a, const auto& b){
-                                      if (a.first != b.first) return a.first < b.first;
-                                      return a.second < b.second;
-                                  });
-                        for (auto& p : sorted) {
-                            auto it2 = gmap.find(p.second);
-                            if (it2 != gmap.end() && !it2->second.issued) {
-                                issueGranuleBuf_(apply_buf_index_, p.second, it2->second);
-                            }
-                        }
+                        issueUnissuedGranulesDeterministic_(apply_buf_index_);
                     }
                     // 延后模式：Apply entry 只会“尽可能发射”，其余 granule 必须在 ReadResp 回调里持续补发，
                     // 否则 inflight 限流会导致部分 granule 永远不被 issue，从而 required_set 永远不 ready → 卡死。
@@ -1020,35 +1036,7 @@ void GatherBufferIF::onDownstreamResp_(Request* r) {
             maybeEnterApply_();
             // 非延后模式：仍在Gather，继续发射未发granule
             if (!defer_issue_until_apply_ && stage_ == Stage::Gather) {
-                auto& gmap = sb_[gather_buf_index_].granules;
-                std::vector<std::pair<uint64_t,uint64_t>> sorted;
-                sorted.reserve(gmap.size());
-                for (auto& kv : gmap) {
-                    if (kv.second.issued) continue;
-                    // Deterministic issue order: break ties by key to avoid unordered_map iteration jitter.
-                    if (!kv.second.sort_key_valid) {
-                        if (sort_ == Sort::Addr) {
-                            kv.second.cached_sort_key = kv.second.base;
-                        } else if (sort_ == Sort::BankRow) {
-                            kv.second.cached_sort_key = bankRowIndex(kv.second.base);
-                        } else {
-                            kv.second.cached_sort_key = rowIndex(kv.second.base);
-                        }
-                        kv.second.sort_key_valid = true;
-                    }
-                    sorted.emplace_back(kv.second.cached_sort_key, kv.first);
-                }
-                std::sort(sorted.begin(), sorted.end(),
-                          [](const auto& a, const auto& b){
-                              if (a.first != b.first) return a.first < b.first;
-                              return a.second < b.second;
-                          });
-                for (auto& p : sorted) {
-                    auto it = gmap.find(p.second);
-                    if (it != gmap.end() && !it->second.issued) {
-                        issueGranuleBuf_(gather_buf_index_, p.second, it->second);
-                    }
-                }
+                issueUnissuedGranulesDeterministic_(gather_buf_index_);
             }
         } else if (stage_ == Stage::Apply && apply_pending_emit_) {
             // In window_auto mode (including GLOBAL_STEP_SYNC), stage transitions are driven
@@ -1198,34 +1186,7 @@ void GatherBufferIF::maybeEnterApply_() {
         issueMoreUnissuedFromOrder_(apply_buf_index_);
     } else {
         // 非延后：在窗口切换到 Apply 时也补发未发 granule，避免在 Gather 结束时仍有未发请求被遗漏。
-        auto& gmap = sb_[apply_buf_index_].granules;
-        std::vector<std::pair<uint64_t,uint64_t>> sorted;
-        sorted.reserve(gmap.size());
-        for (auto& kv : gmap) {
-            if (kv.second.issued) continue;
-            if (!kv.second.sort_key_valid) {
-                if (sort_ == Sort::Addr) {
-                    kv.second.cached_sort_key = kv.second.base;
-                } else if (sort_ == Sort::BankRow) {
-                    kv.second.cached_sort_key = bankRowIndex(kv.second.base);
-                } else {
-                    kv.second.cached_sort_key = rowIndex(kv.second.base);
-                }
-                kv.second.sort_key_valid = true;
-            }
-            sorted.emplace_back(kv.second.cached_sort_key, kv.first);
-        }
-        std::sort(sorted.begin(), sorted.end(),
-                  [](const auto& a, const auto& b){
-                      if (a.first != b.first) return a.first < b.first;
-                      return a.second < b.second;
-                  });
-        for (auto& p : sorted) {
-            auto it = gmap.find(p.second);
-            if (it != gmap.end() && !it->second.issued) {
-                issueGranuleBuf_(apply_buf_index_, p.second, it->second);
-            }
-        }
+        issueUnissuedGranulesDeterministic_(apply_buf_index_);
 
         // 非延后：只有当全部ready时才会立刻发放
         bool allReady = true;
@@ -1353,29 +1314,18 @@ void GatherBufferIF::buildGranulesWithGapMergeBuf_(int buf) {
         auto flush_segment = [&](bool mark_rowwin=false) {
             if (!has) return;
             uint64_t base = cur_base; uint32_t sz = (uint32_t)(cur_end - cur_base);
-            uint64_t gkey = (base << 32) ^ (uint64_t)sz;
+            GranuleKey gkey = makeGranuleKey_(base, sz);
             if (diag_granule_build_logged_ < 64) {
                 out_.verbose(CALL_INFO, 2, 0,
-                    "[diag-gbi-granule] node=%u core=%u buf=%d key=0x%llx base=0x%llx size=%u subs=%zu\n",
+                    "[diag-gbi-granule] node=%u core=%u buf=%d base=0x%llx size=%u subs=%zu\n",
                     node_id_param_, core_id_param_, buf,
-                    (unsigned long long)gkey,
                     (unsigned long long)base,
                     sz, segSubs.size());
                 ++diag_granule_build_logged_;
             }
-            auto &g = S.granules[gkey];
-            if (g.subs.empty()) {
-                g.base = base;
-                g.size = sz;
-                g.window_id = current_gather_id_;
-                g.payload_bytes = 0;
-                S.required_set.insert(gkey);
-                if (stat_coalesce_granule_size_) {
-                    stat_coalesce_granule_size_->addData((uint64_t)sz);
-                }
-                // 优化3：预分配subs空间（已知即将添加segSubs.size()个元素）
-                g.subs.reserve(segSubs.size());
-            }
+            auto& g = ensureGranule_(buf, gkey);
+            // 优化3：预分配subs空间（已知即将添加segSubs.size()个元素）
+            g.subs.reserve(g.subs.size() + segSubs.size());
             for (auto &it : segSubs) {
                 uint64_t off = (it.addr >= base) ? (it.addr - base) : 0;
                 g.subs.push_back({it.rd->getID(), off, it.size});
@@ -1470,11 +1420,11 @@ void GatherBufferIF::emitApplyResponsesBuf_(int buf) {
         buf, (size_t)S.granules.size(), S.pending_up_reads.size());
 
     // 收集已处理完成的 granule keys（ready 且已发回所有 sub-reads）
-    std::vector<uint64_t> completed_keys;
+    std::vector<GranuleKey> completed_keys;
     completed_keys.reserve(S.granules.size());
 
     // Deterministic traversal: granule and sub-read emission order must be stable across runs.
-    std::vector<std::pair<uint64_t,uint64_t>> sorted_keys;
+    std::vector<std::pair<uint64_t, GranuleKey>> sorted_keys;
     sorted_keys.reserve(S.granules.size());
     for (auto& kvg : S.granules) {
         auto& g = kvg.second;
@@ -1491,13 +1441,13 @@ void GatherBufferIF::emitApplyResponsesBuf_(int buf) {
         sorted_keys.emplace_back(g.cached_sort_key, kvg.first);
     }
     std::sort(sorted_keys.begin(), sorted_keys.end(),
-              [](const auto& a, const auto& b){
+              [this](const auto& a, const auto& b){
                   if (a.first != b.first) return a.first < b.first;
-                  return a.second < b.second;
+                  return granuleKeyLess_(a.second, b.second);
               });
 
     for (auto& pk : sorted_keys) {
-        uint64_t key = pk.second;
+        GranuleKey key = pk.second;
         auto git = S.granules.find(key);
         if (git == S.granules.end()) continue;
         auto& g = git->second;
@@ -1505,28 +1455,28 @@ void GatherBufferIF::emitApplyResponsesBuf_(int buf) {
         // 跳过未 ready 的 granule（保留到下次处理）
         if (!g.ready) {
             out_.verbose(CALL_INFO, 1, 0,
-                "[diag-gbi] granule key=0x%lx NOT ready; window=%" PRIu64 " buf=%d (will retry next Apply)\n",
-                (unsigned long)key, (uint64_t)g.window_id, buf);
+                "[diag-gbi] granule base=0x%llx size=%u NOT ready; window=%" PRIu64 " buf=%d (will retry next Apply)\n",
+                (unsigned long long)g.base, g.size, (uint64_t)g.window_id, buf);
             continue;
         }
 
         auto bit = S.sram_blocks.find(key);
         if (bit == S.sram_blocks.end()) {
             out_.verbose(CALL_INFO, 1, 0,
-                "[diag-gbi] granule key=0x%lx missing SRAM entry (buf=%d)\n",
-                (unsigned long)key, buf);
+                "[diag-gbi] granule base=0x%llx size=%u missing SRAM entry (buf=%d)\n",
+                (unsigned long long)g.base, g.size, buf);
             continue;
         }
 
         const auto& blk = bit->second;
         if (g.subs.empty()) {
             out_.verbose(CALL_INFO, 1, 0,
-                "[diag-gbi] granule key=0x%lx READY but subs=0 (buf=%d) pending_up_reads=%zu\n",
-                (unsigned long)key, buf, S.pending_up_reads.size());
+                "[diag-gbi] granule base=0x%llx size=%u READY but subs=0 (buf=%d) pending_up_reads=%zu\n",
+                (unsigned long long)g.base, g.size, buf, S.pending_up_reads.size());
         }
         out_.verbose(CALL_INFO, 1, 0,
-            "[diag-gbi] granule key=0x%lx subs=%zu ready=%d buf=%d\n",
-            (unsigned long)key, (size_t)g.subs.size(), (int)g.ready, buf);
+            "[diag-gbi] granule base=0x%llx size=%u subs=%zu ready=%d buf=%d\n",
+            (unsigned long long)g.base, g.size, (size_t)g.subs.size(), (int)g.ready, buf);
 
         // Make sub-read emission stable across runs even when upstream Read arrival order differs.
         std::sort(g.subs.begin(), g.subs.end(),
@@ -1543,8 +1493,9 @@ void GatherBufferIF::emitApplyResponsesBuf_(int buf) {
             auto itup = S.pending_up_reads.find(s.up_id);
             if (itup == S.pending_up_reads.end()) {
                 out_.verbose(CALL_INFO, 1, 0,
-                    "[diag-gbi] skip respond: missing pending_up_reads up_id=%" PRIu64 " key=0x%lx off=%u size=%u buf=%d\n",
-                    (uint64_t)s.up_id, (unsigned long)key, (unsigned)s.offset, (unsigned)s.size, buf);
+                    "[diag-gbi] skip respond: missing pending_up_reads up_id=%" PRIu64 " base=0x%llx size=%u off=%u size=%u buf=%d\n",
+                    (uint64_t)s.up_id, (unsigned long long)g.base, g.size,
+                    (unsigned)s.offset, (unsigned)s.size, buf);
                 continue;
             }
             // 使用 up_id 构造响应，避免依赖上游 Read* 指针的生命周期
@@ -1559,8 +1510,8 @@ void GatherBufferIF::emitApplyResponsesBuf_(int buf) {
                 std::memcpy(resp->data.data(), blk.data() + s.offset, s.size);
             }
             out_.verbose(CALL_INFO, 1, 0,
-                "[diag-gbi] respond up_id=%" PRIu64 " key=0x%lx off=%u size=%u pending=%zu data_empty=%d buf=%d\n",
-                (uint64_t)s.up_id, (unsigned long)key, (unsigned)s.offset,
+                "[diag-gbi] respond up_id=%" PRIu64 " base=0x%llx size=%u off=%u size=%u pending=%zu data_empty=%d buf=%d\n",
+                (uint64_t)s.up_id, (unsigned long long)g.base, g.size, (unsigned)s.offset,
                 (unsigned)s.size, (size_t)S.pending_up_reads.size(), resp->data.empty()?1:0, buf);
             // 限量权重返回探针：仅 node_id=0 打印前16条，附带首float与地址
             if (node_id_param_ == 0) {
@@ -1571,8 +1522,9 @@ void GatherBufferIF::emitApplyResponsesBuf_(int buf) {
                         std::memcpy(&f0_dbg, resp->data.data(), sizeof(float));
                     }
                     out_.verbose(CALL_INFO, 2, 0,
-                        "[diag-weightresp-gbi] node=%u key=0x%lx off=%u size=%u f0=%.6f\n",
-                        node_id_param_, (unsigned long)key, (unsigned)s.offset, (unsigned)s.size, f0_dbg);
+                        "[diag-weightresp-gbi] node=%u base=0x%llx size=%u off=%u size=%u f0=%.6f\n",
+                        node_id_param_, (unsigned long long)g.base, g.size,
+                        (unsigned)s.offset, (unsigned)s.size, f0_dbg);
                     ++diag_weightresp_gbi;
                 }
             }
@@ -1656,42 +1608,16 @@ bool GatherBufferIF::rebuildPendingAsGranules_(int buf) {
         uint64_t base = (merge_==Merge::Cacheline || (merge_==Merge::Auto && !use_row)) ? alignDown(rd->pAddr, gsz)
                        : (use_row ? alignDown(rd->pAddr, row_bytes_guess_) : rd->pAddr);
         uint32_t sz = (merge_==Merge::None) ? rd->size : (use_row ? row_bytes_guess_ : gsz);
-        uint64_t key = (base << 32) ^ (uint64_t)sz;
-        auto& g = S.granules[key];
-        if (g.subs.empty()) {
-            g.base = base;
-            g.size = sz;
-            g.window_id = current_gather_id_;
-            g.payload_bytes = 0;
-            S.required_set.insert(key);
-            if (stat_coalesce_granule_size_) stat_coalesce_granule_size_->addData((uint64_t)sz);
-        }
+        GranuleKey key = makeGranuleKey_(base, sz);
+        auto& g = ensureGranule_(buf, key);
         uint64_t off = (rd->pAddr >= base) ? (rd->pAddr - base) : 0;
         g.subs.push_back({rd->getID(), off, (uint32_t)rd->size});
         g.payload_bytes += (uint64_t)rd->size;
         rebuilt = true;
     }
     if (rebuilt && !defer_issue_until_apply_) {
-        // issue all granules deterministically
-        std::vector<std::pair<uint64_t,uint64_t>> sorted;
-        sorted.reserve(S.granules.size());
-        for (auto& kv : S.granules) {
-            if (!kv.second.sort_key_valid) {
-                if (sort_ == Sort::Addr) kv.second.cached_sort_key = kv.second.base;
-                else if (sort_ == Sort::BankRow) kv.second.cached_sort_key = bankRowIndex(kv.second.base);
-                else kv.second.cached_sort_key = rowIndex(kv.second.base);
-                kv.second.sort_key_valid = true;
-            }
-            sorted.emplace_back(kv.second.cached_sort_key, kv.first);
-        }
-        std::sort(sorted.begin(), sorted.end(), [](auto&a, auto&b){
-            if (a.first != b.first) return a.first < b.first;
-            return a.second < b.second;
-        });
-        for (auto& p : sorted) {
-            auto it = S.granules.find(p.second);
-            if (it != S.granules.end() && !it->second.issued) issueGranuleBuf_(buf, p.second, it->second);
-        }
+        // Non-defer: issue all granules deterministically (bounded by inflight credits).
+        issueUnissuedGranulesDeterministic_(buf);
     }
     if (rebuilt && out_.getVerboseLevel() >= 1) {
         out_.verbose(CALL_INFO, 1, 0,
@@ -1713,7 +1639,7 @@ void GatherBufferIF::doFlushBuf_(int buf) {
     S.bytes_in_sram = 0;
 }
 
-void GatherBufferIF::touchLRU_(int buf, uint64_t key) {
+void GatherBufferIF::touchLRU_(int buf, const GranuleKey& key) {
     auto& S = sb_[buf];
 
     auto it = S.lru_map.find(key);
@@ -1733,7 +1659,7 @@ void GatherBufferIF::ensureCapacity_(int buf, uint64_t need) {
 
     // 淘汰最久未使用的节点（从front开始）
     while (S.bytes_in_sram + need > sram_bytes_ && !S.lru_list.empty()) {
-        uint64_t k = S.lru_list.front();
+        GranuleKey k = S.lru_list.front();
         S.lru_list.pop_front();
         S.lru_map.erase(k);
         // 从SRAM中移除对应数据（若存在）
@@ -1780,6 +1706,13 @@ bool GatherBufferIF::clockTick(Cycle_t) {
                 maybeEnterApply_();
             } else {
                 if (win_cyc_gather_ && stage_counter_ >= win_cyc_gather_) {
+                    fallback_end_gather_count_++;
+                    if (!warned_fallback_end_gather_) {
+                        warned_fallback_end_gather_ = true;
+                        out_.verbose(CALL_INFO, 0, 0,
+                            "[warn-gbi] step_gate fallback EndGather via window_cycles_gather (count=%" PRIu64 ")\n",
+                            (uint64_t)fallback_end_gather_count_);
+                    }
                     sb_[gather_buf_index_].end_gather_seen = true;
                     maybeEnterApply_();
                 } else {
@@ -1817,62 +1750,77 @@ bool GatherBufferIF::clockTick(Cycle_t) {
         // 并行：在Apply阶段也推进下一窗口的Gather构建与下发
         if (!step_gate_enable_ && double_buffer_enable_ && defer_issue_until_apply_ && !sb_[gather_buf_index_].staging_reads.empty()) {
             buildGranulesWithGapMergeBuf_(gather_buf_index_);
-            // 直接按当前排序策略下发新窗口的granule，实现与Apply并行
-            auto& gmap = sb_[gather_buf_index_].granules;
-            std::vector<std::pair<uint64_t,uint64_t>> sorted; sorted.reserve(gmap.size());
-            for (auto &kv : gmap) {
-                if (kv.second.issued) continue;
-                // 优化2：使用缓存的排序键
-                if (!kv.second.sort_key_valid) {
-                    if (sort_ == Sort::Addr) {
-                        kv.second.cached_sort_key = kv.second.base;
-                    } else if (sort_ == Sort::BankRow) {
-                        kv.second.cached_sort_key = bankRowIndex(kv.second.base);
-                    } else {
-                        kv.second.cached_sort_key = rowIndex(kv.second.base);
-                    }
-                    kv.second.sort_key_valid = true;
-                }
-                sorted.emplace_back(kv.second.cached_sort_key, kv.first);
-            }
-            std::sort(sorted.begin(), sorted.end(),
-                      [](const auto& a, const auto& b){
-                          if (a.first != b.first) return a.first < b.first;
-                          return a.second < b.second;
-                      });
-            for (auto &p : sorted) {
-                auto it = gmap.find(p.second);
-                if (it != gmap.end() && !it->second.issued) issueGranuleBuf_(gather_buf_index_, p.second, it->second);
-            }
+            // 直接按当前排序策略下发新窗口的 granule，实现与 Apply 并行（受 inflight 限制）。
+            issueUnissuedGranulesDeterministic_(gather_buf_index_);
         }
         if (apply_auto_end_enable_) {
             if (tryAutoEndApply_()) return false;
         }
         if (win_cyc_apply_ && stage_counter_ >= win_cyc_apply_) {
+            if (step_gate_enable_) {
+                fallback_end_apply_count_++;
+                if (!warned_fallback_end_apply_) {
+                    warned_fallback_end_apply_ = true;
+                    out_.verbose(CALL_INFO, 0, 0,
+                        "[warn-gbi] step_gate fallback EndApply via window_cycles_apply (count=%" PRIu64 ")\n",
+                        (uint64_t)fallback_end_apply_count_);
+                }
+            }
             if (!finishApplyWindow_("apply-cycle-limit")) return false;
         }
     } else if (stage_ == Stage::Scatter) {
         bool scatter_due = false;
+        const char* scatter_reason = nullptr;
         if (step_gate_enable_) {
             if (end_scatter_req_pending_ && end_scatter_req_seq_ == static_cast<uint32_t>(current_gather_id_)) {
                 scatter_due = true;
+                scatter_reason = "scatter-explicit";
             } else if (scatter_immediate_complete_ && stage_counter_ >= 1) {
                 scatter_due = true;
+                scatter_reason = "scatter-immediate";
             } else if (win_cyc_scatter_ && stage_counter_ >= win_cyc_scatter_) {
                 scatter_due = true;
+                scatter_reason = "scatter-cycle";
             }
         } else {
             if (scatter_immediate_complete_ && stage_counter_ >= 1) {
                 scatter_due = true;
+                scatter_reason = "scatter-immediate";
             } else if (win_cyc_scatter_ && stage_counter_ >= win_cyc_scatter_) {
                 scatter_due = true;
+                scatter_reason = "scatter-cycle";
+            }
+        }
+        if (step_gate_enable_ && scatter_due && scatter_reason &&
+            std::strcmp(scatter_reason, "scatter-explicit") != 0) {
+            const auto& ab = sb_[apply_buf_index_];
+            const bool drained =
+                (inflight_counts_[apply_buf_index_] == 0) &&
+                (inflight_counts_[gather_buf_index_] == 0) &&
+                ab.pending_up_reads.empty() &&
+                ab.required_set.empty() &&
+                ab.granules.empty() &&
+                ab.staging_reads.empty();
+            if (!drained) {
+                // Step-gate fallback completion must not end a step with inflight/pending transactions.
+                // Keep waiting until downstream drains.
+                return false;
             }
         }
         if (scatter_due) {
+            if (step_gate_enable_ && scatter_reason && std::strcmp(scatter_reason, "scatter-explicit") != 0) {
+                fallback_end_scatter_count_++;
+                if (!warned_fallback_end_scatter_) {
+                    warned_fallback_end_scatter_ = true;
+                    out_.verbose(CALL_INFO, 0, 0,
+                        "[warn-gbi] step_gate fallback EndScatter via %s (count=%" PRIu64 ")\n",
+                        scatter_reason, (uint64_t)fallback_end_scatter_count_);
+                }
+            }
             if (out_.getVerboseLevel() >= 1) {
                 out_.verbose(CALL_INFO, 1, 0,
                     "[diag-gbi] EndScatter reason=%s gather_id=%" PRIu64 " stage_counter=%" PRIu64 " inflight_apply=%" PRIu64 " inflight_gather=%" PRIu64 "\n",
-                    step_gate_enable_ ? "scatter-explicit" : (scatter_immediate_complete_ ? "scatter-immediate" : "scatter-cycle"),
+                    scatter_reason ? scatter_reason : "scatter-unknown",
                     current_gather_id_, stage_counter_,
                     inflight_counts_[apply_buf_index_], inflight_counts_[gather_buf_index_]);
             }
@@ -1923,18 +1871,8 @@ bool GatherBufferIF::clockTick(Cycle_t) {
 	                            }
 	                            sz = (uint32_t)sz_u64;
 	                        }
-	                        uint64_t key = (base << 32) ^ (uint64_t)sz;
-	                        auto& g = sb_[gather_buf_index_].granules[key];
-	                        if (g.subs.empty()) {
-	                            g.base = base;
-	                            g.size = sz;
-	                            g.window_id = current_gather_id_;
-	                            g.payload_bytes = 0;
-	                            sb_[gather_buf_index_].required_set.insert(key);
-	                            if (stat_coalesce_granule_size_) {
-	                                stat_coalesce_granule_size_->addData((uint64_t)sz);
-	                            }
-	                        }
+	                        GranuleKey key = makeGranuleKey_(base, sz);
+	                        auto& g = ensureGranule_(gather_buf_index_, key);
 	                        if (off + (uint64_t)r->size > (uint64_t)g.size) {
 	                            out_.fatal(CALL_INFO, -1,
 	                                       "GatherBufferIF fatal: queued sub-read out of granule bounds (stage=%d merge=%d use_row=%d base=0x%lx sz=%u addr=0x%lx size=%zu off=%" PRIu64 ")\n",
@@ -2068,34 +2006,7 @@ bool GatherBufferIF::finishApplyWindow_(const char* reason) {
     }
     if (!defer_issue_until_apply_) {
         // 先尝试补发未发 granule（inflight 限制由 issueGranuleBuf_ 内部处理）
-        auto& gmap = sb_[apply_buf_index_].granules;
-        std::vector<std::pair<uint64_t,uint64_t>> sorted;
-        sorted.reserve(gmap.size());
-        for (auto& kv : gmap) {
-            if (kv.second.issued) continue;
-            if (!kv.second.sort_key_valid) {
-                if (sort_ == Sort::Addr) {
-                    kv.second.cached_sort_key = kv.second.base;
-                } else if (sort_ == Sort::BankRow) {
-                    kv.second.cached_sort_key = bankRowIndex(kv.second.base);
-                } else {
-                    kv.second.cached_sort_key = rowIndex(kv.second.base);
-                }
-                kv.second.sort_key_valid = true;
-            }
-            sorted.emplace_back(kv.second.cached_sort_key, kv.first);
-        }
-        std::sort(sorted.begin(), sorted.end(),
-                  [](const auto& a, const auto& b){
-                      if (a.first != b.first) return a.first < b.first;
-                      return a.second < b.second;
-                  });
-        for (auto& p : sorted) {
-            auto it = gmap.find(p.second);
-            if (it != gmap.end() && !it->second.issued) {
-                issueGranuleBuf_(apply_buf_index_, p.second, it->second);
-            }
-        }
+        issueUnissuedGranulesDeterministic_(apply_buf_index_);
         // 若仍有未完成工作，则继续停留在 Apply，等待后续响应/补发完成
         if (!sb_[apply_buf_index_].required_set.empty() ||
             !sb_[apply_buf_index_].granules.empty() ||
@@ -2341,7 +2252,7 @@ bool GatherBufferIF::byteExactVerifyEnabled_() const {
 
 void GatherBufferIF::verifyByteExactDenseRowcol_(uint64_t addr, const std::vector<uint8_t>& data) {
     if (!byteExactVerifyEnabled_()) return;
-    if (lowerCopy_(byte_exact_verify_mode_) != "dense_rowcol_v1") return;
+    if (toLowerCopy(byte_exact_verify_mode_) != "dense_rowcol_v1") return;
     if (data.empty()) return;
     if (byte_exact_base_addr_ == 0 || byte_exact_cols_ == 0 || byte_exact_rows_ == 0) return;
     if (addr < byte_exact_base_addr_) return;
@@ -2404,7 +2315,7 @@ void GatherBufferIF::verifyByteExactDenseRowcol_(uint64_t addr, const std::vecto
 
 void GatherBufferIF::verifyByteExactRawBcsr_(uint64_t addr, const std::vector<uint8_t>& data) {
     if (!byteExactVerifyEnabled_()) return;
-    if (lowerCopy_(byte_exact_verify_mode_) != "raw_bcsr_v1") return;
+    if (toLowerCopy(byte_exact_verify_mode_) != "raw_bcsr_v1") return;
     if (data.empty()) return;
     if (byte_exact_max_resps_ == 0) return;
     if (byte_exact_base_addr_ == 0 || byte_exact_file_size_ == 0) return;
@@ -2515,7 +2426,7 @@ void GatherBufferIF::verifyByteExactRawBcsr_(uint64_t addr, const std::vector<ui
 
 void GatherBufferIF::finishByteExact_() {
     if (!byteExactVerifyEnabled_()) return;
-    const std::string mode_l = lowerCopy_(byte_exact_verify_mode_);
+    const std::string mode_l = toLowerCopy(byte_exact_verify_mode_);
     if (byte_exact_pass_logged_) return;
     if (byte_exact_mismatch_count_ != 0) {
         out_.fatal(CALL_INFO, -1,

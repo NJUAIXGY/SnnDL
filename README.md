@@ -19,6 +19,8 @@ make -j4
 make install
 ```
 
+兼容入口：`install_basic.sh`（等价执行 `make -j && make install`）。
+
 ---
 
 ## 快速运行回归（4×4 mesh 模板）

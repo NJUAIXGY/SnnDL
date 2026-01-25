@@ -5,6 +5,8 @@
 #include <fstream>
 #include <sstream>
 
+#include "SnnDLStringUtil.h"
+
 namespace SST { namespace SnnDL {
 
 std::unique_ptr<ISnnComputeCore> createComputeCoreByName(const std::string& name) {
@@ -153,16 +155,8 @@ void DefaultSnnComputeCore::initVerifyFile_() {
     verify_file_buf_.clear();
     if (!(verify_against_file_ && !verify_file_template_.empty())) return;
     std::string path = verify_file_template_;
-    {
-        size_t pos = path.find("{pe:02d}");
-        if (pos != std::string::npos) {
-            char buf[16]; std::snprintf(buf, sizeof(buf), "%02u", ctx_.node_id);
-            path.replace(pos, 8, buf);
-        } else {
-            pos = path.find("{pe}");
-            if (pos != std::string::npos) path.replace(pos, 4, std::to_string(ctx_.node_id));
-        }
-    }
+    replaceAllIndexed(path, "{pe:02d}", ctx_.node_id, 2);
+    replaceAll(path, "{pe}", std::to_string(ctx_.node_id));
     std::ifstream fin(path, std::ios::binary);
     if (!fin.good()) return;
     fin.seekg(0, std::ios::end);

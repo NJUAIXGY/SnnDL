@@ -15,3 +15,4 @@ SnnDL 的默认体系结构口径是 **cacheline 粒度**（对齐 `memHierarchy
 ## 使用建议
 
 - 若后续增加新的模块目录或公共头文件，建议扩展 `test_includes.cc` 覆盖新增头，提前发现 include/循环依赖问题。
+- 在 `SnnDL/` 目录可运行 `make test-compile` 进行快速编译自检（输出：`test_includes.o`）。

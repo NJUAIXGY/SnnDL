@@ -12,7 +12,6 @@
 
 #include "IGasStageSink.h"
 #include "IGasStepGate.h"
-#include "IManualWindowDrive.h"
 #include "memory/StandardMemAccess.h"
 #include "synapse/gas/GasCustomCmd.h"
 
@@ -38,7 +37,6 @@ void StdMemEndpoint::bindStdMem(SST::SubComponent* stdmem_subcomp) {
     // Reset previous bindings
     mem_access_ = nullptr;
     step_gate_ = nullptr;
-    manual_drive_ = nullptr;
     if (impl_) {
         impl_->stdmem = nullptr;
         impl_->stdmem_access.reset();
@@ -57,7 +55,6 @@ void StdMemEndpoint::bindStdMem(SST::SubComponent* stdmem_subcomp) {
 
     // Optional: query GAS step gate and manual window driver from downstream StandardMem front-end.
     step_gate_ = dynamic_cast<IGasStepGate*>(impl_->stdmem);
-    manual_drive_ = dynamic_cast<IManualWindowDrive*>(impl_->stdmem);
 }
 
 void StdMemEndpoint::init(unsigned int phase) {

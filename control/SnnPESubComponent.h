@@ -24,6 +24,7 @@
 #include "ICoreControlHooks.h"
 #include "ICoreMemoryLink.h"
 #include "IGlobalStepHooks.h"
+#include "ILoaderReadyHooks.h"
 #include "IGasOrchestrator.h"
 #include "IGasStageSink.h"
 
@@ -38,7 +39,6 @@ class IGasStageSink;
 class IWeightReader;
 
 class IPeAggregation; // PE级汇聚接口（避免依赖 MultiCorePE 具体实现）
-class IManualWindowDrive;
 class AccumulatorOps;
 class WeightCacheOps;
 struct WeightAccessor;
@@ -53,6 +53,7 @@ class SnnPESubComponent : public SnnCoreAPI,
                           public ICoreControlHooks,
                           public ICoreMemoryLink,
                           public IGlobalStepHooks,
+                          public ILoaderReadyHooks,
                           public IGasOrchestrator,
                           public IGasStageSink {
 public:
@@ -242,6 +243,7 @@ public:
     virtual void setParentInterface(IPeAggregation* parent) override;
     void setNocTransport(INocTransport* noc) override;
     void onGlobalStepStart(uint32_t seq) override;
+    void onLoaderReady() override;
     virtual void init(unsigned int phase) override;
     virtual void complete(unsigned int phase) override;
     virtual void setup() override;
@@ -524,7 +526,6 @@ private:
     IPeAggregation* parent_pe_cached_ = nullptr;
     Output* output_;
     std::unique_ptr<StdMemEndpoint> stdmem_ep_;
-    bool manual_window_tick_logged_ = false;
     bool clock_tick_logged_ = false;
     SST::Link* memory_link_;
 
@@ -557,13 +558,16 @@ private:
     std::string byte_exact_verify_mode_;
     uint32_t byte_exact_verify_row_scale_ = 1024;
     uint32_t byte_exact_verify_max_mismatch_ = 8;
+    // BCSR semantic verification (orchestrator-level; off by default).
+    // 注意：这是“验证/诊断”能力，不改变正常仿真语义；仅用于实验正确性闭环。
+    bool bcsr_semantic_verify_enable_ = false;
+    uint32_t bcsr_semantic_verify_max_edges_ = 64;
+    uint32_t bcsr_semantic_verify_max_mismatch_ = 8;
+    float bcsr_semantic_verify_abs_tol_ = 1e-6f;
+    float bcsr_semantic_verify_rel_tol_ = 1e-6f;
     // GAS control (component-driven phases)
     bool gas_enable_ = false; // enable GAS control-plane (v1: Begin/EndGather per tick)
     bool gas_window_mode_ = false; // 当为true时，不再每周期发送Begin/EndGather，由下游window驱动
-    bool gas_manual_window_drive_ = false; // 已弃用，保持字段以兼容旧配置
-    uint64_t manual_gas_counter_ = 0;
-    uint64_t manual_gas_gather_cycles_cfg_ = 200; // fallback
-    bool manual_tick_sampled_ = false;
     std::string loader_done_key_;
     bool wait_for_loader_done_ = false;
     bool loader_ready_latched_ = false;
@@ -622,6 +626,7 @@ private:
     }
     void handleNeuronFire_(uint32_t neuron_idx, float v_before, float v_after);
     std::queue<SpikeEvent*> incoming_spikes_;
+    bool drainIncomingSpikesDeterministic_();
     bool weightCacheTryGet_(uint64_t key, float& out);
     void weightCacheStore_(uint64_t key, float value);
     bool window_read_enable_ = false;   // 严格GAS：按窗发起权重读取
@@ -668,7 +673,6 @@ private:
     Statistic<uint64_t>* stat_s1_bytes_read_ = nullptr;
     // 门控诊断：权重读请求发起计数（用于判定发起端是否触发）
     Statistic<uint64_t>* stat_weight_read_requests_ = nullptr;
-    Statistic<uint64_t>* stat_window_reads_issued_total_ = nullptr;
     // GAS totals accumulated from GatherBufferIF via CustomResp
     Statistic<uint64_t>* stat_gas_unique_reads_total_ = nullptr;
     Statistic<uint64_t>* stat_gas_unique_bytes_total_ = nullptr;

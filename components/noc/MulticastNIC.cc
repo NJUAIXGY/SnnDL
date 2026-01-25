@@ -4,6 +4,7 @@
 //
 
 #include "MulticastNIC.h"
+#include "MulticastNICConfig.h"
 
 #include <sst/core/event.h>
 #include <sst/core/params.h>
@@ -12,10 +13,12 @@ namespace SST { namespace SnnDL {
 
 MulticastNIC::MulticastNIC(SST::ComponentId_t id, SST::Params& params)
     : SnnInterface(id, params),
-      out_("SnnDL.MulticastNIC", params.find<int>("verbose", 0), 0, SST::Output::STDOUT) {
+      out_("SnnDL.MulticastNIC", 0, 0, SST::Output::STDOUT) {
+    const MulticastNICConfig cfg = parseMulticastNICConfig(params);
+    out_.setVerboseLevel(cfg.verbose);
 
-    node_id_ = params.find<uint32_t>("node_id", 0);
-    port_name_ = params.find<std::string>("port_name", "network");
+    node_id_ = cfg.node_id;
+    port_name_ = cfg.port_name;
     network_link_ = configureLink(port_name_,
                                   new SST::Event::Handler2<MulticastNIC, &MulticastNIC::handleNetworkLinkEvent_>(this));
 }
@@ -61,4 +64,3 @@ void MulticastNIC::handleNetworkLinkEvent_(SST::Event* ev) {
 }
 
 }} // namespace SST::SnnDL
-

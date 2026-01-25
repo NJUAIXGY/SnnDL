@@ -324,20 +324,21 @@ TrafficWorkload::TrafficWorkload() = default;
 TrafficWorkload::~TrafficWorkload() = default;
 
 void TrafficWorkload::configureFromParams(const SST::Params& params) {
-    params_ = &params;
+    // Copy params to avoid dangling references (some callers pass temporary Params).
+    params_ = std::make_unique<SST::Params>(/*copy*/params);
 
-    traffic_enable_ = params.find<int>("traffic_enable", 0) != 0;
-    traffic_period_cycles_ = params.find<uint64_t>("traffic_period_cycles", 0);
-    traffic_batch_size_ = params.find<uint32_t>("traffic_batch_size", 0);
-    traffic_seed_ = params.find<uint64_t>("traffic_seed", 0);
-    traffic_pre_begin_ = params.find<uint32_t>("traffic_pre_begin", 0);
-    traffic_pre_end_ = params.find<uint32_t>("traffic_pre_end", 0);
-    traffic_stop_cycle_ = params.find<uint64_t>("traffic_stop_cycle", 0);
+    traffic_enable_ = params_->find<int>("traffic_enable", 0) != 0;
+    traffic_period_cycles_ = params_->find<uint64_t>("traffic_period_cycles", 0);
+    traffic_batch_size_ = params_->find<uint32_t>("traffic_batch_size", 0);
+    traffic_seed_ = params_->find<uint64_t>("traffic_seed", 0);
+    traffic_pre_begin_ = params_->find<uint32_t>("traffic_pre_begin", 0);
+    traffic_pre_end_ = params_->find<uint32_t>("traffic_pre_end", 0);
+    traffic_stop_cycle_ = params_->find<uint64_t>("traffic_stop_cycle", 0);
 
-    spikekey_check_enable_ = params.find<int>("traffic_spikekey_check_enable", 1) != 0;
-    spikekey_check_fatal_ = params.find<int>("traffic_spikekey_check_fatal", 0) != 0;
-    spikekey_check_log_cap_ = params.find<uint32_t>("traffic_spikekey_check_log_cap", 8);
-    spikekey_group_log_cap_ = params.find<uint32_t>("traffic_spikekey_group_log_cap", 8);
+    spikekey_check_enable_ = params_->find<int>("traffic_spikekey_check_enable", 1) != 0;
+    spikekey_check_fatal_ = params_->find<int>("traffic_spikekey_check_fatal", 0) != 0;
+    spikekey_check_log_cap_ = params_->find<uint32_t>("traffic_spikekey_check_log_cap", 8);
+    spikekey_group_log_cap_ = params_->find<uint32_t>("traffic_spikekey_group_log_cap", 8);
 
     configured_ = true;
 }

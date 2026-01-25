@@ -372,7 +372,7 @@ AM_CFLAGS =
 AM_CPPFLAGS =  -I/usr/include/python3.10 -I/usr/include/python3.10 -I/home/xgy/remote/sst_install/include/sst/core -I/home/xgy/remote/sst_install/include -I$(top_srcdir)/src -I$(srcdir) \
 	-I$(srcdir)/api -I$(srcdir)/events -I$(srcdir)/components \
 	-I$(srcdir)/control -I$(srcdir)/compute -I$(srcdir)/services \
-	-I/home/xgy/remote/sst_install/include
+	-I$(SST_PREFIX)/include
 AM_CXXFLAGS =  -std=c++17 
 AM_DEFAULT_VERBOSITY = 0
 AM_LDFLAGS =  -L/usr/lib/python3.10/config-3.10-x86_64-linux-gnu -L/usr/lib/x86_64-linux-gnu -lpython3.10 -lcrypt -ldl  -lm -lm 
@@ -460,7 +460,7 @@ INSTALL_DATA = ${INSTALL} -m 644
 INSTALL_PROGRAM = ${INSTALL}
 INSTALL_SCRIPT = ${INSTALL}
 INSTALL_STRIP_PROGRAM = $(install_sh) -c -s
-LD = /usr/bin/ld -m elf_x86_64
+LD = /usr/bin/ld
 LDFLAGS = 
 LIBADD_DL =  
 LIBADD_DLD_LINK = 
@@ -526,7 +526,7 @@ PINTOOL3_RUNTIME =
 PINTOOL_CPPFLAGS = 
 PINTOOL_DIR = 
 PINTOOL_LDFLAGS = 
-PINTOOL_PATH = /home/xgy/.local/bin:/home/xgy/remote/sst_install/bin:/tmp/.tmpns6GeD:/home/xgy/codex-0.45.0/vendor/x86_64-unknown-linux-musl/path:/home/xgy/remote/sst_install/bin:/home/xgy/.vscode-server/cli/servers/Stable-0f0d87fa9e96c856c5212fc86db137ac0d783365/server/bin/remote-cli:/home/xgy/miniconda3/bin:/home/xgy/miniconda3/condabin:/home/xgy/.nvm/versions/node/v22.20.0/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/home/xgy/.vscode-server/data/User/globalStorage/github.copilot-chat/debugCommand
+PINTOOL_PATH = /home/xgy/.codex/tmp/path/codex-arg0PSedAu:/home/xgy/.nvm/versions/node/v22.20.0/lib/node_modules/@openai/codex/vendor/x86_64-unknown-linux-musl/path:/home/xgy/.local/bin:/usr/lib/jvm/java-17-openjdk-amd64/bin:/home/xgy/remote/sst_install/bin:/home/xgy/remote/sst_install/bin:/home/xgy/.nvm/versions/node/v22.20.0/bin:/home/xgy/.vscode-server/cli/servers/Stable-0f0d87fa9e96c856c5212fc86db137ac0d783365/server/bin/remote-cli:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/home/xgy/.vscode-server/data/User/globalStorage/github.copilot-chat/debugCommand
 PINTOOL_RUNTIME = 
 PIN_CPPFLAGS = -g   -Wall   -Werror   -Wno-unknown-pragmas   -D__PIN__=1 -DPIN_CRT=1   -fno-stack-protector   -fno-exceptions   -funwind-tables   -fasynchronous-unwind-tables   -fomit-frame-pointer   -fno-strict-aliasing   -fno-rtti   -faligned-new   -fpic   -DTARGET_IA32E   -DHOST_IA32E   -DTARGET_LINUX   -DPIN_VERSION_MINOR=
 PIN_CPPFLAGS_COMPILER = -fno-exceptions          -fabi-version=2
@@ -1632,7 +1632,7 @@ uninstall-am: uninstall-compLTLIBRARIES
 
 .PHONY: test-compile
 test-compile:
-	$(CXXCOMPILE) -c $(srcdir)/tests/test_includes.cc -o tests/test_includes.o
+	$(CXXCOMPILE) -c $(srcdir)/tests/test_includes.cc -o $(builddir)/test_includes.o
 
 # Tell versions [3.59,3.63) of GNU make to not export all variables.
 # Otherwise a system limit (for SysV at least) may be exceeded.

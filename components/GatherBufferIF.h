@@ -11,6 +11,7 @@
 #include <list>
 #include <fstream>
 #include <mutex>
+#include <functional>
 
 #include <sst/core/sst_config.h>
 #include <sst/core/output.h>
@@ -64,8 +65,8 @@ public:
         {"window_cycles_scatter", "cycles of Scatter window", "0"},
         {"scatter_immediate_complete", "Scatter completes immediately (0/1)", "0"},
         {"clock", "subcomponent clock when window_auto=1", "1GHz"},
-        {"emit_stage_events", "Emit Begin/End Apply/Scatter events upstream (0/1)", "0"},
-        {"emit_stage_events_lenient", "Lenient emission: allow EndApply/Scatter even if inflight>0 at window boundary (0/1)", "0"},
+        {"emit_stage_events", "Emit Begin/End Apply/Scatter events upstream (0/1). Auto-enabled when step_gate_enable=1", "0"},
+        {"emit_stage_events_lenient", "Lenient emission: allow EndApply/Scatter even if inflight>0 at window boundary (0/1). Not allowed with step_gate_enable=1", "0"},
         {"stage_cycles_csv", "Optional CSV path to log per-window stage cycle counts", ""},
         {"probe_gas_csv", "(diagnostic) CSV path to dump probe-gas samples; empty to disable", ""},
         {"port", "shared port name for downstream standardInterface when loaded anonymously"},
@@ -168,6 +169,21 @@ private:
     enum class Merge { None=0, Cacheline=1, Row=2, Auto=3 };
     enum class Sort { Addr=0, Row=1, BankRow=2 };
 
+    struct GranuleKey {
+        uint64_t base;
+        uint32_t size;
+        bool operator==(const GranuleKey& other) const {
+            return base == other.base && size == other.size;
+        }
+    };
+    struct GranuleKeyHash {
+        size_t operator()(const GranuleKey& key) const noexcept {
+            const uint64_t h1 = std::hash<uint64_t>{}(key.base);
+            const uint64_t h2 = std::hash<uint32_t>{}(key.size);
+            return static_cast<size_t>(h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2)));
+        }
+    };
+
     struct SubReq {
         Request::id_t up_id;  // upstream Read ID
         uint64_t      offset; // offset within granule base
@@ -194,7 +210,7 @@ private:
 
     struct DownFrag {
         int buf = 0;
-        uint64_t key = 0;
+        GranuleKey key{};
         uint32_t off = 0;
         uint32_t size = 0;
     };
@@ -207,7 +223,10 @@ private:
     uint64_t rowIndex(uint64_t addr) const { return row_bytes_guess_? (addr / row_bytes_guess_) : 0; }
     uint64_t bankIndex(uint64_t addr) const { return bank_bits_ ? ((addr >> bank_shift_) & ((1ull<<bank_bits_)-1)) : 0; }
     uint64_t bankRowIndex(uint64_t addr) const { return (bankIndex(addr) << 32) | (uint32_t)rowIndex(addr); }
-    void issueGranuleBuf_(int buf, uint64_t key, Granule& g);
+    GranuleKey makeGranuleKey_(uint64_t base, uint32_t size) const;
+    Granule& ensureGranule_(int buf, const GranuleKey& key);
+    static bool granuleKeyLess_(const GranuleKey& a, const GranuleKey& b);
+    void issueGranuleBuf_(int buf, const GranuleKey& key, Granule& g);
     void onDownstreamResp_(Request* r);
     void maybeEnterApply_();
     void emitApplyResponsesBuf_(int buf);
@@ -230,6 +249,7 @@ private:
     uint64_t ensureSortKey_(Granule& g);
     void rebuildIssueOrder_(int buf);
     void issueMoreUnissuedFromOrder_(int buf);
+    void issueUnissuedGranulesDeterministic_(int buf);
     bool byteExactVerifyEnabled_() const;
     void verifyByteExactDenseRowcol_(uint64_t addr, const std::vector<uint8_t>& data);
     void verifyByteExactRawBcsr_(uint64_t addr, const std::vector<uint8_t>& data);
@@ -263,12 +283,11 @@ private:
     uint64_t tail_wait_timeout_ns_ = 0; // 0 = wait all
     bool allow_apply_miss_read_ = false;
     bool flush_after_scatter_ = true;
-    bool defer_issue_until_apply_ = true;
+    bool defer_issue_until_apply_ = false;
     bool strict_mode_ = true; // 非Gather阶段是否严格拦截读（默认开）
     bool double_buffer_enable_ = true; // 允许在Apply阶段在另一SB上并行Gather
     bool window_auto_ = false;
     bool step_gate_enable_ = false; // Step-level gate: pause after EndScatter until openStep()
-    bool manual_window_drive_ = false;
     uint64_t win_cyc_gather_ = 0, win_cyc_apply_ = 0, win_cyc_scatter_ = 0;
     bool apply_auto_end_enable_ = true;
     bool scatter_immediate_complete_ = false;
@@ -359,22 +378,22 @@ private:
     // 双缓冲状态
     struct SBState {
         // LRU（RAII）：std::list + 迭代器，杜绝手工new/delete与悬挂指针
-        std::list<uint64_t> lru_list;  // front=最久未用, back=最近使用
-        std::unordered_map<uint64_t, std::list<uint64_t>::iterator> lru_map; // key -> it
+        std::list<GranuleKey> lru_list;  // front=最久未用, back=最近使用
+        std::unordered_map<GranuleKey, std::list<GranuleKey>::iterator, GranuleKeyHash> lru_map; // key -> it
 
-        std::unordered_map<uint64_t, Granule> granules; // key->granule
+        std::unordered_map<GranuleKey, Granule, GranuleKeyHash> granules; // key->granule
         std::unordered_map<Request::id_t, SST::Interfaces::StandardMem::Read*> pending_up_reads; // upstream read map
         std::vector<SST::Interfaces::StandardMem::Read*> staging_reads;
         std::unordered_map<Request::id_t, uint64_t> staged_arrival_ns; // arrival time
-        std::unordered_set<uint64_t> required_set; // required granules
+        std::unordered_set<GranuleKey, GranuleKeyHash> required_set; // required granules
         // Apply阶段的确定性发射序列（避免每次 ReadResp 都对 granules 做全量排序）：
         // - 用于 defer_issue_until_apply=1 时保证“inflight 限流下仍能持续补发未发 granule”，防止卡死。
         // - 也可用于 Apply 阶段 miss-read/late-read 进入后，统一补发。
-        std::vector<std::pair<uint64_t, uint64_t>> issue_order; // (sort_key, key)
+        std::vector<std::pair<uint64_t, GranuleKey>> issue_order; // (sort_key, key)
         size_t issue_cursor = 0;
         bool issue_order_dirty = true;
 
-        std::unordered_map<uint64_t, std::vector<uint8_t>> sram_blocks; // key->data
+        std::unordered_map<GranuleKey, std::vector<uint8_t>, GranuleKeyHash> sram_blocks; // key->data
         uint64_t bytes_in_sram = 0;
         bool end_gather_seen = false;
 
@@ -404,9 +423,17 @@ private:
     // not by fixed window_cycles_* caps. We latch EndScatter requests and let clockTick advance.
     bool end_scatter_req_pending_ = false;
     uint32_t end_scatter_req_seq_ = 0;
+    uint64_t end_scatter_early_count_ = 0;
+    bool warned_end_scatter_early_ = false;
+    uint64_t fallback_end_gather_count_ = 0;
+    uint64_t fallback_end_apply_count_ = 0;
+    uint64_t fallback_end_scatter_count_ = 0;
+    bool warned_fallback_end_gather_ = false;
+    bool warned_fallback_end_apply_ = false;
+    bool warned_fallback_end_scatter_ = false;
 
     // Utilities for LRU（带buf选择）
-    void touchLRU_(int buf, uint64_t key);
+    void touchLRU_(int buf, const GranuleKey& key);
     void ensureCapacity_(int buf, uint64_t need);
 
     // Stats

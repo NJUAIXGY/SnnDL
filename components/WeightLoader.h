@@ -7,6 +7,7 @@
 #define _SNNDL_WEIGHT_LOADER_H
 
 #include <sst/core/component.h>
+#include <sst/core/link.h>
 #include <sst/core/output.h>
 #include <sst/core/interfaces/stdMem.h>
 #include <sst/core/shared/sharedArray.h>
@@ -30,10 +31,11 @@ public:
         COMPONENT_CATEGORY_UNCATEGORIZED
     )
 
-	    SST_ELI_DOCUMENT_PARAMS(
-		        {"verbose", "日志详细级别", "0"},
-	        {"workload_impl", "工作负载实现: snn/stream/...", ""},
-	        {"weight_file", "兼容旧参数：单文件路径(若提供将优先生效)", ""},
+		    SST_ELI_DOCUMENT_PARAMS(
+			        {"verbose", "日志详细级别", "0"},
+		        {"node_id", "节点ID（仅用于诊断/loader_done事件标识）", "0"},
+		        {"workload_impl", "工作负载实现: snn/stream/...", ""},
+		        {"weight_file", "兼容旧参数：单文件路径(若提供将优先生效)", ""},
 	        {"base_addr_start", "core0权重矩阵的起始地址", "0"},
 	        {"per_core_stride", "相邻核心权重矩阵在内存中的地址跨度(字节)", "0"},
 	        {"num_cores", "核心数", "1"},
@@ -85,9 +87,13 @@ public:
         {"write_pattern_row_scale", "dense_rowcol_v1 的 row_scale（默认1024）", "1024"}
     )
 
-    SST_ELI_DOCUMENT_SUBCOMPONENT_SLOTS(
-        {"memory", "StandardMem内存接口", "SST::Interfaces::StandardMem"}
-    )
+	    SST_ELI_DOCUMENT_SUBCOMPONENT_SLOTS(
+	        {"memory", "StandardMem内存接口", "SST::Interfaces::StandardMem"}
+	    )
+
+	    SST_ELI_DOCUMENT_PORTS(
+	        {"loader_done", "WeightLoader完成事件（可选，桥接跨rank loader_done_key）", {"SnnDL.LoaderDoneEvent"}}
+	    )
 
     // 统计信息文档（Batch‑B: WeightLoader 写入画像）
     SST_ELI_DOCUMENT_STATISTICS(
@@ -188,7 +194,30 @@ private:
 	    void normalizeParams_();
 	    // 统一的分块写入帮助函数（带统计）
 	    inline void sendWrite_(uint64_t addr, const std::vector<uint8_t>& payload, bool timed) {
+        const uint64_t line = memory_ ? static_cast<uint64_t>(memory_->getLineSize()) : 0;
+        if (line != 0 && payload.size() > static_cast<size_t>(line)) {
+            // 强制分片：避免 memHierarchy Incoherent Cache 对“大于 cacheline 的访问”出现堆破坏。
+            size_t off = 0;
+            while (off < payload.size()) {
+                const size_t n = std::min(static_cast<size_t>(line), payload.size() - off);
+                std::vector<uint8_t> frag;
+                frag.insert(frag.end(), payload.begin() + static_cast<ptrdiff_t>(off),
+                            payload.begin() + static_cast<ptrdiff_t>(off + n));
+                sendWrite_(addr + static_cast<uint64_t>(off), frag, timed);
+                off += n;
+            }
+            return;
+        }
+
 	        auto* w = new SST::Interfaces::StandardMem::Write(addr, payload.size(), payload, !timed);
+        // memHierarchy 的 Incoherent Cache 对“大于 cacheline 的 cacheable 写入”不可靠（可能造成堆破坏/非确定性）。
+        // 默认策略：除非显式允许，否则一律标记为 non-cacheable；同时对 >line 的写强制 non-cacheable。
+        if (w) {
+            const bool allow_cache = timed && timed_seed_allow_cache_;
+            if (!allow_cache) {
+                w->setNoncacheable();
+            }
+        }
         if (timed) {
             // 记录发起周期（用于时延统计）
             write_issue_cycle_[w->getID()] = current_cycle_;
@@ -205,13 +234,16 @@ private:
 
   bool loaded_;
   bool runtime_load_needed_ = false;
-    uint32_t pending_writes_ = 0;
-    bool all_writes_completed_ = false;
-    std::string loader_done_key_;
-    bool loader_done_shared_initialized_ = false;
-    bool loader_done_published_ = false;
-    SST::Shared::SharedArray<int> loader_done_shared_;
-    void publishLoaderDone_();
+	    uint32_t pending_writes_ = 0;
+	    bool all_writes_completed_ = false;
+	    std::string loader_done_key_;
+	    uint32_t node_id_ = 0;
+	    SST::Link* loader_done_link_ = nullptr;
+	    bool loader_done_shared_initialized_ = false;
+	    bool loader_done_published_ = false;
+	    bool loader_done_event_sent_ = false;
+	    SST::Shared::SharedArray<int> loader_done_shared_;
+	    void publishLoaderDone_();
 
     // BCSR 配置
     bool bcsr_enable_ = false;

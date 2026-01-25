@@ -28,6 +28,11 @@
 - `ISpikeWorkload.h` / `ISnnSpikeCommWorkload.h`
   - Spike 相关的 workload 可选接口（例如 SNN workload 暴露“本地注入/统计/通信”协作点）。
 
+### Utils（轻量工具，避免重复造轮子）
+- `SnnDLStringUtil.h`
+  - ASCII 小写归一化：`toLowerCopy()`（保持可复现、无 locale 依赖）。
+  - 模板占位符替换：`replaceAll()/replaceAllIndexed()/resolvePeCoreTemplate()`（用于 `{pe}/{core}` 等路径模板）。
+
 ---
 
 ## 内存建模口径（默认 cacheline）
@@ -62,7 +67,7 @@ SnnDL 的“通用 DRAM + memHierarchy”默认建模语义是 **cacheline（例
 ### GAS/Step（控制面窄接口）
 - `IGasCmdSender.h` / `IGasStageSink.h` / `IGasStepGate.h` / `GasOps.h`
   - 阶段事件/统计/门控的窄接口（用于把 Stage 载体与具体实现隔离）。
-- `IGlobalStepHooks.h` / `ICoreControlHooks.h` / `IManualWindowDrive.h`
+- `IGlobalStepHooks.h` / `ICoreControlHooks.h` / `IManualWindowDrive.h`（已弃用，仅兼容保留）
   - Step/GAS 同步与控制钩子（平台面只看“开始/结束/触发”，业务语义在 workload/synapse/stimulus）。
 
 ### PE 级聚合

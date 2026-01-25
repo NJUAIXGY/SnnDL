@@ -4,6 +4,7 @@
 //
 
 #include "MulticastRouter.h"
+#include "MulticastRouterConfig.h"
 
 #include <algorithm>
 #include <cctype>
@@ -14,6 +15,7 @@
 #include <sst/core/event.h>
 #include <sst/core/params.h>
 
+#include "SnnDLStringUtil.h"
 #include "NocPacketEvent.h"
 #include "synapse/route/SpikeNocCodec.h"
 
@@ -37,21 +39,22 @@ inline uint32_t idxOfLocal_(uint32_t local_x, uint32_t local_y, uint32_t block_w
 
 MulticastRouter::MulticastRouter(SST::ComponentId_t id, SST::Params& params)
     : SST::Component(id),
-      out_("SnnDL.MulticastRouter", params.find<int>("verbose", 0), 0, SST::Output::STDOUT),
+      out_("SnnDL.MulticastRouter", 0, 0, SST::Output::STDOUT),
       timebase_(getTimeConverter("1ns")) {
+    const MulticastRouterConfig cfg = parseMulticastRouterConfig(params);
+    out_.setVerboseLevel(cfg.verbose);
 
-    node_id_ = params.find<uint32_t>("node_id", 0);
-    router_latency_cycles_ = params.find<uint64_t>("router_latency_cycles", 0);
-    serialize_output_enable_ = params.find<int>("serialize_output_enable", 0) != 0;
-    serialize_service_cycles_ = params.find<uint64_t>("serialize_service_cycles", 1);
-    if (serialize_service_cycles_ == 0) serialize_service_cycles_ = 1;
+    node_id_ = cfg.node_id;
+    router_latency_cycles_ = cfg.router_latency_cycles;
+    serialize_output_enable_ = cfg.serialize_output_enable;
+    serialize_service_cycles_ = cfg.serialize_service_cycles;
 
     {
-        const std::string inter = params.find<std::string>("multicast_inter_policy", "xy");
+        const std::string inter = cfg.multicast_inter_policy;
         if (!parseInterPolicy_(inter, multicast_inter_policy_)) {
             out_.fatal(CALL_INFO, -1, "Invalid multicast_inter_policy='%s' (supported: xy,yx)\n", inter.c_str());
         }
-        const std::string intra = params.find<std::string>("multicast_intra_policy", "manhattan_x_first");
+        const std::string intra = cfg.multicast_intra_policy;
         if (!parseIntraPolicy_(intra, multicast_intra_policy_)) {
             out_.fatal(
                 CALL_INFO, -1,
@@ -60,7 +63,7 @@ MulticastRouter::MulticastRouter(SST::ComponentId_t id, SST::Params& params)
         }
     }
 
-    const std::string mesh_shape = params.find<std::string>("mesh_shape", "4x4");
+    const std::string mesh_shape = cfg.mesh_shape;
     if (!parseMeshShape_(mesh_shape, mesh_w_, mesh_h_) || mesh_w_ == 0 || mesh_h_ == 0) {
         out_.fatal(CALL_INFO, -1, "Invalid mesh_shape='%s'\n", mesh_shape.c_str());
     }
@@ -77,7 +80,9 @@ MulticastRouter::~MulticastRouter() = default;
 void MulticastRouter::init(unsigned int /*phase*/) {}
 void MulticastRouter::setup() {}
 void MulticastRouter::finish() {
-    out_.output(
+    // 注意：避免使用 Output::output() 造成默认刷屏；统一走 verbose 门控
+    out_.verbose(
+        CALL_INFO, 1, 0,
         "[mcast-router] node=%u in=%" PRIu64 " out=%" PRIu64 " local=%" PRIu64 " fwd_xy=%" PRIu64
         " spikekey_in=%" PRIu64 " stage_inter=%" PRIu64 " stage_intra=%" PRIu64 " clones=%" PRIu64
         "\n",
@@ -419,8 +424,7 @@ bool MulticastRouter::parseMeshShape_(const std::string& shape, uint32_t& out_w,
     out_h = 0;
     if (shape.empty()) return false;
 
-    std::string s = shape;
-    for (auto& ch : s) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    const std::string s = toLowerCopy(shape);
 
     const auto pos = s.find('x');
     if (pos == std::string::npos) return false;
@@ -441,8 +445,7 @@ bool MulticastRouter::parseMeshShape_(const std::string& shape, uint32_t& out_w,
 }
 
 bool MulticastRouter::parseInterPolicy_(const std::string& s, InterBlockRoutePolicy& out) {
-    std::string v = s;
-    for (auto& ch : v) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    const std::string v = toLowerCopy(s);
     if (v == "xy") { out = InterBlockRoutePolicy::XY; return true; }
     if (v == "yx") { out = InterBlockRoutePolicy::YX; return true; }
     if (v == "hash_xy" || v == "hashxy") { out = InterBlockRoutePolicy::HashXY; return true; }
@@ -450,8 +453,7 @@ bool MulticastRouter::parseInterPolicy_(const std::string& s, InterBlockRoutePol
 }
 
 bool MulticastRouter::parseIntraPolicy_(const std::string& s, IntraBlockTreePolicy& out) {
-    std::string v = s;
-    for (auto& ch : v) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    const std::string v = toLowerCopy(s);
     if (v == "manhattan_x_first" || v == "x_first" || v == "xfirst") { out = IntraBlockTreePolicy::ManhattanXFirst; return true; }
     if (v == "manhattan_y_first" || v == "y_first" || v == "yfirst") { out = IntraBlockTreePolicy::ManhattanYFirst; return true; }
     return false;

@@ -5,26 +5,11 @@
 
 #include "multicore/MultiCorePEConfig.h"
 
-#include <algorithm>
-#include <cctype>
-
 #include <sst/core/params.h>
 
 #include "WorkloadConfig.h"
 
 namespace SST { namespace SnnDL {
-
-namespace {
-
-inline std::string toLower_(std::string s) {
-    std::transform(s.begin(), s.end(), s.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    return s;
-}
-
-inline uint64_t clampNonZeroU64_(uint64_t v) { return v ? v : 1ull; }
-
-} // namespace
 
 MultiCorePEConfig parseMultiCorePEConfig(const SST::Params& params) {
     MultiCorePEConfig c{};
@@ -55,14 +40,10 @@ MultiCorePEConfig parseMultiCorePEConfig(const SST::Params& params) {
     c.enable_numa = params.find<bool>("enable_numa", true);
 
     // Workload selector (used to disable step activation for non-SNN workloads).
-    {
-        std::string w = params.find<std::string>("workload_impl", "");
-        if (w.empty()) {
-            if (const char* env = workloadImplFromEnvCached()) w = std::string(env);
-        }
-        c.workload_impl = toLower_(w);
-        if (c.workload_impl.empty()) c.workload_impl = "snn";
-    }
+    c.workload_impl = workloadImplFromParamsOrEnv(params, "snn");
+
+    // Exec mode hint (experiment observability; does not change behavior).
+    c.exec_mode = execModeFromParams(params, "gas");
 
     c.v_thresh = params.find<float>("v_thresh", 1.0f);
     c.v_reset = params.find<float>("v_reset", 0.0f);
@@ -99,10 +80,10 @@ MultiCorePEConfig parseMultiCorePEConfig(const SST::Params& params) {
     c.diag_fire_log = params.find<bool>("diag_fire_log", false);
 
     c.global_step_sync_enable = params.find<bool>("global_step_sync_enable", false);
-    c.global_step_done_policy = toLower_(params.find<std::string>("global_step_done_policy", "endscatter"));
-    c.global_step_quiescent_min_cycles = clampNonZeroU64_(params.find<uint64_t>("global_step_quiescent_min_cycles", 1));
-    c.global_step_drain_min_cycles = clampNonZeroU64_(params.find<uint64_t>("global_step_drain_min_cycles", 200));
-    c.global_step_fixed_cycles = clampNonZeroU64_(params.find<uint64_t>("global_step_fixed_cycles", 100000));
+    c.global_step_done_policy = toLowerCopy(params.find<std::string>("global_step_done_policy", "endscatter"));
+    c.global_step_quiescent_min_cycles = clampNonZeroU64(params.find<uint64_t>("global_step_quiescent_min_cycles", 1));
+    c.global_step_drain_min_cycles = clampNonZeroU64(params.find<uint64_t>("global_step_drain_min_cycles", 200));
+    c.global_step_fixed_cycles = clampNonZeroU64(params.find<uint64_t>("global_step_fixed_cycles", 100000));
     c.loader_done_key = params.find<std::string>("loader_done_key", "");
     c.global_step_ready_delay_cycles = params.find<uint64_t>("global_step_ready_delay_cycles", 0);
 

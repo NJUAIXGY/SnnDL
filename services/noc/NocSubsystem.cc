@@ -131,6 +131,13 @@ void NocSubsystem::routeInternalPacket_(int src_core, int dst_core, NocPacketEve
 void NocSubsystem::onCoreSend(NocPacketEvent* packet) {
     if (!packet) return;
 
+    if (packet->step_seq == 0 && rt_.active_step_seq && *rt_.active_step_seq != 0) {
+        const auto k = packet->packetKind();
+        if (k == NocPacketKind::Spike || k == NocPacketKind::SpikeKey) {
+            packet->step_seq = (*rt_.active_step_seq) + rt_.step_seq_offset;
+        }
+    }
+
     const bool is_local = (static_cast<int>(packet->dst_node) == rt_.node_id);
     if (is_local) {
         const int dst_core = static_cast<int>(packet->dst_endpoint);
@@ -154,6 +161,13 @@ void NocSubsystem::onCoreSend(NocPacketEvent* packet) {
 
 void NocSubsystem::sendFromCore(int src_core, NocPacketEvent* packet) {
     if (!packet) return;
+
+    if (packet->step_seq == 0 && rt_.active_step_seq && *rt_.active_step_seq != 0) {
+        const auto k = packet->packetKind();
+        if (k == NocPacketKind::Spike || k == NocPacketKind::SpikeKey) {
+            packet->step_seq = (*rt_.active_step_seq) + rt_.step_seq_offset;
+        }
+    }
 
     // SpikeKey（原生多播）必须经过外部 router mesh，即便 ingress_node 恰好等于本节点：
     // 否则会走本地 ring 直投，导致跳过 MulticastRouter 的 INTER→INTRA 阶段切换与 block 内复制，
@@ -192,6 +206,12 @@ void NocSubsystem::sendFromCore(int src_core, NocPacketEvent* packet) {
 
 void NocSubsystem::injectLocal(int dst_core, NocPacketEvent* packet) {
     if (!packet) return;
+    if (packet->step_seq == 0 && rt_.active_step_seq && *rt_.active_step_seq != 0) {
+        const auto k = packet->packetKind();
+        if (k == NocPacketKind::Spike || k == NocPacketKind::SpikeKey) {
+            packet->step_seq = (*rt_.active_step_seq) + rt_.step_seq_offset;
+        }
+    }
     if (dst_core < 0 || dst_core >= rt_.num_cores) {
         delete packet;
         return;
@@ -201,6 +221,12 @@ void NocSubsystem::injectLocal(int dst_core, NocPacketEvent* packet) {
 }
 
 void NocSubsystem::sendExternal(NocPacketEvent* packet) {
+    if (packet && packet->step_seq == 0 && rt_.active_step_seq && *rt_.active_step_seq != 0) {
+        const auto k = packet->packetKind();
+        if (k == NocPacketKind::Spike || k == NocPacketKind::SpikeKey) {
+            packet->step_seq = (*rt_.active_step_seq) + rt_.step_seq_offset;
+        }
+    }
     sendExternalPacket_(packet);
 }
 

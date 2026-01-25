@@ -6,9 +6,11 @@
 //
 
 #include "SnnNetworkAdapter.h"
+#include "SnnNetworkAdapterConfig.h"
 #include "SimpleNetworkWrapper.h"
 #include "NocPacketBatchEvent.h"
 #include "SnnDLLogging.h"
+#include "SnnDLStringUtil.h"
 
 #include <algorithm>
 #include <cctype>
@@ -115,26 +117,26 @@ SST::Event* NetworkEventConverter::convertRequestToEvent(SST::Interfaces::Simple
 SnnNetworkAdapter::SnnNetworkAdapter(SST::ComponentId_t id, SST::Params& params)
     : SnnInterface(id, params)
 {
-    int verbose_level = params.find<int>("verbose", 0);
-    output = new SST::Output("SnnNetworkAdapter[@p:@l]: ", verbose_level, 0, SST::Output::STDOUT);
+    const SnnNetworkAdapterConfig cfg = parseSnnNetworkAdapterConfig(params);
 
-    node_id = params.find<uint32_t>("node_id", 0);
-    routing_algorithm = params.find<std::string>("routing_algorithm", "XY");
-    link_bw = params.find<std::string>("link_bw", "40GiB/s");
-    packet_size = params.find<std::string>("packet_size", "64B");
-    input_buf_size = params.find<std::string>("input_buf_size", "1KiB");
-    output_buf_size = params.find<std::string>("output_buf_size", "1KiB");
+    output = new SST::Output("SnnNetworkAdapter[@p:@l]: ", cfg.verbose, 0, SST::Output::STDOUT);
 
-    enable_adaptive_routing = params.find<bool>("enable_adaptive_routing", false);
-    congestion_threshold = params.find<double>("congestion_threshold", 0.8);
-    enable_merlin_router = params.find<bool>("enable_merlin_router", false);
-    use_direct_link = params.find<bool>("use_direct_link", false);
-    use_multi_port = params.find<bool>("use_multi_port", false);
-    port_name = params.find<std::string>("port_name", "network");
+    node_id = cfg.node_id;
+    routing_algorithm = cfg.routing_algorithm;
+    link_bw = cfg.link_bw;
+    packet_size = cfg.packet_size;
+    input_buf_size = cfg.input_buf_size;
+    output_buf_size = cfg.output_buf_size;
 
-    std::string topology_str = params.find<std::string>("topology_type", "mesh2d");
-    topology_type = parseTopologyType(topology_str);
-    topology_shape = params.find<std::string>("topology_shape", "4x4");
+    enable_adaptive_routing = cfg.enable_adaptive_routing;
+    congestion_threshold = cfg.congestion_threshold;
+    enable_merlin_router = cfg.enable_merlin_router;
+    use_direct_link = cfg.use_direct_link;
+    use_multi_port = cfg.use_multi_port;
+    port_name = cfg.port_name;
+
+    topology_type = parseTopologyType(cfg.topology_type);
+    topology_shape = cfg.topology_shape;
 
     // counters
     spikes_routed_count = 0;
@@ -230,11 +232,18 @@ std::string SnnNetworkAdapter::getNetworkStatus() const
     return status.str();
 }
 
+size_t SnnNetworkAdapter::pendingSendCount() const
+{
+    return pending_sends_.size();
+}
+
 bool SnnNetworkAdapter::handleIncoming(int vn)
 {
     if (!router) return true;
     auto* req = router->recv(vn);
     while (req) {
+        const uint32_t req_src = static_cast<uint32_t>(req->src);
+        const uint32_t req_dst = static_cast<uint32_t>(req->dest);
         SST::Event* ev = extractEventFromRequest(req);
         delete req;
         if (!ev) {
@@ -243,6 +252,9 @@ bool SnnNetworkAdapter::handleIncoming(int vn)
         }
 
         if (auto* batch = dynamic_cast<NocPacketBatchEvent*>(ev)) {
+            // Keep metadata consistent with SimpleNetwork envelope.
+            batch->src_node = req_src;
+            batch->dst_node = req_dst;
             for (auto& p : batch->packets) {
                 auto* pkt = new NocPacketEvent();
                 pkt->src_node = batch->src_node;
@@ -257,6 +269,12 @@ bool SnnNetworkAdapter::handleIncoming(int vn)
                 else delete pkt;
             }
             delete batch;
+        } else if (auto* pkt = dynamic_cast<NocPacketEvent*>(ev)) {
+            // Keep metadata consistent with SimpleNetwork envelope.
+            pkt->src_node = req_src;
+            pkt->dst_node = req_dst;
+            if (receive_handler_) receive_handler_(pkt);
+            else delete pkt;
         } else {
             if (receive_handler_) receive_handler_(ev);
             else delete ev;
@@ -365,9 +383,7 @@ void SnnNetworkAdapter::initializeTopologyHandler()
 
 TopologyType SnnNetworkAdapter::parseTopologyType(const std::string& type_str)
 {
-    std::string t = type_str;
-    std::transform(t.begin(), t.end(), t.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    const std::string t = toLowerCopy(type_str);
     if (t == "torus2d") return TopologyType::TORUS_2D;
     return TopologyType::MESH_2D;
 }

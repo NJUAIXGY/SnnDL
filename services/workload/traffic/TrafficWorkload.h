@@ -44,7 +44,8 @@ private:
     void ensureCommReady_();
     std::vector<uint32_t> sampleNeuronIndices_(uint64_t now_cycle);
 
-    const SST::Params* params_ = nullptr;
+    // Keep an owned copy to avoid lifetime ambiguity across different SST param plumbing paths.
+    std::unique_ptr<SST::Params> params_{};
     Runtime rt_{};
 
     bool configured_ = false;

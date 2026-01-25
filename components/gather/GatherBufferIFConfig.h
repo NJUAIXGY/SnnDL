@@ -76,6 +76,23 @@ struct GatherBufferIFConfig {
     uint64_t gather_auto_end_bytes = 0;
     uint64_t gather_auto_end_reads = 0;
 
+    // Dense microbench correctness: byte-exact verification (optional; diagnostics only).
+    bool byte_exact_verify_enable = false;
+    std::string byte_exact_verify_mode;
+    uint32_t byte_exact_verify_row_scale = 1024;
+    uint32_t byte_exact_verify_max_mismatch = 8;
+    uint64_t byte_exact_verify_base_addr = 0;
+    uint32_t byte_exact_verify_rows = 0;
+    uint32_t byte_exact_verify_cols = 0;
+    std::string byte_exact_verify_file_path;
+    uint32_t byte_exact_verify_sample_bytes = 64;
+    uint32_t byte_exact_verify_max_resps = 8;
+    int byte_exact_verify_owner_node = -1;
+    int byte_exact_verify_owner_core = -1;
+    uint64_t byte_exact_verify_rowptr_offset = 0;
+    uint64_t byte_exact_verify_colidx_offset = 0;
+    uint64_t byte_exact_verify_blockdata_offset = 0;
+
     // Adaptive k
     bool k_adapt_enable = false;
     uint32_t k_adapt_window_N = 8;

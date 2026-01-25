@@ -9,6 +9,7 @@
 #define SNNDL_GLOBAL_GAS_STEP_CONTROLLER_H
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include <sst/core/component.h>
@@ -36,7 +37,7 @@ public:
         {"start_seq", "initial step sequence id", "1"},
         {"max_steps", "stop after completing this many steps (0=unbounded)", "0"},
         {"require_all_ready", "wait for PeReady from all connected PEs (0/1)", "1"},
-        {"strict_seq_check", "fatal on unexpected seq transitions (0/1)", "1"}
+        {"strict_seq_check", "fatal on unexpected seq transitions (0/1)", "0"}
     )
 
     SST_ELI_DOCUMENT_PORTS(
@@ -51,6 +52,7 @@ public:
     void finish() override;
 
 private:
+    bool clockTick_(SST::Cycle_t);
     void handleBarrierEvent_(SST::Event* ev, int pe_index);
     void broadcastStart_(uint32_t seq);
     bool allReady_() const;
@@ -61,6 +63,9 @@ private:
     std::vector<uint8_t> pe_ready_;
     std::vector<uint8_t> pe_done_;
 
+    std::string clock_freq_ = "1GHz";
+    bool clock_registered_ = false;
+
     uint32_t start_seq_ = 1;
     uint32_t current_seq_ = 0;
     bool started_ = false;
@@ -70,7 +75,8 @@ private:
 
     int verbose_ = 0;
     bool require_all_ready_ = true;
-    bool strict_seq_check_ = true;
+    bool strict_seq_check_ = false;
+    uint32_t warn_count_ = 0;
 };
 
 }} // namespace SST::SnnDL

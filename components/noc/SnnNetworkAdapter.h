@@ -192,6 +192,7 @@ public:
     void setNodeId(uint32_t node_id) override;
     uint32_t getNodeId() const override;
     std::string getNetworkStatus() const override;
+    size_t pendingSendCount() const override;
 
     // === 网络接口回调方法 ===
     bool handleIncoming(int vn);

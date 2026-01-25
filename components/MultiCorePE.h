@@ -122,6 +122,8 @@ public:
         {"sim_stop_ns",      "组件主控结束仿真（纳秒）。>0时注册为primary并在达到该时间点时OKToEndSim", "0"},
         {"weights_file",     "权重文件路径", ""},
         {"enable_numa",      "启用NUMA优化", "1"},
+        {"workload_impl",    "workload实现选择(snn|stream|traffic). 为空则回退 env:SNNDL_WORKLOAD_IMPL", ""},
+        {"exec_mode",        "执行模式提示(gas|naive_raw). 仅用于实验可观测性，不改变行为", "gas"},
         {"v_thresh",         "触发脉冲的膜电位阈值", "1.0"},
         {"v_reset",          "脉冲发放后膜电位重置值", "0.0"},
         {"v_rest",           "静息膜电位", "0.0"},
@@ -138,7 +140,7 @@ public:
         {"window_us", "统计窗口长度（微秒）", "20"},
         {"window_csv", "窗口化统计输出CSV路径（为空则不输出）", ""},
         {"diag_fire_log", "启用发放统计诊断日志(1=开启)", "0"},
-        {"manual_gas_gather_cycles", "manual_window_drive下每多少周期强制EndGather一次（0=禁用）", "200"},
+        {"manual_gas_gather_cycles", "已弃用：旧 manual drive 兼容参数（当前无效；保留仅为兼容）", "200"},
         {"step_activation_enable", "启用步级随机激活", "0"},
         {"step_activation_fraction", "步级随机激活伯努利概率", "0.0"},
         {"step_activation_fanout", "步级随机激活fanout", "0"},
@@ -176,6 +178,8 @@ public:
         ,
         {"loader_done_key", "SharedArray key toggled by WeightLoader upon completion（用于 Step-limited 下延迟 PE_READY）", ""}
         ,
+        {"loader_done_timeout_cycles", "等待 loader_done_key 超时后降级发送 PE_READY 的周期数（0=禁用）", "0"}
+        ,
         {"global_step_ready_delay_cycles", "global_step_sync_enable=1 时：在 loader_done 后额外等待 N 周期再发送 PE_READY（避免 naive_* 在 rowptr 未就绪时积压）", "0"}
     )
 
@@ -199,6 +203,7 @@ public:
         {"external_spike_input",  "外部脉冲输入端口", {"SnnDL.SpikeEvent"}},
         {"external_spike_output", "外部脉冲输出端口", {"SnnDL.SpikeEvent"}},
         {"gas_step_ctrl", "全局 Step/GAS 同步控制器端口（可选）", {"SnnDL.GasStepBarrierEvent"}},
+        {"loader_done", "WeightLoader完成事件（可选，桥接跨rank loader_done_key）", {"SnnDL.LoaderDoneEvent"}},
         {"network", "网络连接端口（用于direct_link模式）", {"SnnDL.SpikeEvent", "SimpleNetwork"}},
         {"north", "北向网络连接端口（网格拓扑）", {"SnnDL.SpikeEvent"}},
         {"south", "南向网络连接端口（网格拓扑）", {"SnnDL.SpikeEvent"}},
@@ -254,12 +259,6 @@ public:
         {"gas_acc_high_watermark_bytes_total", "累加器峰值占用（总）", "bytes", 1},
         {"gas_acc_spill_records_total", "溢写记录条数（总）", "records", 1},
         {"gas_acc_spilled_bytes_total", "溢写有效字节（总）", "bytes", 1},
-        {"gas_apply_acc_updates_total", "Apply阶段的delta累加次数（总）", "count", 1},
-        {"gas_acc_posts_touched_total", "Apply阶段触达post个数（总）", "posts", 1},
-        {"gas_scatter_spikes_emitted_total", "Scatter阶段发放spike个数（总）", "spikes", 1},
-        {"gas_acc_high_watermark_bytes_total", "累加器峰值占用（总）", "bytes", 1},
-        {"gas_acc_spill_records_total", "溢写记录条数（总）", "records", 1},
-        {"gas_acc_spilled_bytes_total", "溢写有效字节（总）", "bytes", 1},
         {"mem_outstanding_at_issue", "发起时并发请求数", "count", 1},
         {"gas_activity_f", "GAS 窗口内活跃度 f（活跃轴数/列宽）", "ratio", 1},
         {"sim_cycles_total", "总仿真周期（组件clock tick累计）", "cycles", 1},
@@ -270,7 +269,12 @@ public:
         {"step_activation_spikes_injected", "step随机激活成功注入本PE的spike数", "spikes", 1},
         {"step_activation_route_hits", "step随机激活经由BCSR路由成功命中的次数", "count", 1},
         {"step_activation_route_misses", "step随机激活启用BCSR但路由为空的次数", "count", 1},
-        {"step_activation_local_drops", "step随机激活因目标不在本PE而丢弃的spike数", "spikes", 1}
+        {"step_activation_local_drops", "step随机激活因目标不在本PE而丢弃的spike数", "spikes", 1},
+        // Experiment profile observability (sst_dram_si: experiment_profile=universal_core_eval)
+        {"compat_unexpected_stream_activity_total", "非 stream workload 下仍出现 stream 统计活动（计数）", "count", 1},
+        {"compat_naive_gas_stage_events_total", "naive_raw 下观测到 GAS 阶段事件(BeginApply/BeginScatter/EndApply)（计数）", "count", 1},
+        {"compat_finish_incomplete_total", "global_step_sync_enable=1 但本PE在 active step 未完成时结束（计数）", "count", 1},
+        {"loader_done_timeout_fallback_total", "loader_done_key 等待超时后触发降级发送 PE_READY 的次数", "count", 1}
     )
 
     /**
@@ -415,7 +419,7 @@ private:
     bool primary_keepalive_ = false; // 仅在单PE脚本需要保持仿真推进时启用
     bool ok_to_end_sent_ = false; // 防止重复触发 primaryComponentOKToEndSim 导致退出事件重复调度
     bool manual_core_drive_enable_ = false; // 诊断回退：手动驱动子核clock/EndGather
-    uint64_t manual_gas_gather_cycles_ = 200; // manual_window_drive回退下的窗口长度（周期）
+    uint64_t manual_gas_gather_cycles_ = 200; // 已弃用：旧 manual drive 兼容参数（当前无效；保留仅为兼容）
     
     // 权重验证参数
     bool verify_weights_;
@@ -482,6 +486,10 @@ private:
 	    Statistic<uint64_t>* stat_stream_pkt_recv_total_ = nullptr;
 	    Statistic<uint64_t>* stat_stream_pkt_bad_crc_total_ = nullptr;
 	    Statistic<uint64_t>* stat_stream_pkt_bad_magic_total_ = nullptr;
+	    Statistic<uint64_t>* stat_compat_unexpected_stream_activity_total_ = nullptr;
+	    Statistic<uint64_t>* stat_compat_naive_gas_stage_events_total_ = nullptr;
+	    Statistic<uint64_t>* stat_compat_finish_incomplete_total_ = nullptr;
+        Statistic<uint64_t>* stat_loader_done_timeout_fallback_total_ = nullptr;
 	    std::vector<uint64_t> stream_mem_verify_fail_last_;
 	    std::vector<uint64_t> stream_mem_verify_pass_last_;
 	    std::vector<uint64_t> stream_mem_writes_issued_last_;
@@ -559,6 +567,9 @@ private:
     std::string window_csv_;
     std::string window_metrics_csv_;
     bool diag_fire_log_ = false;
+    // Exec-mode / workload hint (experiment observability only; does not change behavior)
+    std::string exec_mode_;
+    bool is_stream_workload_ = false;
     struct WindowAgg {
         uint64_t start_ns = 0;
         uint64_t end_ns = 0;
@@ -605,9 +616,14 @@ private:
     bool global_step_sync_ready_ = false;
     bool global_step_ready_sent_ = false;
     SST::Link* gas_step_ctrl_link_ = nullptr;
+    SST::Link* loader_done_link_ = nullptr;
     bool global_step_start_pending_ = false;
     uint32_t global_step_pending_seq_ = 0;
     uint32_t global_step_active_seq_ = 0;
+    uint32_t global_step_last_seen_seq_ = 0;
+    uint64_t global_step_start_dup_total_ = 0;
+    uint64_t global_step_start_stale_total_ = 0;
+    uint64_t global_step_start_jump_total_ = 0;
     bool global_step_done_sent_ = false;
     GlobalStepDonePolicy global_step_done_policy_ = GlobalStepDonePolicy::EndScatter;
     uint64_t global_step_begin_cycle_ = 0;
@@ -616,11 +632,24 @@ private:
     uint64_t global_step_fixed_cycles_ = 0;
     uint64_t global_step_last_activity_cycle_ = 0;
     uint32_t global_step_drain_diag_count_ = 0;
+
+    // step_seq 门控（naive_raw baseline）：用于禁用“步内级联”，将 step_seq>active 的 Spike packet 暂存到目标 step 再投递。
+    struct DeferredNocPacket {
+        int endpoint_id = -1;
+        NocPacketEvent* pkt = nullptr;
+    };
+    std::unordered_map<uint32_t, std::vector<DeferredNocPacket>> deferred_packets_by_seq_{};
+    void flushDeferredPacketsForSeq_(uint32_t seq);
+    void clearAllDeferredPackets_();
     // Step-limited 下的就绪门控：等待 WeightLoader 发布 done 再发送 PE_READY（避免 naive_* 在 rowptr 未就绪时爆炸式积压）
     std::string loader_done_key_;
     bool wait_for_loader_done_ = false;
     bool loader_ready_latched_ = false;
     uint64_t loader_ready_cycle_ = 0;
+    uint64_t loader_done_timeout_cycles_ = 0;
+    bool loader_wait_started_ = false;
+    uint64_t loader_wait_start_cycle_ = 0;
+    bool loader_ready_forced_ = false;
     uint64_t global_step_ready_delay_cycles_ = 0;
     std::unique_ptr<SST::Shared::SharedArray<int>> loader_done_shared_;
     std::vector<uint8_t> global_step_done_cores_{};
@@ -638,6 +667,10 @@ private:
     void mergeWindowMetricsFromCsv_();
     
     // ===== 核心方法 =====
+
+    void maybeInjectTestTraffic_(SST::Cycle_t current_cycle);
+    void driveCoresManually_(SST::Cycle_t current_cycle);
+    void refreshProcessingUnitStates_();
     
     /**
      * @brief 时钟滴答处理器
@@ -653,6 +686,11 @@ private:
      * @brief 处理全局 Step/GAS 控制器事件（StartStep）
      */
     void handleGasStepCtrlEvent(SST::Event* ev);
+
+    /**
+     * @brief 处理 WeightLoader 完成事件（跨rank桥接 loader_done_key）
+     */
+    void handleLoaderDoneEvent(SST::Event* ev);
 
     /**
      * @brief 在时钟边界打开所有 core 的新窗口（由 StartStep 驱动）

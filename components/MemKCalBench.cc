@@ -1,6 +1,7 @@
 // -*- c++ -*-
 #include <sst/core/sst_config.h>
 #include "MemKCalBench.h"
+#include "MemKCalBenchConfig.h"
 
 #include <sstream>
 #include <algorithm>
@@ -12,37 +13,20 @@ using namespace SST::SnnDL;
 MemKCalBench::MemKCalBench(ComponentId_t id, Params& params)
     : Component(id)
 {
-    int verbose = params.find<int>("verbose", 0);
-    out_ = new Output("MemKCalBench[@p:@l]: ", verbose, 0, Output::STDOUT);
-    row_bytes_  = params.find<uint32_t>("row_bytes", 8192);
-    bank_bits_  = params.find<uint32_t>("bank_bits", 0);
-    bank_shift_ = params.find<uint32_t>("bank_shift", 0);
-    clock_      = params.find<std::string>("clock", "1GHz");
-    out_csv_    = params.find<std::string>("output_csv", "sst_dram_si/stats/kcal/bench_results.csv");
-
-    // payload sizes
-    std::string pls = params.find<std::string>("payload_sizes", "4096,8192,16384,32768");
-    std::vector<uint32_t> payloads;
-    {
-        std::stringstream ss(pls); std::string tok;
-        while (std::getline(ss, tok, ',')) {
-            try { uint32_t v = (uint32_t) std::stoul(tok); if (v) payloads.push_back(v); } catch(...) {}
-        }
-        if (payloads.empty()) payloads = {4096,8192,16384,32768};
-    }
-    uint32_t gap_start = params.find<uint32_t>("gap_start", 0);
-    uint32_t gap_end   = params.find<uint32_t>("gap_end", 65536);
-    uint32_t gap_step  = params.find<uint32_t>("gap_step", 512);
-    std::string scenes = params.find<std::string>("scenes", "row_hit,row_switch");
-    bool do_row_hit = (scenes.find("row_hit") != std::string::npos);
-    bool do_row_sw  = (scenes.find("row_switch") != std::string::npos);
+    const MemKCalBenchConfig cfg = parseMemKCalBenchConfig(params);
+    out_ = new Output("MemKCalBench[@p:@l]: ", cfg.verbose, 0, Output::STDOUT);
+    row_bytes_  = cfg.row_bytes;
+    bank_bits_  = cfg.bank_bits;
+    bank_shift_ = cfg.bank_shift;
+    clock_      = cfg.clock;
+    out_csv_    = cfg.output_csv;
 
     // Build tests
-    for (auto L : payloads) {
-        for (uint32_t g = gap_start; g <= gap_end; g += gap_step) {
-            if (do_row_hit)  tests_.push_back({"row_hit", L, g});
-            if (do_row_sw)   tests_.push_back({"row_switch", L, g});
-            if (gap_end - g < gap_step) break; // guard overflow
+    for (auto L : cfg.payload_sizes) {
+        for (uint32_t g = cfg.gap_start; g <= cfg.gap_end; g += cfg.gap_step) {
+            if (cfg.do_row_hit)  tests_.push_back({"row_hit", L, g});
+            if (cfg.do_row_switch)   tests_.push_back({"row_switch", L, g});
+            if (cfg.gap_end - g < cfg.gap_step) break; // guard overflow
         }
     }
 
@@ -168,4 +152,3 @@ void MemKCalBench::writeCSV_(const std::string& scene, uint32_t L, uint32_t gap,
     if (write_header) f << "scene,L,gap,split_ns,merge_ns\n";
     f << scene << "," << L << "," << gap << "," << t_split_ns << "," << t_merge_ns << "\n";
 }
-
