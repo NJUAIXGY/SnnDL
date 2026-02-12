@@ -10,6 +10,8 @@
 #include <cstdint>
 #include <string>
 
+#include "WorkloadConfig.h"
+
 namespace SST {
 class Params;
 }
@@ -42,6 +44,9 @@ struct MultiCorePEConfig {
 
     // Workload selector (for disabling StepActivation under non-SNN workloads)
     std::string workload_impl;  // normalized lowercase; empty means "snn"
+    WorkloadKind workload_kind = WorkloadKind::Snn;
+    // Optional workload stats modules (comma-separated). Empty -> auto from workload_impl.
+    std::string workload_stats_modules;
     // Execution mode hint (experiment observability only)
     // - gas: default SNN GAS/window pipeline
     // - naive_raw: immediate per-spike reads (no GAS/window); still may use global step sync controller
@@ -111,6 +116,9 @@ struct MultiCorePEConfig {
     int step_activation_trigger_core = 0;
     bool step_reset_mem_each_step = false;
     double step_activation_event_weight = 0.0;
+    // StepActivation pre selection pattern (bernoulli/clustered)
+    std::string step_activation_pre_pattern; // normalized lowercase; empty => bernoulli
+    uint32_t step_activation_pre_cluster_len = 0; // clustered: contiguous pre length (neurons); 0 => auto (64)
     bool step_activation_use_bcsr_routes = false;
     std::string step_activation_bcsr_template;
     uint32_t step_activation_bcsr_rows_per_core = 0; // 0 => default to neurons_per_core

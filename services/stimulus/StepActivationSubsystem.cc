@@ -21,7 +21,7 @@
 #include "../../api/GlobalNeuronLayout.h"
 #include "INocTransport.h"
 #include "NocPacketEvent.h"
-#include "SpikeEvent.h"
+#include "events/SpikeEvent.h"
 
 #include "synapse/route/StepBcsrReachability.h"
 #include "synapse/route/SpikeNocCodec.h"
@@ -46,7 +46,7 @@ void StepActivationSubsystem::configure(const Config& cfg) {
     route_diag_done_ = false;
     route_ack_logged_ = false;
     route_warned_ = false;
-    step_routes_.clear();
+    step_routes_map_.clear();
     pre_with_routes_.clear();
     if (cfg_.bcsr_align == 0) cfg_.bcsr_align = 64;
 }
@@ -104,14 +104,15 @@ void StepActivationSubsystem::initBcsrReachabilityIfEnabled() {
     }
 }
 
-void StepActivationSubsystem::tick(uint64_t current_cycle) {
+void StepActivationSubsystem::tick(uint64_t current_cycle, uint64_t now_ns) {
     if (!cfg_.enable) return;
 
     // legacy: BeginGather 触发（当 period==0 时保留原始行为）
     if (cfg_.period_cycles == 0 && pending_step_inject_ && injection_ready_) {
-        injectStepActivations_(pending_step_seq_, current_cycle);
+        injectStepActivations_(pending_step_seq_, pending_step_ts_ns_);
         last_injection_seq_ = pending_step_seq_;
         pending_step_inject_ = false;
+        pending_step_ts_ns_ = 0;
     }
 
     // 固定周期触发（去耦 BeginGather 时基漂移）
@@ -121,7 +122,7 @@ void StepActivationSubsystem::tick(uint64_t current_cycle) {
             fixed_seq_ = 1;
         }
         if (current_cycle >= next_cycle_) {
-            injectStepActivations_(fixed_seq_, current_cycle);
+            injectStepActivations_(fixed_seq_, now_ns);
             ++fixed_seq_;
             next_cycle_ += cfg_.period_cycles;
         }
@@ -212,8 +213,8 @@ int StepActivationSubsystem::determineTargetUnit_(uint32_t neuron_id) const {
 void StepActivationSubsystem::injectStepActivations_(uint32_t seq, uint64_t sim_time_ns) {
     if (!rt_.layout || !rt_.layout->valid()) return;
     const uint64_t neurons_per_pe = rt_.layout->neuronsPerPE();
-    const int total_neurons = static_cast<int>(neurons_per_pe);
-    if (!cfg_.enable || cfg_.fanout == 0 || total_neurons <= 0) return;
+    const uint64_t local_total = neurons_per_pe;
+    if (!cfg_.enable || cfg_.fanout == 0 || local_total == 0) return;
     if (!rt_.noc) {
         if (rt_.log) rt_.log->fatal(CALL_INFO, -1, "StepActivationSubsystem fatal: runtime.noc is null while step is enabled\n");
         return;
@@ -225,13 +226,13 @@ void StepActivationSubsystem::injectStepActivations_(uint32_t seq, uint64_t sim_
 
     if (st_.invocations) st_.invocations->addData(1);
 
-    const uint64_t local_total = static_cast<uint64_t>(total_neurons);
     const uint64_t max_global = rt_.layout->maxGlobalNeurons();
     const uint64_t diag_cap = (rt_.step_diag_cap_cfg > 0) ? static_cast<uint64_t>(rt_.step_diag_cap_cfg) : 0ULL;
     std::mt19937_64 rng(cfg_.seed ^ (static_cast<uint64_t>(seq) + (static_cast<uint64_t>(rt_.node_id) << 32)));
     std::uniform_int_distribution<uint64_t> post_dist(0, local_total - 1);
     std::bernoulli_distribution pick(fraction);
     const bool activate_all = (fraction >= 0.999999);
+    const bool clustered_pre = (cfg_.pre_pattern == Config::PrePattern::Clustered);
     uint64_t spikes_injected = 0;
     uint64_t sources_selected = 0;
     uint64_t spike_attempts = 0;
@@ -247,25 +248,26 @@ void StepActivationSubsystem::injectStepActivations_(uint32_t seq, uint64_t sim_
         uint64_t max_routes = 0;
         uint64_t local_edges = 0;
         uint64_t remote_edges = 0;
-        for (size_t i = 0; i < step_routes_.size(); ++i) {
-            const auto& v = step_routes_[i];
-            if (!v.empty()) {
-                ++with_routes;
-                if (v.size() > max_routes) max_routes = static_cast<uint64_t>(v.size());
-                for (auto post : v) {
-                    uint32_t pe_of_post = rt_.layout->nodeOf(static_cast<uint64_t>(post));
-                    if (pe_of_post == static_cast<uint32_t>(rt_.node_id)) ++local_edges; else ++remote_edges;
-                }
+        for (const auto& kv : step_routes_map_) {
+            const auto& v = kv.second;
+            if (v.empty()) continue;
+            ++with_routes;
+            if (v.size() > max_routes) max_routes = static_cast<uint64_t>(v.size());
+            for (auto post : v) {
+                uint32_t pe_of_post = rt_.layout->nodeOf(static_cast<uint64_t>(post));
+                if (pe_of_post == static_cast<uint32_t>(rt_.node_id)) ++local_edges; else ++remote_edges;
             }
         }
         if (rt_.log && rt_.log->getVerboseLevel() >= 2) {
             double denom_edges = (local_edges + remote_edges) ? static_cast<double>(local_edges + remote_edges) : 1.0;
             double local_ratio = static_cast<double>(local_edges) / denom_edges;
             double remote_ratio = static_cast<double>(remote_edges) / denom_edges;
+            const uint64_t total_neurons = static_cast<uint64_t>(rt_.num_cores) * static_cast<uint64_t>(rt_.neurons_per_core);
+            const uint64_t total_pre = rt_.global_neuron_base + total_neurons;
             STEP_LOG(2,
-                "[step-activation-summary] node=%d routes_nonempty=%" PRIu64 " total_pre=%zu max_routes=%" PRIu64
+                "[step-activation-summary] node=%d routes_nonempty=%" PRIu64 " total_pre=%" PRIu64 " max_routes=%" PRIu64
                 " max_global=%" PRIu64 " local=%" PRIu64 " (%.2f) remote=%" PRIu64 " (%.2f)\n",
-                rt_.node_id, with_routes, step_routes_.size(), max_routes, max_global,
+                rt_.node_id, with_routes, total_pre, max_routes, max_global,
                 local_edges, local_ratio, remote_edges, remote_ratio);
         }
         route_diag_done_ = true;
@@ -274,16 +276,19 @@ void StepActivationSubsystem::injectStepActivations_(uint32_t seq, uint64_t sim_
     const bool single_pe_bcsr = (rt_.total_nodes == 1) && cfg_.use_bcsr_routes && !pre_with_routes_.empty();
 
     if (single_pe_bcsr) {
+        if (clustered_pre && rt_.log && rt_.log->getVerboseLevel() >= 1) {
+            STEP_LOG(1, "[step-activation] WARN: clustered pre pattern is ignored under single_pe_bcsr path; fallback to Bernoulli\n");
+        }
         for (uint32_t pre_global : pre_with_routes_) {
             if (max_global > 0 && pre_global >= max_global) continue;
             if (!activate_all && !pick(rng)) continue;
             ++sources_selected;
-            const bool use_routes = cfg_.use_bcsr_routes && pre_global < step_routes_.size();
-            const auto* routes = use_routes ? &step_routes_[pre_global] : nullptr;
+            const auto it = step_routes_map_.find(pre_global);
+            const auto* routes = (cfg_.use_bcsr_routes && it != step_routes_map_.end()) ? &it->second : nullptr;
             if (!routes || routes->empty()) continue;
 
             static uint64_t route_sampled = 0;
-            if (step_diag_enabled && use_routes && rt_.node_id == 0 && seq <= 1 && route_sampled < 16) {
+            if (step_diag_enabled && rt_.node_id == 0 && seq <= 1 && route_sampled < 16) {
                 STEP_LOG(1, "[[step-diag-pre]] node=%d seq=%u pre_global=%u routes=%zu\n",
                          rt_.node_id, seq, pre_global, routes->size());
                 ++route_sampled;
@@ -329,17 +334,59 @@ void StepActivationSubsystem::injectStepActivations_(uint32_t seq, uint64_t sim_
             if (diag_cap_hit) break;
         }
     } else {
+        const uint32_t nper = static_cast<uint32_t>(rt_.neurons_per_core > 0 ? rt_.neurons_per_core : 0);
+        uint32_t cluster_len = cfg_.pre_cluster_len;
+        if (cluster_len == 0) cluster_len = 64;
+        if (cluster_len < 1) cluster_len = 1;
+        if (nper > 0 && cluster_len > nper) cluster_len = nper;
+
         for (int core = 0; core < rt_.num_cores; ++core) {
             uint64_t base = rt_.global_neuron_base +
                 static_cast<uint64_t>(core) * static_cast<uint64_t>(rt_.neurons_per_core);
-            for (int n = 0; n < rt_.neurons_per_core; ++n) {
-                if (!activate_all && !pick(rng)) continue;
+            const bool use_routes = cfg_.use_bcsr_routes;
+
+            // Build a pre index list when clustered, otherwise keep the legacy Bernoulli-per-neuron loop.
+            std::vector<uint32_t> pre_local_indices;
+            if (clustered_pre && !activate_all && nper > 0) {
+                const uint32_t target = static_cast<uint32_t>(std::llround(fraction * static_cast<double>(nper)));
+                if (target > 0) {
+                    pre_local_indices.reserve(target);
+                    std::vector<uint8_t> chosen(nper, 0);
+                    auto fill_one = [&](uint32_t idx) {
+                        if (idx >= nper) return;
+                        if (chosen[idx]) return;
+                        chosen[idx] = 1;
+                        pre_local_indices.push_back(idx);
+                    };
+
+                    const uint32_t max_start = (nper > cluster_len) ? (nper - cluster_len) : 0;
+                    std::uniform_int_distribution<uint32_t> start_dist(0, max_start);
+                    const uint32_t max_attempts = std::max<uint32_t>(64, target * 4);
+                    uint32_t attempts = 0;
+                    while (pre_local_indices.size() < target && attempts < max_attempts) {
+                        const uint32_t start = start_dist(rng);
+                        const uint32_t end = std::min<uint32_t>(nper, start + cluster_len);
+                        for (uint32_t i = start; i < end && pre_local_indices.size() < target; ++i) {
+                            fill_one(i);
+                        }
+                        ++attempts;
+                    }
+                    if (pre_local_indices.size() < target) {
+                        std::uniform_int_distribution<uint32_t> idx_dist(0, nper - 1);
+                        while (pre_local_indices.size() < target) {
+                            fill_one(idx_dist(rng));
+                        }
+                    }
+                }
+            }
+
+            auto handle_one_pre = [&](uint32_t n) {
                 ++sources_selected;
                 uint64_t pre_global_64 = base + static_cast<uint64_t>(n);
-                if (max_global > 0 && pre_global_64 >= max_global) continue;
+                if (max_global > 0 && pre_global_64 >= max_global) return;
                 uint32_t pre_global = static_cast<uint32_t>(pre_global_64);
-                const bool use_routes = cfg_.use_bcsr_routes && pre_global < step_routes_.size();
-                const auto* routes = use_routes ? &step_routes_[pre_global] : nullptr;
+                const auto it = step_routes_map_.find(pre_global);
+                const auto* routes = (use_routes && it != step_routes_map_.end()) ? &it->second : nullptr;
 
                 static uint64_t route_sampled = 0;
                 if (step_diag_enabled && use_routes && routes && !routes->empty() &&
@@ -392,7 +439,24 @@ void StepActivationSubsystem::injectStepActivations_(uint32_t seq, uint64_t sim_
                     }
                     if (diag_cap && spikes_injected >= diag_cap) { diag_cap_hit = true; break; }
                 }
-                if (diag_cap_hit) break;
+            };
+
+            if (activate_all) {
+                for (uint32_t n = 0; n < nper; ++n) {
+                    handle_one_pre(n);
+                    if (diag_cap_hit) break;
+                }
+            } else if (clustered_pre) {
+                for (uint32_t n : pre_local_indices) {
+                    handle_one_pre(n);
+                    if (diag_cap_hit) break;
+                }
+            } else {
+                for (uint32_t n = 0; n < nper; ++n) {
+                    if (!pick(rng)) continue;
+                    handle_one_pre(n);
+                    if (diag_cap_hit) break;
+                }
             }
             if (diag_cap_hit) break;
         }
@@ -449,9 +513,7 @@ bool StepActivationSubsystem::loadBcsrReachability_() {
         return false;
     }
 
-    const uint64_t total_neurons = static_cast<uint64_t>(rt_.num_cores) * static_cast<uint64_t>(rt_.neurons_per_core);
-    const uint64_t total_pre = rt_.global_neuron_base + total_neurons;
-    step_routes_.assign(static_cast<size_t>(total_pre), {});
+    step_routes_map_.clear();
 
     StepBcsrReachabilityConfig rcfg{};
     rcfg.bcsr_template = cfg_.bcsr_template;
@@ -483,26 +545,23 @@ bool StepActivationSubsystem::loadBcsrReachability_() {
     std::vector<uint32_t> pre_with_routes;
     bool success = buildStepBcsrReachabilityRoutes(rcfg, rrt, routes_map, pre_with_routes);
     if (success) {
-        for (auto& kv : routes_map) {
-            const uint32_t pre = kv.first;
-            if (pre < step_routes_.size()) step_routes_[pre] = std::move(kv.second);
-        }
+        step_routes_map_ = std::move(routes_map);
         if (rt_.total_nodes == 1) pre_with_routes_ = std::move(pre_with_routes);
         else pre_with_routes_.clear();
     }
 
     if (success) {
         size_t with_routes = 0;
-        for (const auto& vec : step_routes_) if (!vec.empty()) ++with_routes;
+        for (const auto& kv : step_routes_map_) if (!kv.second.empty()) ++with_routes;
         if (cfg_.log_enable && !route_ack_logged_) {
-            STEP_LOG(1, "[step-activation] BCSR reachability loaded: pre_with_routes=%zu total_pre=%zu\n",
-                     with_routes, step_routes_.size());
+            STEP_LOG(1, "[step-activation] BCSR reachability loaded: pre_with_routes=%zu route_keys=%zu\n",
+                     with_routes, step_routes_map_.size());
             computeRouteRatios_();
             route_ack_logged_ = true;
         }
         if (rt_.log && cfg_.log_enable && rt_.log->getVerboseLevel() >= 2) {
             STEP_LOG(2, "[step-activation] node=%d loadBcsrReachability success route_vectors=%zu\n",
-                     rt_.node_id, step_routes_.size());
+                     rt_.node_id, step_routes_map_.size());
         }
         if (rt_.total_nodes == 1 && rt_.log && cfg_.log_enable) {
             STEP_LOG(1, "[step-activation] node=%d single-PE pre_with_routes_list size=%zu\n",
@@ -514,7 +573,7 @@ bool StepActivationSubsystem::loadBcsrReachability_() {
             STEP_LOG(0, "⚠️ step_activation BCSR route build failed, routes cleared; using fallback sampling\n");
             route_warned_ = true;
         }
-        step_routes_.clear();
+        step_routes_map_.clear();
         if (rt_.log && cfg_.log_enable) {
             STEP_LOG(0, "[step-activation] node=%d loadBcsrReachability FAILED\n", rt_.node_id);
         }
@@ -524,14 +583,14 @@ bool StepActivationSubsystem::loadBcsrReachability_() {
 
 void StepActivationSubsystem::computeRouteRatios_() const {
     uint64_t local_edges = 0, remote_edges = 0, total_edges = 0;
-    const uint32_t neurons_per_pe = static_cast<uint32_t>(rt_.neurons_per_core) * static_cast<uint32_t>(rt_.num_cores);
+    const uint64_t neurons_per_pe = (rt_.layout && rt_.layout->valid()) ? rt_.layout->neuronsPerPE() : 0ULL;
     if (neurons_per_pe > 0) {
-        for (size_t pre = 0; pre < step_routes_.size(); ++pre) {
-            const auto& vec = step_routes_[pre];
+        for (const auto& kv : step_routes_map_) {
+            const auto& vec = kv.second;
             total_edges += static_cast<uint64_t>(vec.size());
             for (auto post_global : vec) {
-                uint32_t pe_of_post = static_cast<uint32_t>(post_global / neurons_per_pe);
-                if (pe_of_post == static_cast<uint32_t>(rt_.node_id)) ++local_edges;
+                const uint64_t pe_of_post = static_cast<uint64_t>(post_global) / neurons_per_pe;
+                if (pe_of_post == static_cast<uint64_t>(rt_.node_id)) ++local_edges;
                 else ++remote_edges;
             }
         }

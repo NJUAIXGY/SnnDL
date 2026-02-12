@@ -187,8 +187,9 @@ am_libSnnDL_la_OBJECTS = events/SimpleTestEvent.lo \
 	components/multicore/MultiCorePEConfig.lo \
 	components/MultiCorePE.lo components/SnnNIC.lo \
 	components/SnnPE.lo components/stimulus/SpikeSource.lo \
-	components/WeightLoader.lo control/SnnPESubComponent.lo \
-	control/SnnPESubComponent_bcsr.lo \
+	components/WeightLoader.lo \
+	components/workload_stats/WorkloadStatsRegistry.lo \
+	control/SnnPESubComponent.lo control/SnnPESubComponent_bcsr.lo \
 	control/SnnPESubComponent_routing.lo \
 	control/SnnPESubComponent_scheme1.lo \
 	control/SnnPESubComponent_spike.lo \
@@ -224,6 +225,7 @@ am_libSnnDL_la_OBJECTS = events/SimpleTestEvent.lo \
 	services/workload/snn/SnnWorkload.lo \
 	services/workload/stream/StreamWorkload.lo \
 	services/workload/traffic/TrafficWorkload.lo \
+	services/workload/tensor/TensorWorkload.lo \
 	services/memory/StandardMemAccess.lo
 libSnnDL_la_OBJECTS = $(am_libSnnDL_la_OBJECTS)
 AM_V_lt = $(am__v_lt_$(V))
@@ -263,6 +265,7 @@ am__depfiles_remade = components/$(DEPDIR)/CachelineFragmentMemIF.Plo \
 	components/noc/$(DEPDIR)/SimpleNetworkWrapper.Plo \
 	components/noc/$(DEPDIR)/SnnNetworkAdapter.Plo \
 	components/stimulus/$(DEPDIR)/SpikeSource.Plo \
+	components/workload_stats/$(DEPDIR)/WorkloadStatsRegistry.Plo \
 	compute/$(DEPDIR)/SnnComputeCore.Plo \
 	compute/$(DEPDIR)/SnnCoreEngine.Plo \
 	compute/$(DEPDIR)/SnnLearningCore.Plo \
@@ -300,6 +303,7 @@ am__depfiles_remade = components/$(DEPDIR)/CachelineFragmentMemIF.Plo \
 	services/workload/layout/$(DEPDIR)/NormalizedNeuronLayout.Plo \
 	services/workload/snn/$(DEPDIR)/SnnWorkload.Plo \
 	services/workload/stream/$(DEPDIR)/StreamWorkload.Plo \
+	services/workload/tensor/$(DEPDIR)/TensorWorkload.Plo \
 	services/workload/traffic/$(DEPDIR)/TrafficWorkload.Plo
 am__mv = mv -f
 CXXCOMPILE = $(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) \
@@ -369,7 +373,7 @@ DISTFILES = $(DIST_COMMON) $(DIST_SOURCES) $(TEXINFOS) $(EXTRA_DIST)
 ACLOCAL = ${SHELL} '/home/xgy/remote/sst_workspace/sst-elements/config/missing' aclocal-1.16
 AMTAR = $${TAR-tar}
 AM_CFLAGS =  
-AM_CPPFLAGS =  -I/usr/include/python3.10 -I/usr/include/python3.10 -I/home/xgy/remote/sst_install/include/sst/core -I/home/xgy/remote/sst_install/include -I$(top_srcdir)/src -I$(srcdir) \
+AM_CPPFLAGS =  -I/usr/include/python3.10 -I/usr/include/python3.10 -I/home/xgy/remote/sst_install_mpi/include/sst/core -I/home/xgy/remote/sst_install_mpi/include -I$(top_srcdir)/src -I$(srcdir) \
 	-I$(srcdir)/api -I$(srcdir)/events -I$(srcdir)/components \
 	-I$(srcdir)/control -I$(srcdir)/compute -I$(srcdir)/services \
 	-I$(SST_PREFIX)/include
@@ -460,7 +464,7 @@ INSTALL_DATA = ${INSTALL} -m 644
 INSTALL_PROGRAM = ${INSTALL}
 INSTALL_SCRIPT = ${INSTALL}
 INSTALL_STRIP_PROGRAM = $(install_sh) -c -s
-LD = /usr/bin/ld
+LD = /usr/bin/ld -m elf_x86_64
 LDFLAGS = 
 LIBADD_DL =  
 LIBADD_DLD_LINK = 
@@ -487,15 +491,15 @@ LT_SYS_LIBRARY_PATH =
 MAKEINFO = ${SHELL} '/home/xgy/remote/sst_workspace/sst-elements/config/missing' makeinfo
 MANIFEST_TOOL = :
 MKDIR_P = /usr/bin/mkdir -p
-MPICC = gcc
+MPICC = mpicc
 MPICPP = 
-MPICXX = g++ -std=c++17
+MPICXX = mpic++
 MPICXXCPP = 
 MPILIBS = 
 MPI_CPPFLAGS = 
 NM = /usr/bin/nm -B
 NMEDIT = 
-NUMPY_CPPFLAGS = -I/usr/local/lib/python3.10/dist-packages/numpy/core/include -DHAVE_NUMPY
+NUMPY_CPPFLAGS = -I/home/xgy/.local/lib/python3.10/site-packages/numpy/_core/include -DHAVE_NUMPY
 NVDIMMSIM_CPPFLAGS = 
 NVDIMMSIM_CXXFLAGS = 
 NVDIMMSIM_LDFLAGS = 
@@ -526,7 +530,7 @@ PINTOOL3_RUNTIME =
 PINTOOL_CPPFLAGS = 
 PINTOOL_DIR = 
 PINTOOL_LDFLAGS = 
-PINTOOL_PATH = /home/xgy/.codex/tmp/path/codex-arg0PSedAu:/home/xgy/.nvm/versions/node/v22.20.0/lib/node_modules/@openai/codex/vendor/x86_64-unknown-linux-musl/path:/home/xgy/.local/bin:/usr/lib/jvm/java-17-openjdk-amd64/bin:/home/xgy/remote/sst_install/bin:/home/xgy/remote/sst_install/bin:/home/xgy/.nvm/versions/node/v22.20.0/bin:/home/xgy/.vscode-server/cli/servers/Stable-0f0d87fa9e96c856c5212fc86db137ac0d783365/server/bin/remote-cli:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/home/xgy/.vscode-server/data/User/globalStorage/github.copilot-chat/debugCommand
+PINTOOL_PATH = /home/xgy/.codex/tmp/path/codex-arg0UE7kUS:/home/xgy/.nvm/versions/node/v22.20.0/lib/node_modules/@openai/codex/vendor/x86_64-unknown-linux-musl/path:/home/xgy/.local/bin:/usr/lib/jvm/java-17-openjdk-amd64/bin:/home/xgy/remote/sst_install/bin:/home/xgy/remote/sst_install/bin:/home/xgy/.nvm/versions/node/v22.20.0/bin:/home/xgy/.vscode-server/cli/servers/Stable-0f0d87fa9e96c856c5212fc86db137ac0d783365/server/bin/remote-cli:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/home/xgy/.vscode-server/extensions/ms-python.debugpy-2025.18.0-linux-x64/bundled/scripts/noConfigScripts:/home/xgy/.vscode-server/data/User/globalStorage/github.copilot-chat/debugCommand
 PINTOOL_RUNTIME = 
 PIN_CPPFLAGS = -g   -Wall   -Werror   -Wno-unknown-pragmas   -D__PIN__=1 -DPIN_CRT=1   -fno-stack-protector   -fno-exceptions   -funwind-tables   -fasynchronous-unwind-tables   -fomit-frame-pointer   -fno-strict-aliasing   -fno-rtti   -faligned-new   -fpic   -DTARGET_IA32E   -DHOST_IA32E   -DTARGET_LINUX   -DPIN_VERSION_MINOR=
 PIN_CPPFLAGS_COMPILER = -fno-exceptions          -fabi-version=2
@@ -547,11 +551,11 @@ SSTELEMENTS_GIT_BRANCH = snndl_re
 SSTELEMENTS_GIT_COMMITCOUNT = 15403
 SSTELEMENTS_GIT_HEADSHA = 43e4d871d1c57255085150393da94d925ba7ee1d
 SST_ACTIVE_ELEMENT_LIBRARIES =  ariel cacheTracer cassini cramSim ember firefly gensa golem hermes iris kingsley mask-mpi memHierarchy mercury merlin messier miranda mmu osseous prospero rdmaNic samba shogun simpleElementExample simpleSimulation SnnDL thornhill vanadis vaultsim zodiac
-SST_CONFIG_TOOL = /home/xgy/remote/sst_install/bin/sst-config
+SST_CONFIG_TOOL = /home/xgy/remote/sst_install_mpi/bin/sst-config
 SST_DIST_ELEMENT_LIBRARIES =  ariel balar cacheTracer cassini cramSim ember firefly gensa golem hermes iris kingsley mask-mpi memHierarchy mercury merlin messier miranda mmu osseous prospero rdmaNic samba shogun simpleElementExample simpleSimulation SnnDL thornhill vanadis vaultsim zodiac
-SST_PREFIX = /home/xgy/remote/sst_install
-SST_REGISTER_TOOL = /home/xgy/remote/sst_install/bin/sst-register
-SST_SNIPPETS_TOOL = /home/xgy/remote/sst_install/bin/sst-snippets.py
+SST_PREFIX = /home/xgy/remote/sst_install_mpi
+SST_REGISTER_TOOL = /home/xgy/remote/sst_install_mpi/bin/sst-register
+SST_SNIPPETS_TOOL = /home/xgy/remote/sst_install_mpi/bin/sst-snippets.py
 STAKE_CPPFLAGS = 
 STAKE_LDFLAGS = 
 STAKE_LIB = 
@@ -602,7 +606,7 @@ mandir = ${datarootdir}/man
 mkdir_p = $(MKDIR_P)
 oldincludedir = /usr/include
 pdfdir = ${docdir}
-prefix = /home/xgy/remote/sst_install
+prefix = /home/xgy/remote/sst_install_mpi
 program_transform_name = s,x,x,
 psdir = ${docdir}
 runstatedir = ${localstatedir}/run
@@ -646,6 +650,7 @@ libSnnDL_la_SOURCES = \
 	api/ISynapseRoute.h \
 	api/SynapseRouteBuildConfig.h \
 	api/SnnWeightReader.h \
+	api/IWeightReaderAdopter.h \
 	api/SnnDLLogging.h \
 	events/GatingDecisionEvent.h \
 	events/GasStepBarrierEvent.h \
@@ -679,6 +684,12 @@ libSnnDL_la_SOURCES = \
 	components/stimulus/SpikeSource.h \
 	components/WeightLoader.cc \
 	components/WeightLoader.h \
+	components/workload_stats/IWorkloadStatsModule.h \
+	components/workload_stats/KeyedCounterStatsModule.h \
+	components/workload_stats/StreamWorkloadStatsModule.h \
+	components/workload_stats/TensorWorkloadStatsModule.h \
+	components/workload_stats/WorkloadStatsRegistry.cc \
+	components/workload_stats/WorkloadStatsRegistry.h \
 	control/SnnPESubComponent.cc \
 	control/SnnPESubComponent.h \
 	control/SnnPESubComponent_impl.h \
@@ -756,6 +767,8 @@ libSnnDL_la_SOURCES = \
 	services/workload/stream/StreamWorkload.h \
 	services/workload/traffic/TrafficWorkload.cc \
 	services/workload/traffic/TrafficWorkload.h \
+	services/workload/tensor/TensorWorkload.cc \
+	services/workload/tensor/TensorWorkload.h \
 	services/memory/StandardMemAccess.cc \
 	services/memory/StandardMemAccess.h
 
@@ -900,6 +913,15 @@ components/stimulus/SpikeSource.lo:  \
 	components/stimulus/$(DEPDIR)/$(am__dirstamp)
 components/WeightLoader.lo: components/$(am__dirstamp) \
 	components/$(DEPDIR)/$(am__dirstamp)
+components/workload_stats/$(am__dirstamp):
+	@$(MKDIR_P) components/workload_stats
+	@: > components/workload_stats/$(am__dirstamp)
+components/workload_stats/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) components/workload_stats/$(DEPDIR)
+	@: > components/workload_stats/$(DEPDIR)/$(am__dirstamp)
+components/workload_stats/WorkloadStatsRegistry.lo:  \
+	components/workload_stats/$(am__dirstamp) \
+	components/workload_stats/$(DEPDIR)/$(am__dirstamp)
 control/$(am__dirstamp):
 	@$(MKDIR_P) control
 	@: > control/$(am__dirstamp)
@@ -1086,6 +1108,15 @@ services/workload/traffic/$(DEPDIR)/$(am__dirstamp):
 services/workload/traffic/TrafficWorkload.lo:  \
 	services/workload/traffic/$(am__dirstamp) \
 	services/workload/traffic/$(DEPDIR)/$(am__dirstamp)
+services/workload/tensor/$(am__dirstamp):
+	@$(MKDIR_P) services/workload/tensor
+	@: > services/workload/tensor/$(am__dirstamp)
+services/workload/tensor/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) services/workload/tensor/$(DEPDIR)
+	@: > services/workload/tensor/$(DEPDIR)/$(am__dirstamp)
+services/workload/tensor/TensorWorkload.lo:  \
+	services/workload/tensor/$(am__dirstamp) \
+	services/workload/tensor/$(DEPDIR)/$(am__dirstamp)
 services/memory/$(am__dirstamp):
 	@$(MKDIR_P) services/memory
 	@: > services/memory/$(am__dirstamp)
@@ -1112,6 +1143,8 @@ mostlyclean-compile:
 	-rm -f components/noc/*.lo
 	-rm -f components/stimulus/*.$(OBJEXT)
 	-rm -f components/stimulus/*.lo
+	-rm -f components/workload_stats/*.$(OBJEXT)
+	-rm -f components/workload_stats/*.lo
 	-rm -f compute/*.$(OBJEXT)
 	-rm -f compute/*.lo
 	-rm -f control/*.$(OBJEXT)
@@ -1140,6 +1173,8 @@ mostlyclean-compile:
 	-rm -f services/workload/snn/*.lo
 	-rm -f services/workload/stream/*.$(OBJEXT)
 	-rm -f services/workload/stream/*.lo
+	-rm -f services/workload/tensor/*.$(OBJEXT)
+	-rm -f services/workload/tensor/*.lo
 	-rm -f services/workload/traffic/*.$(OBJEXT)
 	-rm -f services/workload/traffic/*.lo
 
@@ -1162,6 +1197,7 @@ include components/noc/$(DEPDIR)/MulticastRouter.Plo # am--include-marker
 include components/noc/$(DEPDIR)/SimpleNetworkWrapper.Plo # am--include-marker
 include components/noc/$(DEPDIR)/SnnNetworkAdapter.Plo # am--include-marker
 include components/stimulus/$(DEPDIR)/SpikeSource.Plo # am--include-marker
+include components/workload_stats/$(DEPDIR)/WorkloadStatsRegistry.Plo # am--include-marker
 include compute/$(DEPDIR)/SnnComputeCore.Plo # am--include-marker
 include compute/$(DEPDIR)/SnnCoreEngine.Plo # am--include-marker
 include compute/$(DEPDIR)/SnnLearningCore.Plo # am--include-marker
@@ -1199,6 +1235,7 @@ include services/workload/$(DEPDIR)/CoreWorkloadFactory.Plo # am--include-marker
 include services/workload/layout/$(DEPDIR)/NormalizedNeuronLayout.Plo # am--include-marker
 include services/workload/snn/$(DEPDIR)/SnnWorkload.Plo # am--include-marker
 include services/workload/stream/$(DEPDIR)/StreamWorkload.Plo # am--include-marker
+include services/workload/tensor/$(DEPDIR)/TensorWorkload.Plo # am--include-marker
 include services/workload/traffic/$(DEPDIR)/TrafficWorkload.Plo # am--include-marker
 
 $(am__depfiles_remade):
@@ -1242,6 +1279,7 @@ clean-libtool:
 	-rm -rf components/multicore/.libs components/multicore/_libs
 	-rm -rf components/noc/.libs components/noc/_libs
 	-rm -rf components/stimulus/.libs components/stimulus/_libs
+	-rm -rf components/workload_stats/.libs components/workload_stats/_libs
 	-rm -rf compute/.libs compute/_libs
 	-rm -rf control/.libs control/_libs
 	-rm -rf events/.libs events/_libs
@@ -1256,6 +1294,7 @@ clean-libtool:
 	-rm -rf services/workload/layout/.libs services/workload/layout/_libs
 	-rm -rf services/workload/snn/.libs services/workload/snn/_libs
 	-rm -rf services/workload/stream/.libs services/workload/stream/_libs
+	-rm -rf services/workload/tensor/.libs services/workload/tensor/_libs
 	-rm -rf services/workload/traffic/.libs services/workload/traffic/_libs
 snippets-local: 
 
@@ -1388,6 +1427,8 @@ distclean-generic:
 	-rm -f components/noc/$(am__dirstamp)
 	-rm -f components/stimulus/$(DEPDIR)/$(am__dirstamp)
 	-rm -f components/stimulus/$(am__dirstamp)
+	-rm -f components/workload_stats/$(DEPDIR)/$(am__dirstamp)
+	-rm -f components/workload_stats/$(am__dirstamp)
 	-rm -f compute/$(DEPDIR)/$(am__dirstamp)
 	-rm -f compute/$(am__dirstamp)
 	-rm -f control/$(DEPDIR)/$(am__dirstamp)
@@ -1416,6 +1457,8 @@ distclean-generic:
 	-rm -f services/workload/snn/$(am__dirstamp)
 	-rm -f services/workload/stream/$(DEPDIR)/$(am__dirstamp)
 	-rm -f services/workload/stream/$(am__dirstamp)
+	-rm -f services/workload/tensor/$(DEPDIR)/$(am__dirstamp)
+	-rm -f services/workload/tensor/$(am__dirstamp)
 	-rm -f services/workload/traffic/$(DEPDIR)/$(am__dirstamp)
 	-rm -f services/workload/traffic/$(am__dirstamp)
 
@@ -1444,6 +1487,7 @@ distclean: distclean-am
 	-rm -f components/noc/$(DEPDIR)/SimpleNetworkWrapper.Plo
 	-rm -f components/noc/$(DEPDIR)/SnnNetworkAdapter.Plo
 	-rm -f components/stimulus/$(DEPDIR)/SpikeSource.Plo
+	-rm -f components/workload_stats/$(DEPDIR)/WorkloadStatsRegistry.Plo
 	-rm -f compute/$(DEPDIR)/SnnComputeCore.Plo
 	-rm -f compute/$(DEPDIR)/SnnCoreEngine.Plo
 	-rm -f compute/$(DEPDIR)/SnnLearningCore.Plo
@@ -1481,6 +1525,7 @@ distclean: distclean-am
 	-rm -f services/workload/layout/$(DEPDIR)/NormalizedNeuronLayout.Plo
 	-rm -f services/workload/snn/$(DEPDIR)/SnnWorkload.Plo
 	-rm -f services/workload/stream/$(DEPDIR)/StreamWorkload.Plo
+	-rm -f services/workload/tensor/$(DEPDIR)/TensorWorkload.Plo
 	-rm -f services/workload/traffic/$(DEPDIR)/TrafficWorkload.Plo
 	-rm -f Makefile
 distclean-am: clean-am distclean-compile distclean-generic \
@@ -1543,6 +1588,7 @@ maintainer-clean: maintainer-clean-am
 	-rm -f components/noc/$(DEPDIR)/SimpleNetworkWrapper.Plo
 	-rm -f components/noc/$(DEPDIR)/SnnNetworkAdapter.Plo
 	-rm -f components/stimulus/$(DEPDIR)/SpikeSource.Plo
+	-rm -f components/workload_stats/$(DEPDIR)/WorkloadStatsRegistry.Plo
 	-rm -f compute/$(DEPDIR)/SnnComputeCore.Plo
 	-rm -f compute/$(DEPDIR)/SnnCoreEngine.Plo
 	-rm -f compute/$(DEPDIR)/SnnLearningCore.Plo
@@ -1580,6 +1626,7 @@ maintainer-clean: maintainer-clean-am
 	-rm -f services/workload/layout/$(DEPDIR)/NormalizedNeuronLayout.Plo
 	-rm -f services/workload/snn/$(DEPDIR)/SnnWorkload.Plo
 	-rm -f services/workload/stream/$(DEPDIR)/StreamWorkload.Plo
+	-rm -f services/workload/tensor/$(DEPDIR)/TensorWorkload.Plo
 	-rm -f services/workload/traffic/$(DEPDIR)/TrafficWorkload.Plo
 	-rm -f Makefile
 maintainer-clean-am: distclean-am maintainer-clean-generic

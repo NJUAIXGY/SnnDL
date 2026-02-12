@@ -223,17 +223,18 @@ public:
      */
     void injectDirectionLink(const std::string& direction, SST::Link* link);
     
-    /**
-     * @brief 从父组件发送事件到指定方向
-     * @param event 要发送的事件
-     * @param direction 发送方向
-     */
-    void sendEventToDirection(SST::Event* event, const std::string& direction);
-    
-    // === SST组件生命周期方法 ===
-    void init(unsigned int phase) override;
-    void setup() override;
-    void finish() override;
+	    /**
+	     * @brief 从父组件发送事件到指定方向
+	     * @param event 要发送的事件
+	     * @param direction 发送方向
+	     * @return true 表示已成功注入链路（send接管event生命周期），false 表示丢弃（已delete event）
+	     */
+	    bool sendEventToDirection(SST::Event* event, const std::string& direction);
+	    
+	    // === SST组件生命周期方法 ===
+	    void init(unsigned int phase) override;
+	    void setup() override;
+	    void finish() override;
 
 private:
     // === 内部初始化方法 ===

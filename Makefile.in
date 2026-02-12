@@ -187,8 +187,9 @@ am_libSnnDL_la_OBJECTS = events/SimpleTestEvent.lo \
 	components/multicore/MultiCorePEConfig.lo \
 	components/MultiCorePE.lo components/SnnNIC.lo \
 	components/SnnPE.lo components/stimulus/SpikeSource.lo \
-	components/WeightLoader.lo control/SnnPESubComponent.lo \
-	control/SnnPESubComponent_bcsr.lo \
+	components/WeightLoader.lo \
+	components/workload_stats/WorkloadStatsRegistry.lo \
+	control/SnnPESubComponent.lo control/SnnPESubComponent_bcsr.lo \
 	control/SnnPESubComponent_routing.lo \
 	control/SnnPESubComponent_scheme1.lo \
 	control/SnnPESubComponent_spike.lo \
@@ -224,6 +225,7 @@ am_libSnnDL_la_OBJECTS = events/SimpleTestEvent.lo \
 	services/workload/snn/SnnWorkload.lo \
 	services/workload/stream/StreamWorkload.lo \
 	services/workload/traffic/TrafficWorkload.lo \
+	services/workload/tensor/TensorWorkload.lo \
 	services/memory/StandardMemAccess.lo
 libSnnDL_la_OBJECTS = $(am_libSnnDL_la_OBJECTS)
 AM_V_lt = $(am__v_lt_@AM_V@)
@@ -263,6 +265,7 @@ am__depfiles_remade = components/$(DEPDIR)/CachelineFragmentMemIF.Plo \
 	components/noc/$(DEPDIR)/SimpleNetworkWrapper.Plo \
 	components/noc/$(DEPDIR)/SnnNetworkAdapter.Plo \
 	components/stimulus/$(DEPDIR)/SpikeSource.Plo \
+	components/workload_stats/$(DEPDIR)/WorkloadStatsRegistry.Plo \
 	compute/$(DEPDIR)/SnnComputeCore.Plo \
 	compute/$(DEPDIR)/SnnCoreEngine.Plo \
 	compute/$(DEPDIR)/SnnLearningCore.Plo \
@@ -300,6 +303,7 @@ am__depfiles_remade = components/$(DEPDIR)/CachelineFragmentMemIF.Plo \
 	services/workload/layout/$(DEPDIR)/NormalizedNeuronLayout.Plo \
 	services/workload/snn/$(DEPDIR)/SnnWorkload.Plo \
 	services/workload/stream/$(DEPDIR)/StreamWorkload.Plo \
+	services/workload/tensor/$(DEPDIR)/TensorWorkload.Plo \
 	services/workload/traffic/$(DEPDIR)/TrafficWorkload.Plo
 am__mv = mv -f
 CXXCOMPILE = $(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) \
@@ -646,6 +650,7 @@ libSnnDL_la_SOURCES = \
 	api/ISynapseRoute.h \
 	api/SynapseRouteBuildConfig.h \
 	api/SnnWeightReader.h \
+	api/IWeightReaderAdopter.h \
 	api/SnnDLLogging.h \
 	events/GatingDecisionEvent.h \
 	events/GasStepBarrierEvent.h \
@@ -679,6 +684,12 @@ libSnnDL_la_SOURCES = \
 	components/stimulus/SpikeSource.h \
 	components/WeightLoader.cc \
 	components/WeightLoader.h \
+	components/workload_stats/IWorkloadStatsModule.h \
+	components/workload_stats/KeyedCounterStatsModule.h \
+	components/workload_stats/StreamWorkloadStatsModule.h \
+	components/workload_stats/TensorWorkloadStatsModule.h \
+	components/workload_stats/WorkloadStatsRegistry.cc \
+	components/workload_stats/WorkloadStatsRegistry.h \
 	control/SnnPESubComponent.cc \
 	control/SnnPESubComponent.h \
 	control/SnnPESubComponent_impl.h \
@@ -756,6 +767,8 @@ libSnnDL_la_SOURCES = \
 	services/workload/stream/StreamWorkload.h \
 	services/workload/traffic/TrafficWorkload.cc \
 	services/workload/traffic/TrafficWorkload.h \
+	services/workload/tensor/TensorWorkload.cc \
+	services/workload/tensor/TensorWorkload.h \
 	services/memory/StandardMemAccess.cc \
 	services/memory/StandardMemAccess.h
 
@@ -900,6 +913,15 @@ components/stimulus/SpikeSource.lo:  \
 	components/stimulus/$(DEPDIR)/$(am__dirstamp)
 components/WeightLoader.lo: components/$(am__dirstamp) \
 	components/$(DEPDIR)/$(am__dirstamp)
+components/workload_stats/$(am__dirstamp):
+	@$(MKDIR_P) components/workload_stats
+	@: > components/workload_stats/$(am__dirstamp)
+components/workload_stats/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) components/workload_stats/$(DEPDIR)
+	@: > components/workload_stats/$(DEPDIR)/$(am__dirstamp)
+components/workload_stats/WorkloadStatsRegistry.lo:  \
+	components/workload_stats/$(am__dirstamp) \
+	components/workload_stats/$(DEPDIR)/$(am__dirstamp)
 control/$(am__dirstamp):
 	@$(MKDIR_P) control
 	@: > control/$(am__dirstamp)
@@ -1086,6 +1108,15 @@ services/workload/traffic/$(DEPDIR)/$(am__dirstamp):
 services/workload/traffic/TrafficWorkload.lo:  \
 	services/workload/traffic/$(am__dirstamp) \
 	services/workload/traffic/$(DEPDIR)/$(am__dirstamp)
+services/workload/tensor/$(am__dirstamp):
+	@$(MKDIR_P) services/workload/tensor
+	@: > services/workload/tensor/$(am__dirstamp)
+services/workload/tensor/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) services/workload/tensor/$(DEPDIR)
+	@: > services/workload/tensor/$(DEPDIR)/$(am__dirstamp)
+services/workload/tensor/TensorWorkload.lo:  \
+	services/workload/tensor/$(am__dirstamp) \
+	services/workload/tensor/$(DEPDIR)/$(am__dirstamp)
 services/memory/$(am__dirstamp):
 	@$(MKDIR_P) services/memory
 	@: > services/memory/$(am__dirstamp)
@@ -1112,6 +1143,8 @@ mostlyclean-compile:
 	-rm -f components/noc/*.lo
 	-rm -f components/stimulus/*.$(OBJEXT)
 	-rm -f components/stimulus/*.lo
+	-rm -f components/workload_stats/*.$(OBJEXT)
+	-rm -f components/workload_stats/*.lo
 	-rm -f compute/*.$(OBJEXT)
 	-rm -f compute/*.lo
 	-rm -f control/*.$(OBJEXT)
@@ -1140,6 +1173,8 @@ mostlyclean-compile:
 	-rm -f services/workload/snn/*.lo
 	-rm -f services/workload/stream/*.$(OBJEXT)
 	-rm -f services/workload/stream/*.lo
+	-rm -f services/workload/tensor/*.$(OBJEXT)
+	-rm -f services/workload/tensor/*.lo
 	-rm -f services/workload/traffic/*.$(OBJEXT)
 	-rm -f services/workload/traffic/*.lo
 
@@ -1162,6 +1197,7 @@ distclean-compile:
 @AMDEP_TRUE@@am__include@ @am__quote@components/noc/$(DEPDIR)/SimpleNetworkWrapper.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@components/noc/$(DEPDIR)/SnnNetworkAdapter.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@components/stimulus/$(DEPDIR)/SpikeSource.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@components/workload_stats/$(DEPDIR)/WorkloadStatsRegistry.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@compute/$(DEPDIR)/SnnComputeCore.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@compute/$(DEPDIR)/SnnCoreEngine.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@compute/$(DEPDIR)/SnnLearningCore.Plo@am__quote@ # am--include-marker
@@ -1199,6 +1235,7 @@ distclean-compile:
 @AMDEP_TRUE@@am__include@ @am__quote@services/workload/layout/$(DEPDIR)/NormalizedNeuronLayout.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@services/workload/snn/$(DEPDIR)/SnnWorkload.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@services/workload/stream/$(DEPDIR)/StreamWorkload.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@services/workload/tensor/$(DEPDIR)/TensorWorkload.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@services/workload/traffic/$(DEPDIR)/TrafficWorkload.Plo@am__quote@ # am--include-marker
 
 $(am__depfiles_remade):
@@ -1242,6 +1279,7 @@ clean-libtool:
 	-rm -rf components/multicore/.libs components/multicore/_libs
 	-rm -rf components/noc/.libs components/noc/_libs
 	-rm -rf components/stimulus/.libs components/stimulus/_libs
+	-rm -rf components/workload_stats/.libs components/workload_stats/_libs
 	-rm -rf compute/.libs compute/_libs
 	-rm -rf control/.libs control/_libs
 	-rm -rf events/.libs events/_libs
@@ -1256,6 +1294,7 @@ clean-libtool:
 	-rm -rf services/workload/layout/.libs services/workload/layout/_libs
 	-rm -rf services/workload/snn/.libs services/workload/snn/_libs
 	-rm -rf services/workload/stream/.libs services/workload/stream/_libs
+	-rm -rf services/workload/tensor/.libs services/workload/tensor/_libs
 	-rm -rf services/workload/traffic/.libs services/workload/traffic/_libs
 snippets-local: 
 
@@ -1388,6 +1427,8 @@ distclean-generic:
 	-rm -f components/noc/$(am__dirstamp)
 	-rm -f components/stimulus/$(DEPDIR)/$(am__dirstamp)
 	-rm -f components/stimulus/$(am__dirstamp)
+	-rm -f components/workload_stats/$(DEPDIR)/$(am__dirstamp)
+	-rm -f components/workload_stats/$(am__dirstamp)
 	-rm -f compute/$(DEPDIR)/$(am__dirstamp)
 	-rm -f compute/$(am__dirstamp)
 	-rm -f control/$(DEPDIR)/$(am__dirstamp)
@@ -1416,6 +1457,8 @@ distclean-generic:
 	-rm -f services/workload/snn/$(am__dirstamp)
 	-rm -f services/workload/stream/$(DEPDIR)/$(am__dirstamp)
 	-rm -f services/workload/stream/$(am__dirstamp)
+	-rm -f services/workload/tensor/$(DEPDIR)/$(am__dirstamp)
+	-rm -f services/workload/tensor/$(am__dirstamp)
 	-rm -f services/workload/traffic/$(DEPDIR)/$(am__dirstamp)
 	-rm -f services/workload/traffic/$(am__dirstamp)
 
@@ -1444,6 +1487,7 @@ distclean: distclean-am
 	-rm -f components/noc/$(DEPDIR)/SimpleNetworkWrapper.Plo
 	-rm -f components/noc/$(DEPDIR)/SnnNetworkAdapter.Plo
 	-rm -f components/stimulus/$(DEPDIR)/SpikeSource.Plo
+	-rm -f components/workload_stats/$(DEPDIR)/WorkloadStatsRegistry.Plo
 	-rm -f compute/$(DEPDIR)/SnnComputeCore.Plo
 	-rm -f compute/$(DEPDIR)/SnnCoreEngine.Plo
 	-rm -f compute/$(DEPDIR)/SnnLearningCore.Plo
@@ -1481,6 +1525,7 @@ distclean: distclean-am
 	-rm -f services/workload/layout/$(DEPDIR)/NormalizedNeuronLayout.Plo
 	-rm -f services/workload/snn/$(DEPDIR)/SnnWorkload.Plo
 	-rm -f services/workload/stream/$(DEPDIR)/StreamWorkload.Plo
+	-rm -f services/workload/tensor/$(DEPDIR)/TensorWorkload.Plo
 	-rm -f services/workload/traffic/$(DEPDIR)/TrafficWorkload.Plo
 	-rm -f Makefile
 distclean-am: clean-am distclean-compile distclean-generic \
@@ -1543,6 +1588,7 @@ maintainer-clean: maintainer-clean-am
 	-rm -f components/noc/$(DEPDIR)/SimpleNetworkWrapper.Plo
 	-rm -f components/noc/$(DEPDIR)/SnnNetworkAdapter.Plo
 	-rm -f components/stimulus/$(DEPDIR)/SpikeSource.Plo
+	-rm -f components/workload_stats/$(DEPDIR)/WorkloadStatsRegistry.Plo
 	-rm -f compute/$(DEPDIR)/SnnComputeCore.Plo
 	-rm -f compute/$(DEPDIR)/SnnCoreEngine.Plo
 	-rm -f compute/$(DEPDIR)/SnnLearningCore.Plo
@@ -1580,6 +1626,7 @@ maintainer-clean: maintainer-clean-am
 	-rm -f services/workload/layout/$(DEPDIR)/NormalizedNeuronLayout.Plo
 	-rm -f services/workload/snn/$(DEPDIR)/SnnWorkload.Plo
 	-rm -f services/workload/stream/$(DEPDIR)/StreamWorkload.Plo
+	-rm -f services/workload/tensor/$(DEPDIR)/TensorWorkload.Plo
 	-rm -f services/workload/traffic/$(DEPDIR)/TrafficWorkload.Plo
 	-rm -f Makefile
 maintainer-clean-am: distclean-am maintainer-clean-generic

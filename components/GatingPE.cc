@@ -149,6 +149,7 @@ void GatingPE::writeCSV() {
 
 bool GatingPE::parseTargets(const std::string& s, std::vector<uint32_t>& out) {
     // format: a-b,c,d-e
+    out.clear();
     std::istringstream ss(s);
     std::string tok;
     while (std::getline(ss, tok, ',')) {
@@ -159,6 +160,7 @@ bool GatingPE::parseTargets(const std::string& s, std::vector<uint32_t>& out) {
         } else {
             uint32_t a = (uint32_t)std::stoul(tok.substr(0,dash));
             uint32_t b = (uint32_t)std::stoul(tok.substr(dash+1));
+            if (b < a) continue;
             for (uint32_t x=a; x<=b; ++x) out.push_back(x);
         }
     }
@@ -168,17 +170,17 @@ bool GatingPE::parseTargets(const std::string& s, std::vector<uint32_t>& out) {
 bool GatingPE::onEmitTick(SST::Cycle_t) {
     if (!nic_) return false;
     // 解析一次targets
-    static std::vector<uint32_t> targets; if (targets.empty()) parseTargets(gate_targets_, targets);
+    if (parsed_targets_.empty()) parseTargets(gate_targets_, parsed_targets_);
     // 解析一次transitions
-    static std::vector<Transition> trs; if (trs.empty()) parseTransitions(transitions_, trs);
-    if (targets.empty() || trs.empty()) return false;
+    if (parsed_transitions_.empty()) parseTransitions(transitions_, parsed_transitions_);
+    if (parsed_targets_.empty() || parsed_transitions_.empty()) return false;
 
     // 简单轮转：每个目标源PE发一个决策（src_row按emit_sent_轮转）
     uint32_t row = (rows_per_pe_ == 0) ? 0u : (uint32_t)(emit_sent_ % rows_per_pe_);
-    for (uint32_t src_pe : targets) {
+    for (uint32_t src_pe : parsed_targets_) {
         // 找到对应的dst范围
         std::vector<uint32_t> dst_pes;
-        for (auto &tr : trs) if (src_pe >= tr.src.a && src_pe <= tr.src.b) {
+        for (auto &tr : parsed_transitions_) if (src_pe >= tr.src.a && src_pe <= tr.src.b) {
             for (uint32_t p=tr.dst.a; p<=tr.dst.b; ++p) dst_pes.push_back(p);
         }
         if (dst_pes.empty()) continue;

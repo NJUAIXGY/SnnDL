@@ -400,6 +400,7 @@ bool SnnNIC::handleIncoming(int vn)
                 pkt->dst_endpoint = p.dst_endpoint;
                 pkt->kind = p.kind;
                 pkt->hop_count = p.hop_count;
+                pkt->step_seq = p.step_seq;
                 pkt->timestamp = p.timestamp;
                 pkt->payload = std::move(p.payload);
                 deliverPacket(pkt);
@@ -699,6 +700,7 @@ void SnnNIC::flushBatchToNode_(uint32_t dest_node, bool is_timeout)
         pp.dst_endpoint = pkt->dst_endpoint;
         pp.kind = pkt->kind;
         pp.hop_count = pkt->hop_count;
+        pp.step_seq = pkt->step_seq;
         pp.timestamp = pkt->timestamp;
         pp.payload = std::move(pkt->payload);
         payload_sum += static_cast<uint64_t>(pp.payload.size());
@@ -755,6 +757,8 @@ bool SnnNIC::sendControl(SST::Event* ev, uint32_t dest_node)
         stat_packets_sent->addData(1);
         return true;
     }
+    // 失败：取回 payload，保持“失败时由调用方负责释放”的语义（避免 double free）
+    (void)req->takePayload();
     delete req;
     return false;
 }

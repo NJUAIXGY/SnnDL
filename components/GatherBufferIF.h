@@ -215,6 +215,13 @@ private:
         uint32_t size = 0;
     };
 
+    enum class ReadAttachKind : uint8_t {
+        OpenStep,
+        ManualBeginGather,
+        QueuedImport,
+        ImmediateSend,
+    };
+
     // Helpers
     Merge parseMerge(const std::string& s) const;
     Sort parseSort(const std::string& s) const;
@@ -250,6 +257,14 @@ private:
     void rebuildIssueOrder_(int buf);
     void issueMoreUnissuedFromOrder_(int buf);
     void issueUnissuedGranulesDeterministic_(int buf);
+    bool attachReadToGranule_(int tgt_buf,
+                              SST::Interfaces::StandardMem::Read* rd,
+                              ReadAttachKind kind,
+                              bool issue_now,
+                              uint32_t seq,
+                              int stage,
+                              int buf);
+    bool drainQueuedNonGatherReadsToGather_(ReadAttachKind kind, uint32_t seq, int stage);
     bool byteExactVerifyEnabled_() const;
     void verifyByteExactDenseRowcol_(uint64_t addr, const std::vector<uint8_t>& data);
     void verifyByteExactRawBcsr_(uint64_t addr, const std::vector<uint8_t>& data);

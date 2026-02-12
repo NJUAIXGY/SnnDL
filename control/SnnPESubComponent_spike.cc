@@ -10,7 +10,7 @@
 #include "SnnPESubComponent.h"
 #include "SnnPESubComponent_impl.h"
 #include "ISpikeWorkload.h"
-#include "SpikeEvent.h"
+#include "events/SpikeEvent.h"
 #include "synapse/weights/WeightAccessor.h"
 #include "synapse/weights/WeightMemorySubsystem.h"
 #include "SnnDLLogging.h"

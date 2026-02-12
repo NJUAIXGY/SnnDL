@@ -68,23 +68,24 @@ bool SnnPESubComponent::parseBcsrMeta(const std::string& meta_path, uint32_t& ro
                                       uint64_t& rowptr_off_out, uint64_t& colidx_off_out,
                                       uint64_t& blockdata_off_out, uint64_t& blockids_off_out,
                                       uint32_t& total_blocks_out) const {
-    std::ifstream meta(meta_path);
-    if (!meta.good()) return false;
-    std::string text((std::istreambuf_iterator<char>(meta)), std::istreambuf_iterator<char>());
-    uint64_t value = 0;
-    bool ok = false;
-    if (bcsrExtractUnsignedJson(text, "\"rows\"", value)) { rows_out = static_cast<uint32_t>(value); ok = true; }
-    if (bcsrExtractUnsignedJson(text, "\"cols\"", value)) { cols_out = static_cast<uint32_t>(value); ok = true; }
-    if (bcsrExtractUnsignedJson(text, "\"br\"", value)) { br_out = static_cast<uint32_t>(value); ok = true; }
-    if (bcsrExtractUnsignedJson(text, "\"bc\"", value)) { bc_out = static_cast<uint32_t>(value); ok = true; }
-    if (bcsrExtractUnsignedJson(text, "\"idx_bytes\"", value)) { idx_bytes_out = static_cast<uint32_t>(value); ok = true; }
-    if (bcsrExtractUnsignedJson(text, "\"val_bytes\"", value)) { val_bytes_out = static_cast<uint32_t>(value); ok = true; }
-    if (bcsrExtractUnsignedJson(text, "\"rowptr_offset\"", value)) { rowptr_off_out = value; ok = true; }
-    if (bcsrExtractUnsignedJson(text, "\"colidx_offset\"", value)) { colidx_off_out = value; ok = true; }
-    if (bcsrExtractUnsignedJson(text, "\"blockdata_offset\"", value)) { blockdata_off_out = value; ok = true; }
-    if (bcsrExtractUnsignedJson(text, "\"blockids_offset\"", value)) { blockids_off_out = value; ok = true; }
-    if (bcsrExtractUnsignedJson(text, "\"total_blocks\"", value)) { total_blocks_out = static_cast<uint32_t>(value); ok = true; }
-    return ok;
+    BcsrMeta meta{};
+    if (!parseBcsrMetaJsonFile(meta_path, meta)) return false;
+
+    if (meta.rows == 0 || meta.cols == 0) return false;
+    if (meta.rowptr_offset == 0 && meta.colidx_offset == 0 && meta.blockdata_offset == 0) return false;
+
+    rows_out = meta.rows;
+    cols_out = meta.cols;
+    br_out = meta.br;
+    bc_out = meta.bc;
+    idx_bytes_out = meta.idx_bytes;
+    val_bytes_out = meta.val_bytes;
+    rowptr_off_out = meta.rowptr_offset;
+    colidx_off_out = meta.colidx_offset;
+    blockdata_off_out = meta.blockdata_offset;
+    blockids_off_out = meta.blockids_offset;
+    total_blocks_out = meta.total_blocks;
+    return true;
 }
 
 float SnnPESubComponent::readBcsrWeightFromFile_(uint32_t post_local, uint32_t pre_global) const {

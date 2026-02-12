@@ -188,6 +188,9 @@ SnnNetworkAdapter::~SnnNetworkAdapter()
     if (output) delete output;
     output = nullptr;
 
+    if (simple_network_wrapper) delete simple_network_wrapper;
+    simple_network_wrapper = nullptr;
+
     while (!pending_sends_.empty()) {
         auto& ps = pending_sends_.front();
         delete ps.payload;
@@ -263,6 +266,7 @@ bool SnnNetworkAdapter::handleIncoming(int vn)
                 pkt->dst_endpoint = p.dst_endpoint;
                 pkt->kind = p.kind;
                 pkt->hop_count = p.hop_count;
+                pkt->step_seq = p.step_seq;
                 pkt->timestamp = p.timestamp;
                 pkt->payload = std::move(p.payload);
                 if (receive_handler_) receive_handler_(pkt);
@@ -312,7 +316,7 @@ void SnnNetworkAdapter::handleDirectEvent(SST::Event* event)
 {
     if (!event) return;
     if (auto* pkt = dynamic_cast<NocPacketEvent*>(event)) {
-        constexpr uint16_t kMaxHops = 10;
+        constexpr uint16_t kMaxHops = NocPacketEvent::kDefaultMaxHops;
         if (pkt->hop_count >= kMaxHops) { delete pkt; return; }
         pkt->hop_count += 1;
         if (pkt->dst_node == node_id) {
@@ -332,20 +336,21 @@ void SnnNetworkAdapter::injectDirectionLink(const std::string& direction, SST::L
     if (link) parent_direction_links[direction] = link;
 }
 
-void SnnNetworkAdapter::sendEventToDirection(SST::Event* event, const std::string& direction)
+bool SnnNetworkAdapter::sendEventToDirection(SST::Event* event, const std::string& direction)
 {
-    if (!event) return;
+    if (!event) return false;
     auto it = direction_links.find(direction);
     if (it != direction_links.end() && it->second) {
         it->second->send(event);
-        return;
+        return true;
     }
     auto it2 = parent_direction_links.find(direction);
     if (it2 != parent_direction_links.end() && it2->second) {
         it2->second->send(event);
-        return;
+        return true;
     }
     delete event;
+    return false;
 }
 
 void SnnNetworkAdapter::init(unsigned int phase)
@@ -412,11 +417,16 @@ void SnnNetworkAdapter::routeEvent_(SST::Event* event, uint32_t dest_node)
         int port = topology_handler->calculateRoute(dest_node);
         const char* dir = portToDirection_(port);
         if (dir) {
-            sendEventToDirection(event, dir);
-            remote_spikes_count++;
-            if (stat_remote_spikes) stat_remote_spikes->addData(1);
-            spikes_routed_count++;
-            if (stat_spikes_routed) stat_spikes_routed->addData(1);
+            const bool sent = sendEventToDirection(event, dir);
+            if (sent) {
+                remote_spikes_count++;
+                if (stat_remote_spikes) stat_remote_spikes->addData(1);
+                spikes_routed_count++;
+                if (stat_spikes_routed) stat_spikes_routed->addData(1);
+            } else {
+                packets_dropped++;
+                if (stat_packets_dropped) stat_packets_dropped->addData(1);
+            }
             return;
         }
     }

@@ -3,7 +3,7 @@
 
 #include <sst/core/event.h>
 #include <sst/core/serialization/serializable.h>
-#include "SpikeEvent.h"
+#include "events/SpikeEvent.h"
 
 namespace SST {
 namespace SnnDL {
@@ -42,7 +42,7 @@ public:
      * @brief 设置包装的SpikeEvent
      * @param spike SpikeEvent指针
      */
-    void setSpikeEvent(SpikeEvent* spike) { spike_data = spike; }
+    void setSpikeEvent(SpikeEvent* spike);
     
     /**
      * @brief 克隆事件
@@ -68,6 +68,7 @@ public:
 
 private:
     SpikeEvent* spike_data;  ///< 包装的SpikeEvent数据
+    bool owns_spike_data_ = false;
 };
 
 } // namespace SnnDL

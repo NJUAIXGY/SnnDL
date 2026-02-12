@@ -26,6 +26,8 @@ enum class NocPacketKind : uint16_t {
 
 class NocPacketEvent : public SST::Event {
 public:
+    static constexpr uint16_t kDefaultMaxHops = 10;
+
     uint32_t src_node = 0;
     uint32_t dst_node = 0;
     uint16_t src_endpoint = 0;

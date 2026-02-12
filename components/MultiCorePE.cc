@@ -23,6 +23,7 @@
 #include "SnnDLLogging.h"
 #include "SnnCoreAPI.h"
 #include "multicore/MultiCorePEConfig.h"
+#include "workload_stats/WorkloadStatsRegistry.h"
 
 #include <fstream>
 #include <sstream>
@@ -37,6 +38,7 @@
 #include <climits>
 #include <cinttypes>
 #include <cerrno>
+#include <cstring>
 #include <sys/stat.h>
 #include <sys/types.h>
 
@@ -203,7 +205,17 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
     window_ns_ = window_us_ * 1000ULL; // 1us = 1000ns（组件时钟1GHz，tick≈1ns）
     diag_fire_log_ = cfg.diag_fire_log;
     exec_mode_ = cfg.exec_mode;
-    is_stream_workload_ = (cfg.workload_impl == "stream" || cfg.workload_impl == "traffic");
+    std::vector<std::string> unknown_modules;
+    workload_stats_modules_ =
+        WorkloadStatsRegistry::buildModules(cfg.workload_impl, cfg.workload_stats_modules, &unknown_modules);
+    if (!unknown_modules.empty() && output_) {
+        std::ostringstream oss;
+        for (size_t i = 0; i < unknown_modules.size(); ++i) {
+            if (i) oss << ",";
+            oss << unknown_modules[i];
+        }
+        output_->verbose(CALL_INFO, 1, 0, "[workload_stats] unknown modules ignored: %s\n", oss.str().c_str());
+    }
 
     // Global Step/GAS barrier sync (Phase-step-sync)
     global_step_sync_enable_ = cfg.global_step_sync_enable;
@@ -246,6 +258,15 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
         step_cfg.trigger_core = cfg.step_activation_trigger_core;
         step_cfg.reset_mem_each_step = cfg.step_reset_mem_each_step;
         step_cfg.event_weight = cfg.step_activation_event_weight;
+        {
+            const std::string& pat = cfg.step_activation_pre_pattern;
+            if (pat == "clustered" || pat == "cluster" || pat == "block") {
+                step_cfg.pre_pattern = StepActivationSubsystem::Config::PrePattern::Clustered;
+            } else {
+                step_cfg.pre_pattern = StepActivationSubsystem::Config::PrePattern::BernoulliUniform;
+            }
+        }
+        step_cfg.pre_cluster_len = cfg.step_activation_pre_cluster_len;
         step_cfg.use_bcsr_routes = cfg.step_activation_use_bcsr_routes;
         step_cfg.bcsr_template = cfg.step_activation_bcsr_template;
         step_cfg.bcsr_rows_per_core =
@@ -267,7 +288,7 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
 
         // 通用 workload（例如 stream）下必须禁用 Step/Synapse 语义注入，否则会污染纯通信/纯内存负载。
         // 选择来源：优先 Params.workload_impl，其次环境变量 SNNDL_WORKLOAD_IMPL（保持脚本不改的兼容路径）。
-        if (cfg.workload_impl == "stream" || cfg.workload_impl == "traffic") {
+        if (isNonSnnWorkloadKind(cfg.workload_kind)) {
             step_cfg.enable = false;
             step_cfg.fraction = 0.0;
             step_cfg.fanout = 0;
@@ -356,28 +377,8 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
         unit_states_[i].is_active = false;
         unit_states_[i].spikes_processed = 0;
         unit_states_[i].neurons_fired = 0;
-        unit_states_[i].stream_mem_writes_issued_total = 0;
-        unit_states_[i].stream_mem_reads_issued_total = 0;
-        unit_states_[i].stream_mem_bytes_written_total = 0;
-        unit_states_[i].stream_mem_bytes_read_total = 0;
-        unit_states_[i].stream_mem_verify_pass_total = 0;
-        unit_states_[i].stream_mem_verify_fail_total = 0;
-        unit_states_[i].stream_pkt_sent_total = 0;
-        unit_states_[i].stream_pkt_recv_total = 0;
-        unit_states_[i].stream_pkt_bad_crc_total = 0;
-        unit_states_[i].stream_pkt_bad_magic_total = 0;
         unit_states_[i].utilization = 0.0;
     }
-    stream_mem_verify_fail_last_.assign(static_cast<size_t>(num_cores_), 0);
-    stream_mem_verify_pass_last_.assign(static_cast<size_t>(num_cores_), 0);
-    stream_mem_writes_issued_last_.assign(static_cast<size_t>(num_cores_), 0);
-    stream_mem_reads_issued_last_.assign(static_cast<size_t>(num_cores_), 0);
-    stream_mem_bytes_written_last_.assign(static_cast<size_t>(num_cores_), 0);
-    stream_mem_bytes_read_last_.assign(static_cast<size_t>(num_cores_), 0);
-    stream_pkt_sent_last_.assign(static_cast<size_t>(num_cores_), 0);
-    stream_pkt_recv_last_.assign(static_cast<size_t>(num_cores_), 0);
-    stream_pkt_bad_crc_last_.assign(static_cast<size_t>(num_cores_), 0);
-    stream_pkt_bad_magic_last_.assign(static_cast<size_t>(num_cores_), 0);
     
     // 初始化组件指针为空
     l2_cache_ = nullptr;
@@ -891,6 +892,7 @@ void MultiCorePE::driveCoresManually_(Cycle_t current_cycle) {
 }
 
 void MultiCorePE::refreshProcessingUnitStates_() {
+    static const std::map<std::string, uint64_t> kEmptyStats;
     // 更新处理单元状态统计（从SnnPE SubComponent获取实际数据）
     for (int i = 0; i < num_cores_; i++) {
         if (cores_[i] != nullptr) {
@@ -898,32 +900,15 @@ void MultiCorePE::refreshProcessingUnitStates_() {
             cores_[i]->getStatistics(core_stats);
             auto it_sp = core_stats.find("spikes_received");
             auto it_nf = core_stats.find("neurons_fired");
-            auto it_sm_w = core_stats.find("stream_mem_writes_issued_total");
-            auto it_sm_r = core_stats.find("stream_mem_reads_issued_total");
-            auto it_sm_bw = core_stats.find("stream_mem_bytes_written_total");
-            auto it_sm_br = core_stats.find("stream_mem_bytes_read_total");
-            auto it_sm_vp = core_stats.find("stream_mem_verify_pass_total");
-            auto it_sm_vf = core_stats.find("stream_mem_verify_fail_total");
-            auto it_pkt_s = core_stats.find("stream_pkt_sent_total");
-            auto it_pkt_r = core_stats.find("stream_pkt_recv_total");
-            auto it_pkt_bc = core_stats.find("stream_pkt_bad_crc_total");
-            auto it_pkt_bm = core_stats.find("stream_pkt_bad_magic_total");
             uint64_t old_spikes = unit_states_[i].spikes_processed;
             uint64_t new_spikes = (it_sp != core_stats.end()) ? it_sp->second : 0;
             unit_states_[i].spikes_processed = new_spikes;
             unit_states_[i].neurons_fired = (it_nf != core_stats.end()) ? it_nf->second : 0;
-            unit_states_[i].stream_mem_writes_issued_total = (it_sm_w != core_stats.end()) ? it_sm_w->second : 0;
-            unit_states_[i].stream_mem_reads_issued_total = (it_sm_r != core_stats.end()) ? it_sm_r->second : 0;
-            unit_states_[i].stream_mem_bytes_written_total = (it_sm_bw != core_stats.end()) ? it_sm_bw->second : 0;
-            unit_states_[i].stream_mem_bytes_read_total = (it_sm_br != core_stats.end()) ? it_sm_br->second : 0;
-            unit_states_[i].stream_mem_verify_pass_total = (it_sm_vp != core_stats.end()) ? it_sm_vp->second : 0;
-            unit_states_[i].stream_mem_verify_fail_total = (it_sm_vf != core_stats.end()) ? it_sm_vf->second : 0;
-            unit_states_[i].stream_pkt_sent_total = (it_pkt_s != core_stats.end()) ? it_pkt_s->second : 0;
-            unit_states_[i].stream_pkt_recv_total = (it_pkt_r != core_stats.end()) ? it_pkt_r->second : 0;
-            unit_states_[i].stream_pkt_bad_crc_total = (it_pkt_bc != core_stats.end()) ? it_pkt_bc->second : 0;
-            unit_states_[i].stream_pkt_bad_magic_total = (it_pkt_bm != core_stats.end()) ? it_pkt_bm->second : 0;
             unit_states_[i].utilization = cores_[i]->getUtilization();
             unit_states_[i].is_active = cores_[i]->hasWork();
+            for (auto& mod : workload_stats_modules_) {
+                if (mod) mod->refreshCore(static_cast<size_t>(i), core_stats);
+            }
 
             // 调试：跟踪统计数据变化 (已禁用避免过多输出)
             // if (new_spikes != old_spikes) {
@@ -937,6 +922,9 @@ void MultiCorePE::refreshProcessingUnitStates_() {
             unit_states_[i].neurons_fired = 0;
             unit_states_[i].utilization = 0.0;
             unit_states_[i].is_active = false;
+            for (auto& mod : workload_stats_modules_) {
+                if (mod) mod->refreshCore(static_cast<size_t>(i), kEmptyStats);
+            }
         }
     }
 }
@@ -1055,7 +1043,7 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
     }
     
     // 0a. Step 注入调度（Phase3-B 下沉为 StepActivationSubsystem）
-    step_activation_subsys_.tick(static_cast<uint64_t>(current_cycle_));
+    step_activation_subsys_.tick(static_cast<uint64_t>(current_cycle_), getCurrentSimTimeNano());
 
     // 0b. 测试注入：在首个有效周期从 core0 向 core1 注入一个跨核脉冲（仅当启用测试流量时）
     maybeInjectTestTraffic_(current_cycle_);
@@ -1489,21 +1477,18 @@ void MultiCorePE::initializeStatistics() {
     stat_unique_neurons_fired_total_ = registerStatistic<uint64_t>("unique_neurons_fired_total");
     stat_external_spikes_sent_ = registerStatistic<uint64_t>("external_spikes_sent");
     stat_external_spikes_received_ = registerStatistic<uint64_t>("external_spikes_received");
-    stat_stream_mem_verify_fail_total_ = registerStatistic<uint64_t>("stream_mem_verify_fail_total");
-    stat_stream_mem_writes_issued_total_ = registerStatistic<uint64_t>("stream_mem_writes_issued_total");
-    stat_stream_mem_reads_issued_total_ = registerStatistic<uint64_t>("stream_mem_reads_issued_total");
-    stat_stream_mem_bytes_written_total_ = registerStatistic<uint64_t>("stream_mem_bytes_written_total");
-    stat_stream_mem_bytes_read_total_ = registerStatistic<uint64_t>("stream_mem_bytes_read_total");
-    stat_stream_mem_verify_pass_total_ = registerStatistic<uint64_t>("stream_mem_verify_pass_total");
-    stat_stream_pkt_sent_total_ = registerStatistic<uint64_t>("stream_pkt_sent_total");
-    stat_stream_pkt_recv_total_ = registerStatistic<uint64_t>("stream_pkt_recv_total");
-    stat_stream_pkt_bad_crc_total_ = registerStatistic<uint64_t>("stream_pkt_bad_crc_total");
-    stat_stream_pkt_bad_magic_total_ = registerStatistic<uint64_t>("stream_pkt_bad_magic_total");
     // Experiment profile observability counters (do not change behavior)
     stat_compat_unexpected_stream_activity_total_ = registerStatistic<uint64_t>("compat_unexpected_stream_activity_total");
     stat_compat_naive_gas_stage_events_total_ = registerStatistic<uint64_t>("compat_naive_gas_stage_events_total");
     stat_compat_finish_incomplete_total_ = registerStatistic<uint64_t>("compat_finish_incomplete_total");
     stat_loader_done_timeout_fallback_total_ = registerStatistic<uint64_t>("loader_done_timeout_fallback_total");
+    for (auto& mod : workload_stats_modules_) {
+        if (!mod) continue;
+        if (std::strcmp(mod->name(), "stream") == 0) {
+            mod->bindUnexpectedActivityStat(stat_compat_unexpected_stream_activity_total_);
+        }
+        mod->initialize(*this, static_cast<size_t>(num_cores_));
+    }
     // Batch-A: 注册组件级直方图统计（具体类型由Python侧设置为Histogram）
     stat_mem_read_latency_cycles_ = registerStatistic<uint64_t>("mem_read_latency_cycles");
     stat_mem_read_latency_cycles_weights_ = registerStatistic<uint64_t>("mem_read_latency_cycles_weights");
@@ -1898,11 +1883,10 @@ void MultiCorePE::loadAndDistributeWeights() {
         PE_LOG(2, "⚠️ 未指定权重文件，使用默认权重\n");
         return;
     }
-    
-    
-    // TODO: 实现权重加载和分布逻辑
-    // 这里应该从文件加载权重并分发到各个处理单元
-    
+
+    // 当前架构下权重文件通过核心参数传递给各个 SnnPESubComponent，
+    // 这里保持幂等 no-op，避免误导性的“未实现”行为。
+    PE_LOG(2, "ℹ️ weights_file 已通过 core_params 下发至子核心，跳过PE级重复分发\n");
 }
 
 void MultiCorePE::updateStatistics() {
@@ -1910,126 +1894,20 @@ void MultiCorePE::updateStatistics() {
     uint64_t total_spikes = 0;
     uint64_t total_fired = 0;
     double total_utilization = 0.0;
-    uint64_t stream_mem_verify_fail_delta = 0;
-    uint64_t stream_mem_verify_pass_delta = 0;
-    uint64_t stream_mem_writes_issued_delta = 0;
-    uint64_t stream_mem_reads_issued_delta = 0;
-    uint64_t stream_mem_bytes_written_delta = 0;
-    uint64_t stream_mem_bytes_read_delta = 0;
-    uint64_t stream_pkt_sent_delta = 0;
-    uint64_t stream_pkt_recv_delta = 0;
-    uint64_t stream_pkt_bad_crc_delta = 0;
-    uint64_t stream_pkt_bad_magic_delta = 0;
     
     for (int i = 0; i < num_cores_; i++) {
         total_spikes += unit_states_[i].spikes_processed;
         total_fired += unit_states_[i].neurons_fired;
         total_utilization += unit_states_[i].utilization;
-
-        if (static_cast<size_t>(i) < stream_mem_verify_fail_last_.size()) {
-            const size_t idx = static_cast<size_t>(i);
-            auto delta_of = [](uint64_t cur, uint64_t prev) -> uint64_t {
-                return (cur >= prev) ? (cur - prev) : cur;
-            };
-
-            // stream mem verify
-            {
-                const uint64_t cur = unit_states_[i].stream_mem_verify_fail_total;
-                const uint64_t prev = stream_mem_verify_fail_last_[idx];
-                stream_mem_verify_fail_delta += delta_of(cur, prev);
-                stream_mem_verify_fail_last_[idx] = cur;
-            }
-            {
-                const uint64_t cur = unit_states_[i].stream_mem_verify_pass_total;
-                const uint64_t prev = stream_mem_verify_pass_last_[idx];
-                stream_mem_verify_pass_delta += delta_of(cur, prev);
-                stream_mem_verify_pass_last_[idx] = cur;
-            }
-
-            // stream mem io
-            {
-                const uint64_t cur = unit_states_[i].stream_mem_writes_issued_total;
-                const uint64_t prev = stream_mem_writes_issued_last_[idx];
-                stream_mem_writes_issued_delta += delta_of(cur, prev);
-                stream_mem_writes_issued_last_[idx] = cur;
-            }
-            {
-                const uint64_t cur = unit_states_[i].stream_mem_reads_issued_total;
-                const uint64_t prev = stream_mem_reads_issued_last_[idx];
-                stream_mem_reads_issued_delta += delta_of(cur, prev);
-                stream_mem_reads_issued_last_[idx] = cur;
-            }
-            {
-                const uint64_t cur = unit_states_[i].stream_mem_bytes_written_total;
-                const uint64_t prev = stream_mem_bytes_written_last_[idx];
-                stream_mem_bytes_written_delta += delta_of(cur, prev);
-                stream_mem_bytes_written_last_[idx] = cur;
-            }
-            {
-                const uint64_t cur = unit_states_[i].stream_mem_bytes_read_total;
-                const uint64_t prev = stream_mem_bytes_read_last_[idx];
-                stream_mem_bytes_read_delta += delta_of(cur, prev);
-                stream_mem_bytes_read_last_[idx] = cur;
-            }
-
-            // stream packets
-            {
-                const uint64_t cur = unit_states_[i].stream_pkt_sent_total;
-                const uint64_t prev = stream_pkt_sent_last_[idx];
-                stream_pkt_sent_delta += delta_of(cur, prev);
-                stream_pkt_sent_last_[idx] = cur;
-            }
-            {
-                const uint64_t cur = unit_states_[i].stream_pkt_recv_total;
-                const uint64_t prev = stream_pkt_recv_last_[idx];
-                stream_pkt_recv_delta += delta_of(cur, prev);
-                stream_pkt_recv_last_[idx] = cur;
-            }
-            {
-                const uint64_t cur = unit_states_[i].stream_pkt_bad_crc_total;
-                const uint64_t prev = stream_pkt_bad_crc_last_[idx];
-                stream_pkt_bad_crc_delta += delta_of(cur, prev);
-                stream_pkt_bad_crc_last_[idx] = cur;
-            }
-            {
-                const uint64_t cur = unit_states_[i].stream_pkt_bad_magic_total;
-                const uint64_t prev = stream_pkt_bad_magic_last_[idx];
-                stream_pkt_bad_magic_delta += delta_of(cur, prev);
-                stream_pkt_bad_magic_last_[idx] = cur;
-            }
-        }
-    }
-    
-    const bool stream_activity =
-        (stream_mem_verify_fail_delta |
-         stream_mem_verify_pass_delta |
-         stream_mem_writes_issued_delta |
-         stream_mem_reads_issued_delta |
-         stream_mem_bytes_written_delta |
-         stream_mem_bytes_read_delta |
-         stream_pkt_sent_delta |
-         stream_pkt_recv_delta |
-         stream_pkt_bad_crc_delta |
-         stream_pkt_bad_magic_delta) != 0;
-    if (stream_activity && !is_stream_workload_) {
-        if (stat_compat_unexpected_stream_activity_total_) stat_compat_unexpected_stream_activity_total_->addData(1);
     }
 
     // 更新统计信息
     if (stat_spikes_processed_) stat_spikes_processed_->addData(total_spikes);
-    stat_neurons_fired_->addData(total_fired);
-    stat_avg_utilization_->addData(total_utilization / num_cores_);
-    // Stream stats: always addData (even 0) so that CSV has stable keys for summary/DoD checks.
-    if (stat_stream_mem_verify_fail_total_) stat_stream_mem_verify_fail_total_->addData(stream_mem_verify_fail_delta);
-    if (stat_stream_mem_verify_pass_total_) stat_stream_mem_verify_pass_total_->addData(stream_mem_verify_pass_delta);
-    if (stat_stream_mem_writes_issued_total_) stat_stream_mem_writes_issued_total_->addData(stream_mem_writes_issued_delta);
-    if (stat_stream_mem_reads_issued_total_) stat_stream_mem_reads_issued_total_->addData(stream_mem_reads_issued_delta);
-    if (stat_stream_mem_bytes_written_total_) stat_stream_mem_bytes_written_total_->addData(stream_mem_bytes_written_delta);
-    if (stat_stream_mem_bytes_read_total_) stat_stream_mem_bytes_read_total_->addData(stream_mem_bytes_read_delta);
-    if (stat_stream_pkt_sent_total_) stat_stream_pkt_sent_total_->addData(stream_pkt_sent_delta);
-    if (stat_stream_pkt_recv_total_) stat_stream_pkt_recv_total_->addData(stream_pkt_recv_delta);
-    if (stat_stream_pkt_bad_crc_total_) stat_stream_pkt_bad_crc_total_->addData(stream_pkt_bad_crc_delta);
-    if (stat_stream_pkt_bad_magic_total_) stat_stream_pkt_bad_magic_total_->addData(stream_pkt_bad_magic_delta);
+    if (stat_neurons_fired_) stat_neurons_fired_->addData(total_fired);
+    if (stat_avg_utilization_) stat_avg_utilization_->addData(total_utilization / num_cores_);
+    for (auto& mod : workload_stats_modules_) {
+        if (mod) mod->emitDeltas();
+    }
 
     if (diag_fire_log_ && output_) {
         std::ostringstream oss;

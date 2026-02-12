@@ -28,6 +28,9 @@
 - `stimulus/SpikeSource.{h,cc}`
   - 可选 spike 源（在部分实验脚本中可能禁用）。
 - `MemKCalBench.{h,cc}`
+  - micro-benchmark：用于 K 校准或 memory 访问特征测试。
+- `SnnPE.{h,cc}`
+  - 旧架构兼容组件（deprecated/compat），新功能优先在 MultiCorePE 体系演进。
 
 ---
 
@@ -42,9 +45,6 @@
   - `avg_granule_bytes`（dense+cacheline 模式下应接近 `line_size_bytes`）
 
 mesh 模板会在每次运行目录写出 `effective_config.json`（并汇总进 `essential_summary_mesh.json` 的 `model.effective`），用于记录最终生效的合并/粒度参数，避免配置文件与实际行为不一致导致误读。
-  - micro-benchmark：用于 K 校准或 memory 访问特征测试。
-- `SnnPE.{h,cc}`
-  - 旧架构兼容组件（deprecated/compat），新功能优先在 MultiCorePE 体系演进。
 
 ## 子目录
 
@@ -54,6 +54,7 @@ mesh 模板会在每次运行目录写出 `effective_config.json`（并汇总进
 - `components/gas/`：全局 Step/GAS 同步组件（Mesh barrier 控制面）。
 - `components/multicore/`：MultiCorePE 参数解析收敛模块（纯编译期组织，不新增 ELI 对象）。
 - `components/gather/`：GatherBufferIF 参数解析收敛模块（纯编译期组织，不新增 ELI 对象）。
+- `components/workload_stats/`：workload 统计模块注册表与实现（tensor/stream 等）。
 
 ## 依赖边界（建议）
 

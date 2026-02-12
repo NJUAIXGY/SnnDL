@@ -39,6 +39,7 @@ libSnnDL_la_SOURCES = \
 	api/ISynapseRoute.h \
 	api/SynapseRouteBuildConfig.h \
 	api/SnnWeightReader.h \
+	api/IWeightReaderAdopter.h \
 	api/SnnDLLogging.h \
 	events/GatingDecisionEvent.h \
 	events/GasStepBarrierEvent.h \
@@ -72,6 +73,12 @@ libSnnDL_la_SOURCES = \
 	components/stimulus/SpikeSource.h \
 	components/WeightLoader.cc \
 	components/WeightLoader.h \
+	components/workload_stats/IWorkloadStatsModule.h \
+	components/workload_stats/KeyedCounterStatsModule.h \
+	components/workload_stats/StreamWorkloadStatsModule.h \
+	components/workload_stats/TensorWorkloadStatsModule.h \
+	components/workload_stats/WorkloadStatsRegistry.cc \
+	components/workload_stats/WorkloadStatsRegistry.h \
 	control/SnnPESubComponent.cc \
 	control/SnnPESubComponent.h \
 	control/SnnPESubComponent_impl.h \
@@ -149,6 +156,8 @@ libSnnDL_la_SOURCES = \
 	services/workload/stream/StreamWorkload.h \
 	services/workload/traffic/TrafficWorkload.cc \
 	services/workload/traffic/TrafficWorkload.h \
+	services/workload/tensor/TensorWorkload.cc \
+	services/workload/tensor/TensorWorkload.h \
 	services/memory/StandardMemAccess.cc \
 	services/memory/StandardMemAccess.h
 

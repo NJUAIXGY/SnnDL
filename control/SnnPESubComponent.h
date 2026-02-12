@@ -70,7 +70,7 @@ public:
         {"core_id", "ID of the core", ""},
         {"compute_core_impl", "Compute core implementation name (default/snn)", "default"},
         // Phase6：通用 workload（默认仍为 SNN；stream 用于通信+内存 read-after-write 验证负载）
-        {"workload_impl", "Workload implementation: snn (default) / stream / traffic", "snn"},
+        {"workload_impl", "Workload implementation: snn (default) / stream / traffic / tensor", "snn"},
         {"stream_mem_enable", "Enable stream memory read/write verify (0/1)", "1"},
         {"stream_mem_period_cycles", "Issue one stream write per N cycles (0=as fast as possible)", "100"},
         {"stream_mem_region_bytes", "Stream memory region size in bytes (0=disable mem)", "4096"},
@@ -82,6 +82,44 @@ public:
         {"stream_comm_payload_bytes", "RawBytes payload bytes (excluding header)", "64"},
         {"stream_strict", "Fail-fast on any stream verify error (0/1)", "1"},
         {"stream_seed", "Base seed for stream pattern generation (uint64)", "0"},
+        // Phase6+：tensor workload（systolic/GEMM microbench；完全非 SNN）
+        {"tensor_m", "Tensor workload: GEMM M dimension", "256"},
+        {"tensor_n", "Tensor workload: GEMM N dimension", "256"},
+        {"tensor_k", "Tensor workload: GEMM K dimension", "256"},
+        {"tensor_element_bytes", "Tensor workload: element size (bytes)", "2"},
+        {"tensor_array_m", "Tensor workload: systolic array M", "32"},
+        {"tensor_array_n", "Tensor workload: systolic array N", "32"},
+        {"tensor_compute_efficiency", "Tensor workload: peak efficiency [0,1]", "1.0"},
+        {"tensor_overlap_enable", "Tensor workload: overlap DMA and compute (0/1)", "1"},
+        {"tensor_start_cycle", "Tensor workload: start cycle", "1"},
+        {"tensor_iterations", "Tensor workload: total iterations (0=unbounded)", "0"},
+        {"tensor_mem_enable", "Tensor workload: enable IMemoryAccess reads/writes (0/1)", "1"},
+        {"tensor_mem_region_bytes", "Tensor workload: address region bytes (wrap-around)", "1048576"},
+        {"tensor_mem_req_bytes", "Tensor workload: memory request bytes", "64"},
+        {"tensor_mem_max_outstanding", "Tensor workload: max outstanding memory requests", "32"},
+        {"tensor_dataflow", "Tensor workload: dataflow (os/ws/is)", "os"},
+        {"tensor_tile_m", "Tensor workload: tile size M (0=use full M)", "0"},
+        {"tensor_tile_n", "Tensor workload: tile size N (0=use full N)", "0"},
+        {"tensor_tile_k", "Tensor workload: tile size K (0=use full K)", "0"},
+        {"tensor_exec_mode", "Tensor workload: execution mode (bulk/tile)", "bulk"},
+        {"tensor_tile_schedule", "Tensor workload: tile schedule (auto/mnk/mkn/nkm)", "auto"},
+        {"tensor_writeback_policy", "Tensor workload: writeback policy (at_end_of_k)", "at_end_of_k"},
+        {"tensor_ub_bytes", "Tensor workload: on-chip unified buffer bytes (0=disable)", "0"},
+        {"tensor_acc_bytes", "Tensor workload: on-chip accumulator bytes (0=disable)", "0"},
+        {"tensor_dma_bandwidth_bytes_per_cycle", "Tensor workload: DMA bandwidth (bytes/cycle, 0=disable)", "0"},
+        {"tensor_double_buffer", "Tensor workload: enable double-buffer overlap (0/1)", "0"},
+        {"tensor_collective_type", "Tensor workload: collective type (none/allreduce/allgather/reducescatter)", "none"},
+        {"tensor_collective_blocking", "Tensor workload: treat collective as barrier between iterations (0/1)", "0"},
+        {"tensor_collective_scope", "Tensor workload: collective scope (per_core/per_pe/per_system)", "per_core"},
+        {"tensor_collective_bytes", "Tensor workload: collective bytes per op", "0"},
+        {"tensor_collective_period_cycles", "Tensor workload: collective period cycles", "0"},
+        {"tensor_collective_pattern", "Tensor workload: collective pattern (ring/mesh_x/mesh_xy)", "ring"},
+        {"tensor_collective_packet_bytes", "Tensor workload: collective packet bytes", "256"},
+        {"tensor_comm_enable", "Tensor workload: enable RawBytes NoC traffic (0/1)", "0"},
+        {"tensor_comm_period_cycles", "Tensor workload: send one RawBytes packet per N cycles", "0"},
+        {"tensor_comm_payload_bytes", "Tensor workload: RawBytes payload bytes", "0"},
+        {"tensor_strict", "Tensor workload: fail-fast on missing mem/noc (0/1)", "1"},
+        {"tensor_seed", "Tensor workload: base seed (uint64)", "0"},
         {"total_cores", "Total number of cores in the PE", "8"},
         {"global_neuron_base", "Global base ID for neurons in this core", "0"},
         {"num_neurons", "Number of neurons in this core", "64"},
@@ -499,10 +537,11 @@ private:
     bool read_force_single_ = false; // 当为真时，强制按单元素读取（req_size=4B），用于定位对齐/切片问题
 
 	    // === Phase6: Workload selection ===
-	    enum class WorkloadImpl : uint8_t { Snn = 0, Stream = 1, Traffic = 2 };
+	    enum class WorkloadImpl : uint8_t { Snn = 0, Stream = 1, Traffic = 2, Tensor = 3 };
 	    WorkloadImpl workload_impl_ = WorkloadImpl::Snn;
 	    inline bool isStreamWorkload_() const { return workload_impl_ == WorkloadImpl::Stream; }
 	    inline bool isTrafficWorkload_() const { return workload_impl_ == WorkloadImpl::Traffic; }
+	    inline bool isTensorWorkload_() const { return workload_impl_ == WorkloadImpl::Tensor; }
 	    inline bool isNonSnnWorkload_() const { return workload_impl_ != WorkloadImpl::Snn; }
 
 	    // Phase6.3：workload 插件（Phase6/Phase3）；当前仅 stream 通过工厂创建，SNN 保持原快路径。

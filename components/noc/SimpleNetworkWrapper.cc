@@ -81,18 +81,15 @@ void SimpleNetworkWrapper::finish()
 
 bool SimpleNetworkWrapper::send(SimpleNetwork::Request* req, int vn) 
 {
-    if (!req || !network_adapter) {
-        return false;
-    }
-    
+    if (!req || !network_adapter) return false;
+
     WRAP_LOG(2, "📤 包装器发送请求: 目标=%ld, 虚拟网络=%d\n", req->dest, vn);
-    
+
     // 透传 payload（接管生命周期）
+    if (!req->inspectPayload()) return false;
     SST::Event* payload = req->takePayload();
     const uint32_t dest_node = static_cast<uint32_t>(req->dest);
     delete req;
-
-    if (!payload) return false;
     network_adapter->sendToNode(dest_node, payload);
 
     // 触发发送通知

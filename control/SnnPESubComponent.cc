@@ -28,6 +28,7 @@
 #include "CoreWorkloadFactory.h"
 #include "ISpikeWorkload.h"
 #include "ISnnSpikeCommWorkload.h"
+#include "IWeightReaderAdopter.h"
 #include "synapse/route/SpikeCommSubsystem.h"
 #include "synapse/route/SynapseRouteSubsystem.h"
 #include "WorkloadConfig.h"
@@ -407,17 +408,26 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
 
     // Phase6：workload 选择（优先 Params，其次环境变量）
     // 约定：默认 "snn" 仍走 legacy 主链路；仅当显式选择 stream/traffic 时才启用 workload_。
-    if (cfg.workload_impl == "stream") {
-        workload_impl_ = WorkloadImpl::Stream;
-    } else if (cfg.workload_impl == "traffic") {
-        workload_impl_ = WorkloadImpl::Traffic;
-    } else {
-        workload_impl_ = WorkloadImpl::Snn;
+    const WorkloadKind workload_kind = workloadKindFromString(cfg.workload_impl);
+    switch (workload_kind) {
+        case WorkloadKind::Stream:
+            workload_impl_ = WorkloadImpl::Stream;
+            break;
+        case WorkloadKind::Traffic:
+            workload_impl_ = WorkloadImpl::Traffic;
+            break;
+        case WorkloadKind::Tensor:
+            workload_impl_ = WorkloadImpl::Tensor;
+            break;
+        case WorkloadKind::Snn:
+        default:
+            workload_impl_ = WorkloadImpl::Snn;
+            break;
     }
 
     // Phase6：通过工厂创建 workload（snn/stream/traffic）
     {
-        const char* name = isTrafficWorkload_() ? "traffic" : (isStreamWorkload_() ? "stream" : "snn");
+        const char* name = workloadKindName(workload_kind);
         if (!workload_) workload_ = createWorkloadByName(std::string(name));
         if (!workload_) {
             if (output_) {
@@ -674,7 +684,7 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     // 获取权重文件路径（由 WeightLoader 负责加载；控制层仅缓存以便日志/兼容）
     weights_file_path_ = cfg.weights_file;
 
-    if (!isStreamWorkload_()) {
+    if (!isStreamWorkload_() && !isTensorWorkload_()) {
         // Phase4 Task6.1：compute core 创建/配置下沉到 workload=snn；
         // 控制层此处仅构建 synapse/weights 的 weight reader 子系统。
         configureWeightReaderSubsystem_(params);
@@ -905,7 +915,9 @@ void SnnPESubComponent::bindWorkloadRuntime_() {
     rt.time.ctx = this;
     rt.time.now_ns = &SnnPESubComponent::workloadNowNsThunk_;
     rt.reporting.ctx = this;
-    rt.reporting.report_mem_issue = &SnnPESubComponent::reportSnnMemIssueThunk_;
+    // Non-SNN workloads must not be counted as weight reads (keep analysis semantics clean).
+    rt.reporting.report_mem_issue =
+        isNonSnnWorkload_() ? &SnnPESubComponent::reportStreamMemIssueThunk_ : &SnnPESubComponent::reportSnnMemIssueThunk_;
     rt.reporting.report_apply_scatter = &SnnPESubComponent::reportApplyScatterThunk_;
     rt.reporting.request_gas_end_gather = &SnnPESubComponent::requestGasEndGatherThunk_;
     rt.reporting.request_gas_end_scatter = &SnnPESubComponent::requestGasEndScatterThunk_;
@@ -928,6 +940,14 @@ void SnnPESubComponent::bindWorkloadRuntime_() {
     }
 
     workload_->bindRuntime(rt);
+
+    // Tier2-E (A): CoreShell 统一装配 weight reader（WMS），并将所有权一次性移交给 workload=snn。
+    // - 避免 control 与 workload 重复创建 WeightMemorySubsystem/WeightCacheOps；
+    // - 不改变脚本侧参数/接口，仅在 C++ 内部通过窄接口移交所有权。
+    if (auto* adopter = dynamic_cast<IWeightReaderAdopter*>(workload_.get())) {
+        std::unique_ptr<IWeightReader> reader = legacySnnTakeWeightReader();
+        if (reader) adopter->adoptWeightReader(std::move(reader));
+    }
 }
 
 void SnnPESubComponent::setParentInterface(IPeAggregation* parent) {
@@ -965,7 +985,7 @@ bool SnnPESubComponent::deliverPacket(NocPacketEvent* packet) {
 }
 
 void SnnPESubComponent::onGlobalStepStart(uint32_t seq) {
-    if (isStreamWorkload_()) {
+    if (isStreamWorkload_() || isTensorWorkload_()) {
         // stream workload 不参与 SNN/GAS window 编排；
         // 但仍需要打开 memory(GatherBufferIF) 的 step gate，否则 StandardMemAccess 会拒绝请求（write/read 返回失败）。
         curr_stage_seq_ = seq;
@@ -975,6 +995,7 @@ void SnnPESubComponent::onGlobalStepStart(uint32_t seq) {
                 gate->openStep(seq);
             }
         }
+        if (workload_) workload_->onGlobalStepStart(seq);
         return;
     }
     // 全局 Step 同步：打开 memory(GatherBufferIF) 的新窗口。
@@ -986,6 +1007,7 @@ void SnnPESubComponent::onGlobalStepStart(uint32_t seq) {
     auto* gate = stdmem_ep_->stepGate();
     if (gate) {
         gate->openStep(seq);
+        if (workload_) workload_->onGlobalStepStart(seq);
         return;
     }
 
@@ -999,6 +1021,7 @@ void SnnPESubComponent::onGlobalStepStart(uint32_t seq) {
         return;
     }
     curr_stage_seq_ = seq;
+    if (workload_) workload_->onGlobalStepStart(seq);
 }
 
 // === GAS stage/stat sink (Phase4-Task6.4) ===
@@ -1102,7 +1125,7 @@ void SnnPESubComponent::onGasStatEvent(const GasStatEvent& st) {
     }
 }
 
-void SnnPESubComponent::configureWeightReaderSubsystem_(const Params& /*params*/) {
+void SnnPESubComponent::configureWeightReaderSubsystem_(const Params& params) {
     // 构建权重读取子系统（Phase E：内存子系统闭环，控制层不再持有 pending/解析）
     if (!weight_reader_adapter_) {
         auto mem = std::make_unique<WeightMemorySubsystem>();
@@ -1110,6 +1133,7 @@ void SnnPESubComponent::configureWeightReaderSubsystem_(const Params& /*params*/
             [this](uint64_t key, float& out) { return weightCacheTryGet_(key, out); },
             [this](uint64_t key, float val) { weightCacheStore_(key, val); }
         );
+        const bool disable_weight_cache = params.find<int>("disable_weight_cache", 0) != 0;
         // Phase A/E：窗口读集合/预算/outstanding + 读发起/响应闭环下沉到子系统（保持行为与日志口径）
         {
             WeightMemorySubsystem::OrchestratorConfig ocfg{};
@@ -1151,6 +1175,28 @@ void SnnPESubComponent::configureWeightReaderSubsystem_(const Params& /*params*/
             ocfg.use_bcsr = use_bcsr_;
             ocfg.bcsr_force_file_read = bcsr_force_file_read_;
             ocfg.bcsr_prefetch_all = bcsr_prefetch_all_;
+            ocfg.bcsr_rowptr_file_fallback_enable = bcsr_rowptr_file_fallback_enable_;
+            ocfg.bcsr_colidx_inflight_coalesce_enable =
+                params.find<int>("bcsr_colidx_inflight_coalesce_enable", 1) != 0;
+            ocfg.bcsr_block_inflight_coalesce_enable =
+                params.find<int>("bcsr_block_inflight_coalesce_enable", 1) != 0;
+            ocfg.bcsr_row_index_prefetch_mode =
+                params.find<std::string>("bcsr_row_index_prefetch_mode", "auto");
+            ocfg.bcsr_row_index_prefetch_all_rows_threshold =
+                params.find<uint32_t>("bcsr_row_index_prefetch_all_rows_threshold", 1024);
+            ocfg.bcsr_row_index_prefetch_all_rows_max_bytes =
+                params.find<uint64_t>("bcsr_row_index_prefetch_all_rows_max_bytes", 64ull * 1024ull);
+            ocfg.bcsr_block_cache_auto_tune =
+                params.find<int>("bcsr_block_cache_auto_tune", 1) != 0;
+            ocfg.bcsr_block_cache_max_bytes =
+                params.find<uint64_t>("bcsr_block_cache_max_bytes", 64ull * 1024ull * 1024ull);
+            ocfg.bcsr_block_cache_tune_miss_ratio =
+                params.find<float>("bcsr_block_cache_tune_miss_ratio", 0.05f);
+            ocfg.bcsr_block_cache_tune_min_misses =
+                params.find<uint32_t>("bcsr_block_cache_tune_min_misses", 64);
+            ocfg.bcsr_populate_weight_cache_enable =
+                params.find<int>("bcsr_populate_weight_cache_enable", 1) != 0;
+            if (disable_weight_cache) ocfg.bcsr_populate_weight_cache_enable = false;
             ocfg.bcsr_weight_guard_enable = bcsr_weight_guard_enable_;
             ocfg.bcsr_weight_abs_max = bcsr_weight_abs_max_;
             ocfg.bcsr_semantic_verify_enable = bcsr_semantic_verify_enable_;
@@ -1192,8 +1238,41 @@ void SnnPESubComponent::configureWeightReaderSubsystem_(const Params& /*params*/
         }
         weight_mem_subsystem_ = mem.get();
         // Phase E：BCSR 缓存容量配置下沉到 BcsrWeightManager
-        bcsr_weights_->setRowIndexCacheCapacity(bcsr_row_index_cache_cap_);
+        uint32_t row_cap = bcsr_row_index_cache_cap_;
+        const bool row_auto_fit = params.find<int>("bcsr_row_index_cache_auto_fit", 0) != 0;
+        if (row_auto_fit && row_cap > 0 && bcsr_weights_) {
+            const uint32_t br_eff = bcsr_weights_->effectiveBlockRows();
+            const uint32_t n_block_rows =
+                br_eff ? ((num_neurons_ + br_eff - 1u) / br_eff) : static_cast<uint32_t>(num_neurons_);
+            if (n_block_rows > 0 && row_cap < n_block_rows) {
+                if (window_read_debug_ && output_ && output_->getVerboseLevel() >= 2) {
+                    output_->verbose(CALL_INFO, 2, 0,
+                                     "[bcsr] auto-fit row_index_cache_cap %u -> %u (node=%u core=%d rows=%u br=%u)\n",
+                                     row_cap,
+                                     n_block_rows,
+                                     node_id_,
+                                     core_id_,
+                                     num_neurons_,
+                                     br_eff);
+                }
+                row_cap = n_block_rows;
+            }
+        }
+        bcsr_weights_->setRowIndexCacheCapacity(row_cap);
         bcsr_weights_->setBlockCacheCapacity(bcsr_block_cache_cap_);
+        {
+            std::string pol = params.find<std::string>("bcsr_block_cache_policy", "lru");
+            for (auto& ch : pol) {
+                if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+            }
+            if (pol == "fifo") {
+                bcsr_weights_->setBlockCachePolicy(BcsrWeightManager::BlockCachePolicy::FIFO);
+            } else if (pol == "legacy_unordered" || pol == "legacy") {
+                bcsr_weights_->setBlockCachePolicy(BcsrWeightManager::BlockCachePolicy::LegacyUnordered);
+            } else {
+                bcsr_weights_->setBlockCachePolicy(BcsrWeightManager::BlockCachePolicy::LRU);
+            }
+        }
         windowStateConfigure_();
         if (window_read_enable_) reserveWindowContainers_();
         weight_reader_adapter_ = std::move(mem);

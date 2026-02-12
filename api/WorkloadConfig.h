@@ -20,6 +20,36 @@ namespace SST { namespace SnnDL {
 
 inline uint64_t clampNonZeroU64(uint64_t v) { return v ? v : 1ull; }
 
+// Workload 分类（供 PE/CoreShell 做策略选择，避免散落的 string if/else 堆叠）。
+enum class WorkloadKind : uint8_t {
+    Snn = 0,
+    Stream = 1,
+    Traffic = 2,
+    Tensor = 3,
+};
+
+inline WorkloadKind workloadKindFromString(const std::string& impl) {
+    const std::string w = toLowerCopy(std::string(impl));
+    if (w == "stream") return WorkloadKind::Stream;
+    if (w == "traffic") return WorkloadKind::Traffic;
+    if (w == "tensor") return WorkloadKind::Tensor;
+    return WorkloadKind::Snn;
+}
+
+inline const char* workloadKindName(WorkloadKind k) {
+    switch (k) {
+        case WorkloadKind::Snn: return "snn";
+        case WorkloadKind::Stream: return "stream";
+        case WorkloadKind::Traffic: return "traffic";
+        case WorkloadKind::Tensor: return "tensor";
+        default: return "snn";
+    }
+}
+
+inline bool isNonSnnWorkloadKind(WorkloadKind k) {
+    return k != WorkloadKind::Snn;
+}
+
 inline const char* workloadImplFromEnvCached() {
     static const char* cached = []() -> const char* {
         const char* v = std::getenv("SNNDL_WORKLOAD_IMPL");

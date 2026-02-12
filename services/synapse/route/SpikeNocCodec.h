@@ -15,7 +15,7 @@
 #include "api/MulticastLimits.h"
 #include "GlobalNeuronLayout.h"
 #include "NocPacketEvent.h"
-#include "SpikeEvent.h"
+#include "events/SpikeEvent.h"
 
 namespace SST { namespace SnnDL {
 

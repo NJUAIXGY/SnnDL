@@ -201,6 +201,11 @@ void buildRoutesFromCandidates_(const SynapseRouteBuildConfig& cfg,
                                uint32_t rows,
                                bool group_by_pe,
                                SynapseRouteSubsystem::RouteMap& routes_out) {
+    if (group_by_pe && rows == 0) {
+        if (out) out->verbose(CALL_INFO, 1, 0,
+                              "⚠️ 路由构建：rows=0 且 group_by_pe=1，已回退为 group_by_pe=0（避免除零）\n");
+        group_by_pe = false;
+    }
     for (auto& kv : tmp) {
         uint32_t pre = kv.first;
         const auto& lst_in = kv.second;
@@ -435,7 +440,16 @@ bool buildWeightDrivenRoutesDense_(const SynapseRouteBuildConfig& cfg,
     const uint32_t rows = cfg.rows;
     const uint32_t cols = cfg.cols;
     const uint32_t total_nodes = cfg.total_nodes;
-    const size_t expected = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+    if (rows == 0 || cols == 0) {
+        if (out) out->verbose(CALL_INFO, 1, 0, "⚠️ 路由构建失败：rows/cols 非法（rows=%u cols=%u）\n", rows, cols);
+        return false;
+    }
+    const uint64_t expected64 = static_cast<uint64_t>(rows) * static_cast<uint64_t>(cols);
+    if (expected64 > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+        if (out) out->verbose(CALL_INFO, 1, 0, "⚠️ 路由构建失败：rows*cols 溢出 size_t（rows=%u cols=%u）\n", rows, cols);
+        return false;
+    }
+    const size_t expected = static_cast<size_t>(expected64);
     std::unordered_map<uint32_t, std::vector<std::pair<float,uint32_t>>> tmp;
     tmp.reserve(cols);
     uint64_t dropped_self_pe = 0;
@@ -470,7 +484,10 @@ bool buildWeightDrivenRoutesDense_(const SynapseRouteBuildConfig& cfg,
                 float w = buf[idx];
                 if (std::fabs(w) > cfg.routing_epsilon) {
                     uint32_t pre_global = col;
-                    uint32_t dest_global = pe * rows + row;
+                    const uint64_t dest_global64 =
+                        static_cast<uint64_t>(pe) * static_cast<uint64_t>(rows) + static_cast<uint64_t>(row);
+                    if (dest_global64 > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) continue;
+                    uint32_t dest_global = static_cast<uint32_t>(dest_global64);
                     if (cfg.route_exclude_self_pe) {
                         uint32_t src_pe = pre_global / rows;
                         if (src_pe == pe) { dropped_self_pe++; continue; }

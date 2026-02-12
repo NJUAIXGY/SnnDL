@@ -246,6 +246,7 @@ void NocSubsystem::onNicReceiveEvent(SST::Event* event) {
             pkt->dst_endpoint = p.dst_endpoint;
             pkt->kind = p.kind;
             pkt->hop_count = p.hop_count;
+            pkt->step_seq = p.step_seq;
             pkt->timestamp = p.timestamp;
             pkt->payload = std::move(p.payload);
             onNicReceive(pkt);
@@ -273,6 +274,7 @@ void NocSubsystem::onExternalPortEvent(SST::Event* event) {
             pkt->dst_endpoint = p.dst_endpoint;
             pkt->kind = p.kind;
             pkt->hop_count = p.hop_count;
+            pkt->step_seq = p.step_seq;
             pkt->timestamp = p.timestamp;
             pkt->payload = std::move(p.payload);
             onExternalPortEvent(pkt);
@@ -287,7 +289,7 @@ void NocSubsystem::onExternalPortEvent(SST::Event* event) {
     }
 
     // hop/TTL 保护（保持旧语义：避免端口回送循环）
-    constexpr uint16_t kMaxHops = 10;
+    constexpr uint16_t kMaxHops = NocPacketEvent::kDefaultMaxHops;
     if (packet->hop_count >= kMaxHops) {
         delete packet;
         return;
@@ -329,6 +331,7 @@ void NocSubsystem::onDirectionalLinkEvent(SST::Event* event, const std::string& 
             pkt->dst_endpoint = p.dst_endpoint;
             pkt->kind = p.kind;
             pkt->hop_count = p.hop_count;
+            pkt->step_seq = p.step_seq;
             pkt->timestamp = p.timestamp;
             pkt->payload = std::move(p.payload);
             onNicReceive(pkt);

@@ -12,7 +12,7 @@
 #include "GlobalNeuronLayout.h"
 #include "INocTransport.h"
 #include "NocPacketEvent.h"
-#include "SpikeEvent.h"
+#include "events/SpikeEvent.h"
 #include "SpikeNocCodec.h"
 
 namespace SST { namespace SnnDL {

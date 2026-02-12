@@ -41,6 +41,8 @@ MultiCorePEConfig parseMultiCorePEConfig(const SST::Params& params) {
 
     // Workload selector (used to disable step activation for non-SNN workloads).
     c.workload_impl = workloadImplFromParamsOrEnv(params, "snn");
+    c.workload_kind = workloadKindFromString(c.workload_impl);
+    c.workload_stats_modules = toLowerCopy(params.find<std::string>("workload_stats_modules", ""));
 
     // Exec mode hint (experiment observability; does not change behavior).
     c.exec_mode = execModeFromParams(params, "gas");
@@ -95,6 +97,8 @@ MultiCorePEConfig parseMultiCorePEConfig(const SST::Params& params) {
     c.step_activation_trigger_core = params.find<int>("step_activation_trigger_core", 0);
     c.step_reset_mem_each_step = params.find<bool>("step_reset_mem_each_step", false);
     c.step_activation_event_weight = params.find<double>("step_activation_event_weight", 0.0);
+    c.step_activation_pre_pattern = toLowerCopy(params.find<std::string>("step_activation_pre_pattern", "bernoulli"));
+    c.step_activation_pre_cluster_len = params.find<uint32_t>("step_activation_pre_cluster_len", 0);
     c.step_activation_use_bcsr_routes = params.find<bool>("step_activation_use_bcsr_routes", false);
     c.step_activation_bcsr_template = params.find<std::string>("step_activation_bcsr_template", "");
     c.step_activation_bcsr_rows_per_core = params.find<uint32_t>("step_activation_bcsr_rows_per_core", 0);

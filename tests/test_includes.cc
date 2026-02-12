@@ -33,6 +33,10 @@
 #include "services/stimulus/StepActivationSubsystem.h"
 // Phase: native multicast lab (traffic-only workload)
 #include "services/workload/traffic/TrafficWorkload.h"
+// Phase: tensor workload (systolic microbench)
+#include "services/workload/tensor/TensorWorkload.h"
+// Workload stats registry (PE aggregation)
+#include "components/workload_stats/WorkloadStatsRegistry.h"
 
 int main(int argc, char** argv) {
     (void)argc;
@@ -40,6 +44,18 @@ int main(int argc, char** argv) {
 
     // compile-only reference for new kinds/helpers
     (void)SST::SnnDL::NocPacketKind::SpikeKey;
+
+    SST::SnnDL::TensorWorkload::Config tensor_cfg;
+    tensor_cfg.collective_type = "allreduce";
+    tensor_cfg.collective_bytes = 1024;
+    tensor_cfg.collective_period_cycles = 100;
+    tensor_cfg.collective_pattern = "ring";
+    tensor_cfg.collective_packet_bytes = 256;
+    tensor_cfg.exec_mode = "tile";
+    tensor_cfg.tile_schedule = "mkn";
+    tensor_cfg.writeback_policy = "at_end_of_k";
+    tensor_cfg.collective_blocking = true;
+    tensor_cfg.collective_scope = "per_core";
 
     return 0;
 }

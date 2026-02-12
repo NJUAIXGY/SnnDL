@@ -5,6 +5,14 @@
 
 namespace SST { namespace SnnDL {
 
+namespace {
+
+inline uint32_t resolveNeuronsPerPe_(uint32_t neurons_per_pe_cfg) {
+    return neurons_per_pe_cfg;
+}
+
+} // namespace
+
 void SnnRouteProvider::configure(const Config& cfg,
                                  const std::shared_ptr<const RouteMap>& routes_shared,
                                  const RouteMap* routes_local) {
@@ -33,7 +41,14 @@ void SnnRouteProvider::computeFanout(uint32_t source_global, uint32_t neuron_idx
             if (itg != cfg_.gating_cache->end() && now_cycles <= itg->second.expire_cycle) {
                 const auto& dpes = itg->second.dest_pes;
                 if (!dpes.empty()) {
-                    uint32_t denom = (cfg_.neurons_per_pe_cfg > 0) ? cfg_.neurons_per_pe_cfg : cfg_.num_neurons;
+                    const uint32_t denom = resolveNeuronsPerPe_(cfg_.neurons_per_pe_cfg);
+                    if (denom == 0) {
+                        if (cfg_.out) {
+                            cfg_.out->verbose(CALL_INFO, 1, 0,
+                                              "⚠️ gating路径忽略：neurons_per_pe_cfg=0（denom=0） src_g=%u\n",
+                                              source_global);
+                        }
+                    } else {
                     for (uint32_t dpe : dpes) {
                         FanoutEntry fe;
                         fe.dest_node = dpe;
@@ -48,6 +63,7 @@ void SnnRouteProvider::computeFanout(uint32_t source_global, uint32_t neuron_idx
                                           source_global, dpes.size());
                     }
                     return;
+                    }
                 }
             }
         }
@@ -72,11 +88,19 @@ void SnnRouteProvider::fanoutWeightDriven_(uint32_t source_global, uint32_t neur
     if (it == route_tbl->end()) return;
     const auto& dests = it->second;
     if (dests.empty()) return;
-    uint32_t denom = (cfg_.neurons_per_pe_cfg > 0) ? cfg_.neurons_per_pe_cfg : cfg_.num_neurons;
+    const uint32_t denom = resolveNeuronsPerPe_(cfg_.neurons_per_pe_cfg);
+    if (denom == 0) {
+        if (cfg_.out) {
+            cfg_.out->verbose(CALL_INFO, 0, 0,
+                              "⚠️ 权重驱动扇出忽略：neurons_per_pe_cfg=0（denom=0） src_g=%u\n",
+                              source_global);
+        }
+        return;
+    }
     for (uint32_t dest_global : dests) {
         FanoutEntry fe;
         fe.dest_global = dest_global;
-        fe.dest_node = (denom ? (dest_global / denom) : 0);
+        fe.dest_node = (dest_global / denom);
         out_entries.push_back(fe);
     }
     if (cfg_.log_weight_details && cfg_.out) {
@@ -87,13 +111,14 @@ void SnnRouteProvider::fanoutWeightDriven_(uint32_t source_global, uint32_t neur
 void SnnRouteProvider::fanoutFixed_(uint32_t neuron_idx,
                                     std::vector<FanoutEntry>& out_entries) const {
     // 固定映射沿用原逻辑：输入层 -> 隐藏层；隐藏层 -> 输出层；输出层不再发送
+    const uint32_t neurons_per_node = (cfg_.neurons_per_pe_cfg > 0) ? cfg_.neurons_per_pe_cfg : 16u;
     uint32_t target_neuron = 0;
     uint32_t target_node = cfg_.node_id;
     if (cfg_.node_id >= 0 && cfg_.node_id <= 3) {
         uint32_t target_hidden_base = (cfg_.node_id < 2) ? 4 : 8;
         uint32_t target_hidden_node = target_hidden_base + (cfg_.node_id % 2) * 2 + (neuron_idx % 2);
         target_node = target_hidden_node;
-        target_neuron = target_hidden_node * 16 + neuron_idx;
+        target_neuron = target_hidden_node * neurons_per_node + neuron_idx;
         if (cfg_.log_weight_details && cfg_.out) {
             cfg_.out->verbose(CALL_INFO, 2, 0,
                 "🔥 输入层节点%d神经元%d -> 隐藏层节点%d神经元%d\n",
@@ -102,7 +127,8 @@ void SnnRouteProvider::fanoutFixed_(uint32_t neuron_idx,
     } else if (cfg_.node_id >= 4 && cfg_.node_id <= 11) {
         uint32_t target_output_node = 12 + ((cfg_.node_id - 4) / 2);
         target_node = target_output_node;
-        target_neuron = target_output_node * 16 + (neuron_idx % 16);
+        const uint32_t fold = (neurons_per_node > 0) ? neurons_per_node : 1u;
+        target_neuron = target_output_node * neurons_per_node + (neuron_idx % fold);
         if (cfg_.log_weight_details && cfg_.out) {
             cfg_.out->verbose(CALL_INFO, 2, 0,
                 "🔥 隐藏层节点%d神经元%d -> 输出层节点%d神经元%d\n",

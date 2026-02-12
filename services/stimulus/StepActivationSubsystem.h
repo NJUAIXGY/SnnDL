@@ -14,6 +14,7 @@
 #include <functional>
 #include <limits>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace SST { class Output; }
@@ -28,6 +29,11 @@ class GlobalNeuronLayout;
 class StepActivationSubsystem final {
 public:
     struct Config {
+        enum class PrePattern : uint32_t {
+            BernoulliUniform = 0,
+            Clustered = 1,
+        };
+
         bool enable = false;
         double fraction = 0.0;
         uint32_t fanout = 0;
@@ -40,6 +46,13 @@ public:
 
         bool reset_mem_each_step = false;
         double event_weight = 0.0;  // 预留（当前未参与注入权重；保持兼容）
+
+        // 选择 pre 的模式：
+        // - BernoulliUniform：逐神经元伯努利采样（默认；兼容历史行为）
+        // - Clustered：每 core 选取若干连续的 pre 段（用于制造空间局部性，便于评估 merge 参数）
+        PrePattern pre_pattern = PrePattern::BernoulliUniform;
+        // Clustered 模式：每段连续 pre 的长度（单位：neuron）。0 表示自动（默认 64）。
+        uint32_t pre_cluster_len = 0;
 
         // BCSR reachability 路由采样（仅影响“post 选择”）
         bool use_bcsr_routes = false;
@@ -101,7 +114,7 @@ public:
     void setInjectionReady(bool ready) { injection_ready_ = ready; }
 
     // 由 MultiCorePE 每拍调用：处理 pending 注入与固定周期注入。
-    void tick(uint64_t current_cycle);
+    void tick(uint64_t current_cycle, uint64_t now_ns);
 
     // 由 MultiCorePE 的阶段事件转发：BeginGather（仅当 period_cycles==0 时有效）
     void onBeginGather(uint32_t seq, uint64_t ts_ns, int core_id);
@@ -144,7 +157,7 @@ private:
     bool route_ack_logged_ = false;
     bool route_warned_ = false;
 
-    std::vector<std::vector<uint32_t>> step_routes_;
+    std::unordered_map<uint32_t, std::vector<uint32_t>> step_routes_map_;
     std::vector<uint32_t> pre_with_routes_;
 };
 

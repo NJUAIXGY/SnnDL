@@ -29,16 +29,17 @@ make install
 
 ```bash
 cd "sst_dram_si"
-export MESH_SIM_TIME="100us"
+export MESH_MAX_STEPS="4"
 ./tools/run_mesh_with_time.sh
 ```
+如需按时间停止：设置 `MESH_MAX_STEPS<=0` 并指定 `MESH_SIM_TIME="100us"`。
 
 可选：切换到 `workload=stream`（不涉及 Spike/GAS/权重/BCSR，仅做 packet-first 通信 + 内存 read-after-write 校验）：
 
 ```bash
 cd "sst_dram_si"
 export SNNDL_WORKLOAD_IMPL="stream"
-export MESH_SIM_TIME="100us"
+export MESH_MAX_STEPS="4"
 ./tools/run_mesh_with_time.sh
 ```
 
@@ -47,8 +48,86 @@ export MESH_SIM_TIME="100us"
 ```bash
 cd "sst_dram_si"
 export SNNDL_WORKLOAD_IMPL="traffic"
-export MESH_SIM_TIME="100us"
+export MESH_MAX_STEPS="4"
 ./tools/run_mesh_with_time.sh
+```
+
+### Tensor 工作负载（计算范式扩张）
+
+除 SNN/stream/traffic 外，SnnDL 也支持 `workload=tensor`（面向 GEMM/systolic 类 compute+memory+NoC 压力），推荐通过独立 workload 目录运行，避免与主实验目录脚本/输出混淆：
+
+```bash
+cd "sst_workloads/tensor_si"
+export TENSOR_SI_SIM_TIME="10us"
+bash "./tools/run_tensor_mesh_with_time.sh"
+```
+
+完整参数与输出口径说明见：`sst_workloads/tensor_si/README.md`。
+
+可选：显式选择聚合统计模块（逗号分隔）：
+
+```bash
+cd "sst_workloads/tensor_si"
+TENSOR_SI_WORKLOAD_STATS_MODULES="tensor,stream" bash "./tools/run_tensor_mesh_with_time.sh"
+```
+
+可选：启用 collective 通信建模（近似 ring/mesh 模式）：
+
+```bash
+cd "sst_workloads/tensor_si"
+TENSOR_SI_TENSOR_COLLECTIVE_TYPE="allreduce" \
+TENSOR_SI_TENSOR_COLLECTIVE_BYTES="1048576" \
+TENSOR_SI_TENSOR_COLLECTIVE_PERIOD="100" \
+TENSOR_SI_TENSOR_COLLECTIVE_PATTERN="ring" \
+TENSOR_SI_TENSOR_COLLECTIVE_PACKET_BYTES="256" \
+bash "./tools/run_tensor_mesh_with_time.sh"
+```
+
+可选：启用 Level-2 `tile` 执行语义（compute 受 DMA/memory backpressure 约束 + stall 分解统计）：
+
+```bash
+cd "sst_workloads/tensor_si"
+TENSOR_SI_TENSOR_EXEC_MODE="tile" \
+TENSOR_SI_TENSOR_TILE_SCHEDULE="auto" \
+TENSOR_SI_TENSOR_WRITEBACK_POLICY="at_end_of_k" \
+bash "./tools/run_tensor_mesh_with_time.sh"
+```
+
+可选：将 collective 作为 iteration 间 barrier（等待本 epoch 的 recv bytes 达标后再进入下一次 iteration）：
+
+```bash
+cd "sst_workloads/tensor_si"
+TENSOR_SI_TENSOR_COLLECTIVE_TYPE="allreduce" \
+TENSOR_SI_TENSOR_COLLECTIVE_BYTES="1048576" \
+TENSOR_SI_TENSOR_COLLECTIVE_PERIOD="100" \
+TENSOR_SI_TENSOR_COLLECTIVE_PATTERN="ring" \
+TENSOR_SI_TENSOR_COLLECTIVE_PACKET_BYTES="256" \
+TENSOR_SI_TENSOR_COLLECTIVE_BLOCKING="1" \
+TENSOR_SI_TENSOR_COLLECTIVE_SCOPE="per_core" \
+bash "./tools/run_tensor_mesh_with_time.sh"
+```
+
+> `TENSOR_SI_TENSOR_COLLECTIVE_SCOPE` 仅在 `*_COLLECTIVE_BLOCKING=1` 时生效：
+> - `per_core`：每个 core 独立等待自身 epoch 完成（默认）
+> - `per_pe`：同一 PE 内所有 cores 的 epoch 完成后，PE 内任一 core 才能进入下一 iteration
+> - `per_system`：全系统（nodes×cores）epoch 完成后，系统内任一 core 才能进入下一 iteration
+>
+> 注：`per_pe/per_system` 会注入少量 `Control` 包做 barrier 完成广播（可在 `tensor_pkt_{sent,recv}_total` 里观察到）。
+
+常用参数入口：
+
+- tensor：`TENSOR_SI_TENSOR_M`、`TENSOR_SI_TENSOR_N`、`TENSOR_SI_TENSOR_K`、`TENSOR_SI_TENSOR_ARRAY_M`、`TENSOR_SI_TENSOR_ARRAY_N`
+- dataflow/tile：`TENSOR_SI_TENSOR_DATAFLOW`、`TENSOR_SI_TENSOR_TILE_M`、`TENSOR_SI_TENSOR_TILE_N`、`TENSOR_SI_TENSOR_TILE_K`
+- exec/schedule：`TENSOR_SI_TENSOR_EXEC_MODE`、`TENSOR_SI_TENSOR_TILE_SCHEDULE`、`TENSOR_SI_TENSOR_WRITEBACK_POLICY`
+- on-chip/DMA：`TENSOR_SI_TENSOR_UB_BYTES`、`TENSOR_SI_TENSOR_ACC_BYTES`、`TENSOR_SI_TENSOR_DMA_BW`、`TENSOR_SI_TENSOR_DOUBLE_BUFFER`
+- collective：`TENSOR_SI_TENSOR_COLLECTIVE_TYPE`、`TENSOR_SI_TENSOR_COLLECTIVE_BYTES`、`TENSOR_SI_TENSOR_COLLECTIVE_PERIOD`、`TENSOR_SI_TENSOR_COLLECTIVE_PATTERN`、`TENSOR_SI_TENSOR_COLLECTIVE_PACKET_BYTES`、`TENSOR_SI_TENSOR_COLLECTIVE_BLOCKING`、`TENSOR_SI_TENSOR_COLLECTIVE_SCOPE`
+- 统计模块：`TENSOR_SI_WORKLOAD_STATS_MODULES="tensor[,stream]"`
+
+### 一键回归门禁（DRAM-SI + tensor_si）
+
+```bash
+cd "<repo_root>"
+bash "tools/run_snndl_regression_gate.sh"
 ```
 
 输出目录通常位于：
@@ -60,7 +139,8 @@ export MESH_SIM_TIME="100us"
 SnnDL 的默认内存建模语义与 `memHierarchy` 保持一致：**以 cacheline（例如 64B）作为系统层事务/流量的基本单位**。
 
 - 论文/报告中的“DRAM traffic”主口径建议以 `memHierarchy MemController requests_received_*`（L2 traffic）为准；
-- `memory_bytes/memory_requests` 表示上层发起的逻辑请求（L1 logical request），用于解释合并/去重形态，不应直接等价为 off-chip 流量；
+- `essential_summary_mesh.json` 中的 `memory.memory_requests` / `memory.memory_bytes` 表示上层发起的逻辑请求（L1 logical request），用于解释合并/去重形态，不应直接等价为 off-chip 流量；
+  - 其中 `memory_bytes` 为对 core 侧统计 `mem_req_size_bytes` 的汇总派生指标；
 - 若切换到 row-streaming/DMA 假设，必须显式标注并单列结果（不得与 cacheline 模式混算）。
 
 ---
@@ -83,24 +163,33 @@ SnnDL 支持一条“原生多播（native multicast）”路径：以 `SpikeKey
 
 ## 目录结构（按边界划分）
 
-> 说明：以“源码子目录”为准（忽略 `.deps/.libs` 等构建产物目录）。每个源码子目录都应有自己的 README，优先以子目录 README 为准。
+> 说明：以“源码子目录”为准（忽略 `.deps/.libs` 等构建产物目录）。多数源码子目录都有 README，优先以子目录 README 为准（缺失时以本 README + 代码为准）。
 
 ```
 SnnDL/
 ├── api/            # 跨层稳定接口（窄抽象）
 ├── events/         # 事件与数据载体（Spike/Gating 等）
 ├── components/     # SST 组件装配壳（ELI 注册对象）
-│   ├── gather/     # GatherBufferIF 构造期参数解析收敛（不新增运行期组件）
-│   ├── multicore/  # MultiCorePE 构造期参数解析收敛（不新增运行期组件）
-├── control/        # 通用 CoreShell（只做装配/分发/统计汇聚；业务逻辑在 workload）
+│   ├── gas/            # 全局 Step/GAS 同步控制面（barrier 等）
+│   ├── gather/         # GatherBufferIF 构造期参数解析收敛（不新增运行期组件）
+│   ├── multicore/      # MultiCorePE 构造期参数解析收敛（不新增运行期组件）
+│   ├── noc/            # 可选 NoC/多播相关组件（实验/高级用法）
+│   ├── stimulus/       # 可选 Stimulus 注入型组件（如 SpikeSource）
+│   ├── mpi/            # MPI 扩展（可选编译）
+│   └── workload_stats/ # workload 统计模块注册表与实现（tensor/stream 等）
+├── control/        # 通用 CoreShell（平台壳：clock/packet/stat + workload 运行时绑定）
 ├── compute/        # 可替换 compute core（神经动力学/学习/验证）
 ├── services/       # 可复用事务子系统（按子域拆分）
 │   ├── noc/        # NoC 传输域（send/recv/forward/本地投递）
 │   ├── memory/     # 纯内存访问域（地址→字节块）
 │   ├── synapse/    # 突触语义域（weights/route/gas 事务闭环）
 │   ├── stimulus/   # Stimulus 域（Step 注入/外部刺激）
-│   ├── workload/   # Workload 插件域（snn/stream 等）
-│   │   ├── layout/ # Workload neuron layout 口径归一化（num_neurons/neurons_per_pe/base）
+│   ├── workload/   # Workload 插件域（snn/stream/traffic/tensor）
+│   │   ├── snn/    # Spike/GAS/BCSR/Step 主链路
+│   │   ├── stream/ # packet-first + mem read-after-write 校验
+│   │   ├── traffic/ # 通信/多播验证负载（不建模动力学）
+│   │   ├── tensor/ # GEMM/systolic 类 compute+memory+NoC 压力
+│   │   └── layout/ # Workload neuron layout 口径归一化（num_neurons/neurons_per_pe/base）
 │   └── legacy/     # 历史遗留/参考实现（默认不进主链路）
 ├── docs/           # 设计与阶段性方案文档
 └── tests/          # include 自检等轻量测试
@@ -111,7 +200,7 @@ SnnDL/
 ## 关键边界（控制 / 计算 / 路由 / 内存 / 权重）
 
 - `components/`：SST 对接与装配壳（端口、Link、Clock、Stat、生命周期）；尽量不写算法事务。
-- `control/`：通用 CoreShell（时钟驱动、packet 递送、统计汇聚）；**不包含 SNN 业务状态机**。
+- `control/`：通用 CoreShell（时钟驱动、packet 递送、统计汇聚）；**不承载 SNN 业务状态机**（但会保留 GAS/Step 控制面事件转发与 legacy 兼容残留，逐步下沉中）。
 - `services/workload/`：workload 插件（例如 `snn`/`stream`）；承载业务状态机与事务编排。
 - `services/workload/traffic`：通信/多播验证用 workload；不建模动力学，但可复用 `synapse/route` 的 fanout/multicast 事务。
 - `compute/`：神经动力学与学习等计算逻辑（`ISnnComputeCore`）；**不直接触碰 StandardMem/NoC**（通过 `IWeightReader`/workload 注入）。
@@ -125,8 +214,14 @@ SnnDL/
 ## 开发提示
 
 - 修改 C++ 后必须执行 `make install` 才会影响实际 `sst` 运行加载的元素库。
-- 若需要调整构建清单：优先改 `Makefile.am`，并同步保持 `Makefile.in` 与之匹配（`make` 会通过 `config.status` 重生成 `Makefile`）。
-- 回归建议：每个阶段至少跑一次 `MESH_SIM_TIME="100us"`，并对比 `essential_summary_mesh.json` 的关键字段（避免非确定性回归）。
+  - 若使用 `SST_ADD_LIB_PATH="<.../SnnDL/.libs[:...]>"`
+    并配合 `SST_BIN="sst_workspace/sst-core/src/sst/core/sst"` 运行，可在不 install 的情况下验证本地编译产物。
+- 若需要调整构建清单：优先改 `Makefile.am`。若需要让改动生效：
+  - 推荐：在 `sst_workspace/sst-elements/` 目录运行 `autoreconf -fi` 重生成 `Makefile.in`，再运行 `./config.status` 刷新各子目录 `Makefile`。
+  - 若不方便跑 autotools：请同时手动更新 `Makefile.in`，并在 `sst_workspace/sst-elements/` 运行 `./config.status`。
+- `configure.m4` 提供 `--with-hdf5`（预留/占位）：当前代码未使用 `HAVE_HDF5`，且 `Makefile.am` 未链接 HDF5；如需启用需补齐实现/链接与验证。
+- Tier2-E：若 `workload=snn` 支持 `api/IWeightReaderAdopter.h`，CoreShell 会在 runtime 绑定后把已装配的 `IWeightReader`（通常为 `WeightMemorySubsystem`）**一次性移交所有权**给 workload，避免 control/workload 双实例装配（脚本参数与外部接口不变）。
+- 回归建议：每个阶段至少跑一次 `MESH_MAX_STEPS="4"`，并对比 `essential_summary_mesh.json` 的关键字段（避免非确定性回归）。
 
 ---
 

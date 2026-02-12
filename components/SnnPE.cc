@@ -923,16 +923,22 @@ void SnnPE::routeSpike(SpikeEvent* spike_event, uint32_t target_node) {
         return;
     }
     
-    if (router->spaceToSend(0, 8)) {
+    const int size_bits = static_cast<int>(sizeof(SpikeEvent) * 8);
+    if (router->spaceToSend(0, size_bits)) {
         // 创建脉冲事件副本作为负载
         SpikeEvent* payload = new SpikeEvent(*spike_event);
         
         // 创建网络请求
         SST::Interfaces::SimpleNetwork::Request* req = 
-            new SST::Interfaces::SimpleNetwork::Request(target_node, node_id, sizeof(SpikeEvent) * 8, true, true, payload);
+            new SST::Interfaces::SimpleNetwork::Request(target_node, node_id, static_cast<size_t>(size_bits), true, true, payload);
         
         // 发送
-        router->send(req, 0);
+        const bool sent = router->send(req, 0);
+        if (!sent) {
+            delete req; // Request 析构会释放 payload
+            PE_LOG(1, "警告：路由器发送失败，丢弃脉冲到节点%u\n", target_node);
+            return;
+        }
         
         PE_LOG(3, "路由脉冲：节点%u -> 节点%u\n", node_id, target_node);
     } else {

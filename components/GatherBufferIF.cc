@@ -357,43 +357,8 @@ void GatherBufferIF::openStep(uint32_t seq) {
     }
 
     // 将非Gather阶段拦截的读请求归属到本窗口并下发（与原 EndScatter->BeginGather 行为保持一致）
-	    if (!queued_non_gather_reads_.empty()) {
-	        for (auto* r : queued_non_gather_reads_) {
-	            sb_[gather_buf_index_].pending_up_reads[r->getID()] = r;
-	            uint64_t gsz = granuleSize();
-	            bool use_row = (merge_==Merge::Row) || (merge_==Merge::Auto && row_bytes_guess_ > gsz);
-	            uint64_t base = (merge_==Merge::Cacheline || (merge_==Merge::Auto && !use_row)) ? alignDown(r->pAddr, gsz)
-	                           : (use_row ? alignDown(r->pAddr, row_bytes_guess_) : r->pAddr);
-	            uint32_t sz = (merge_==Merge::None) ? r->size : (use_row ? row_bytes_guess_ : gsz);
-	            uint64_t off = (r->pAddr >= base) ? (r->pAddr - base) : 0;
-	            uint64_t need = off + (uint64_t)r->size;
-	            if (need > (uint64_t)sz) {
-	                const uint64_t align_unit = use_row ? (uint64_t)row_bytes_guess_ : gsz;
-	                const uint64_t au = (align_unit == 0) ? 64 : align_unit;
-	                const uint64_t sz_u64 = ((need + au - 1) / au) * au;
-	                if (sz_u64 > 0xffffffffull) {
-	                    out_.fatal(CALL_INFO, -1,
-	                               "GatherBufferIF fatal: openStep computed granule sz too large (seq=%u need=%" PRIu64 " align_unit=%" PRIu64 " sz_u64=%" PRIu64 ")\n",
-	                               (uint32_t)seq, (uint64_t)need, (uint64_t)au, (uint64_t)sz_u64);
-	                    return;
-	                }
-	                sz = (uint32_t)sz_u64;
-	            }
-	            GranuleKey key = makeGranuleKey_(base, sz);
-	            auto& g = ensureGranule_(gather_buf_index_, key);
-	            if (off + (uint64_t)r->size > (uint64_t)g.size) {
-	                out_.fatal(CALL_INFO, -1,
-	                           "GatherBufferIF fatal: openStep sub-read out of granule bounds (seq=%u merge=%d use_row=%d base=0x%lx sz=%u addr=0x%lx size=%zu off=%" PRIu64 ")\n",
-	                           (uint32_t)seq, (int)merge_, (int)use_row,
-	                           (uint64_t)base, (uint32_t)g.size, (uint64_t)r->pAddr, (size_t)r->size, (uint64_t)off);
-	                return;
-	            }
-            g.subs.push_back({r->getID(), off, (uint32_t)r->size});
-            g.payload_bytes += (uint64_t)r->size;
-            if (!g.issued) { issueGranuleBuf_(gather_buf_index_, key, g); }
-            if (stat_up_reads_) stat_up_reads_->addData(1);
-        }
-        queued_non_gather_reads_.clear();
+    if (!drainQueuedNonGatherReadsToGather_(ReadAttachKind::OpenStep, seq, (int)stage_)) {
+        return;
     }
 }
 
@@ -473,45 +438,10 @@ void GatherBufferIF::send(Request* req) {
                     sb_[gather_buf_index_].issue_order.clear();
                     sb_[gather_buf_index_].issue_cursor = 0;
                     sb_[gather_buf_index_].issue_order_dirty = true;
-	                    // 将非Gather阶段缓存的读导入当前Gather窗口
-	                    if (!queued_non_gather_reads_.empty()) {
-	                        for (auto* r : queued_non_gather_reads_) {
-	                            sb_[gather_buf_index_].pending_up_reads[r->getID()] = r;
-	                            uint64_t gsz = granuleSize();
-	                            bool use_row = (merge_==Merge::Row) || (merge_==Merge::Auto && row_bytes_guess_ > gsz);
-	                            uint64_t base = (merge_==Merge::Cacheline || (merge_==Merge::Auto && !use_row)) ? alignDown(r->pAddr, gsz)
-	                                               : (use_row ? alignDown(r->pAddr, row_bytes_guess_) : r->pAddr);
-	                            uint32_t sz = (merge_==Merge::None) ? r->size : (use_row ? row_bytes_guess_ : gsz);
-	                            uint64_t off = (r->pAddr >= base) ? (r->pAddr - base) : 0;
-	                            uint64_t need = off + (uint64_t)r->size;
-	                            if (need > (uint64_t)sz) {
-	                                const uint64_t align_unit = use_row ? (uint64_t)row_bytes_guess_ : gsz;
-	                                const uint64_t au = (align_unit == 0) ? 64 : align_unit;
-	                                const uint64_t sz_u64 = ((need + au - 1) / au) * au;
-	                                if (sz_u64 > 0xffffffffull) {
-	                                    out_.fatal(CALL_INFO, -1,
-	                                               "GatherBufferIF fatal: manual BeginGather computed granule sz too large (need=%" PRIu64 " align_unit=%" PRIu64 " sz_u64=%" PRIu64 ")\n",
-	                                               (uint64_t)need, (uint64_t)au, (uint64_t)sz_u64);
-	                                    return;
-	                                }
-	                                sz = (uint32_t)sz_u64;
-	                            }
-	                            GranuleKey key = makeGranuleKey_(base, sz);
-	                            auto& g = ensureGranule_(gather_buf_index_, key);
-	                            if (off + (uint64_t)r->size > (uint64_t)g.size) {
-	                                out_.fatal(CALL_INFO, -1,
-	                                           "GatherBufferIF fatal: manual BeginGather sub-read out of granule bounds (merge=%d use_row=%d base=0x%lx sz=%u addr=0x%lx size=%zu off=%" PRIu64 ")\n",
-	                                           (int)merge_, (int)use_row,
-	                                           (uint64_t)base, (uint32_t)g.size, (uint64_t)r->pAddr, (size_t)r->size, (uint64_t)off);
-	                                return;
-	                            }
-	                            g.subs.push_back({r->getID(), off, (uint32_t)r->size});
-	                            g.payload_bytes += (uint64_t)r->size;
-	                            if (!g.issued) { issueGranuleBuf_(gather_buf_index_, key, g); }
-	                            if (stat_up_reads_) stat_up_reads_->addData(1);
-	                        }
-	                        queued_non_gather_reads_.clear();
-	                    }
+                    // 将非Gather阶段缓存的读导入当前Gather窗口
+                    if (!drainQueuedNonGatherReadsToGather_(ReadAttachKind::ManualBeginGather, 0, (int)stage_)) {
+                        return;
+                    }
                     break;
                 case GasOp::EndGather:
                     sb_[gather_buf_index_].end_gather_seen = true; tail_wait_start_ns_ = getCurrentSimTimeNano();
@@ -593,44 +523,15 @@ void GatherBufferIF::send(Request* req) {
                 // Stage later for gap/Lmax (and optional row-window) merging
                 sb_[tgt].staging_reads.push_back(rd);
                 sb_[tgt].staged_arrival_ns[rd->getID()] = getCurrentSimTimeNano();
-	            } else {
-	                uint64_t gsz = granuleSize();
-	                bool use_row = (merge_==Merge::Row) || (merge_==Merge::Auto && row_bytes_guess_ > gsz);
-	                uint64_t base = (merge_==Merge::Cacheline || (merge_==Merge::Auto && !use_row)) ? alignDown(rd->pAddr, gsz)
-	                               : (use_row ? alignDown(rd->pAddr, row_bytes_guess_) : rd->pAddr);
-	                uint32_t sz = (merge_==Merge::None) ? rd->size : (use_row ? row_bytes_guess_ : gsz);
-	                uint64_t off = (rd->pAddr >= base) ? (rd->pAddr - base) : 0;
-	                uint64_t need = off + (uint64_t)rd->size;
-	                if (need > (uint64_t)sz) {
-	                    const uint64_t align_unit = use_row ? (uint64_t)row_bytes_guess_ : gsz;
-	                    const uint64_t au = (align_unit == 0) ? 64 : align_unit;
-	                    const uint64_t sz_u64 = ((need + au - 1) / au) * au;
-	                    if (sz_u64 > 0xffffffffull) {
-	                        out_.fatal(CALL_INFO, -1,
-	                                   "GatherBufferIF fatal: computed granule sz too large (need=%" PRIu64 " align_unit=%" PRIu64 " sz_u64=%" PRIu64 ")\n",
-	                                   (uint64_t)need, (uint64_t)au, (uint64_t)sz_u64);
-	                        return;
-	                    }
-	                    sz = (uint32_t)sz_u64;
-	                }
-	                GranuleKey key = makeGranuleKey_(base, sz);
-	                auto& g = ensureGranule_(tgt, key);
-	                if (off + (uint64_t)rd->size > (uint64_t)g.size) {
-	                    out_.fatal(CALL_INFO, -1,
-	                               "GatherBufferIF fatal: sub-read out of granule bounds (stage=%d buf=%d merge=%d use_row=%d base=0x%lx sz=%u addr=0x%lx size=%zu off=%" PRIu64 ")\n",
-	                               (int)stage_, tgt, (int)merge_, (int)use_row,
-	                               (uint64_t)base, (uint32_t)g.size, (uint64_t)rd->pAddr, (size_t)rd->size, (uint64_t)off);
-	                    return;
-	                }
-	                g.subs.push_back({rd->getID(), off, (uint32_t)rd->size});
-	                g.payload_bytes += (uint64_t)rd->size;
+            } else {
                 // NOTE:
                 // - When defer_issue_until_apply_=1, Gather-stage reads are issued at Apply entry after building segments.
                 // - Apply-stage reads, however, arrive *after* Apply has already started (e.g. miss-reads / late requests).
                 //   They must be issued immediately to guarantee forward progress; otherwise they will sit in granules
                 //   without another Apply entry to trigger issuance, causing a deadlock.
-                if (stage_ == Stage::Apply || !defer_issue_until_apply_) {
-                    if (!g.issued) { issueGranuleBuf_(tgt, key, g); }
+                const bool issue_now = (stage_ == Stage::Apply || !defer_issue_until_apply_);
+                if (!attachReadToGranule_(tgt, rd, ReadAttachKind::ImmediateSend, issue_now, 0, (int)stage_, tgt)) {
+                    return;
                 }
             }
             if (stat_up_reads_) stat_up_reads_->addData(1);
@@ -667,6 +568,116 @@ StandardMem::Request* GatherBufferIF::poll() {
 }
 
 // === helpers ===
+bool GatherBufferIF::attachReadToGranule_(int tgt_buf,
+                                         StandardMem::Read* rd,
+                                         ReadAttachKind kind,
+                                         bool issue_now,
+                                         uint32_t seq,
+                                         int stage,
+                                         int buf) {
+    uint64_t gsz = granuleSize();
+    bool use_row = (merge_ == Merge::Row) || (merge_ == Merge::Auto && row_bytes_guess_ > gsz);
+    uint64_t base = (merge_ == Merge::Cacheline || (merge_ == Merge::Auto && !use_row))
+                        ? alignDown(rd->pAddr, gsz)
+                        : (use_row ? alignDown(rd->pAddr, row_bytes_guess_) : rd->pAddr);
+    uint32_t sz = (merge_ == Merge::None) ? rd->size : (use_row ? row_bytes_guess_ : gsz);
+    uint64_t off = (rd->pAddr >= base) ? (rd->pAddr - base) : 0;
+    uint64_t need = off + (uint64_t)rd->size;
+
+    if (need > (uint64_t)sz) {
+        const uint64_t align_unit = use_row ? (uint64_t)row_bytes_guess_ : gsz;
+        const uint64_t au = (align_unit == 0) ? 64 : align_unit;
+        const uint64_t sz_u64 = ((need + au - 1) / au) * au;
+        if (sz_u64 > 0xffffffffull) {
+            switch (kind) {
+                case ReadAttachKind::OpenStep:
+                    out_.fatal(CALL_INFO, -1,
+                               "GatherBufferIF fatal: openStep computed granule sz too large (seq=%u need=%" PRIu64 " align_unit=%" PRIu64 " sz_u64=%" PRIu64 ")\n",
+                               (uint32_t)seq, (uint64_t)need, (uint64_t)au, (uint64_t)sz_u64);
+                    return false;
+                case ReadAttachKind::ManualBeginGather:
+                    out_.fatal(CALL_INFO, -1,
+                               "GatherBufferIF fatal: manual BeginGather computed granule sz too large (need=%" PRIu64 " align_unit=%" PRIu64 " sz_u64=%" PRIu64 ")\n",
+                               (uint64_t)need, (uint64_t)au, (uint64_t)sz_u64);
+                    return false;
+                case ReadAttachKind::QueuedImport:
+                    out_.fatal(CALL_INFO, -1,
+                               "GatherBufferIF fatal: queued computed granule sz too large (need=%" PRIu64 " align_unit=%" PRIu64 " sz_u64=%" PRIu64 ")\n",
+                               (uint64_t)need, (uint64_t)au, (uint64_t)sz_u64);
+                    return false;
+                case ReadAttachKind::ImmediateSend:
+                    out_.fatal(CALL_INFO, -1,
+                               "GatherBufferIF fatal: computed granule sz too large (need=%" PRIu64 " align_unit=%" PRIu64 " sz_u64=%" PRIu64 ")\n",
+                               (uint64_t)need, (uint64_t)au, (uint64_t)sz_u64);
+                    return false;
+                default:
+                    out_.fatal(CALL_INFO, -1,
+                               "GatherBufferIF fatal: computed granule sz too large (need=%" PRIu64 " align_unit=%" PRIu64 " sz_u64=%" PRIu64 ")\n",
+                               (uint64_t)need, (uint64_t)au, (uint64_t)sz_u64);
+                    return false;
+            }
+        }
+        sz = (uint32_t)sz_u64;
+    }
+
+    GranuleKey key = makeGranuleKey_(base, sz);
+    auto& g = ensureGranule_(tgt_buf, key);
+    if (off + (uint64_t)rd->size > (uint64_t)g.size) {
+        switch (kind) {
+            case ReadAttachKind::OpenStep:
+                out_.fatal(CALL_INFO, -1,
+                           "GatherBufferIF fatal: openStep sub-read out of granule bounds (seq=%u merge=%d use_row=%d base=0x%lx sz=%u addr=0x%lx size=%zu off=%" PRIu64 ")\n",
+                           (uint32_t)seq, (int)merge_, (int)use_row,
+                           (uint64_t)base, (uint32_t)g.size, (uint64_t)rd->pAddr, (size_t)rd->size, (uint64_t)off);
+                return false;
+            case ReadAttachKind::ManualBeginGather:
+                out_.fatal(CALL_INFO, -1,
+                           "GatherBufferIF fatal: manual BeginGather sub-read out of granule bounds (merge=%d use_row=%d base=0x%lx sz=%u addr=0x%lx size=%zu off=%" PRIu64 ")\n",
+                           (int)merge_, (int)use_row,
+                           (uint64_t)base, (uint32_t)g.size, (uint64_t)rd->pAddr, (size_t)rd->size, (uint64_t)off);
+                return false;
+            case ReadAttachKind::QueuedImport:
+                out_.fatal(CALL_INFO, -1,
+                           "GatherBufferIF fatal: queued sub-read out of granule bounds (stage=%d merge=%d use_row=%d base=0x%lx sz=%u addr=0x%lx size=%zu off=%" PRIu64 ")\n",
+                           stage, (int)merge_, (int)use_row,
+                           (uint64_t)base, (uint32_t)g.size, (uint64_t)rd->pAddr, (size_t)rd->size, (uint64_t)off);
+                return false;
+            case ReadAttachKind::ImmediateSend:
+                out_.fatal(CALL_INFO, -1,
+                           "GatherBufferIF fatal: sub-read out of granule bounds (stage=%d buf=%d merge=%d use_row=%d base=0x%lx sz=%u addr=0x%lx size=%zu off=%" PRIu64 ")\n",
+                           stage, buf, (int)merge_, (int)use_row,
+                           (uint64_t)base, (uint32_t)g.size, (uint64_t)rd->pAddr, (size_t)rd->size, (uint64_t)off);
+                return false;
+            default:
+                out_.fatal(CALL_INFO, -1,
+                           "GatherBufferIF fatal: sub-read out of granule bounds (stage=%d buf=%d merge=%d use_row=%d base=0x%lx sz=%u addr=0x%lx size=%zu off=%" PRIu64 ")\n",
+                           stage, buf, (int)merge_, (int)use_row,
+                           (uint64_t)base, (uint32_t)g.size, (uint64_t)rd->pAddr, (size_t)rd->size, (uint64_t)off);
+                return false;
+        }
+    }
+
+    g.subs.push_back({rd->getID(), off, (uint32_t)rd->size});
+    g.payload_bytes += (uint64_t)rd->size;
+    if (issue_now) {
+        if (!g.issued) { issueGranuleBuf_(tgt_buf, key, g); }
+    }
+    return true;
+}
+
+bool GatherBufferIF::drainQueuedNonGatherReadsToGather_(ReadAttachKind kind, uint32_t seq, int stage) {
+    if (queued_non_gather_reads_.empty()) return true;
+    for (auto* r : queued_non_gather_reads_) {
+        sb_[gather_buf_index_].pending_up_reads[r->getID()] = r;
+        if (!attachReadToGranule_(gather_buf_index_, r, kind, true, seq, stage, gather_buf_index_)) {
+            return false;
+        }
+        if (stat_up_reads_) stat_up_reads_->addData(1);
+    }
+    queued_non_gather_reads_.clear();
+    return true;
+}
+
 GatherBufferIF::Merge GatherBufferIF::parseMerge(const std::string& s) const {
     if (s == "none") return Merge::None;
     if (s == "cacheline") return Merge::Cacheline;
@@ -1847,48 +1858,13 @@ bool GatherBufferIF::clockTick(Cycle_t) {
                     auto* cr4 = new StandardMem::CustomResp((StandardMem::Request::id_t)0, bg, 0, 0, 0);
                     (*upstream_handler_)(cr4);
                 }
-	                // 不清理 gather 缓冲，允许在 Apply 阶段已开始的下一窗口继续累积
-	                // 导入非Gather缓存
-	                if (!queued_non_gather_reads_.empty()) {
-	                    for (auto* r : queued_non_gather_reads_) {
-	                        sb_[gather_buf_index_].pending_up_reads[r->getID()] = r;
-	                        uint64_t gsz = granuleSize();
-	                        bool use_row = (merge_==Merge::Row) || (merge_==Merge::Auto && row_bytes_guess_ > gsz);
-	                        uint64_t base = (merge_==Merge::Cacheline || (merge_==Merge::Auto && !use_row)) ? alignDown(r->pAddr, gsz)
-	                                       : (use_row ? alignDown(r->pAddr, row_bytes_guess_) : r->pAddr);
-	                        uint32_t sz = (merge_==Merge::None) ? r->size : (use_row ? row_bytes_guess_ : gsz);
-	                        uint64_t off = (r->pAddr >= base) ? (r->pAddr - base) : 0;
-	                        uint64_t need = off + (uint64_t)r->size;
-	                        if (need > (uint64_t)sz) {
-	                            const uint64_t align_unit = use_row ? (uint64_t)row_bytes_guess_ : gsz;
-	                            const uint64_t au = (align_unit == 0) ? 64 : align_unit;
-	                            const uint64_t sz_u64 = ((need + au - 1) / au) * au;
-	                            if (sz_u64 > 0xffffffffull) {
-	                                out_.fatal(CALL_INFO, -1,
-	                                           "GatherBufferIF fatal: queued computed granule sz too large (need=%" PRIu64 " align_unit=%" PRIu64 " sz_u64=%" PRIu64 ")\n",
-	                                           (uint64_t)need, (uint64_t)au, (uint64_t)sz_u64);
-	                                return false;
-	                            }
-	                            sz = (uint32_t)sz_u64;
-	                        }
-	                        GranuleKey key = makeGranuleKey_(base, sz);
-	                        auto& g = ensureGranule_(gather_buf_index_, key);
-	                        if (off + (uint64_t)r->size > (uint64_t)g.size) {
-	                            out_.fatal(CALL_INFO, -1,
-	                                       "GatherBufferIF fatal: queued sub-read out of granule bounds (stage=%d merge=%d use_row=%d base=0x%lx sz=%u addr=0x%lx size=%zu off=%" PRIu64 ")\n",
-	                                       (int)stage_, (int)merge_, (int)use_row,
-	                                       (uint64_t)base, (uint32_t)g.size, (uint64_t)r->pAddr, (size_t)r->size, (uint64_t)off);
-	                            return false;
-	                        }
-	                        g.subs.push_back({r->getID(), off, (uint32_t)r->size});
-	                        g.payload_bytes += (uint64_t)r->size;
-	                        if (!g.issued) { issueGranuleBuf_(gather_buf_index_, key, g); }
-	                        if (stat_up_reads_) stat_up_reads_->addData(1);
-	                    }
-	                    queued_non_gather_reads_.clear();
-	                }
-	            }
-	        }
+                // 不清理 gather 缓冲，允许在 Apply 阶段已开始的下一窗口继续累积
+                // 导入非Gather缓存
+                if (!drainQueuedNonGatherReadsToGather_(ReadAttachKind::QueuedImport, 0, (int)stage_)) {
+                    return false;
+                }
+            }
+        }
     }
     // track inflight peak (sum of both buffers)
     uint64_t inflight_total = (uint64_t)(inflight_counts_[0] + inflight_counts_[1]);

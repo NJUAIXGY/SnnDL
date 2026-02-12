@@ -14,7 +14,7 @@
 #include <sst/core/output.h>
 #include <sst/core/params.h>
 
-#include "SpikeEvent.h"
+#include "events/SpikeEvent.h"
 #include "SnnWeightReader.h"
 #include "SnnCoreEngine.h"
 #include "SnnLearningCore.h"

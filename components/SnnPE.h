@@ -30,7 +30,7 @@
 #include <unordered_map>
 #include <memory>
 
-#include "SpikeEvent.h"
+#include "events/SpikeEvent.h"
 #include "SnnInterface.h"
 #include "SnnNeuronModel.h"
 

@@ -74,6 +74,40 @@ static bool readFileSlice(const std::string& path, uint64_t offset, size_t bytes
     f.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(bytes));
     return static_cast<size_t>(f.gcount()) == bytes;
 }
+
+struct RowIndexPrefetchPolicy {
+    std::string mode;
+    uint32_t block_rows = 0;
+    uint32_t n_block_rows = 0;
+    bool enabled = false;
+    bool auto_all_rows = false;
+};
+
+static RowIndexPrefetchPolicy computeRowIndexPrefetchPolicy(const WeightMemorySubsystem::OrchestratorConfig& orch) {
+    RowIndexPrefetchPolicy p{};
+    if (!orch.use_bcsr || !orch.bcsr_mgr) return p;
+    if (!orch.bcsr_mgr->isRowptrReady()) return p;
+
+    p.mode = toLowerCopy(orch.bcsr_row_index_prefetch_mode);
+    if (p.mode.empty()) p.mode = "auto";
+    if (p.mode == "off") return p;
+
+    p.block_rows = orch.bcsr_mgr->effectiveBlockRows();
+    p.n_block_rows =
+        p.block_rows ? ((orch.num_neurons + p.block_rows - 1u) / p.block_rows) : static_cast<uint32_t>(orch.num_neurons);
+    if (p.n_block_rows == 0) return p;
+
+    p.enabled = true;
+    if (p.mode == "auto" && p.n_block_rows <= orch.bcsr_row_index_prefetch_all_rows_threshold) {
+        uint32_t last_start = 0;
+        uint32_t last_end = 0;
+        if (orch.bcsr_mgr->rowBounds(p.n_block_rows - 1u, last_start, last_end) && last_end > 0) {
+            const size_t colidx_bytes = orch.bcsr_mgr->colIndexBytes(last_end);
+            p.auto_all_rows = (colidx_bytes <= orch.bcsr_row_index_prefetch_all_rows_max_bytes);
+        }
+    }
+    return p;
+}
 } // namespace
 
 void WeightMemorySubsystem::onClockTick(uint64_t now_cycle) {
@@ -139,34 +173,64 @@ void WeightMemorySubsystem::drainPendingReads_() {
     if (drain_pending_in_progress_) return;
     drain_pending_in_progress_ = true;
 
-    auto drain_colidx = [this]() -> bool {
-        while (!pending_colidx_reads_.empty()) {
-            const uint64_t inflight_key = pending_colidx_reads_.front();
-            auto it = inflight_colidx_.find(inflight_key);
-            if (it == inflight_colidx_.end()) {
-                pending_colidx_reads_.pop_front();
+    auto fail_waiters = [](auto& waiters) {
+        for (auto& ww : waiters) {
+            if (ww.cb) ww.cb(0.0f);
+        }
+    };
+
+    auto drain_inflight_queue =
+        [this, &fail_waiters](auto& pending_queue, auto& inflight_map, auto&& make_meta, auto&& on_issued) -> bool {
+        while (!pending_queue.empty()) {
+            const uint64_t inflight_key = pending_queue.front();
+            auto it = inflight_map.find(inflight_key);
+            if (it == inflight_map.end()) {
+                pending_queue.pop_front();
                 continue;
             }
-            ColidxInflight& inflight = it->second;
+            auto& inflight = it->second;
             if (inflight.issued) {
                 inflight.queued = false;
-                pending_colidx_reads_.pop_front();
+                pending_queue.pop_front();
                 continue;
             }
             if (!orch_.use_bcsr || !orch_.bcsr_mgr) {
                 auto waiters = std::move(inflight.waiters);
-                inflight_colidx_.erase(it);
-                pending_colidx_reads_.pop_front();
-                for (auto& ww : waiters) {
-                    if (ww.cb) ww.cb(0.0f);
-                }
+                inflight_map.erase(it);
+                pending_queue.pop_front();
+                fail_waiters(waiters);
                 continue;
             }
+
+            PendingMeta meta = make_meta(inflight);
+            const IssueStatus st = tryIssueRead_(std::move(meta), inflight.count_budget, /*budget_reserved*/true);
+            if (st == IssueStatus::Issued) {
+                inflight.issued = true;
+                inflight.queued = false;
+                pending_queue.pop_front();
+                on_issued();
+                return true;
+            }
+            if (st == IssueStatus::DeferredInflight) return false;
+            if (st == IssueStatus::DeferredBudget) return false;
+
+            // Failed
+            auto waiters = std::move(inflight.waiters);
+            inflight_map.erase(it);
+            pending_queue.pop_front();
+            fail_waiters(waiters);
+            return true;
+        }
+        return false;
+    };
+
+    auto drain_colidx = [this, &drain_inflight_queue]() -> bool {
+        auto make_meta = [this](const ColidxInflight& inflight) -> PendingMeta {
             const uint32_t block_count = (inflight.row_end > inflight.row_start)
                                              ? (inflight.row_end - inflight.row_start)
                                              : 0;
-            const size_t bytes = orch_.bcsr_mgr->colIndexBytes(block_count);
-            const uint64_t addr = orch_.bcsr_mgr->colIndexAddr(inflight.row_start);
+            const size_t bytes = orch_.bcsr_mgr ? orch_.bcsr_mgr->colIndexBytes(block_count) : 0;
+            const uint64_t addr = orch_.bcsr_mgr ? orch_.bcsr_mgr->colIndexAddr(inflight.row_start) : 0;
 
             PendingMeta meta{};
             meta.window_seq = inflight.window_seq;
@@ -184,56 +248,20 @@ void WeightMemorySubsystem::drainPendingReads_() {
             meta.has_single_cb = false;
             meta.is_weight = true;
             meta.count_weight_read = false;
+            return meta;
+        };
 
-            const IssueStatus st = tryIssueRead_(std::move(meta), inflight.count_budget, /*budget_reserved*/true);
-            if (st == IssueStatus::Issued) {
-                inflight.issued = true;
-                inflight.queued = false;
-                pending_colidx_reads_.pop_front();
-                if (diag_debug_ && diag_window_active_) diag_win_.rowidx_miss += 1;
-                return true;
-            }
-            if (st == IssueStatus::DeferredInflight) return false;
-            if (st == IssueStatus::DeferredBudget) return false;
+        auto on_issued = [this]() {
+            if (diag_debug_ && diag_window_active_) diag_win_.rowidx_miss += 1;
+        };
 
-            // Failed
-            auto waiters = std::move(inflight.waiters);
-            inflight_colidx_.erase(it);
-            pending_colidx_reads_.pop_front();
-            for (auto& ww : waiters) {
-                if (ww.cb) ww.cb(0.0f);
-            }
-            return true;
-        }
-        return false;
+        return drain_inflight_queue(pending_colidx_reads_, inflight_colidx_, make_meta, on_issued);
     };
 
-    auto drain_block = [this]() -> bool {
-        while (!pending_block_reads_.empty()) {
-            const uint64_t inflight_key = pending_block_reads_.front();
-            auto it = inflight_block_.find(inflight_key);
-            if (it == inflight_block_.end()) {
-                pending_block_reads_.pop_front();
-                continue;
-            }
-            BlockInflight& inflight = it->second;
-            if (inflight.issued) {
-                inflight.queued = false;
-                pending_block_reads_.pop_front();
-                continue;
-            }
-            if (!orch_.use_bcsr || !orch_.bcsr_mgr) {
-                auto waiters = std::move(inflight.waiters);
-                inflight_block_.erase(it);
-                pending_block_reads_.pop_front();
-                for (auto& ww : waiters) {
-                    if (ww.cb) ww.cb(0.0f);
-                }
-                continue;
-            }
-
-            const size_t block_bytes = orch_.bcsr_mgr->blockBytes();
-            const uint64_t addr = orch_.bcsr_mgr->blockDataAddr(inflight.global_block_index);
+    auto drain_block = [this, &drain_inflight_queue]() -> bool {
+        auto make_meta = [this](const BlockInflight& inflight) -> PendingMeta {
+            const size_t block_bytes = orch_.bcsr_mgr ? orch_.bcsr_mgr->blockBytes() : 0;
+            const uint64_t addr = orch_.bcsr_mgr ? orch_.bcsr_mgr->blockDataAddr(inflight.global_block_index) : 0;
             uint64_t req_addr = addr;
             size_t req_size = block_bytes;
             size_t slice_off = 0;
@@ -255,28 +283,14 @@ void WeightMemorySubsystem::drainPendingReads_() {
             meta.has_single_cb = false;
             meta.is_weight = true;
             meta.count_weight_read = true;
+            return meta;
+        };
 
-            const IssueStatus st = tryIssueRead_(std::move(meta), inflight.count_budget, /*budget_reserved*/true);
-            if (st == IssueStatus::Issued) {
-                inflight.issued = true;
-                inflight.queued = false;
-                pending_block_reads_.pop_front();
-                if (diag_debug_ && diag_window_active_) diag_win_.block_miss += 1;
-                return true;
-            }
-            if (st == IssueStatus::DeferredInflight) return false;
-            if (st == IssueStatus::DeferredBudget) return false;
+        auto on_issued = [this]() {
+            if (diag_debug_ && diag_window_active_) diag_win_.block_miss += 1;
+        };
 
-            // Failed
-            auto waiters = std::move(inflight.waiters);
-            inflight_block_.erase(it);
-            pending_block_reads_.pop_front();
-            for (auto& ww : waiters) {
-                if (ww.cb) ww.cb(0.0f);
-            }
-            return true;
-        }
-        return false;
+        return drain_inflight_queue(pending_block_reads_, inflight_block_, make_meta, on_issued);
     };
 
     // Priority: colidx first (unblocks many blocks), then blockdata.
@@ -315,29 +329,10 @@ void WeightMemorySubsystem::drainPendingDirectReads_() {
 
 void WeightMemorySubsystem::maybeEnqueueRowIndexPrefetchAllRows_() {
     if (!kEnableBcsrOptimizations) return;
-    if (!orch_.use_bcsr || !orch_.bcsr_mgr) return;
-    if (!orch_.bcsr_mgr->isRowptrReady()) return;
+    const auto p = computeRowIndexPrefetchPolicy(orch_);
+    if (!p.enabled) return;
 
-    std::string mode = toLowerCopy(orch_.bcsr_row_index_prefetch_mode);
-    if (mode.empty()) mode = "auto";
-    if (mode == "off") return;
-
-    const uint32_t br = orch_.bcsr_mgr->effectiveBlockRows();
-    const uint32_t nBlockRows =
-        br ? ((orch_.num_neurons + br - 1u) / br) : static_cast<uint32_t>(orch_.num_neurons);
-    if (nBlockRows == 0) return;
-
-    bool auto_all = false;
-    if (mode == "auto" && nBlockRows <= orch_.bcsr_row_index_prefetch_all_rows_threshold) {
-        uint32_t last_start = 0;
-        uint32_t last_end = 0;
-        if (orch_.bcsr_mgr->rowBounds(nBlockRows - 1u, last_start, last_end) && last_end > 0) {
-            const size_t colidx_bytes = orch_.bcsr_mgr->colIndexBytes(last_end);
-            auto_all = (colidx_bytes <= orch_.bcsr_row_index_prefetch_all_rows_max_bytes);
-        }
-    }
-
-    const bool do_all = (mode == "all_rows") || auto_all;
+    const bool do_all = (p.mode == "all_rows") || p.auto_all_rows;
     if (!do_all) return;
     if (row_index_prefetch_all_done_) return;
 
@@ -349,40 +344,21 @@ void WeightMemorySubsystem::maybeEnqueueRowIndexPrefetchAllRows_() {
 
 void WeightMemorySubsystem::maybeEnqueueRowIndexPrefetchPostsPrev_() {
     if (!kEnableBcsrOptimizations) return;
-    if (!orch_.use_bcsr || !orch_.bcsr_mgr) return;
-    if (!orch_.bcsr_mgr->isRowptrReady()) return;
+    const auto p = computeRowIndexPrefetchPolicy(orch_);
+    if (!p.enabled) return;
 
-    std::string mode = toLowerCopy(orch_.bcsr_row_index_prefetch_mode);
-    if (mode.empty()) mode = "auto";
-    if (mode == "off") return;
-
-    const uint32_t br = orch_.bcsr_mgr->effectiveBlockRows();
-    const uint32_t nBlockRows =
-        br ? ((orch_.num_neurons + br - 1u) / br) : static_cast<uint32_t>(orch_.num_neurons);
-    if (nBlockRows == 0) return;
-
-    bool auto_all = false;
-    if (mode == "auto" && nBlockRows <= orch_.bcsr_row_index_prefetch_all_rows_threshold) {
-        uint32_t last_start = 0;
-        uint32_t last_end = 0;
-        if (orch_.bcsr_mgr->rowBounds(nBlockRows - 1u, last_start, last_end) && last_end > 0) {
-            const size_t colidx_bytes = orch_.bcsr_mgr->colIndexBytes(last_end);
-            auto_all = (colidx_bytes <= orch_.bcsr_row_index_prefetch_all_rows_max_bytes);
-        }
-    }
-
-    const bool do_posts_prev = (mode == "posts_prev") || (mode == "auto" && !auto_all);
+    const bool do_posts_prev = (p.mode == "posts_prev") || (p.mode == "auto" && !p.auto_all_rows);
     if (!do_posts_prev) return;
 
     const auto& posts = postsPrev();
     if (posts.empty()) return;
 
-    std::vector<uint8_t> seen(nBlockRows, 0);
+    std::vector<uint8_t> seen(p.n_block_rows, 0);
     std::vector<uint32_t> rows;
-    rows.reserve(std::min<size_t>(posts.size(), nBlockRows));
+    rows.reserve(std::min<size_t>(posts.size(), p.n_block_rows));
     for (uint32_t post_local : posts) {
-        const uint32_t block_row = br ? (post_local / br) : post_local;
-        if (block_row >= nBlockRows) continue;
+        const uint32_t block_row = p.block_rows ? (post_local / p.block_rows) : post_local;
+        if (block_row >= p.n_block_rows) continue;
         if (seen[block_row]) continue;
         seen[block_row] = 1;
         rows.push_back(block_row);
@@ -393,12 +369,8 @@ void WeightMemorySubsystem::maybeEnqueueRowIndexPrefetchPostsPrev_() {
 
 void WeightMemorySubsystem::drainRowIndexPrefetch_() {
     if (!kEnableBcsrOptimizations) return;
-    if (!orch_.use_bcsr || !orch_.bcsr_mgr) return;
-    if (!orch_.bcsr_mgr->isRowptrReady()) return;
-
-    std::string mode = toLowerCopy(orch_.bcsr_row_index_prefetch_mode);
-    if (mode.empty()) mode = "auto";
-    if (mode == "off") return;
+    const auto p = computeRowIndexPrefetchPolicy(orch_);
+    if (!p.enabled) return;
 
     while (!row_index_prefetch_rows_.empty()) {
         if (window_.max_outstanding != 0 && window_.outstanding >= window_.max_outstanding) break;
@@ -407,13 +379,9 @@ void WeightMemorySubsystem::drainRowIndexPrefetch_() {
 
         if (block_row == UINT32_MAX) {
             if (row_index_prefetch_bulk_inflight_) continue;
-            const uint32_t br = orch_.bcsr_mgr->effectiveBlockRows();
-            const uint32_t nBlockRows =
-                br ? ((orch_.num_neurons + br - 1u) / br) : static_cast<uint32_t>(orch_.num_neurons);
-            if (nBlockRows == 0) continue;
             uint32_t last_start = 0;
             uint32_t last_end = 0;
-            if (!orch_.bcsr_mgr->rowBounds(nBlockRows - 1u, last_start, last_end)) continue;
+            if (!orch_.bcsr_mgr->rowBounds(p.n_block_rows - 1u, last_start, last_end)) continue;
             const uint32_t total_blocks = last_end;
             if (total_blocks == 0) continue;
 

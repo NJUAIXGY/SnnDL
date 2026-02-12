@@ -4,7 +4,7 @@
 
 #include "workload/snn/SnnWorkload.h"
 #include "ISnnComputeCore.h"
-#include "SpikeEvent.h"
+#include "events/SpikeEvent.h"
 #include "SnnWeightReader.h"
 #include "synapse/gas/AccumulatorOps.h"
 #include "synapse/weights/WeightAccessor.h"
@@ -47,6 +47,16 @@ SnnWorkload::~SnnWorkload() {
     while (!incoming_spikes_.empty()) {
         delete incoming_spikes_.front();
         incoming_spikes_.pop();
+    }
+}
+
+void SnnWorkload::adoptWeightReader(std::unique_ptr<IWeightReader> reader) {
+    if (!reader) return;
+    if (weight_reader_) return;
+    weight_reader_ = std::move(reader);
+    weight_mem_subsystem_ = dynamic_cast<WeightMemorySubsystem*>(weight_reader_.get());
+    if (weight_mem_subsystem_) {
+        weight_mem_subsystem_->bindMemory(rt_.mem);
     }
 }
 
@@ -268,7 +278,6 @@ bool SnnWorkload::ensureLoaderReady_() {
 }
 
 void SnnWorkload::ensureWeightReaderOwned_() {
-    if (weight_reader_) return;
     normalizeLayout_();
 
     if (!params_) {
@@ -276,196 +285,205 @@ void SnnWorkload::ensureWeightReaderOwned_() {
         std::abort();
     }
 
-    // === Build local cache/weight accessor/BCSR manager (workload-owned) ===
-    const uint32_t max_cache_entries = params_->find<uint32_t>("max_cache_entries", 65536);
-    const bool use_clock_weight_cache = params_->find<int>("use_clock_weight_cache", 0) != 0;
-    const bool disable_weight_cache = params_->find<int>("disable_weight_cache", 0) != 0;
+    if (!weight_reader_) {
+        // === Build local cache/weight accessor/BCSR manager (workload-owned) ===
+        const uint32_t max_cache_entries = params_->find<uint32_t>("max_cache_entries", 65536);
+        const bool use_clock_weight_cache = params_->find<int>("use_clock_weight_cache", 0) != 0;
+        const bool disable_weight_cache = params_->find<int>("disable_weight_cache", 0) != 0;
 
-    if (!weight_cache_ops_) weight_cache_ops_ = std::make_unique<WeightCacheOps>();
-    {
-        WeightCacheOps::Config cache_cfg{};
-        cache_cfg.max_entries = max_cache_entries;
-        cache_cfg.use_clock = use_clock_weight_cache;
-        cache_cfg.disable_cache = disable_weight_cache;
-        weight_cache_ops_->configure(cache_cfg, /*on_evict*/[](){});
-        weight_cache_ops_->reserve(cache_cfg.max_entries ? cache_cfg.max_entries : 1);
-    }
-
-    if (!weight_accessor_) weight_accessor_ = std::make_unique<WeightAccessor>();
-    uint32_t weights_cols = params_->find<uint32_t>("weights_cols", 0);
-    if (weights_cols == 0) weights_cols = num_neurons_;
-    weight_accessor_->configure(WeightAccessorConfig{
-        static_cast<uint32_t>(rt_.core_id),
-        static_cast<uint64_t>(global_neuron_base_),
-        static_cast<uint32_t>(num_neurons_),
-        static_cast<uint32_t>(weights_cols),
-        use_post_row_pre_col_
-    });
-
-    if (!bcsr_mgr_) bcsr_mgr_ = std::make_unique<BcsrWeightManager>();
-    if (use_bcsr_) {
-        const uint64_t base_addr = params_->find<uint64_t>("base_addr", 0);
-        const uint64_t rp_off = params_->find<uint64_t>("bcsr_rowptr_offset", 0);
-        const uint64_t ci_off = params_->find<uint64_t>("bcsr_colidx_offset", 0);
-        const uint64_t bd_off = params_->find<uint64_t>("bcsr_blockdata_offset", 0);
-        const uint64_t id_off = params_->find<uint64_t>("bcsr_blockids_offset", 0);
-        const uint32_t br = params_->find<uint32_t>("bcsr_block_rows", 16);
-        const uint32_t bc = params_->find<uint32_t>("bcsr_block_cols", 16);
-        const uint32_t idxb = params_->find<uint32_t>("bcsr_idx_bytes", 2);
-        const uint32_t valb = params_->find<uint32_t>("bcsr_val_bytes", 4);
-        const uint64_t rowptr_addr = base_addr + rp_off;
-        const uint64_t colidx_addr = base_addr + ci_off;
-        const uint64_t blockdata_addr = base_addr + bd_off;
-        const uint64_t blockids_addr = id_off ? (base_addr + id_off) : 0;
-        bcsr_mgr_->configure(rowptr_addr, colidx_addr, blockdata_addr, blockids_addr, br, bc, idxb, valb);
-        // Row-index cache (colidx) 是 Apply 的关键路径：cap 太小会导致每窗重复 colidx burst → bursts 不降 → apply_ns 不降。
-        // 默认不强制覆盖用户配置；仅当显式启用 auto_fit 时，自动扩到覆盖本 core 的全部 block rows（语义不变，仅减少重复读）。
-        uint32_t row_cap = params_->find<uint32_t>("bcsr_row_index_cache_cap", 64);
-        const bool row_auto_fit = params_->find<int>("bcsr_row_index_cache_auto_fit", 0) != 0;
-        if (row_auto_fit && row_cap > 0) {
-            const uint32_t br_eff = br ? br : 16;
-            const uint32_t n_block_rows =
-                br_eff ? ((num_neurons_ + br_eff - 1u) / br_eff) : static_cast<uint32_t>(num_neurons_);
-            if (n_block_rows > 0 && row_cap < n_block_rows) {
-                if (rt_.log) {
-                    rt_.log->verbose(CALL_INFO, 2, 0,
-                                     "[bcsr] auto-fit row_index_cache_cap %u -> %u (node=%u core=%u rows=%u br=%u)\n",
-                                     row_cap,
-                                     n_block_rows,
-                                     static_cast<uint32_t>(rt_.node_id),
-                                     static_cast<uint32_t>(rt_.core_id),
-                                     static_cast<uint32_t>(num_neurons_),
-                                     br_eff);
-                }
-                row_cap = n_block_rows;
-            }
-        }
-        bcsr_mgr_->setRowIndexCacheCapacity(row_cap);
-        bcsr_mgr_->setBlockCacheCapacity(params_->find<uint32_t>("bcsr_block_cache_cap", 256));
+        if (!weight_cache_ops_) weight_cache_ops_ = std::make_unique<WeightCacheOps>();
         {
-            std::string pol = params_->find<std::string>("bcsr_block_cache_policy", "lru");
-            for (auto& ch : pol) {
-                if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
-            }
-            if (pol == "fifo") {
-                bcsr_mgr_->setBlockCachePolicy(BcsrWeightManager::BlockCachePolicy::FIFO);
-            } else if (pol == "legacy_unordered" || pol == "legacy") {
-                bcsr_mgr_->setBlockCachePolicy(BcsrWeightManager::BlockCachePolicy::LegacyUnordered);
-            } else {
-                bcsr_mgr_->setBlockCachePolicy(BcsrWeightManager::BlockCachePolicy::LRU);
-            }
+            WeightCacheOps::Config cache_cfg{};
+            cache_cfg.max_entries = max_cache_entries;
+            cache_cfg.use_clock = use_clock_weight_cache;
+            cache_cfg.disable_cache = disable_weight_cache;
+            weight_cache_ops_->configure(cache_cfg, /*on_evict*/[](){});
+            weight_cache_ops_->reserve(cache_cfg.max_entries ? cache_cfg.max_entries : 1);
         }
-    }
 
-    // === Build WeightMemorySubsystem ===
-    auto wms = std::make_unique<WeightMemorySubsystem>();
-    wms->configure(
-        [this](uint64_t key, float& out) -> bool {
-            return weight_cache_ops_ ? weight_cache_ops_->tryGet(key, out) : false;
-        },
-        [this](uint64_t key, float v) {
-            if (weight_cache_ops_) weight_cache_ops_->store(key, v);
+        if (!weight_accessor_) weight_accessor_ = std::make_unique<WeightAccessor>();
+        uint32_t weights_cols = params_->find<uint32_t>("weights_cols", 0);
+        if (weights_cols == 0) weights_cols = num_neurons_;
+        weight_accessor_->configure(WeightAccessorConfig{
+            static_cast<uint32_t>(rt_.core_id),
+            static_cast<uint64_t>(global_neuron_base_),
+            static_cast<uint32_t>(num_neurons_),
+            static_cast<uint32_t>(weights_cols),
+            use_post_row_pre_col_
         });
 
-    const uint64_t base_addr = params_->find<uint64_t>("base_addr", 0);
-    const uint64_t weight_region_end =
-        base_addr + static_cast<uint64_t>(num_neurons_) * static_cast<uint64_t>(weights_cols) * sizeof(float);
-
-    WeightMemorySubsystem::OrchestratorConfig ocfg{};
-    ocfg.accessor = weight_accessor_.get();
-    ocfg.cache_try = [this](uint64_t key, float& out) -> bool {
-        return weight_cache_ops_ ? weight_cache_ops_->tryGet(key, out) : false;
-    };
-    ocfg.cache_put = [this](uint64_t key, float v) {
-        if (weight_cache_ops_) weight_cache_ops_->store(key, v);
-    };
-    ocfg.acc_update = [this](uint32_t post_local, float dv) {
-        if (acc_ops_) acc_ops_->update(post_local, dv);
-    };
-    ocfg.report_mem_issue = [this](size_t bytes, bool /*count_weight_read*/) {
-        if (rt_.reporting.report_mem_issue) rt_.reporting.report_mem_issue(rt_.reporting.ctx, bytes);
-    };
-    ocfg.ensure_loader_ready = [this]() { return ensureLoaderReady_(); };
-    ocfg.bcsr_rowptr_ready = [this]() { return !use_bcsr_ || (bcsr_mgr_ && bcsr_mgr_->isRowptrReady()); };
-    ocfg.ensure_rowptr_ready_or_fatal = [this](const char* reason) {
-        if (rt_.log) {
-            rt_.log->fatal(CALL_INFO, -1,
-                           "SnnWorkload fatal: BCSR rowptr not ready (%s) node=%u core=%u\n",
-                           reason ? reason : "unknown",
-                           static_cast<uint32_t>(rt_.node_id),
-                           static_cast<uint32_t>(rt_.core_id));
+        if (!bcsr_mgr_) bcsr_mgr_ = std::make_unique<BcsrWeightManager>();
+        if (use_bcsr_) {
+            const uint64_t base_addr = params_->find<uint64_t>("base_addr", 0);
+            const uint64_t rp_off = params_->find<uint64_t>("bcsr_rowptr_offset", 0);
+            const uint64_t ci_off = params_->find<uint64_t>("bcsr_colidx_offset", 0);
+            const uint64_t bd_off = params_->find<uint64_t>("bcsr_blockdata_offset", 0);
+            const uint64_t id_off = params_->find<uint64_t>("bcsr_blockids_offset", 0);
+            const uint32_t br = params_->find<uint32_t>("bcsr_block_rows", 16);
+            const uint32_t bc = params_->find<uint32_t>("bcsr_block_cols", 16);
+            const uint32_t idxb = params_->find<uint32_t>("bcsr_idx_bytes", 2);
+            const uint32_t valb = params_->find<uint32_t>("bcsr_val_bytes", 4);
+            const uint64_t rowptr_addr = base_addr + rp_off;
+            const uint64_t colidx_addr = base_addr + ci_off;
+            const uint64_t blockdata_addr = base_addr + bd_off;
+            const uint64_t blockids_addr = id_off ? (base_addr + id_off) : 0;
+            bcsr_mgr_->configure(rowptr_addr, colidx_addr, blockdata_addr, blockids_addr, br, bc, idxb, valb);
+            // Row-index cache (colidx) 是 Apply 的关键路径：cap 太小会导致每窗重复 colidx burst → bursts 不降 → apply_ns 不降。
+            // 默认不强制覆盖用户配置；仅当显式启用 auto_fit 时，自动扩到覆盖本 core 的全部 block rows（语义不变，仅减少重复读）。
+            uint32_t row_cap = params_->find<uint32_t>("bcsr_row_index_cache_cap", 64);
+            const bool row_auto_fit = params_->find<int>("bcsr_row_index_cache_auto_fit", 0) != 0;
+            if (row_auto_fit && row_cap > 0) {
+                const uint32_t br_eff = br ? br : 16;
+                const uint32_t n_block_rows =
+                    br_eff ? ((num_neurons_ + br_eff - 1u) / br_eff) : static_cast<uint32_t>(num_neurons_);
+                if (n_block_rows > 0 && row_cap < n_block_rows) {
+                    if (rt_.log) {
+                        rt_.log->verbose(CALL_INFO, 2, 0,
+                                         "[bcsr] auto-fit row_index_cache_cap %u -> %u (node=%u core=%u rows=%u br=%u)\n",
+                                         row_cap,
+                                         n_block_rows,
+                                         static_cast<uint32_t>(rt_.node_id),
+                                         static_cast<uint32_t>(rt_.core_id),
+                                         static_cast<uint32_t>(num_neurons_),
+                                         br_eff);
+                    }
+                    row_cap = n_block_rows;
+                }
+            }
+            bcsr_mgr_->setRowIndexCacheCapacity(row_cap);
+            bcsr_mgr_->setBlockCacheCapacity(params_->find<uint32_t>("bcsr_block_cache_cap", 256));
+            {
+                std::string pol = params_->find<std::string>("bcsr_block_cache_policy", "lru");
+                for (auto& ch : pol) {
+                    if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+                }
+                if (pol == "fifo") {
+                    bcsr_mgr_->setBlockCachePolicy(BcsrWeightManager::BlockCachePolicy::FIFO);
+                } else if (pol == "legacy_unordered" || pol == "legacy") {
+                    bcsr_mgr_->setBlockCachePolicy(BcsrWeightManager::BlockCachePolicy::LegacyUnordered);
+                } else {
+                    bcsr_mgr_->setBlockCachePolicy(BcsrWeightManager::BlockCachePolicy::LRU);
+                }
+            }
         }
-        std::abort();
-    };
-    ocfg.resume_issue_after_rowptr_ready = [this]() {
-        if (apply_acc_enable_ && gas_window_mode_ && gas_stage_ == GasStage::Apply && weight_mem_subsystem_) {
-            weight_mem_subsystem_->issueFromEdges();
+
+        // === Build WeightMemorySubsystem ===
+        auto wms = std::make_unique<WeightMemorySubsystem>();
+        wms->configure(
+            [this](uint64_t key, float& out) -> bool {
+                return weight_cache_ops_ ? weight_cache_ops_->tryGet(key, out) : false;
+            },
+            [this](uint64_t key, float v) {
+                if (weight_cache_ops_) weight_cache_ops_->store(key, v);
+            });
+
+        const uint64_t base_addr = params_->find<uint64_t>("base_addr", 0);
+        const uint64_t weight_region_end =
+            base_addr + static_cast<uint64_t>(num_neurons_) * static_cast<uint64_t>(weights_cols) * sizeof(float);
+
+        WeightMemorySubsystem::OrchestratorConfig ocfg{};
+        ocfg.accessor = weight_accessor_.get();
+        ocfg.cache_try = [this](uint64_t key, float& out) -> bool {
+            return weight_cache_ops_ ? weight_cache_ops_->tryGet(key, out) : false;
+        };
+        ocfg.cache_put = [this](uint64_t key, float v) {
+            if (weight_cache_ops_) weight_cache_ops_->store(key, v);
+        };
+        ocfg.acc_update = [this](uint32_t post_local, float dv) {
+            if (acc_ops_) acc_ops_->update(post_local, dv);
+        };
+        ocfg.report_mem_issue = [this](size_t bytes, bool /*count_weight_read*/) {
+            if (rt_.reporting.report_mem_issue) rt_.reporting.report_mem_issue(rt_.reporting.ctx, bytes);
+        };
+        ocfg.ensure_loader_ready = [this]() { return ensureLoaderReady_(); };
+        ocfg.bcsr_rowptr_ready = [this]() { return !use_bcsr_ || (bcsr_mgr_ && bcsr_mgr_->isRowptrReady()); };
+        ocfg.ensure_rowptr_ready_or_fatal = [this](const char* reason) {
+            if (rt_.log) {
+                rt_.log->fatal(CALL_INFO, -1,
+                               "SnnWorkload fatal: BCSR rowptr not ready (%s) node=%u core=%u\n",
+                               reason ? reason : "unknown",
+                               static_cast<uint32_t>(rt_.node_id),
+                               static_cast<uint32_t>(rt_.core_id));
+            }
+            std::abort();
+        };
+        ocfg.resume_issue_after_rowptr_ready = [this]() {
+            if (apply_acc_enable_ && gas_window_mode_ && gas_stage_ == GasStage::Apply && weight_mem_subsystem_) {
+                weight_mem_subsystem_->issueFromEdges();
+            }
+        };
+        ocfg.use_bcsr = use_bcsr_;
+        ocfg.bcsr_prefetch_all = params_->find<int>("bcsr_prefetch_all", 0) != 0;
+        ocfg.bcsr_colidx_inflight_coalesce_enable =
+            params_->find<int>("bcsr_colidx_inflight_coalesce_enable", 1) != 0;
+        ocfg.bcsr_block_inflight_coalesce_enable =
+            params_->find<int>("bcsr_block_inflight_coalesce_enable", 1) != 0;
+        ocfg.bcsr_row_index_prefetch_mode =
+            params_->find<std::string>("bcsr_row_index_prefetch_mode", "auto");
+        ocfg.bcsr_row_index_prefetch_all_rows_threshold =
+            params_->find<uint32_t>("bcsr_row_index_prefetch_all_rows_threshold", 1024);
+        ocfg.bcsr_row_index_prefetch_all_rows_max_bytes =
+            params_->find<uint64_t>("bcsr_row_index_prefetch_all_rows_max_bytes", 64ull * 1024ull);
+        ocfg.bcsr_block_cache_auto_tune =
+            params_->find<int>("bcsr_block_cache_auto_tune", 1) != 0;
+        ocfg.bcsr_block_cache_max_bytes =
+            params_->find<uint64_t>("bcsr_block_cache_max_bytes", 64ull * 1024ull * 1024ull);
+        ocfg.bcsr_block_cache_tune_miss_ratio =
+            params_->find<float>("bcsr_block_cache_tune_miss_ratio", 0.05f);
+        ocfg.bcsr_block_cache_tune_min_misses =
+            params_->find<uint32_t>("bcsr_block_cache_tune_min_misses", 64);
+        ocfg.bcsr_populate_weight_cache_enable =
+            params_->find<int>("bcsr_populate_weight_cache_enable", 1) != 0;
+        if (disable_weight_cache) ocfg.bcsr_populate_weight_cache_enable = false;
+        ocfg.bcsr_force_file_read = params_->find<int>("bcsr_force_file_read", 0) != 0;
+        ocfg.bcsr_rowptr_file_fallback_enable = params_->find<int>("bcsr_rowptr_file_fallback_enable", 0) != 0;
+        ocfg.bcsr_weight_guard_enable = params_->find<int>("bcsr_weight_guard_enable", 1) != 0;
+        ocfg.bcsr_weight_abs_max = params_->find<float>("bcsr_weight_abs_max", 10.0f);
+        ocfg.bcsr_semantic_verify_enable = params_->find<int>("bcsr_semantic_verify_enable", 0) != 0;
+        ocfg.bcsr_semantic_verify_max_edges = params_->find<uint32_t>("bcsr_semantic_verify_max_edges", 64);
+        ocfg.bcsr_semantic_verify_max_mismatch = params_->find<uint32_t>("bcsr_semantic_verify_max_mismatch", 8);
+        ocfg.bcsr_semantic_verify_abs_tol = params_->find<float>("bcsr_semantic_verify_abs_tol", 1e-6f);
+        ocfg.bcsr_semantic_verify_rel_tol = params_->find<float>("bcsr_semantic_verify_rel_tol", 1e-6f);
+        ocfg.readresp_zero_fallback = params_->find<int>("readresp_zero_fallback", 0) != 0;
+        ocfg.init_default_weight = params_->find<float>("init_default_weight", 0.5f);
+        ocfg.num_neurons = num_neurons_;
+        ocfg.weights_cols = weights_cols;
+        ocfg.use_post_row_pre_col = use_post_row_pre_col_;
+        ocfg.base_addr = base_addr;
+        ocfg.weight_region_end = weight_region_end;
+        ocfg.read_force_single = params_->find<int>("read_force_single", 0) != 0;
+        ocfg.merge_read_cacheline = params_->find<int>("merge_read_cacheline", 1) != 0;
+        ocfg.merge_read_row = params_->find<int>("merge_read_row", 0) != 0;
+        ocfg.merge_read_auto = params_->find<int>("merge_read_auto", 0) != 0;
+        ocfg.line_size_bytes = params_->find<uint32_t>("line_size_bytes", 64);
+        ocfg.byte_exact_verify_enable = params_->find<int>("byte_exact_verify_enable", 0) != 0;
+        ocfg.byte_exact_verify_mode = params_->find<std::string>("byte_exact_verify_mode", "");
+        ocfg.byte_exact_verify_row_scale = params_->find<uint32_t>("byte_exact_verify_row_scale", 1024);
+        ocfg.byte_exact_verify_max_mismatch = params_->find<uint32_t>("byte_exact_verify_max_mismatch", 8);
+        ocfg.memory_warmup_cycles = params_->find<uint64_t>("memory_warmup_cycles", 0);
+        ocfg.loader_barrier_cycles = params_->find<uint64_t>("loader_barrier_cycles", 0);
+        ocfg.node_id = rt_.node_id;
+        ocfg.core_id = rt_.core_id;
+        ocfg.weights_template = params_->find<std::string>("weights_template", "");
+        ocfg.bcsr_mgr = bcsr_mgr_.get();
+        wms->configureOrchestrator(std::move(ocfg));
+
+        const uint32_t window_read_budget = params_->find<uint32_t>("window_read_budget", 1024);
+        const uint32_t max_outstanding = params_->find<uint32_t>("max_outstanding_requests", 16);
+        wms->configureWindow(window_read_budget, max_outstanding);
+        if (window_read_enable_) wms->reserveWindowContainers(num_neurons_);
+
+        wms->bindMemory(rt_.mem);
+        weight_mem_subsystem_ = wms.get();
+        weight_reader_ = std::move(wms);
+    } else {
+        if (!weight_mem_subsystem_) {
+            weight_mem_subsystem_ = dynamic_cast<WeightMemorySubsystem*>(weight_reader_.get());
         }
-    };
-    ocfg.use_bcsr = use_bcsr_;
-    ocfg.bcsr_prefetch_all = params_->find<int>("bcsr_prefetch_all", 0) != 0;
-    ocfg.bcsr_colidx_inflight_coalesce_enable =
-        params_->find<int>("bcsr_colidx_inflight_coalesce_enable", 1) != 0;
-    ocfg.bcsr_block_inflight_coalesce_enable =
-        params_->find<int>("bcsr_block_inflight_coalesce_enable", 1) != 0;
-    ocfg.bcsr_row_index_prefetch_mode =
-        params_->find<std::string>("bcsr_row_index_prefetch_mode", "auto");
-    ocfg.bcsr_row_index_prefetch_all_rows_threshold =
-        params_->find<uint32_t>("bcsr_row_index_prefetch_all_rows_threshold", 1024);
-    ocfg.bcsr_row_index_prefetch_all_rows_max_bytes =
-        params_->find<uint64_t>("bcsr_row_index_prefetch_all_rows_max_bytes", 64ull * 1024ull);
-    ocfg.bcsr_block_cache_auto_tune =
-        params_->find<int>("bcsr_block_cache_auto_tune", 1) != 0;
-    ocfg.bcsr_block_cache_max_bytes =
-        params_->find<uint64_t>("bcsr_block_cache_max_bytes", 64ull * 1024ull * 1024ull);
-    ocfg.bcsr_block_cache_tune_miss_ratio =
-        params_->find<float>("bcsr_block_cache_tune_miss_ratio", 0.05f);
-    ocfg.bcsr_block_cache_tune_min_misses =
-        params_->find<uint32_t>("bcsr_block_cache_tune_min_misses", 64);
-    ocfg.bcsr_populate_weight_cache_enable =
-        params_->find<int>("bcsr_populate_weight_cache_enable", 1) != 0;
-    if (disable_weight_cache) ocfg.bcsr_populate_weight_cache_enable = false;
-    ocfg.bcsr_force_file_read = params_->find<int>("bcsr_force_file_read", 0) != 0;
-    ocfg.bcsr_rowptr_file_fallback_enable = params_->find<int>("bcsr_rowptr_file_fallback_enable", 0) != 0;
-    ocfg.bcsr_weight_guard_enable = params_->find<int>("bcsr_weight_guard_enable", 1) != 0;
-    ocfg.bcsr_weight_abs_max = params_->find<float>("bcsr_weight_abs_max", 10.0f);
-    ocfg.bcsr_semantic_verify_enable = params_->find<int>("bcsr_semantic_verify_enable", 0) != 0;
-    ocfg.bcsr_semantic_verify_max_edges = params_->find<uint32_t>("bcsr_semantic_verify_max_edges", 64);
-    ocfg.bcsr_semantic_verify_max_mismatch = params_->find<uint32_t>("bcsr_semantic_verify_max_mismatch", 8);
-    ocfg.bcsr_semantic_verify_abs_tol = params_->find<float>("bcsr_semantic_verify_abs_tol", 1e-6f);
-    ocfg.bcsr_semantic_verify_rel_tol = params_->find<float>("bcsr_semantic_verify_rel_tol", 1e-6f);
-    ocfg.readresp_zero_fallback = params_->find<int>("readresp_zero_fallback", 0) != 0;
-    ocfg.init_default_weight = params_->find<float>("init_default_weight", 0.5f);
-    ocfg.num_neurons = num_neurons_;
-    ocfg.weights_cols = weights_cols;
-    ocfg.use_post_row_pre_col = use_post_row_pre_col_;
-    ocfg.base_addr = base_addr;
-    ocfg.weight_region_end = weight_region_end;
-    ocfg.read_force_single = params_->find<int>("read_force_single", 0) != 0;
-    ocfg.merge_read_cacheline = params_->find<int>("merge_read_cacheline", 1) != 0;
-    ocfg.merge_read_row = params_->find<int>("merge_read_row", 0) != 0;
-    ocfg.merge_read_auto = params_->find<int>("merge_read_auto", 0) != 0;
-    ocfg.line_size_bytes = params_->find<uint32_t>("line_size_bytes", 64);
-    ocfg.byte_exact_verify_enable = params_->find<int>("byte_exact_verify_enable", 0) != 0;
-    ocfg.byte_exact_verify_mode = params_->find<std::string>("byte_exact_verify_mode", "");
-    ocfg.byte_exact_verify_row_scale = params_->find<uint32_t>("byte_exact_verify_row_scale", 1024);
-    ocfg.byte_exact_verify_max_mismatch = params_->find<uint32_t>("byte_exact_verify_max_mismatch", 8);
-    ocfg.memory_warmup_cycles = params_->find<uint64_t>("memory_warmup_cycles", 0);
-    ocfg.loader_barrier_cycles = params_->find<uint64_t>("loader_barrier_cycles", 0);
-    ocfg.node_id = rt_.node_id;
-    ocfg.core_id = rt_.core_id;
-    ocfg.weights_template = params_->find<std::string>("weights_template", "");
-    ocfg.bcsr_mgr = bcsr_mgr_.get();
-    wms->configureOrchestrator(std::move(ocfg));
-
-    const uint32_t window_read_budget = params_->find<uint32_t>("window_read_budget", 1024);
-    const uint32_t max_outstanding = params_->find<uint32_t>("max_outstanding_requests", 16);
-    wms->configureWindow(window_read_budget, max_outstanding);
-    if (window_read_enable_) wms->reserveWindowContainers(num_neurons_);
-
-    wms->bindMemory(rt_.mem);
-    weight_mem_subsystem_ = wms.get();
-    weight_reader_ = std::move(wms);
+        if (weight_mem_subsystem_) {
+            weight_mem_subsystem_->bindMemory(rt_.mem);
+        }
+    }
 
     // Phase4-Task6.4: window accumulator moved into workload=snn; bind WMS acc_update callback.
     if (apply_acc_enable_ && gas_window_mode_) {

@@ -15,6 +15,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "IWeightReaderAdopter.h"
 #include "IGasStageSink.h"
 #include "ISpikeWorkload.h"
 #include "ISnnSpikeCommWorkload.h"
@@ -37,12 +38,15 @@ class AccumulatorOps;
 class SynapseRouteSubsystem;
 class SpikeCommSubsystem;
 class NocSpikeTransport;
-struct SynapseRouteBuildConfig;
+	struct SynapseRouteBuildConfig;
 
-class SnnWorkload final : public ISpikeWorkload, public ISnnSpikeCommWorkload, public IGasStageSink {
-public:
-    SnnWorkload();
-    ~SnnWorkload() override;
+	class SnnWorkload final : public ISpikeWorkload,
+	                          public ISnnSpikeCommWorkload,
+	                          public IGasStageSink,
+	                          public IWeightReaderAdopter {
+	public:
+	    SnnWorkload();
+	    ~SnnWorkload() override;
 
     void configureFromParams(const SST::Params& params) override;
     void bindRuntime(const Runtime& rt) override;
@@ -66,12 +70,15 @@ public:
     uint64_t emitNeuronFireBatch(const std::vector<uint32_t>& neuron_indices, uint64_t now_cycle) override;
     bool ready() const override;
 
-    // IGasStageSink (Phase4-Task6.4): workload=snn 接管 GAS/window 阶段机业务动作
-    void onGasStageEvent(const GasStageEvent& ev) override;
-    void onGasStatEvent(const GasStatEvent& st) override;
+	    // IGasStageSink (Phase4-Task6.4): workload=snn 接管 GAS/window 阶段机业务动作
+	    void onGasStageEvent(const GasStageEvent& ev) override;
+	    void onGasStatEvent(const GasStatEvent& st) override;
 
-private:
-    enum class GasStage { Idle=0, Gather=1, Apply=2, Scatter=3 };
+	    // IWeightReaderAdopter (Tier2-E): adopt CoreShell-provisioned weight reader to avoid duplicate assembly.
+	    void adoptWeightReader(std::unique_ptr<IWeightReader> reader) override;
+
+	private:
+	    enum class GasStage { Idle=0, Gather=1, Apply=2, Scatter=3 };
 
     uint64_t nowNs_() const;
     void normalizeLayout_();

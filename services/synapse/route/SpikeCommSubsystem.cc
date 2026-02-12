@@ -21,7 +21,7 @@
 
 #include "INocTransport.h"
 #include "SpikeNocCodec.h"
-#include "SpikeEvent.h"
+#include "events/SpikeEvent.h"
 #include "SynapseRouteSubsystem.h"
 
 namespace SST { namespace SnnDL {

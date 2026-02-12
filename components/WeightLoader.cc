@@ -13,6 +13,7 @@
 #include <cctype>
 #include <iterator>
 #include <random>
+#include <limits>
 
 #include "WeightLoaderConfig.h"
 #include "LoaderDoneEvent.h"
@@ -57,6 +58,7 @@ bool WeightLoader::parseMetaU64_(const std::string& meta_text, const char* key, 
 bool WeightLoader::parseMetaU32_(const std::string& meta_text, const char* key, uint32_t& out) {
     uint64_t tmp = 0;
     if (!parseMetaU64_(meta_text, key, tmp)) return false;
+    if (tmp > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) return false;
     out = static_cast<uint32_t>(tmp);
     return true;
 }

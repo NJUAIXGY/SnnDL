@@ -30,7 +30,7 @@
 #include <random>
 #include <limits>
 
-#include "SpikeEvent.h"
+#include "events/SpikeEvent.h"
 #include "SnnInterface.h"
 #include "SnnPEParentInterface.h"
 #include "IPeAggregation.h"
@@ -41,6 +41,7 @@
 #include "stimulus/StepActivationSubsystem.h"
 #include "noc/NocSubsystem.h"
 #include "synapse/route/SpikePacketBridge.h"
+#include "workload_stats/IWorkloadStatsModule.h"
 
 namespace SST {
 namespace SnnDL {
@@ -62,31 +63,10 @@ struct ProcessingUnitState {
     bool is_active;
     uint64_t spikes_processed;
     uint64_t neurons_fired;
-    // Stream workload counters (pulled from core->getStatistics map)
-    uint64_t stream_mem_writes_issued_total;
-    uint64_t stream_mem_reads_issued_total;
-    uint64_t stream_mem_bytes_written_total;
-    uint64_t stream_mem_bytes_read_total;
-    uint64_t stream_mem_verify_pass_total;
-    uint64_t stream_mem_verify_fail_total;
-    uint64_t stream_pkt_sent_total;
-    uint64_t stream_pkt_recv_total;
-    uint64_t stream_pkt_bad_crc_total;
-    uint64_t stream_pkt_bad_magic_total;
     double utilization;
     
     ProcessingUnitState() : unit_id(-1), neuron_id_start(0), neuron_count(0), 
                            is_active(false), spikes_processed(0), neurons_fired(0),
-                           stream_mem_writes_issued_total(0),
-                           stream_mem_reads_issued_total(0),
-                           stream_mem_bytes_written_total(0),
-                           stream_mem_bytes_read_total(0),
-                           stream_mem_verify_pass_total(0),
-                           stream_mem_verify_fail_total(0),
-                           stream_pkt_sent_total(0),
-                           stream_pkt_recv_total(0),
-                           stream_pkt_bad_crc_total(0),
-                           stream_pkt_bad_magic_total(0),
                            utilization(0.0) {}
 };
 
@@ -95,7 +75,7 @@ struct ProcessingUnitState {
  * 
  * 集成多个ProcessingUnit、共享L2缓存、内部互连网络
  */
-class MultiCorePE : public SST::Component, public SnnPEParentInterface, public IPeAggregation {
+class MultiCorePE : public SST::Component, public SnnPEParentInterface, public IPeAggregation, public IWorkloadStatRegistrar {
 public:
     // ELI注册信息
     SST_ELI_REGISTER_COMPONENT(
@@ -122,7 +102,8 @@ public:
         {"sim_stop_ns",      "组件主控结束仿真（纳秒）。>0时注册为primary并在达到该时间点时OKToEndSim", "0"},
         {"weights_file",     "权重文件路径", ""},
         {"enable_numa",      "启用NUMA优化", "1"},
-        {"workload_impl",    "workload实现选择(snn|stream|traffic). 为空则回退 env:SNNDL_WORKLOAD_IMPL", ""},
+        {"workload_impl",    "workload实现选择(snn|stream|traffic|tensor). 为空则回退 env:SNNDL_WORKLOAD_IMPL", ""},
+        {"workload_stats_modules", "workload统计模块(逗号分隔). 为空则按workload_impl自动选择", ""},
         {"exec_mode",        "执行模式提示(gas|naive_raw). 仅用于实验可观测性，不改变行为", "gas"},
         {"v_thresh",         "触发脉冲的膜电位阈值", "1.0"},
         {"v_reset",          "脉冲发放后膜电位重置值", "0.0"},
@@ -147,6 +128,8 @@ public:
         {"step_activation_seed", "步级随机激活随机种子", "0xdecafbad"},
         {"step_activation_period_cycles", "固定周期触发step随机激活(>0启用; 0=沿用BeginGather触发)", "0"},
         {"step_activation_event_weight", "步级注入事件权重（非严格模式备用）", "0.0"},
+        {"step_activation_pre_pattern", "step随机激活 pre 选择模式：bernoulli/clustered", "bernoulli"},
+        {"step_activation_pre_cluster_len", "clustered模式：连续 pre 段长度（neuron）；0=自动(64)", "0"},
         {"step_reset_mem_each_step", "步末复位膜电位", "0"},
         {"step_activation_use_bcsr_routes", "随机激活是否使用BCSR路由表", "0"},
         {"sentinel_enable", "启用 sentinel 调试输出(0/1)", "0"},
@@ -243,6 +226,33 @@ public:
 	        {"stream_pkt_recv_total", "Stream workload: raw-bytes packets received（PE聚合）", "packets", 1},
 	        {"stream_pkt_bad_crc_total", "Stream workload: bad CRC packets（PE聚合）", "packets", 1},
 	        {"stream_pkt_bad_magic_total", "Stream workload: bad magic packets（PE聚合）", "packets", 1},
+	        // Tensor workload（PE聚合，供 essential_summary_mesh 汇总）
+	        {"tensor_mem_reads_issued_total", "Tensor workload: total reads issued（PE聚合）", "requests", 1},
+	        {"tensor_mem_writes_issued_total", "Tensor workload: total writes issued（PE聚合）", "requests", 1},
+	        {"tensor_mem_bytes_read_total", "Tensor workload: bytes read（issued, PE聚合）", "bytes", 1},
+	        {"tensor_mem_bytes_write_total", "Tensor workload: bytes written（issued, PE聚合）", "bytes", 1},
+        {"tensor_compute_cycles_total", "Tensor workload: compute cycles（PE聚合）", "cycles", 1},
+        {"tensor_mac_ops_total", "Tensor workload: MAC ops（PE聚合）", "ops", 1},
+        {"tensor_dma_stall_cycles_total", "Tensor workload: DMA stall cycles（PE聚合）", "cycles", 1},
+        {"tensor_iter_cycles_total", "Tensor workload: iteration cycles（PE聚合）", "cycles", 1},
+        {"tensor_stall_dma_budget_cycles_total", "Tensor workload: stall (DMA budget) cycles（PE聚合）", "cycles", 1},
+        {"tensor_stall_mem_outstanding_cycles_total", "Tensor workload: stall (mem outstanding) cycles（PE聚合）", "cycles", 1},
+        {"tensor_stall_wait_read_cycles_total", "Tensor workload: stall (wait read) cycles（PE聚合）", "cycles", 1},
+        {"tensor_stall_wait_write_cycles_total", "Tensor workload: stall (wait write) cycles（PE聚合）", "cycles", 1},
+        {"tensor_stall_collective_cycles_total", "Tensor workload: stall (collective barrier) cycles（PE聚合）", "cycles", 1},
+        {"tensor_dma_cycles_total", "Tensor workload: DMA cycles（PE聚合）", "cycles", 1},
+        {"tensor_dram_bytes_total", "Tensor workload: DRAM bytes（PE聚合）", "bytes", 1},
+        {"tensor_onchip_bytes_total", "Tensor workload: on-chip bytes（PE聚合）", "bytes", 1},
+        {"tensor_tile_count_total", "Tensor workload: tile count（PE聚合）", "tiles", 1},
+        {"tensor_collective_bytes_sent_total", "Tensor workload: collective bytes sent（PE聚合）", "bytes", 1},
+        {"tensor_collective_bytes_recv_total", "Tensor workload: collective bytes received（PE聚合）", "bytes", 1},
+        {"tensor_collective_pkts_sent_total", "Tensor workload: collective packets sent（PE聚合）", "packets", 1},
+        {"tensor_collective_pkts_recv_total", "Tensor workload: collective packets received（PE聚合）", "packets", 1},
+        {"tensor_collective_cycles_total", "Tensor workload: collective cycles（PE聚合）", "cycles", 1},
+        {"tensor_pkt_sent_total", "Tensor workload: RawBytes packets sent（PE聚合）", "packets", 1},
+        {"tensor_pkt_recv_total", "Tensor workload: RawBytes packets received（PE聚合）", "packets", 1},
+        {"tensor_pkt_bytes_sent_total", "Tensor workload: RawBytes bytes sent（PE聚合）", "bytes", 1},
+        {"tensor_pkt_bytes_recv_total", "Tensor workload: RawBytes bytes received（PE聚合）", "bytes", 1},
 	        {"mem_read_latency_cycles", "端到端内存读延迟（cycles）", "cycles", 1},
 	        {"mem_read_latency_cycles_weights", "权重访问读延迟（cycles）", "cycles", 1},
 	        {"mem_read_latency_cycles_state", "非权重访问读延迟（cycles）", "cycles", 1},
@@ -367,6 +377,10 @@ public:
      */
     int getTotalNeurons() const override { return total_neurons_; }
 
+    SST::Statistics::Statistic<uint64_t>* registerU64(const std::string& stat_name) override {
+        return registerStatistic<uint64_t>(stat_name);
+    }
+
     // 友元类声明
     friend class MultiCoreController;
 
@@ -476,30 +490,11 @@ private:
 	    Statistic<uint64_t>* stat_step_activation_route_hits_ = nullptr;
 	    Statistic<uint64_t>* stat_step_activation_route_misses_ = nullptr;
 	    Statistic<uint64_t>* stat_step_activation_local_drops_ = nullptr;
-	    Statistic<uint64_t>* stat_stream_mem_verify_fail_total_ = nullptr;
-	    Statistic<uint64_t>* stat_stream_mem_writes_issued_total_ = nullptr;
-	    Statistic<uint64_t>* stat_stream_mem_reads_issued_total_ = nullptr;
-	    Statistic<uint64_t>* stat_stream_mem_bytes_written_total_ = nullptr;
-	    Statistic<uint64_t>* stat_stream_mem_bytes_read_total_ = nullptr;
-	    Statistic<uint64_t>* stat_stream_mem_verify_pass_total_ = nullptr;
-	    Statistic<uint64_t>* stat_stream_pkt_sent_total_ = nullptr;
-	    Statistic<uint64_t>* stat_stream_pkt_recv_total_ = nullptr;
-	    Statistic<uint64_t>* stat_stream_pkt_bad_crc_total_ = nullptr;
-	    Statistic<uint64_t>* stat_stream_pkt_bad_magic_total_ = nullptr;
 	    Statistic<uint64_t>* stat_compat_unexpected_stream_activity_total_ = nullptr;
 	    Statistic<uint64_t>* stat_compat_naive_gas_stage_events_total_ = nullptr;
 	    Statistic<uint64_t>* stat_compat_finish_incomplete_total_ = nullptr;
         Statistic<uint64_t>* stat_loader_done_timeout_fallback_total_ = nullptr;
-	    std::vector<uint64_t> stream_mem_verify_fail_last_;
-	    std::vector<uint64_t> stream_mem_verify_pass_last_;
-	    std::vector<uint64_t> stream_mem_writes_issued_last_;
-	    std::vector<uint64_t> stream_mem_reads_issued_last_;
-	    std::vector<uint64_t> stream_mem_bytes_written_last_;
-	    std::vector<uint64_t> stream_mem_bytes_read_last_;
-	    std::vector<uint64_t> stream_pkt_sent_last_;
-	    std::vector<uint64_t> stream_pkt_recv_last_;
-	    std::vector<uint64_t> stream_pkt_bad_crc_last_;
-	    std::vector<uint64_t> stream_pkt_bad_magic_last_;
+        std::vector<std::unique_ptr<IWorkloadStatsModule>> workload_stats_modules_;
 
     // 本地统计：仅在环形跨核投递成功时累加
     uint64_t inter_core_messages_count_ = 0;
@@ -569,7 +564,6 @@ private:
     bool diag_fire_log_ = false;
     // Exec-mode / workload hint (experiment observability only; does not change behavior)
     std::string exec_mode_;
-    bool is_stream_workload_ = false;
     struct WindowAgg {
         uint64_t start_ns = 0;
         uint64_t end_ns = 0;
