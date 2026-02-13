@@ -112,6 +112,10 @@ GatherBufferIF::GatherBufferIF(ComponentId_t id, Params& params, TimeConverter* 
     bank_auto_enable_ = cfg.bank_auto_enable;
     bank_auto_min_banks_ = cfg.bank_auto_min_banks;
     bank_auto_max_banks_ = cfg.bank_auto_max_banks;
+    apply_issue_policy_ = parseApplyIssuePolicy(cfg.apply_issue_policy);
+    apply_frags_per_issue_ = cfg.apply_frags_per_issue;
+    apply_bank_credit_ = cfg.apply_bank_credit;
+    apply_age_fair_ns_ = cfg.apply_age_fair_ns;
     row_window_enable_ = cfg.row_window_enable;
     row_window_bytes_  = cfg.row_window_bytes;
     row_window_timeout_ns_ = cfg.row_window_timeout_ns;
@@ -177,6 +181,10 @@ GatherBufferIF::GatherBufferIF(ComponentId_t id, Params& params, TimeConverter* 
     stat_gap_absorbed_bytes_ = registerStatistic<uint64_t>("gas_gap_absorbed_bytes");
     stat_row_window_triggers_ = registerStatistic<uint64_t>("gas_row_window_triggers");
     stat_row_window_bytes_    = registerStatistic<uint64_t>("gas_row_window_bytes");
+    stat_apply_bank_rr_turns_ = registerStatistic<uint64_t>("gas_apply_bank_rr_turns");
+    stat_apply_row_sticky_hits_ = registerStatistic<uint64_t>("gas_apply_row_sticky_hits");
+    stat_apply_age_forced_ = registerStatistic<uint64_t>("gas_apply_age_forced");
+    stat_apply_active_banks_peak_ = registerStatistic<uint64_t>("gas_apply_active_banks_peak");
     // 门控诊断：下发到下游的唯一granule读次数
     stat_reads_issued_        = registerStatistic<uint64_t>("gas_reads_issued");
     // Adaptive k stats (optional)
@@ -622,6 +630,8 @@ bool GatherBufferIF::attachReadToGranule_(int tgt_buf,
 
     GranuleKey key = makeGranuleKey_(base, sz);
     auto& g = ensureGranule_(tgt_buf, key);
+    const uint64_t arr_ns = getCurrentSimTimeNano();
+    if (g.min_arrival_ns == 0 || arr_ns < g.min_arrival_ns) g.min_arrival_ns = arr_ns;
     if (off + (uint64_t)rd->size > (uint64_t)g.size) {
         switch (kind) {
             case ReadAttachKind::OpenStep:
@@ -691,6 +701,12 @@ GatherBufferIF::Sort GatherBufferIF::parseSort(const std::string& s) const {
     return Sort::Row;
 }
 
+GatherBufferIF::ApplyIssuePolicy GatherBufferIF::parseApplyIssuePolicy(const std::string& s) const {
+    const std::string v = toLowerCopy(s);
+    if (v == "bank_rr_row_sticky_age") return ApplyIssuePolicy::BankRrRowStickyAge;
+    return ApplyIssuePolicy::Order;
+}
+
 GatherBufferIF::GranuleKey GatherBufferIF::makeGranuleKey_(uint64_t base, uint32_t size) const {
     return GranuleKey{base, size};
 }
@@ -708,6 +724,7 @@ GatherBufferIF::Granule& GatherBufferIF::ensureGranule_(int buf, const GranuleKe
         g.payload_bytes = 0;
         S.required_set.insert(key);
         S.issue_order_dirty = true;
+        S.apply_bank_q_dirty = true;
         if (stat_coalesce_granule_size_) {
             stat_coalesce_granule_size_->addData((uint64_t)key.size);
         }
@@ -790,6 +807,185 @@ void GatherBufferIF::issueMoreUnissuedFromOrder_(int buf) {
     }
 }
 
+void GatherBufferIF::rebuildApplyBankQueues_(int buf) {
+    auto& S = sb_[buf];
+    const size_t nbanks = bank_bits_ ? static_cast<size_t>(1ull << bank_bits_) : 1ull;
+    S.apply_bank_q.clear();
+    S.apply_bank_q.resize(nbanks);
+    if (S.apply_last_row.size() != nbanks) {
+        S.apply_last_row.assign(nbanks, UINT64_MAX);
+    }
+    if (S.apply_bank_rr_cursor >= nbanks) S.apply_bank_rr_cursor = 0;
+
+    struct Cand { uint32_t bank; uint64_t row; GranuleKey key; };
+    std::vector<Cand> cands;
+    cands.reserve(S.granules.size());
+    for (auto& kv : S.granules) {
+        Granule& g = kv.second;
+        if (g.ready) continue;
+        const bool fully_issued = (g.frags_total > 0 && g.frags_issued >= g.frags_total);
+        if (fully_issued) continue;
+        const uint32_t bank = (nbanks == 1) ? 0u : static_cast<uint32_t>(bankIndex(g.base) % nbanks);
+        cands.push_back(Cand{bank, rowIndex(g.base), kv.first});
+    }
+    std::sort(cands.begin(), cands.end(),
+              [this](const Cand& a, const Cand& b){
+                  if (a.bank != b.bank) return a.bank < b.bank;
+                  if (a.row != b.row) return a.row < b.row;
+                  return granuleKeyLess_(a.key, b.key);
+              });
+    for (const auto& c : cands) {
+        S.apply_bank_q[c.bank].push_back(c.key);
+    }
+    S.apply_bank_q_dirty = false;
+}
+
+void GatherBufferIF::issueMoreApplyScheduled_(int buf) {
+    auto& S = sb_[buf];
+    if (S.apply_bank_q_dirty) {
+        rebuildApplyBankQueues_(buf);
+    }
+    if (S.apply_bank_q.empty()) return;
+
+    const size_t nbanks = S.apply_bank_q.size();
+    std::vector<uint32_t> active_per_bank(nbanks, 0);
+    for (auto& kv : S.granules) {
+        Granule& g = kv.second;
+        if (!g.issued || g.ready) continue;
+        const size_t bank = (nbanks == 1) ? 0 : static_cast<size_t>(bankIndex(g.base) % nbanks);
+        if (bank < nbanks) active_per_bank[bank]++;
+    }
+
+    // Peak: number of banks with any active granule (issued && !ready).
+    uint32_t active_banks = 0;
+    for (size_t b = 0; b < nbanks; ++b) if (active_per_bank[b] > 0) active_banks++;
+    if (active_banks > win_apply_active_banks_peak_) win_apply_active_banks_peak_ = active_banks;
+
+    const uint64_t now_ns = getCurrentSimTimeNano();
+    const uint64_t age_thr = apply_age_fair_ns_;
+    const uint32_t bank_credit = apply_bank_credit_;
+    const uint32_t max_frags = apply_frags_per_issue_;
+    const size_t kInvalid = static_cast<size_t>(-1);
+
+    while ((inflight_counts_[0] + inflight_counts_[1]) < max_inflight_reads_) {
+        bool progressed = false;
+
+        for (size_t attempt = 0; attempt < nbanks; ++attempt) {
+            const size_t bank = (S.apply_bank_rr_cursor + attempt) % nbanks;
+            auto& q = S.apply_bank_q[bank];
+
+            // Drop stale candidates at head.
+            while (!q.empty()) {
+                const GranuleKey& kf = q.front();
+                auto it = S.granules.find(kf);
+                if (it == S.granules.end()) { q.pop_front(); continue; }
+                Granule& gf = it->second;
+                const bool fully_issued = (gf.frags_total > 0 && gf.frags_issued >= gf.frags_total);
+                if (gf.ready || fully_issued) { q.pop_front(); continue; }
+                break;
+            }
+            if (q.empty()) continue;
+
+            size_t idx_front = kInvalid;
+            size_t idx_sticky = kInvalid;
+            size_t idx_age = kInvalid;
+            const uint64_t last_row = (bank < S.apply_last_row.size()) ? S.apply_last_row[bank] : UINT64_MAX;
+
+            const size_t fast_limit = std::min<size_t>(q.size(), 32);
+            auto scan_range = [&](size_t begin, size_t end) {
+                for (size_t i = begin; i < end; ++i) {
+                    const GranuleKey& key = q[i];
+                    auto it = S.granules.find(key);
+                    if (it == S.granules.end()) continue;
+                    Granule& g = it->second;
+                    const bool fully_issued = (g.frags_total > 0 && g.frags_issued >= g.frags_total);
+                    if (g.ready || fully_issued) continue;
+
+                    if (!g.issued && bank_credit > 0 && active_per_bank[bank] >= bank_credit) {
+                        // Can't start a new granule in this bank yet.
+                        continue;
+                    }
+
+                    if (idx_front == kInvalid) idx_front = i;
+
+                    const uint64_t row = rowIndex(g.base);
+                    if (last_row != UINT64_MAX && row == last_row && idx_sticky == kInvalid) idx_sticky = i;
+
+                    if (age_thr > 0 && g.min_arrival_ns > 0 && now_ns >= g.min_arrival_ns) {
+                        if ((now_ns - g.min_arrival_ns) >= age_thr && idx_age == kInvalid) idx_age = i;
+                    }
+                }
+            };
+
+            scan_range(0, fast_limit);
+            if (idx_front == kInvalid && q.size() > fast_limit) {
+                // Slow path: ensure forward progress even when the first window is blocked by credit/stale entries.
+                scan_range(fast_limit, q.size());
+            }
+
+            size_t idx = idx_front;
+            bool age_forced = false;
+            bool sticky_pick = false;
+            if (idx_age != kInvalid) { idx = idx_age; age_forced = true; }
+            else if (idx_sticky != kInvalid) { idx = idx_sticky; sticky_pick = true; }
+
+            if (idx == kInvalid) continue;
+
+            // Rotate so the selected key becomes the head (deterministic).
+            for (size_t r = 0; r < idx; ++r) {
+                q.push_back(q.front());
+                q.pop_front();
+            }
+            const GranuleKey key = q.front();
+            auto it = S.granules.find(key);
+            if (it == S.granules.end()) { q.pop_front(); continue; }
+            Granule& g = it->second;
+            const bool fully_issued_before = (g.frags_total > 0 && g.frags_issued >= g.frags_total);
+            if (g.ready || fully_issued_before) { q.pop_front(); continue; }
+            if (!g.issued && bank_credit > 0 && active_per_bank[bank] >= bank_credit) {
+                // Can't start; try other bank.
+                continue;
+            }
+
+            const uint32_t before_frags = g.frags_issued;
+            const bool before_issued = g.issued;
+            issueGranuleBufBudget_(buf, key, g, max_frags);
+
+            if (g.frags_issued == before_frags && g.issued == before_issued) {
+                // No progress (most likely inflight full).
+                return;
+            }
+
+            if (!before_issued && g.issued) {
+                active_per_bank[bank] += 1;
+                uint32_t ab = 0;
+                for (size_t b = 0; b < nbanks; ++b) if (active_per_bank[b] > 0) ab++;
+                if (ab > win_apply_active_banks_peak_) win_apply_active_banks_peak_ = ab;
+            }
+
+            // Scheduler counters (per-window; flushed at FinishApplyWindow).
+            win_apply_bank_rr_turns_ += 1;
+            if (sticky_pick) win_apply_row_sticky_hits_ += 1;
+            if (age_forced) win_apply_age_forced_ += 1;
+            if (bank < S.apply_last_row.size()) {
+                S.apply_last_row[bank] = rowIndex(g.base);
+            }
+
+            S.apply_bank_rr_cursor = (bank + 1) % nbanks;
+            progressed = true;
+
+            // If fully issued, remove it from candidates.
+            const bool fully_issued_after = (g.frags_total > 0 && g.frags_issued >= g.frags_total);
+            if (fully_issued_after && !q.empty() && q.front() == key) {
+                q.pop_front();
+            }
+            break;
+        }
+
+        if (!progressed) return;
+    }
+}
+
 void GatherBufferIF::issueUnissuedGranulesDeterministic_(int buf) {
     auto& S = sb_[buf];
     auto& gmap = S.granules;
@@ -822,6 +1018,10 @@ uint64_t GatherBufferIF::granuleSize() const {
 }
 
 void GatherBufferIF::issueGranuleBuf_(int buf, const GranuleKey& key, Granule& g) {
+    issueGranuleBufBudget_(buf, key, g, /*max_frags_to_issue=*/0);
+}
+
+void GatherBufferIF::issueGranuleBufBudget_(int buf, const GranuleKey& key, Granule& g, uint32_t max_frags_to_issue) {
     // 关键：memHierarchy.Cache（尤其 Incoherent L1）无法正确处理一次性 size>cache_line 的 GetS payload。
     // 这里将一个 granule 的下游读拆分为 cacheline 级分片并在 SRAM 中拼接，避免权重读出脏/非确定性。
     const uint64_t gsz_u64 = granuleSize();
@@ -835,7 +1035,10 @@ void GatherBufferIF::issueGranuleBuf_(int buf, const GranuleKey& key, Granule& g
     }
     if (g.frags_issued >= g.frags_total) return;
 
-    while (g.frags_issued < g.frags_total && (inflight_counts_[0] + inflight_counts_[1]) < max_inflight_reads_) {
+    uint32_t issued_now = 0;
+    while (g.frags_issued < g.frags_total &&
+           (inflight_counts_[0] + inflight_counts_[1]) < max_inflight_reads_ &&
+           (max_frags_to_issue == 0 || issued_now < max_frags_to_issue)) {
         if (!g.issued) {
             g.issued = true;
             g.issue_ns = getCurrentSimTimeNano();
@@ -856,6 +1059,7 @@ void GatherBufferIF::issueGranuleBuf_(int buf, const GranuleKey& key, Granule& g
         if (stat_reads_issued_) stat_reads_issued_->addData(1);
         backend_->send(rd);
         g.frags_issued++;
+        issued_now++;
     }
 }
 
@@ -940,7 +1144,14 @@ void GatherBufferIF::onDownstreamResp_(Request* r) {
 
                 // 若还有未发分片，继续发起（受 max_inflight 限制）
                 if (g.frags_total > 0 && g.frags_issued < g.frags_total) {
-                    issueGranuleBuf_(buf_index, key, g);
+                    const bool apply_sched =
+                        defer_issue_until_apply_ &&
+                        apply_issue_policy_ == ApplyIssuePolicy::BankRrRowStickyAge &&
+                        stage_ == Stage::Apply &&
+                        buf_index == apply_buf_index_;
+                    if (!apply_sched) {
+                        issueGranuleBuf_(buf_index, key, g);
+                    }
                 }
 
                 bool completed_now = false;
@@ -1034,7 +1245,11 @@ void GatherBufferIF::onDownstreamResp_(Request* r) {
                     // 延后模式：Apply entry 只会“尽可能发射”，其余 granule 必须在 ReadResp 回调里持续补发，
                     // 否则 inflight 限流会导致部分 granule 永远不被 issue，从而 required_set 永远不 ready → 卡死。
                     if (defer_issue_until_apply_) {
-                        issueMoreUnissuedFromOrder_(apply_buf_index_);
+                        if (apply_issue_policy_ == ApplyIssuePolicy::BankRrRowStickyAge) {
+                            issueMoreApplyScheduled_(apply_buf_index_);
+                        } else {
+                            issueMoreUnissuedFromOrder_(apply_buf_index_);
+                        }
                     }
                 }
             }
@@ -1194,7 +1409,15 @@ void GatherBufferIF::maybeEnterApply_() {
             }
         }
 
-        issueMoreUnissuedFromOrder_(apply_buf_index_);
+        if (apply_issue_policy_ == ApplyIssuePolicy::BankRrRowStickyAge) {
+            auto& A = sb_[apply_buf_index_];
+            A.apply_bank_q_dirty = true;
+            A.apply_bank_rr_cursor = 0;
+            std::fill(A.apply_last_row.begin(), A.apply_last_row.end(), UINT64_MAX);
+            issueMoreApplyScheduled_(apply_buf_index_);
+        } else {
+            issueMoreUnissuedFromOrder_(apply_buf_index_);
+        }
     } else {
         // 非延后：在窗口切换到 Apply 时也补发未发 granule，避免在 Gather 结束时仍有未发请求被遗漏。
         issueUnissuedGranulesDeterministic_(apply_buf_index_);
@@ -1317,7 +1540,7 @@ void GatherBufferIF::buildGranulesWithGapMergeBuf_(int buf) {
         uint64_t cur_base = 0, cur_end = 0; bool has=false;
         uint64_t seg_sum_bytes = 0;      // sum of sub-read sizes in current segment
         bool seg_used_row_window = false; // whether coarse row-window absorption was used
-        uint64_t seg_start_ns = 0;        // arrival time of first sub-read in segment
+        uint64_t seg_start_ns = 0;        // min arrival time across sub-reads in segment
         // temp list of sub-reads per current segment
         std::vector<ReadItem> segSubs;
         // 优化3：预分配segSubs容器（假设每段平均包含vec的一半元素）
@@ -1335,6 +1558,9 @@ void GatherBufferIF::buildGranulesWithGapMergeBuf_(int buf) {
                 ++diag_granule_build_logged_;
             }
             auto& g = ensureGranule_(buf, gkey);
+            if (seg_start_ns != 0) {
+                if (g.min_arrival_ns == 0 || seg_start_ns < g.min_arrival_ns) g.min_arrival_ns = seg_start_ns;
+            }
             // 优化3：预分配subs空间（已知即将添加segSubs.size()个元素）
             g.subs.reserve(g.subs.size() + segSubs.size());
             for (auto &it : segSubs) {
@@ -1376,6 +1602,7 @@ void GatherBufferIF::buildGranulesWithGapMergeBuf_(int buf) {
                 if (b > cur_end) cur_end = b;
                 segSubs.push_back(it);
                 seg_sum_bytes += it.size;
+                if (it.arr_ns > 0 && (seg_start_ns == 0 || it.arr_ns < seg_start_ns)) seg_start_ns = it.arr_ns;
             } else {
                 uint64_t gap = a - cur_end;
                 uint64_t new_len = (b - cur_base);
@@ -1383,6 +1610,7 @@ void GatherBufferIF::buildGranulesWithGapMergeBuf_(int buf) {
                 if (gap_merge_enable_ && gap_k_bytes_>0 && gap <= gap_k_bytes_ && new_len <= burst_bytes_max_) {
                     // absorb gap
                     cur_end = b; gap_abs_sum += gap; segSubs.push_back(it); absorbed = true; seg_sum_bytes += it.size;
+                    if (it.arr_ns > 0 && (seg_start_ns == 0 || it.arr_ns < seg_start_ns)) seg_start_ns = it.arr_ns;
                 }
                 // Row-window timeout trigger: if enabled and window has waited too long, flush before adding
                 if (!absorbed && row_window_enable_ && row_window_timeout_ns_>0 && seg_start_ns>0 && it.arr_ns>0) {
@@ -1399,6 +1627,7 @@ void GatherBufferIF::buildGranulesWithGapMergeBuf_(int buf) {
                     if (tentative_sum <= row_window_bytes_ && new_len <= burst_bytes_max_) {
                         cur_end = b; // absorb regardless of gap size
                         segSubs.push_back(it); absorbed = true; seg_sum_bytes = tentative_sum; seg_used_row_window = true;
+                        if (it.arr_ns > 0 && (seg_start_ns == 0 || it.arr_ns < seg_start_ns)) seg_start_ns = it.arr_ns;
                     }
                 }
                 if (!absorbed) {
@@ -1756,7 +1985,11 @@ bool GatherBufferIF::clockTick(Cycle_t) {
             buildGranulesWithGapMergeBuf_(apply_buf_index_);
             sb_[apply_buf_index_].issue_order_dirty = true;
             rebuildIssueOrder_(apply_buf_index_);
-            issueMoreUnissuedFromOrder_(apply_buf_index_);
+            if (apply_issue_policy_ == ApplyIssuePolicy::BankRrRowStickyAge) {
+                issueMoreApplyScheduled_(apply_buf_index_);
+            } else {
+                issueMoreUnissuedFromOrder_(apply_buf_index_);
+            }
         }
         // 并行：在Apply阶段也推进下一窗口的Gather构建与下发
         if (!step_gate_enable_ && double_buffer_enable_ && defer_issue_until_apply_ && !sb_[gather_buf_index_].staging_reads.empty()) {
@@ -1883,6 +2116,10 @@ void GatherBufferIF::resetWindowMetrics_() {
     win_row_adj_same_ = 0;
     win_row_adj_total_ = 0;
     win_buffer_max_bytes_ = 0;
+    win_apply_bank_rr_turns_ = 0;
+    win_apply_row_sticky_hits_ = 0;
+    win_apply_age_forced_ = 0;
+    win_apply_active_banks_peak_ = 0;
 }
 
 void GatherBufferIF::resetGatherAutoCounters_() {
@@ -2000,6 +2237,13 @@ bool GatherBufferIF::finishApplyWindow_(const char* reason) {
             apply_pending_emit_ = true;
             return false; // wait for downstream drain
         }
+    }
+    // Apply-stage DRAM-aware scheduling counters (optional; flushed once per window).
+    if (apply_issue_policy_ == ApplyIssuePolicy::BankRrRowStickyAge) {
+        if (stat_apply_bank_rr_turns_) stat_apply_bank_rr_turns_->addData(win_apply_bank_rr_turns_);
+        if (stat_apply_row_sticky_hits_) stat_apply_row_sticky_hits_->addData(win_apply_row_sticky_hits_);
+        if (stat_apply_age_forced_) stat_apply_age_forced_->addData(win_apply_age_forced_);
+        if (stat_apply_active_banks_peak_) stat_apply_active_banks_peak_->addData(win_apply_active_banks_peak_);
     }
     stage_ = Stage::Scatter;
     stage_counter_ = 0;

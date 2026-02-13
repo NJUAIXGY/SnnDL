@@ -44,6 +44,12 @@ struct GatherBufferIFConfig {
     uint32_t bank_auto_min_banks = 4;
     uint32_t bank_auto_max_banks = 32;
 
+    // Apply-stage issue scheduling (optional; default preserves legacy "order" behavior).
+    std::string apply_issue_policy = "order"; // order|bank_rr_row_sticky_age
+    uint32_t apply_frags_per_issue = 1;       // max frags per scheduling step (0=unlimited)
+    uint32_t apply_bank_credit = 1;           // max active granules per bank (0=unlimited)
+    uint64_t apply_age_fair_ns = 2000;        // age-based fairness threshold (ns), 0=disable
+
     // Coarse row-window
     bool row_window_enable = false;
     uint64_t row_window_bytes = 0;

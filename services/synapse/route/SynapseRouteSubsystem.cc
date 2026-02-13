@@ -59,6 +59,25 @@ bool parseIngressPolicy_(const std::string& s, IngressPolicy& out) {
     return false;
 }
 
+inline bool parseU32CsvField_(std::string tok, uint32_t& out) {
+    size_t b = 0;
+    while (b < tok.size() && std::isspace(static_cast<unsigned char>(tok[b]))) ++b;
+    size_t e = tok.size();
+    while (e > b && std::isspace(static_cast<unsigned char>(tok[e - 1]))) --e;
+    tok = tok.substr(b, e - b);
+    if (tok.empty()) return false;
+    try {
+        size_t pos = 0;
+        const unsigned long long v = std::stoull(tok, &pos, 10);
+        if (pos != tok.size()) return false;
+        if (v > static_cast<unsigned long long>(std::numeric_limits<uint32_t>::max())) return false;
+        out = static_cast<uint32_t>(v);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 inline uint32_t selectIngressNodeBlocked_(IngressPolicy policy,
                                          uint32_t pre_global,
                                          uint32_t block_id,
@@ -363,12 +382,35 @@ bool buildRoutesFromEdgesCSV_(const SynapseRouteBuildConfig& cfg,
     };
     std::unordered_map<uint32_t, std::vector<std::pair<float,uint32_t>>> tmp;
     uint64_t dropped_self = 0, dropped_layer = 0;
+    uint64_t bad_rows = 0;
+    uint64_t bad_rows_logged = 0;
+    uint64_t total_rows = 0;
+    constexpr uint64_t kMaxBadRowsLog = 8;
     while (std::getline(fin, line)) {
         if (line.empty()) continue;
+        total_rows++;
         auto toks = split(line);
-        if (toks.size() < 2) continue;
-        uint32_t src = (uint32_t) std::stoul(toks[0]);
-        uint32_t dst = (uint32_t) std::stoul(toks[1]);
+        if (toks.size() < 2) {
+            bad_rows++;
+            if (out && bad_rows_logged < kMaxBadRowsLog) {
+                out->verbose(CALL_INFO, 1, 0,
+                             "⚠️ 映射CSV坏行(列数<2) line='%s'\n",
+                             line.c_str());
+                bad_rows_logged++;
+            }
+            continue;
+        }
+        uint32_t src = 0, dst = 0;
+        if (!parseU32CsvField_(toks[0], src) || !parseU32CsvField_(toks[1], dst)) {
+            bad_rows++;
+            if (out && bad_rows_logged < kMaxBadRowsLog) {
+                out->verbose(CALL_INFO, 1, 0,
+                             "⚠️ 映射CSV坏行(src/dst解析失败) src='%s' dst='%s' line='%s'\n",
+                             toks[0].c_str(), toks[1].c_str(), line.c_str());
+                bad_rows_logged++;
+            }
+            continue;
+        }
         float w = 1.0f;
         if (toks.size() >= 3) { try { w = std::stof(toks[2]); } catch(...) { w = 1.0f; } }
         if (std::fabs(w) <= cfg.routing_epsilon) continue;
@@ -384,6 +426,11 @@ bool buildRoutesFromEdgesCSV_(const SynapseRouteBuildConfig& cfg,
             }
         }
         tmp[src].emplace_back(std::fabs(w), dst);
+    }
+    if (bad_rows > 0 && out) {
+        out->verbose(CALL_INFO, 1, 0,
+                     "⚠️ 映射CSV解析存在坏行: file=%s total_rows=%" PRIu64 " bad_rows=%" PRIu64 "\n",
+                     cfg.mapping_edges_file.c_str(), total_rows, bad_rows);
     }
     buildRoutesFromCandidates_(cfg, out, cfg.verify_routing_weights, tmp, rows,
                               /*group_by_pe=*/cfg.mapping_assume_block_ids, routes_out);

@@ -33,6 +33,11 @@ GatherBufferIFConfig parseGatherBufferIFConfig(const SST::Params& params) {
     c.bank_auto_min_banks = params.find<uint32_t>("bank_auto_min_banks", 4);
     c.bank_auto_max_banks = params.find<uint32_t>("bank_auto_max_banks", 32);
 
+    c.apply_issue_policy = params.find<std::string>("apply_issue_policy", "order");
+    c.apply_frags_per_issue = params.find<uint32_t>("apply_frags_per_issue", 1);
+    c.apply_bank_credit = params.find<uint32_t>("apply_bank_credit", 1);
+    c.apply_age_fair_ns = params.find<uint64_t>("apply_age_fair_ns", 2000);
+
     c.row_window_enable = params.find<int>("row_window_enable", 0) != 0;
     c.row_window_bytes = params.find<uint64_t>("row_window_bytes", 0);
     c.row_window_timeout_ns = params.find<uint64_t>("row_window_timeout_ns", 0);

@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 
 #include <sst/core/output.h>
 
@@ -31,12 +32,32 @@ uint64_t StandardMemAccess::lineBytes_() const {
 }
 
 uint64_t StandardMemAccess::allocFragmentGroupId_() {
-    // Use a high-bit prefix to avoid colliding with StandardMem IDs (+1 offset, typically small).
-    const uint64_t id = (1ull << 63) | next_group_id_;
-    next_group_id_ += 1;
-    // Avoid ever returning 0.
-    if (id == 0) return allocFragmentGroupId_();
-    return id;
+    // High bit is reserved for fragment-group ids to avoid colliding with StandardMem ids.
+    constexpr uint64_t kHighBit = (1ull << 63);
+    constexpr uint64_t kLowMask = kHighBit - 1ull;
+
+    uint64_t low = (next_group_id_ & kLowMask);
+    if (low == 0) low = 1;
+    const uint64_t start = low;
+
+    while (true) {
+        const uint64_t id = kHighBit | low;
+        if (frag_groups_.find(id) == frag_groups_.end()) {
+            low = (low == kLowMask) ? 1 : (low + 1);
+            next_group_id_ = low;
+            return id;
+        }
+
+        low = (low == kLowMask) ? 1 : (low + 1);
+        if (low == start) break;
+    }
+
+    if (out_) {
+        out_->fatal(CALL_INFO, -1,
+                    "[stdmem-access-assert] fragment group id space exhausted node=%d core=%d groups=%zu\n",
+                    node_id_, core_id_, frag_groups_.size());
+    }
+    abort();
 }
 
 void StandardMemAccess::onFragmentResp_(uint64_t group_id, uint64_t line_index, std::vector<uint8_t> data) {
@@ -74,14 +95,81 @@ StandardMemAccess::read(uint64_t addr, size_t bytes, ReadCallback cb) {
     }
 
     const uint64_t line_bytes = lineBytes_();
+    if (line_bytes == 0) {
+        if (out_) {
+            out_->fatal(CALL_INFO, -1,
+                        "[stdmem-access-assert] invalid line size node=%d core=%d line=0\n",
+                        node_id_, core_id_);
+        }
+        abort();
+    }
+    if (bytes > static_cast<size_t>(std::numeric_limits<uint64_t>::max())) {
+        if (out_) {
+            out_->fatal(CALL_INFO, -1,
+                        "[stdmem-access-assert] request bytes overflow node=%d core=%d addr=0x%llx bytes=%zu\n",
+                        node_id_, core_id_, (unsigned long long)addr, bytes);
+        }
+        abort();
+    }
     const bool need_fragment = (line_bytes != 0 && bytes > static_cast<size_t>(line_bytes));
     if (need_fragment) {
-        const uint64_t base = (line_bytes != 0) ? (addr / line_bytes) * line_bytes : addr;
-        const uint64_t end = addr + static_cast<uint64_t>(bytes);
-        const uint64_t aligned_end =
-            (line_bytes != 0) ? ((end + line_bytes - 1) / line_bytes) * line_bytes : end;
-        const size_t total_bytes = static_cast<size_t>(aligned_end - base);
-        const size_t nlines = (line_bytes != 0) ? (total_bytes / static_cast<size_t>(line_bytes)) : 0;
+        const auto failFragment = [&](const char* reason,
+                                      uint64_t base,
+                                      uint64_t end,
+                                      uint64_t aligned_end,
+                                      uint64_t span) -> void {
+            if (out_) {
+                out_->fatal(CALL_INFO, -1,
+                            "[stdmem-access-assert] invalid fragment read node=%d core=%d reason=%s "
+                            "addr=0x%llx bytes=%zu line=%" PRIu64
+                            " base=0x%llx end=0x%llx aligned_end=0x%llx span=%" PRIu64 "\n",
+                            node_id_, core_id_, reason,
+                            (unsigned long long)addr, bytes, line_bytes,
+                            (unsigned long long)base,
+                            (unsigned long long)end,
+                            (unsigned long long)aligned_end,
+                            span);
+            }
+            abort();
+        };
+
+        const uint64_t bytes_u64 = static_cast<uint64_t>(bytes);
+        const uint64_t base = (addr / line_bytes) * line_bytes;
+        if (addr > (std::numeric_limits<uint64_t>::max() - bytes_u64)) {
+            failFragment("addr_plus_bytes_overflow", base, 0, 0, 0);
+        }
+        const uint64_t end = addr + bytes_u64;
+
+        uint64_t aligned_end = end;
+        const uint64_t rem = end % line_bytes;
+        if (rem != 0) {
+            const uint64_t add = line_bytes - rem;
+            if (end > (std::numeric_limits<uint64_t>::max() - add)) {
+                failFragment("align_up_overflow", base, end, 0, 0);
+            }
+            aligned_end = end + add;
+        }
+
+        if (aligned_end < base) {
+            failFragment("aligned_end_before_base", base, end, aligned_end, 0);
+        }
+        const uint64_t span = aligned_end - base;
+        if (span == 0) {
+            failFragment("zero_span", base, end, aligned_end, span);
+        }
+        if ((span % line_bytes) != 0) {
+            failFragment("span_not_multiple_of_line", base, end, aligned_end, span);
+        }
+        if (span > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+            failFragment("span_exceeds_size_t", base, end, aligned_end, span);
+        }
+        const uint64_t nlines_u64 = span / line_bytes;
+        if (nlines_u64 == 0 || nlines_u64 > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+            failFragment("invalid_line_count", base, end, aligned_end, span);
+        }
+
+        const size_t total_bytes = static_cast<size_t>(span);
+        const size_t nlines = static_cast<size_t>(nlines_u64);
 
         const uint64_t group_id = allocFragmentGroupId_();
         FragmentGroup g{};

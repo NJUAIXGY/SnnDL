@@ -43,6 +43,10 @@ public:
         {"bank_auto_enable", "Enable heuristic bank bits/shift auto-detect when bank_bits=0", "1"},
         {"bank_auto_min_banks", "Heuristic: minimum distinct banks expected", "4"},
         {"bank_auto_max_banks", "Heuristic: maximum distinct banks expected", "32"},
+        {"apply_issue_policy", "Apply-stage issue policy (optional): order|bank_rr_row_sticky_age", "order"},
+        {"apply_frags_per_issue", "Apply-stage max downstream fragments per issue step (0=unlimited)", "1"},
+        {"apply_bank_credit", "Apply-stage per-bank max active granules (0=unlimited)", "1"},
+        {"apply_age_fair_ns", "Apply-stage fairness threshold (ns): force-issue when age >= threshold (0=disable)", "2000"},
         {"row_window_enable", "Enable coarse row-window merge (0/1)", "0"},
         {"row_window_bytes", "Row-window byte threshold to trigger burst", "0"},
         {"row_window_timeout_ns", "Row-window timeout to trigger burst (ns)", "0"},
@@ -122,6 +126,10 @@ public:
         {"gas_gap_absorbed_bytes", "Gap bytes absorbed by fine-grained merge (sum)", "bytes", 1},
         {"gas_row_window_triggers", "Number of row-window bursts (coarse merge)", "count", 1},
         {"gas_row_window_bytes", "Bytes issued by row-window bursts (sum)", "bytes", 1},
+        {"gas_apply_bank_rr_turns", "Apply scheduler: number of bank round-robin selections per window", "count", 1},
+        {"gas_apply_row_sticky_hits", "Apply scheduler: number of row-sticky picks per window", "count", 1},
+        {"gas_apply_age_forced", "Apply scheduler: number of age-forced picks per window", "count", 1},
+        {"gas_apply_active_banks_peak", "Apply scheduler: peak active banks per window", "count", 1},
         // Adaptive-k (C3) statistics (registered unconditionally; collection gated by params)
         {"gas_k_dyn_bytes", "Adaptive-k dynamic threshold (bytes)", "bytes", 1},
         {"gas_oeff_ns_avg", "Per-window average fixed overhead O_eff (ns)", "ns", 1},
@@ -164,10 +172,11 @@ private:
     bool debug_enable_ = false;
     bool sentinel_enable_ = false;
 
-    // Internal types
-    enum class Stage { Idle=0, Gather=1, Apply=2, Scatter=3 };
-    enum class Merge { None=0, Cacheline=1, Row=2, Auto=3 };
-    enum class Sort { Addr=0, Row=1, BankRow=2 };
+	    // Internal types
+	    enum class Stage { Idle=0, Gather=1, Apply=2, Scatter=3 };
+	    enum class Merge { None=0, Cacheline=1, Row=2, Auto=3 };
+	    enum class Sort { Addr=0, Row=1, BankRow=2 };
+	    enum class ApplyIssuePolicy { Order=0, BankRrRowStickyAge=1 };
 
     struct GranuleKey {
         uint64_t base;
@@ -189,12 +198,13 @@ private:
         uint64_t      offset; // offset within granule base
         uint32_t      size;   // bytes to return
     };
-    struct Granule {
-        uint64_t base; uint32_t size; std::vector<SubReq> subs;
-        bool issued=false; bool ready=false; uint64_t down_id=0;
-        uint64_t issue_ns=0; // adaptive k: time when issued downstream
-        uint64_t window_id=0; // gather/apply window ID for this granule
-        uint64_t payload_bytes = 0; // sum of upstream sub-request sizes (bytes)
+	    struct Granule {
+	        uint64_t base; uint32_t size; std::vector<SubReq> subs;
+	        bool issued=false; bool ready=false; uint64_t down_id=0;
+	        uint64_t issue_ns=0; // adaptive k: time when issued downstream
+	        uint64_t window_id=0; // gather/apply window ID for this granule
+	        uint64_t payload_bytes = 0; // sum of upstream sub-request sizes (bytes)
+	        uint64_t min_arrival_ns = 0; // min arrival time across sub-reads (ns); used for Apply fairness
 
         // 下游分片：为兼容 memHierarchy.Cache（尤其 Incoherent L1），避免一次性发起 size>cache_line 的 GetS
         // 导致 cache 在回包时越界拼 payload（表现为权重读脏/非确定性/发放归零）。
@@ -222,19 +232,21 @@ private:
         ImmediateSend,
     };
 
-    // Helpers
-    Merge parseMerge(const std::string& s) const;
-    Sort parseSort(const std::string& s) const;
+	    // Helpers
+	    Merge parseMerge(const std::string& s) const;
+	    Sort parseSort(const std::string& s) const;
+	    ApplyIssuePolicy parseApplyIssuePolicy(const std::string& s) const;
     uint64_t alignDown(uint64_t addr, uint64_t bytes) const { return (addr/bytes)*bytes; }
     uint64_t granuleSize() const;
     uint64_t rowIndex(uint64_t addr) const { return row_bytes_guess_? (addr / row_bytes_guess_) : 0; }
     uint64_t bankIndex(uint64_t addr) const { return bank_bits_ ? ((addr >> bank_shift_) & ((1ull<<bank_bits_)-1)) : 0; }
     uint64_t bankRowIndex(uint64_t addr) const { return (bankIndex(addr) << 32) | (uint32_t)rowIndex(addr); }
-    GranuleKey makeGranuleKey_(uint64_t base, uint32_t size) const;
-    Granule& ensureGranule_(int buf, const GranuleKey& key);
-    static bool granuleKeyLess_(const GranuleKey& a, const GranuleKey& b);
-    void issueGranuleBuf_(int buf, const GranuleKey& key, Granule& g);
-    void onDownstreamResp_(Request* r);
+	    GranuleKey makeGranuleKey_(uint64_t base, uint32_t size) const;
+	    Granule& ensureGranule_(int buf, const GranuleKey& key);
+	    static bool granuleKeyLess_(const GranuleKey& a, const GranuleKey& b);
+	    void issueGranuleBuf_(int buf, const GranuleKey& key, Granule& g);
+	    void issueGranuleBufBudget_(int buf, const GranuleKey& key, Granule& g, uint32_t max_frags_to_issue);
+	    void onDownstreamResp_(Request* r);
     void maybeEnterApply_();
     void emitApplyResponsesBuf_(int buf);
     void doFlushBuf_(int buf);
@@ -253,10 +265,12 @@ private:
     void applyCtrlConfig_(uint64_t k, uint64_t rowwin_bytes, uint64_t timeout_ns);
     bool rebuildPendingAsGranules_(int buf);
     static std::vector<uint64_t> parseCsvU64_(const std::string& s);
-    uint64_t ensureSortKey_(Granule& g);
-    void rebuildIssueOrder_(int buf);
-    void issueMoreUnissuedFromOrder_(int buf);
-    void issueUnissuedGranulesDeterministic_(int buf);
+	    uint64_t ensureSortKey_(Granule& g);
+	    void rebuildIssueOrder_(int buf);
+	    void issueMoreUnissuedFromOrder_(int buf);
+	    void rebuildApplyBankQueues_(int buf);
+	    void issueMoreApplyScheduled_(int buf);
+	    void issueUnissuedGranulesDeterministic_(int buf);
     bool attachReadToGranule_(int tgt_buf,
                               SST::Interfaces::StandardMem::Read* rd,
                               ReadAttachKind kind,
@@ -290,10 +304,15 @@ private:
     uint32_t bank_bits_ = 0;        // bank field width; 0 disables bank_row sort
     uint32_t bank_shift_ = 0;       // bank bit LSB
     bool bank_auto_enable_ = true;  // allow heuristic detection if bits==0
-    uint32_t bank_auto_min_banks_ = 4;
-    uint32_t bank_auto_max_banks_ = 32;
-    bool bank_auto_done_ = false;
-    uint32_t sram_access_ns_ = 0;
+	    uint32_t bank_auto_min_banks_ = 4;
+	    uint32_t bank_auto_max_banks_ = 32;
+	    bool bank_auto_done_ = false;
+	    // Apply-stage issue scheduling (optional; default preserves legacy 'order' behavior).
+	    ApplyIssuePolicy apply_issue_policy_ = ApplyIssuePolicy::Order;
+	    uint32_t apply_frags_per_issue_ = 1; // max frags per scheduling step (0=unlimited)
+	    uint32_t apply_bank_credit_ = 1;     // max active granules per bank (0=unlimited)
+	    uint64_t apply_age_fair_ns_ = 2000;  // age fairness threshold (ns), 0=disable
+	    uint32_t sram_access_ns_ = 0;
     uint32_t max_inflight_reads_ = 128;
     uint64_t tail_wait_timeout_ns_ = 0; // 0 = wait all
     bool allow_apply_miss_read_ = false;
@@ -404,13 +423,19 @@ private:
         // Apply阶段的确定性发射序列（避免每次 ReadResp 都对 granules 做全量排序）：
         // - 用于 defer_issue_until_apply=1 时保证“inflight 限流下仍能持续补发未发 granule”，防止卡死。
         // - 也可用于 Apply 阶段 miss-read/late-read 进入后，统一补发。
-        std::vector<std::pair<uint64_t, GranuleKey>> issue_order; // (sort_key, key)
-        size_t issue_cursor = 0;
-        bool issue_order_dirty = true;
+	        std::vector<std::pair<uint64_t, GranuleKey>> issue_order; // (sort_key, key)
+	        size_t issue_cursor = 0;
+	        bool issue_order_dirty = true;
+	
+	        // Apply-stage DRAM-aware issue scheduling state (optional; only used when apply_issue_policy != order).
+	        std::vector<std::deque<GranuleKey>> apply_bank_q; // per-bank candidate granules (unissued only; may contain stale keys)
+	        std::vector<uint64_t> apply_last_row; // per-bank last row_id (rowIndex)
+	        size_t apply_bank_rr_cursor = 0;
+	        bool apply_bank_q_dirty = true;
 
-        std::unordered_map<GranuleKey, std::vector<uint8_t>, GranuleKeyHash> sram_blocks; // key->data
-        uint64_t bytes_in_sram = 0;
-        bool end_gather_seen = false;
+	        std::unordered_map<GranuleKey, std::vector<uint8_t>, GranuleKeyHash> sram_blocks; // key->data
+	        uint64_t bytes_in_sram = 0;
+	        bool end_gather_seen = false;
 
         // 构造函数：预分配容器空间（优化3）
         SBState() {
@@ -463,11 +488,16 @@ private:
     Statistic<uint64_t>* stat_stage_cycles_s_ = nullptr;
     Statistic<uint64_t>* stat_coalesce_granule_size_ = nullptr; // bytes per granule
     Statistic<uint64_t>* stat_buffer_occupancy_bytes_ = nullptr; // sampled on store
-    Statistic<uint64_t>* stat_gap_absorbed_bytes_ = nullptr; // total gap bytes absorbed by gap merge
-    Statistic<uint64_t>* stat_row_window_triggers_ = nullptr; // number of row-window bursts
-    Statistic<uint64_t>* stat_row_window_bytes_ = nullptr;    // bytes issued due to row-window
-    // 门控诊断：下发到下游的唯一granule读次数
-    Statistic<uint64_t>* stat_reads_issued_ = nullptr;
+	    Statistic<uint64_t>* stat_gap_absorbed_bytes_ = nullptr; // total gap bytes absorbed by gap merge
+	    Statistic<uint64_t>* stat_row_window_triggers_ = nullptr; // number of row-window bursts
+	    Statistic<uint64_t>* stat_row_window_bytes_ = nullptr;    // bytes issued due to row-window
+	    // Apply-stage scheduler stats (optional; only meaningful when apply_issue_policy != order)
+	    Statistic<uint64_t>* stat_apply_bank_rr_turns_ = nullptr;
+	    Statistic<uint64_t>* stat_apply_row_sticky_hits_ = nullptr;
+	    Statistic<uint64_t>* stat_apply_age_forced_ = nullptr;
+	    Statistic<uint64_t>* stat_apply_active_banks_peak_ = nullptr;
+	    // 门控诊断：下发到下游的唯一granule读次数
+	    Statistic<uint64_t>* stat_reads_issued_ = nullptr;
     // Adaptive k stats
     Statistic<uint64_t>* stat_k_dyn_bytes_ = nullptr;         // current k dynamic (bytes)
     Statistic<uint64_t>* stat_oeff_ns_avg_ = nullptr;         // average O_eff per window (ns)
@@ -482,9 +512,13 @@ private:
     uint64_t win_bursts_ = 0;          // number of bursts (granules) issued in this window
     uint64_t win_seg_latency_sum_ns_ = 0; // sum of segment latencies
     uint64_t win_seg_count_ = 0;       // number of segments measured
-    uint64_t win_inflight_peak_ = 0;   // inflight peak within window
-    uint64_t win_row_adj_same_ = 0;    // adjacent pairs mapped to same (row or bank_row)
-    uint64_t win_row_adj_total_ = 0;   // total adjacent pairs considered
+	    uint64_t win_inflight_peak_ = 0;   // inflight peak within window
+	    uint64_t win_row_adj_same_ = 0;    // adjacent pairs mapped to same (row or bank_row)
+	    uint64_t win_row_adj_total_ = 0;   // total adjacent pairs considered
+	    uint64_t win_apply_bank_rr_turns_ = 0;
+	    uint64_t win_apply_row_sticky_hits_ = 0;
+	    uint64_t win_apply_age_forced_ = 0;
+	    uint64_t win_apply_active_banks_peak_ = 0;
 
     // --- Adaptive control state ---
     bool ctrl_enable_ = false;

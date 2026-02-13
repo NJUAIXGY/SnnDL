@@ -1,6 +1,9 @@
 // -*- c++ -*-
 #include "GatingPE.h"
+#include <cctype>
+#include <limits>
 #include <sstream>
+#include <stdexcept>
 #include <random>
 #include "SnnNIC.h"
 #include "SnnInterface.h"
@@ -9,6 +12,35 @@
 
 using namespace SST;
 using namespace SST::SnnDL;
+
+namespace {
+
+static inline void trimAsciiInplace_(std::string& s) {
+    size_t b = 0;
+    while (b < s.size() && std::isspace(static_cast<unsigned char>(s[b]))) ++b;
+    size_t e = s.size();
+    while (e > b && std::isspace(static_cast<unsigned char>(s[e - 1]))) --e;
+    if (b == 0 && e == s.size()) return;
+    s = s.substr(b, e - b);
+}
+
+static inline bool parseU32Strict_(const std::string& in, uint32_t& out) {
+    std::string s = in;
+    trimAsciiInplace_(s);
+    if (s.empty()) return false;
+    try {
+        size_t pos = 0;
+        const unsigned long long v = std::stoull(s, &pos, 10);
+        if (pos != s.size()) return false;
+        if (v > static_cast<unsigned long long>(std::numeric_limits<uint32_t>::max())) return false;
+        out = static_cast<uint32_t>(v);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+} // namespace
 
 GatingPE::GatingPE(ComponentId_t id, Params& params)
     : Component(id)
@@ -82,22 +114,48 @@ void GatingPE::finish() { /* no-op */ }
 
 bool GatingPE::parseTransitions(const std::string& s, std::vector<Transition>& out) {
     // format: a-b:c-d, e-f:g-h, ... (inclusive bounds)
+    out.clear();
     std::istringstream ss(s);
     std::string tok;
     while (std::getline(ss, tok, ',')) {
+        trimAsciiInplace_(tok);
         if (tok.empty()) continue;
         size_t colon = tok.find(':');
-        if (colon == std::string::npos) return false;
+        if (colon == std::string::npos) {
+            if (out_) out_->verbose(CALL_INFO, 1, 0, "⚠️ transitions token缺少':'分隔符: '%s'\n", tok.c_str());
+            return false;
+        }
         std::string left = tok.substr(0, colon);
         std::string right = tok.substr(colon+1);
-        auto parseRange = [](const std::string& r)->Range{
+        trimAsciiInplace_(left);
+        trimAsciiInplace_(right);
+        auto parseRange = [](const std::string& r, Range& out_range)->bool{
             size_t dash = r.find('-');
-            Range R{};
-            if (dash == std::string::npos) { R.a = R.b = (uint32_t) std::stoul(r); }
-            else { R.a = (uint32_t) std::stoul(r.substr(0,dash)); R.b = (uint32_t) std::stoul(r.substr(dash+1)); }
-            return R;
+            if (dash == std::string::npos) {
+                uint32_t v = 0;
+                if (!parseU32Strict_(r, v)) return false;
+                out_range.a = v;
+                out_range.b = v;
+                return true;
+            }
+
+            uint32_t a = 0, b = 0;
+            if (!parseU32Strict_(r.substr(0, dash), a)) return false;
+            if (!parseU32Strict_(r.substr(dash + 1), b)) return false;
+            if (b < a) return false;
+            out_range.a = a;
+            out_range.b = b;
+            return true;
         };
-        Transition tr; tr.src = parseRange(left); tr.dst = parseRange(right);
+        Transition tr;
+        if (!parseRange(left, tr.src)) {
+            if (out_) out_->verbose(CALL_INFO, 1, 0, "⚠️ transitions源范围解析失败: '%s'\n", left.c_str());
+            return false;
+        }
+        if (!parseRange(right, tr.dst)) {
+            if (out_) out_->verbose(CALL_INFO, 1, 0, "⚠️ transitions目标范围解析失败: '%s'\n", right.c_str());
+            return false;
+        }
         out.push_back(tr);
     }
     return !out.empty();
@@ -153,14 +211,27 @@ bool GatingPE::parseTargets(const std::string& s, std::vector<uint32_t>& out) {
     std::istringstream ss(s);
     std::string tok;
     while (std::getline(ss, tok, ',')) {
+        trimAsciiInplace_(tok);
         if (tok.empty()) continue;
         size_t dash = tok.find('-');
         if (dash == std::string::npos) {
-            out.push_back((uint32_t)std::stoul(tok));
+            uint32_t v = 0;
+            if (!parseU32Strict_(tok, v)) {
+                if (out_) out_->verbose(CALL_INFO, 1, 0, "⚠️ gate_targets项解析失败: '%s'\n", tok.c_str());
+                return false;
+            }
+            out.push_back(v);
         } else {
-            uint32_t a = (uint32_t)std::stoul(tok.substr(0,dash));
-            uint32_t b = (uint32_t)std::stoul(tok.substr(dash+1));
-            if (b < a) continue;
+            uint32_t a = 0, b = 0;
+            if (!parseU32Strict_(tok.substr(0, dash), a) ||
+                !parseU32Strict_(tok.substr(dash + 1), b)) {
+                if (out_) out_->verbose(CALL_INFO, 1, 0, "⚠️ gate_targets范围解析失败: '%s'\n", tok.c_str());
+                return false;
+            }
+            if (b < a) {
+                if (out_) out_->verbose(CALL_INFO, 1, 0, "⚠️ gate_targets范围无效(右端小于左端): '%s'\n", tok.c_str());
+                return false;
+            }
             for (uint32_t x=a; x<=b; ++x) out.push_back(x);
         }
     }
