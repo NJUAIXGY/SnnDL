@@ -315,6 +315,9 @@ public:
         {"gas_row_window_bytes_total", "GAS 行窗口触发覆盖字节（总）", "bytes", 1},
         {"gas_total_bursts", "GAS granule/突发 数（总）", "bursts", 1},
         {"gas_total_payload_bytes", "GAS granule 有效载荷字节总和", "bytes", 1},
+        {"gas_unique_line_count_total", "GAS 诊断：近似 unique cacheline 数（总；DRAM-aware）", "lines", 1},
+        {"gas_covered_line_count_total", "GAS 诊断：近似 covered cacheline 数（总；DRAM-aware）", "lines", 1},
+        {"gas_overfetch_bytes_total", "GAS 诊断：overfetch bytes（总；DRAM-aware）", "bytes", 1},
         {"gas_apply_acc_updates_total", "Apply阶段的delta累加次数（总）", "count", 1},
         {"gas_acc_posts_touched_total", "Apply阶段触达post个数（总）", "posts", 1},
         {"gas_scatter_spikes_emitted_total", "Scatter阶段发放spike个数（总）", "spikes", 1},
@@ -385,7 +388,10 @@ public:
                                uint64_t rowwin_triggers, uint64_t rowwin_bytes,
                                uint64_t bursts, uint64_t payload_bytes,
                                uint64_t window_inflight_peak = 0,
-                               uint64_t window_buffer_max_bytes = 0);
+                               uint64_t window_buffer_max_bytes = 0,
+                               uint64_t unique_line_count = 0,
+                               uint64_t covered_line_count = 0,
+                               uint64_t overfetch_bytes = 0);
     void accumulateActivityF(double f);
     void accumulateApplyScatterStats(uint64_t acc_updates, uint64_t posts_touched,
                                      uint64_t spikes_emitted, uint64_t hwm_bytes,
@@ -525,6 +531,9 @@ private:
     Statistic<uint64_t>* stat_gas_rowwin_bytes_total_ = nullptr;
     Statistic<uint64_t>* stat_gas_total_bursts_ = nullptr;
     Statistic<uint64_t>* stat_gas_total_payload_bytes_ = nullptr;
+    Statistic<uint64_t>* stat_gas_unique_line_count_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_covered_line_count_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_overfetch_bytes_total_ = nullptr;
     Statistic<uint64_t>* stat_gas_apply_acc_updates_total_ = nullptr;
     Statistic<uint64_t>* stat_gas_acc_posts_touched_total_ = nullptr;
     Statistic<uint64_t>* stat_gas_scatter_spikes_emitted_total_ = nullptr;

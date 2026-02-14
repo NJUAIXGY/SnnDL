@@ -34,7 +34,10 @@ public:
                                        uint64_t rowwin_triggers, uint64_t rowwin_bytes,
                                        uint64_t bursts, uint64_t payload_bytes,
                                        uint64_t window_inflight_peak,
-                                       uint64_t window_buffer_max_bytes) = 0;
+                                       uint64_t window_buffer_max_bytes,
+                                       uint64_t unique_line_count,
+                                       uint64_t covered_line_count,
+                                       uint64_t overfetch_bytes) = 0;
 
     virtual void accumulateActivityF(double f) = 0;
     virtual void accumulateApplyScatterStats(uint64_t acc_updates, uint64_t posts_touched,
@@ -46,4 +49,3 @@ public:
 };
 
 }} // namespace SST::SnnDL
-

@@ -19,6 +19,7 @@
 
 #include "IGasStepGate.h"
 #include "synapse/gas/GasCustomCmd.h"
+#include "gather/apply/DramAwareTuner.h"
 
 namespace SST { namespace SnnDL {
 
@@ -43,10 +44,18 @@ public:
         {"bank_auto_enable", "Enable heuristic bank bits/shift auto-detect when bank_bits=0", "1"},
         {"bank_auto_min_banks", "Heuristic: minimum distinct banks expected", "4"},
         {"bank_auto_max_banks", "Heuristic: maximum distinct banks expected", "32"},
-        {"apply_issue_policy", "Apply-stage issue policy (optional): order|bank_rr_row_sticky_age", "order"},
+        {"apply_issue_policy", "Apply-stage issue policy (optional): order|bank_rr_row_sticky_age|dram_aware_v1", "order"},
         {"apply_frags_per_issue", "Apply-stage max downstream fragments per issue step (0=unlimited)", "1"},
         {"apply_bank_credit", "Apply-stage per-bank max active granules (0=unlimited)", "1"},
         {"apply_age_fair_ns", "Apply-stage fairness threshold (ns): force-issue when age >= threshold (0=disable)", "2000"},
+        // DRAM-aware Apply (exploration; default OFF; activated by apply_issue_policy=dram_aware_v1)
+        {"dram_row_bytes", "DRAM row bytes (0=use row_bytes_guess)", "0"},
+        {"dram_bank_count", "DRAM bank count hint (0=derive/disable)", "0"},
+        {"dram_read_burst_bytes", "DRAM minimum burst bytes (for cost model)", "64"},
+        {"dram_row_miss_penalty_cycles", "DRAM row-miss penalty weight (cycles, heuristic)", "0"},
+        {"dram_overfetch_budget_bytes", "Per-window overfetch budget (bytes, 0=unlimited)", "0"},
+        {"dram_aware_enable_row_window", "Allow DRAM-aware to enable row-window (0/1)", "0"},
+        {"dram_aware_k_policy", "DRAM-aware k policy: fixed|cost_budgeted|density_budgeted", "cost_budgeted"},
         {"row_window_enable", "Enable coarse row-window merge (0/1)", "0"},
         {"row_window_bytes", "Row-window byte threshold to trigger burst", "0"},
         {"row_window_timeout_ns", "Row-window timeout to trigger burst (ns)", "0"},
@@ -126,6 +135,10 @@ public:
         {"gas_gap_absorbed_bytes", "Gap bytes absorbed by fine-grained merge (sum)", "bytes", 1},
         {"gas_row_window_triggers", "Number of row-window bursts (coarse merge)", "count", 1},
         {"gas_row_window_bytes", "Bytes issued by row-window bursts (sum)", "bytes", 1},
+        // DRAM-aware Apply diagnostics (exploration; meaningful only when apply_issue_policy=dram_aware_v1)
+        {"gas_overfetch_bytes", "Overfetch bytes issued by segment merges (issued_bytes - payload_bytes)", "bytes", 1},
+        {"gas_unique_line_count", "Approx unique cacheline count touched by staged reads (per window)", "count", 1},
+        {"gas_covered_line_count", "Approx covered cacheline count by issued segments (per window)", "count", 1},
         {"gas_apply_bank_rr_turns", "Apply scheduler: number of bank round-robin selections per window", "count", 1},
         {"gas_apply_row_sticky_hits", "Apply scheduler: number of row-sticky picks per window", "count", 1},
         {"gas_apply_age_forced", "Apply scheduler: number of age-forced picks per window", "count", 1},
@@ -176,7 +189,7 @@ private:
 	    enum class Stage { Idle=0, Gather=1, Apply=2, Scatter=3 };
 	    enum class Merge { None=0, Cacheline=1, Row=2, Auto=3 };
 	    enum class Sort { Addr=0, Row=1, BankRow=2 };
-	    enum class ApplyIssuePolicy { Order=0, BankRrRowStickyAge=1 };
+	    enum class ApplyIssuePolicy { Order=0, BankRrRowStickyAge=1, DramAwareV1=2 };
 
     struct GranuleKey {
         uint64_t base;
@@ -238,7 +251,7 @@ private:
 	    ApplyIssuePolicy parseApplyIssuePolicy(const std::string& s) const;
     uint64_t alignDown(uint64_t addr, uint64_t bytes) const { return (addr/bytes)*bytes; }
     uint64_t granuleSize() const;
-    uint64_t rowIndex(uint64_t addr) const { return row_bytes_guess_? (addr / row_bytes_guess_) : 0; }
+    uint64_t rowIndex(uint64_t addr) const { return row_bytes_effective_? (addr / row_bytes_effective_) : 0; }
     uint64_t bankIndex(uint64_t addr) const { return bank_bits_ ? ((addr >> bank_shift_) & ((1ull<<bank_bits_)-1)) : 0; }
     uint64_t bankRowIndex(uint64_t addr) const { return (bankIndex(addr) << 32) | (uint32_t)rowIndex(addr); }
 	    GranuleKey makeGranuleKey_(uint64_t base, uint32_t size) const;
@@ -296,6 +309,7 @@ private:
     Merge merge_ = Merge::Cacheline;
     Sort sort_ = Sort::Row;
     uint32_t row_bytes_guess_ = 8192;
+    uint32_t row_bytes_effective_ = 8192; // may be overridden by dram_row_bytes when dram-aware is enabled
     uint64_t sram_bytes_ = 256*1024;
     // Fine-grained merge knobs
     bool gap_merge_enable_ = true;
@@ -389,6 +403,14 @@ private:
     bool row_window_enable_ = false;
     uint64_t row_window_bytes_ = 0;
     uint64_t row_window_timeout_ns_ = 0;
+
+    // DRAM-aware Apply (exploration; default OFF; activated by apply_issue_policy=dram_aware_v1)
+    uint32_t dram_bank_count_ = 0;
+    uint32_t dram_read_burst_bytes_ = 64;
+    uint32_t dram_row_miss_penalty_cycles_ = 0;
+    uint64_t dram_overfetch_budget_bytes_ = 0;
+    bool dram_aware_enable_row_window_ = false;
+    gather::apply::DramAwareKPolicy dram_aware_k_policy_ = gather::apply::DramAwareKPolicy::CostBudgeted;
     // Double-buffer indices
     int gather_buf_index_ = 0; // 当前接收/构建/发射（下轮）的SB
     int apply_buf_index_  = 1; // 当前用于Apply/回答上游的SB
@@ -489,8 +511,12 @@ private:
     Statistic<uint64_t>* stat_coalesce_granule_size_ = nullptr; // bytes per granule
     Statistic<uint64_t>* stat_buffer_occupancy_bytes_ = nullptr; // sampled on store
 	    Statistic<uint64_t>* stat_gap_absorbed_bytes_ = nullptr; // total gap bytes absorbed by gap merge
-	    Statistic<uint64_t>* stat_row_window_triggers_ = nullptr; // number of row-window bursts
-	    Statistic<uint64_t>* stat_row_window_bytes_ = nullptr;    // bytes issued due to row-window
+    Statistic<uint64_t>* stat_row_window_triggers_ = nullptr; // number of row-window bursts
+    Statistic<uint64_t>* stat_row_window_bytes_ = nullptr;    // bytes issued due to row-window
+    // DRAM-aware metrics (exploration; gated by apply_issue_policy=dram_aware_v1)
+    Statistic<uint64_t>* stat_overfetch_bytes_ = nullptr;     // issued_bytes - payload_bytes (sum over segments)
+    Statistic<uint64_t>* stat_unique_line_count_ = nullptr;   // approx unique lines touched (per window)
+    Statistic<uint64_t>* stat_covered_line_count_ = nullptr;  // approx covered lines by issued segments (per window)
 	    // Apply-stage scheduler stats (optional; only meaningful when apply_issue_policy != order)
 	    Statistic<uint64_t>* stat_apply_bank_rr_turns_ = nullptr;
 	    Statistic<uint64_t>* stat_apply_row_sticky_hits_ = nullptr;
@@ -501,7 +527,11 @@ private:
     // Adaptive k stats
     Statistic<uint64_t>* stat_k_dyn_bytes_ = nullptr;         // current k dynamic (bytes)
     Statistic<uint64_t>* stat_oeff_ns_avg_ = nullptr;         // average O_eff per window (ns)
-    Statistic<uint64_t>* stat_bw_eff_bytes_per_us_ = nullptr; // scaled bandwidth (bytes/us)
+	    Statistic<uint64_t>* stat_bw_eff_bytes_per_us_ = nullptr; // scaled bandwidth (bytes/us)
+	    // Control stats
+	    Statistic<uint64_t>* stat_ctrl_probes_ = nullptr;
+	    Statistic<uint64_t>* stat_ctrl_adopts_ = nullptr;
+	    Statistic<uint64_t>* stat_ctrl_reverts_ = nullptr;
 
     // Time tracking (ns) for non-window mode
     uint64_t last_stage_change_ns_ = 0;
@@ -539,13 +569,8 @@ private:
     double ctrl_last_score_ = 0.0; // reqs_per_mib of current cfg (lower better)
     double ctrl_last_lat_ = 0.0;   // avg segment latency ns
 
-    // Stats for control
-    Statistic<uint64_t>* stat_ctrl_probes_ = nullptr;
-    Statistic<uint64_t>* stat_ctrl_adopts_ = nullptr;
-    Statistic<uint64_t>* stat_ctrl_reverts_ = nullptr;
-    
-    bool warned_auto_custom_req_ = false;
-    bool warned_defer_issue_path_ = false;
+	    bool warned_auto_custom_req_ = false;
+	    bool warned_defer_issue_path_ = false;
 
     bool diagEnabled_(int level = 1) const;
 };

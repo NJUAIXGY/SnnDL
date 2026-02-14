@@ -119,6 +119,15 @@ struct GatherBufferIFConfig {
     std::string ctrl_rowwin_list = "0,16384,32768,65536";
     std::string ctrl_timeout_list = "0,300,600";
 
+    // DRAM-aware Apply (exploration; default OFF, activated by apply_issue_policy=dram_aware_v1)
+    uint32_t dram_row_bytes = 0;
+    uint32_t dram_bank_count = 0;
+    uint32_t dram_read_burst_bytes = 64;
+    uint32_t dram_row_miss_penalty_cycles = 0;
+    uint64_t dram_overfetch_budget_bytes = 0;
+    bool dram_aware_enable_row_window = false;
+    std::string dram_aware_k_policy = "cost_budgeted"; // fixed|cost_budgeted|density_budgeted
+
     // Granule/window metrics export
     std::string export_granules_csv;
     uint32_t node_id = 0;

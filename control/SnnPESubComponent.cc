@@ -1108,7 +1108,8 @@ void SnnPESubComponent::onGasStatEvent(const GasStatEvent& st) {
         pe->accumulateGasStatsExt(st.unique_bytes, st.unique_reads,
                                   st.rowwin_triggers, st.rowwin_bytes,
                                   st.bursts, st.payload_bytes,
-                                  st.window_inflight_peak, st.window_buffer_max_bytes);
+                                  st.window_inflight_peak, st.window_buffer_max_bytes,
+                                  st.unique_line_count, st.covered_line_count, st.overfetch_bytes);
     }
     // Local (per-core) copies for unique_* only (optional)
     if (stat_gas_unique_reads_total_ && st.unique_reads) stat_gas_unique_reads_total_->addData(st.unique_reads);

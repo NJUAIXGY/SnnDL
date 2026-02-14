@@ -1502,6 +1502,9 @@ void MultiCorePE::initializeStatistics() {
     stat_gas_rowwin_bytes_total_ = registerStatistic<uint64_t>("gas_row_window_bytes_total");
     stat_gas_total_bursts_ = registerStatistic<uint64_t>("gas_total_bursts");
     stat_gas_total_payload_bytes_ = registerStatistic<uint64_t>("gas_total_payload_bytes");
+    stat_gas_unique_line_count_total_ = registerStatistic<uint64_t>("gas_unique_line_count_total");
+    stat_gas_covered_line_count_total_ = registerStatistic<uint64_t>("gas_covered_line_count_total");
+    stat_gas_overfetch_bytes_total_ = registerStatistic<uint64_t>("gas_overfetch_bytes_total");
     stat_gas_apply_acc_updates_total_ = registerStatistic<uint64_t>("gas_apply_acc_updates_total");
     stat_gas_acc_posts_touched_total_ = registerStatistic<uint64_t>("gas_acc_posts_touched_total");
     stat_gas_scatter_spikes_emitted_total_ = registerStatistic<uint64_t>("gas_scatter_spikes_emitted_total");
@@ -1560,12 +1563,18 @@ void MultiCorePE::accumulateGasStatsExt(uint64_t unique_bytes, uint64_t unique_r
                                         uint64_t rowwin_triggers, uint64_t rowwin_bytes,
                                         uint64_t bursts, uint64_t payload_bytes,
                                         uint64_t window_inflight_peak,
-                                        uint64_t window_buffer_max_bytes) {
+                                        uint64_t window_buffer_max_bytes,
+                                        uint64_t unique_line_count,
+                                        uint64_t covered_line_count,
+                                        uint64_t overfetch_bytes) {
     accumulateGasStats(unique_bytes, unique_reads);
     if (rowwin_triggers && stat_gas_rowwin_triggers_total_) stat_gas_rowwin_triggers_total_->addData(rowwin_triggers);
     if (rowwin_bytes && stat_gas_rowwin_bytes_total_) stat_gas_rowwin_bytes_total_->addData(rowwin_bytes);
     if (bursts && stat_gas_total_bursts_) stat_gas_total_bursts_->addData(bursts);
     if (payload_bytes && stat_gas_total_payload_bytes_) stat_gas_total_payload_bytes_->addData(payload_bytes);
+    if (unique_line_count && stat_gas_unique_line_count_total_) stat_gas_unique_line_count_total_->addData(unique_line_count);
+    if (covered_line_count && stat_gas_covered_line_count_total_) stat_gas_covered_line_count_total_->addData(covered_line_count);
+    if (overfetch_bytes && stat_gas_overfetch_bytes_total_) stat_gas_overfetch_bytes_total_->addData(overfetch_bytes);
 }
 
 void MultiCorePE::accumulateActivityF(double f) {

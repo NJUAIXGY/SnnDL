@@ -103,6 +103,7 @@ GatherBufferIF::GatherBufferIF(ComponentId_t id, Params& params, TimeConverter* 
     merge_ = parseMerge(cfg.merge_policy);
     sort_  = parseSort(cfg.sort_policy);
     row_bytes_guess_ = cfg.row_bytes_guess;
+    row_bytes_effective_ = row_bytes_guess_;
     sram_bytes_ = cfg.sram_bytes;
     gap_merge_enable_ = cfg.gap_merge_enable;
     gap_k_bytes_ = cfg.gap_merge_k_bytes;
@@ -113,6 +114,15 @@ GatherBufferIF::GatherBufferIF(ComponentId_t id, Params& params, TimeConverter* 
     bank_auto_min_banks_ = cfg.bank_auto_min_banks;
     bank_auto_max_banks_ = cfg.bank_auto_max_banks;
     apply_issue_policy_ = parseApplyIssuePolicy(cfg.apply_issue_policy);
+    if (apply_issue_policy_ == ApplyIssuePolicy::DramAwareV1 && cfg.dram_row_bytes > 0) {
+        row_bytes_effective_ = cfg.dram_row_bytes;
+    }
+    dram_bank_count_ = cfg.dram_bank_count;
+    dram_read_burst_bytes_ = cfg.dram_read_burst_bytes;
+    dram_row_miss_penalty_cycles_ = cfg.dram_row_miss_penalty_cycles;
+    dram_overfetch_budget_bytes_ = cfg.dram_overfetch_budget_bytes;
+    dram_aware_enable_row_window_ = cfg.dram_aware_enable_row_window;
+    dram_aware_k_policy_ = gather::apply::DramAwareTuner::parseKPolicy(cfg.dram_aware_k_policy);
     apply_frags_per_issue_ = cfg.apply_frags_per_issue;
     apply_bank_credit_ = cfg.apply_bank_credit;
     apply_age_fair_ns_ = cfg.apply_age_fair_ns;
@@ -181,6 +191,10 @@ GatherBufferIF::GatherBufferIF(ComponentId_t id, Params& params, TimeConverter* 
     stat_gap_absorbed_bytes_ = registerStatistic<uint64_t>("gas_gap_absorbed_bytes");
     stat_row_window_triggers_ = registerStatistic<uint64_t>("gas_row_window_triggers");
     stat_row_window_bytes_    = registerStatistic<uint64_t>("gas_row_window_bytes");
+    // DRAM-aware stats (exploration; meaningful only when apply_issue_policy=dram_aware_v1)
+    stat_overfetch_bytes_     = registerStatistic<uint64_t>("gas_overfetch_bytes");
+    stat_unique_line_count_   = registerStatistic<uint64_t>("gas_unique_line_count");
+    stat_covered_line_count_  = registerStatistic<uint64_t>("gas_covered_line_count");
     stat_apply_bank_rr_turns_ = registerStatistic<uint64_t>("gas_apply_bank_rr_turns");
     stat_apply_row_sticky_hits_ = registerStatistic<uint64_t>("gas_apply_row_sticky_hits");
     stat_apply_age_forced_ = registerStatistic<uint64_t>("gas_apply_age_forced");
@@ -704,6 +718,7 @@ GatherBufferIF::Sort GatherBufferIF::parseSort(const std::string& s) const {
 GatherBufferIF::ApplyIssuePolicy GatherBufferIF::parseApplyIssuePolicy(const std::string& s) const {
     const std::string v = toLowerCopy(s);
     if (v == "bank_rr_row_sticky_age") return ApplyIssuePolicy::BankRrRowStickyAge;
+    if (v == "dram_aware_v1") return ApplyIssuePolicy::DramAwareV1;
     return ApplyIssuePolicy::Order;
 }
 
@@ -1409,7 +1424,8 @@ void GatherBufferIF::maybeEnterApply_() {
             }
         }
 
-        if (apply_issue_policy_ == ApplyIssuePolicy::BankRrRowStickyAge) {
+        if (apply_issue_policy_ == ApplyIssuePolicy::BankRrRowStickyAge ||
+            apply_issue_policy_ == ApplyIssuePolicy::DramAwareV1) {
             auto& A = sb_[apply_buf_index_];
             A.apply_bank_q_dirty = true;
             A.apply_bank_rr_cursor = 0;
@@ -1475,6 +1491,56 @@ void GatherBufferIF::buildGranulesWithGapMergeBuf_(int buf) {
     std::unordered_map<Request::id_t, uint64_t> staged_arrival_ns;
     staged_arrival_ns.swap(S.staged_arrival_ns);
     if (staged_reads.empty()) return;
+
+    const bool dram_aware = (apply_issue_policy_ == ApplyIssuePolicy::DramAwareV1);
+    const uint64_t line_bytes_u64 = granuleSize();
+    const uint64_t line_bytes = (line_bytes_u64 > 0 && line_bytes_u64 <= (1ull << 20)) ? line_bytes_u64 : 64ull;
+
+    uint64_t payload_bytes_total = 0;
+    uint64_t unique_line_count = 0;
+    if (dram_aware) {
+        std::unordered_set<uint64_t> uniq_lines;
+        uniq_lines.reserve(staged_reads.size() * 2);
+        for (auto* rd : staged_reads) {
+            payload_bytes_total += (uint64_t)rd->size;
+            const uint64_t a0 = rd->pAddr;
+            const uint64_t a1 = rd->pAddr + (uint64_t)rd->size;
+            const uint64_t l0 = a0 / line_bytes;
+            const uint64_t l1 = (a1 + line_bytes - 1) / line_bytes;
+            for (uint64_t li = l0; li < l1; ++li) uniq_lines.insert(li);
+        }
+        unique_line_count = (uint64_t)uniq_lines.size();
+    } else {
+        for (auto* rd : staged_reads) payload_bytes_total += (uint64_t)rd->size;
+    }
+
+    bool gap_merge_enable_eff = gap_merge_enable_;
+    uint64_t gap_k_bytes_eff = gap_k_bytes_;
+    uint64_t overfetch_budget_left = 0; // 0 => unlimited
+    if (dram_aware) {
+        gather::apply::DramAwareParams p{};
+        p.line_bytes = (uint32_t)line_bytes;
+        p.row_bytes = row_bytes_effective_;
+        p.bank_count = dram_bank_count_;
+        p.read_burst_bytes = (dram_read_burst_bytes_ == 0) ? (uint32_t)line_bytes : dram_read_burst_bytes_;
+        p.row_miss_penalty_cycles = dram_row_miss_penalty_cycles_;
+        p.overfetch_budget_bytes = dram_overfetch_budget_bytes_;
+
+        gather::apply::WindowAccessSummary sum{};
+        sum.unique_line_count = unique_line_count;
+        sum.covered_line_count = unique_line_count; // conservative for density before segments are built
+        sum.payload_bytes = payload_bytes_total;
+
+        gather::apply::DramAwareTuner tuner(p, dram_aware_k_policy_, /*k_cap_bytes=*/gap_k_bytes_);
+        const auto eff = tuner.derive(sum);
+        gap_merge_enable_eff = gap_merge_enable_ && eff.gap_merge_enable;
+        gap_k_bytes_eff = eff.gap_k_bytes;
+        overfetch_budget_left = eff.overfetch_budget_bytes;
+    }
+
+    // Per-window DRAM-aware counters (exported as statistics; only meaningful when dram_aware=1).
+    uint64_t win_overfetch_bytes = 0;
+    uint64_t win_covered_line_count = 0;
 
     // Heuristic bank bits/shift detection if requested
     if (!bank_auto_done_ && bank_auto_enable_ && bank_bits_ == 0) {
@@ -1548,6 +1614,11 @@ void GatherBufferIF::buildGranulesWithGapMergeBuf_(int buf) {
         auto flush_segment = [&](bool mark_rowwin=false) {
             if (!has) return;
             uint64_t base = cur_base; uint32_t sz = (uint32_t)(cur_end - cur_base);
+            if (dram_aware) {
+                const uint64_t payload = seg_sum_bytes;
+                if ((uint64_t)sz > payload) win_overfetch_bytes += ((uint64_t)sz - payload);
+                win_covered_line_count += (((uint64_t)sz + line_bytes - 1) / line_bytes);
+            }
             GranuleKey gkey = makeGranuleKey_(base, sz);
             if (diag_granule_build_logged_ < 64) {
                 out_.verbose(CALL_INFO, 2, 0,
@@ -1607,10 +1678,17 @@ void GatherBufferIF::buildGranulesWithGapMergeBuf_(int buf) {
                 uint64_t gap = a - cur_end;
                 uint64_t new_len = (b - cur_base);
                 bool absorbed = false;
-                if (gap_merge_enable_ && gap_k_bytes_>0 && gap <= gap_k_bytes_ && new_len <= burst_bytes_max_) {
-                    // absorb gap
-                    cur_end = b; gap_abs_sum += gap; segSubs.push_back(it); absorbed = true; seg_sum_bytes += it.size;
-                    if (it.arr_ns > 0 && (seg_start_ns == 0 || it.arr_ns < seg_start_ns)) seg_start_ns = it.arr_ns;
+                if (gap_merge_enable_eff && gap_k_bytes_eff>0 && gap <= gap_k_bytes_eff && new_len <= burst_bytes_max_) {
+                    // absorb gap (optional budget guard)
+                    if (overfetch_budget_left == 0 || gap <= overfetch_budget_left) {
+                        cur_end = b;
+                        gap_abs_sum += gap;
+                        if (overfetch_budget_left > 0) overfetch_budget_left -= gap;
+                        segSubs.push_back(it);
+                        absorbed = true;
+                        seg_sum_bytes += it.size;
+                        if (it.arr_ns > 0 && (seg_start_ns == 0 || it.arr_ns < seg_start_ns)) seg_start_ns = it.arr_ns;
+                    }
                 }
                 // Row-window timeout trigger: if enabled and window has waited too long, flush before adding
                 if (!absorbed && row_window_enable_ && row_window_timeout_ns_>0 && seg_start_ns>0 && it.arr_ns>0) {
@@ -1625,9 +1703,16 @@ void GatherBufferIF::buildGranulesWithGapMergeBuf_(int buf) {
                 if (!absorbed && row_window_enable_ && row_window_bytes_>0) {
                     uint64_t tentative_sum = seg_sum_bytes + it.size;
                     if (tentative_sum <= row_window_bytes_ && new_len <= burst_bytes_max_) {
-                        cur_end = b; // absorb regardless of gap size
-                        segSubs.push_back(it); absorbed = true; seg_sum_bytes = tentative_sum; seg_used_row_window = true;
-                        if (it.arr_ns > 0 && (seg_start_ns == 0 || it.arr_ns < seg_start_ns)) seg_start_ns = it.arr_ns;
+                        // absorb regardless of gap size (optional budget guard)
+                        if (overfetch_budget_left == 0 || gap <= overfetch_budget_left) {
+                            cur_end = b;
+                            if (overfetch_budget_left > 0) overfetch_budget_left -= gap;
+                            segSubs.push_back(it);
+                            absorbed = true;
+                            seg_sum_bytes = tentative_sum;
+                            seg_used_row_window = true;
+                            if (it.arr_ns > 0 && (seg_start_ns == 0 || it.arr_ns < seg_start_ns)) seg_start_ns = it.arr_ns;
+                        }
                     }
                 }
                 if (!absorbed) {
@@ -1641,12 +1726,21 @@ void GatherBufferIF::buildGranulesWithGapMergeBuf_(int buf) {
         flush_segment(/*mark_rowwin=*/seg_used_row_window);
     }
     if (stat_gap_absorbed_bytes_ && gap_abs_sum) stat_gap_absorbed_bytes_->addData(gap_abs_sum);
-    // Also surface fine-merge absorption to the PE-level stats sink (SnnPESubComponent) via CustomResp,
-    // because GatherBufferIF is instantiated during init() and cannot safely register new CSV statistics late.
-    if (gap_abs_sum && upstream_handler_) {
-        auto* s = new GasStatData(0, 0, 0, 0, 0, 0, 0, 0, gap_abs_sum);
+    // Surface window-level merge diagnostics to the PE-level stats sink (SnnPESubComponent) via CustomResp,
+    // because GatherBufferIF is instantiated during init() and cannot reliably emit CSV stats itself.
+    if ((gap_abs_sum || (dram_aware && (unique_line_count || win_covered_line_count || win_overfetch_bytes))) && upstream_handler_) {
+        auto* s = new GasStatData(0, 0, 0, 0, 0, 0, 0, 0,
+                                 gap_abs_sum,
+                                 (dram_aware ? unique_line_count : 0),
+                                 (dram_aware ? win_covered_line_count : 0),
+                                 (dram_aware ? win_overfetch_bytes : 0));
         auto* cr = new StandardMem::CustomResp((StandardMem::Request::id_t)0, s, 0, 0, 0);
         (*upstream_handler_)(cr);
+    }
+    if (dram_aware) {
+        if (stat_unique_line_count_) stat_unique_line_count_->addData(unique_line_count);
+        if (stat_covered_line_count_) stat_covered_line_count_->addData(win_covered_line_count);
+        if (stat_overfetch_bytes_) stat_overfetch_bytes_->addData(win_overfetch_bytes);
     }
     // NOTE: do NOT clear S.staging_reads / S.staged_arrival_ns here. New staged reads may have been
     // added re-entrantly during upstream callbacks above; those must be preserved for the next tick.

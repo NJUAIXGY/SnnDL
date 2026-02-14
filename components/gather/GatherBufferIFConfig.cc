@@ -105,6 +105,15 @@ GatherBufferIFConfig parseGatherBufferIFConfig(const SST::Params& params) {
     c.ctrl_rowwin_list = params.find<std::string>("ctrl_rowwin_list", "0,16384,32768,65536");
     c.ctrl_timeout_list = params.find<std::string>("ctrl_timeout_list", "0,300,600");
 
+    // DRAM-aware Apply (exploration; default OFF)
+    c.dram_row_bytes = params.find<uint32_t>("dram_row_bytes", 0);
+    c.dram_bank_count = params.find<uint32_t>("dram_bank_count", 0);
+    c.dram_read_burst_bytes = params.find<uint32_t>("dram_read_burst_bytes", 64);
+    c.dram_row_miss_penalty_cycles = params.find<uint32_t>("dram_row_miss_penalty_cycles", 0);
+    c.dram_overfetch_budget_bytes = params.find<uint64_t>("dram_overfetch_budget_bytes", 0);
+    c.dram_aware_enable_row_window = params.find<int>("dram_aware_enable_row_window", 0) != 0;
+    c.dram_aware_k_policy = params.find<std::string>("dram_aware_k_policy", "cost_budgeted");
+
     c.export_granules_csv = params.find<std::string>("export_granules_csv", "");
     c.node_id = params.find<uint32_t>("node_id", 0);
     c.core_id = params.find<uint32_t>("core_id", static_cast<uint32_t>(-1));

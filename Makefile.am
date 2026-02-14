@@ -57,6 +57,10 @@ libSnnDL_la_SOURCES = \
 	components/GatherBufferIF.h \
 	components/gather/GatherBufferIFConfig.cc \
 	components/gather/GatherBufferIFConfig.h \
+	components/gather/apply/DramAwareModel.cc \
+	components/gather/apply/DramAwareModel.h \
+	components/gather/apply/DramAwareTuner.cc \
+	components/gather/apply/DramAwareTuner.h \
 	components/GatingPE.cc \
 	components/GatingPE.h \
 	components/MemKCalBench.cc \

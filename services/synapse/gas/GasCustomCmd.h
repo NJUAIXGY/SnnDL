@@ -61,19 +61,29 @@ struct GasStatData : public SST::Interfaces::StandardMem::CustomData {
     uint64_t window_inflight_peak = 0;     // per-window inflight peak (two-buffer sum)
     uint64_t window_buffer_max_bytes = 0;  // per-window SRAM occupancy peak
     uint64_t gap_absorbed_bytes = 0;       // fine merge: absorbed gap bytes (window-level or segment-level additive)
+    // DRAM-aware Apply diagnostics (optional; emitted only when enabled)
+    uint64_t unique_line_count = 0;        // approx unique cachelines touched by staged reads (per window)
+    uint64_t covered_line_count = 0;       // approx covered cachelines by issued segments (per window)
+    uint64_t overfetch_bytes = 0;          // issued_bytes - payload_bytes (per window)
 
     GasStatData() = default;
     GasStatData(uint64_t r, uint64_t b,
                 uint64_t rwt=0, uint64_t rwb=0,
                 uint64_t bursts_=0, uint64_t payload_=0,
                 uint64_t inflight_peak_=0, uint64_t buffer_peak_=0,
-                uint64_t gap_abs_=0)
+                uint64_t gap_abs_=0,
+                uint64_t unique_lines_=0,
+                uint64_t covered_lines_=0,
+                uint64_t overfetch_bytes_=0)
         : unique_reads(r), unique_bytes(b),
           rowwin_triggers(rwt), rowwin_bytes(rwb),
           bursts(bursts_), payload_bytes(payload_),
           window_inflight_peak(inflight_peak_),
           window_buffer_max_bytes(buffer_peak_),
-          gap_absorbed_bytes(gap_abs_) {}
+          gap_absorbed_bytes(gap_abs_),
+          unique_line_count(unique_lines_),
+          covered_line_count(covered_lines_),
+          overfetch_bytes(overfetch_bytes_) {}
 
     // CustomData API
     SST::Interfaces::StandardMem::CustomData* makeResponse() override { return new GasStatData(0, 0); }
@@ -89,7 +99,10 @@ struct GasStatData : public SST::Interfaces::StandardMem::CustomData {
                ",payload=" + std::to_string(payload_bytes) +
                ",inflight_peak=" + std::to_string(window_inflight_peak) +
                ",buffer_peak=" + std::to_string(window_buffer_max_bytes) +
-               ",gap_abs=" + std::to_string(gap_absorbed_bytes);
+               ",gap_abs=" + std::to_string(gap_absorbed_bytes) +
+               ",uniq_lines=" + std::to_string(unique_line_count) +
+               ",cov_lines=" + std::to_string(covered_line_count) +
+               ",overfetch=" + std::to_string(overfetch_bytes);
     }
     void serialize_order(SST::Core::Serialization::serializer& ser) override {
         SST_SER(unique_reads);
@@ -101,6 +114,9 @@ struct GasStatData : public SST::Interfaces::StandardMem::CustomData {
         SST_SER(window_inflight_peak);
         SST_SER(window_buffer_max_bytes);
         SST_SER(gap_absorbed_bytes);
+        SST_SER(unique_line_count);
+        SST_SER(covered_line_count);
+        SST_SER(overfetch_bytes);
     }
     ImplementSerializable(SST::SnnDL::GasStatData);
 };

@@ -30,6 +30,10 @@ struct GasStatEvent {
     uint64_t window_inflight_peak = 0;
     uint64_t window_buffer_max_bytes = 0;
     uint64_t gap_absorbed_bytes = 0;
+    // DRAM-aware Apply diagnostics (optional; only meaningful when enabled)
+    uint64_t unique_line_count = 0;
+    uint64_t covered_line_count = 0;
+    uint64_t overfetch_bytes = 0;
 };
 
 class IGasStageSink {
