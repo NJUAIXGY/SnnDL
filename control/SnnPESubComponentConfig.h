@@ -63,6 +63,9 @@ struct SnnPESubComponentConfig {
     bool merge_read_row = false;
     bool merge_read_auto = false;
     uint32_t line_size_bytes = 64;
+    // Dense weights physical layout (experiment; default row_major)
+    std::string dense_layout_mode = "row_major"; // row_major|phys_v1
+    uint32_t dense_phys_dram_row_bytes = 0;      // required when dense_layout_mode=phys_v1
 
     // GAS orchestration knobs (CoreShell-level)
     bool gas_enable = false;
@@ -191,6 +194,8 @@ inline SnnPESubComponentConfig parseSnnPESubComponentConfig(const SST::Params& p
     c.merge_read_row = params.find<int>("merge_read_row", 0) != 0;
     c.merge_read_auto = params.find<int>("merge_read_auto", 0) != 0;
     c.line_size_bytes = params.find<uint32_t>("line_size_bytes", 64);
+    c.dense_layout_mode = params.find<std::string>("dense_layout_mode", "row_major");
+    c.dense_phys_dram_row_bytes = params.find<uint32_t>("dense_phys_dram_row_bytes", 0);
 
     c.gas_enable = params.find<int>("gas_enable", 0) != 0;
     c.gas_window_mode = params.find<int>("gas_window_mode", 0) != 0;

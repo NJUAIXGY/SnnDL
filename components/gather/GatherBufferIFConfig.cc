@@ -78,6 +78,8 @@ GatherBufferIFConfig parseGatherBufferIFConfig(const SST::Params& params) {
     c.byte_exact_verify_base_addr = params.find<uint64_t>("byte_exact_verify_base_addr", 0);
     c.byte_exact_verify_rows = params.find<uint32_t>("byte_exact_verify_rows", 0);
     c.byte_exact_verify_cols = params.find<uint32_t>("byte_exact_verify_cols", 0);
+    c.byte_exact_dense_layout_mode = params.find<std::string>("byte_exact_dense_layout_mode", "row_major");
+    c.byte_exact_dense_phys_dram_row_bytes = params.find<uint32_t>("byte_exact_dense_phys_dram_row_bytes", 0);
     c.byte_exact_verify_file_path = params.find<std::string>("byte_exact_verify_file_path", "");
     c.byte_exact_verify_sample_bytes = params.find<uint32_t>("byte_exact_verify_sample_bytes", 64);
     c.byte_exact_verify_max_resps = params.find<uint32_t>("byte_exact_verify_max_resps", 8);

@@ -42,6 +42,8 @@ GatherBufferIF::GatherBufferIF(ComponentId_t id, Params& params, TimeConverter* 
     byte_exact_base_addr_ = cfg.byte_exact_verify_base_addr;
     byte_exact_rows_ = cfg.byte_exact_verify_rows;
     byte_exact_cols_ = cfg.byte_exact_verify_cols;
+    byte_exact_dense_layout_mode_ = cfg.byte_exact_dense_layout_mode;
+    byte_exact_dense_phys_dram_row_bytes_ = cfg.byte_exact_dense_phys_dram_row_bytes;
     byte_exact_file_path_ = cfg.byte_exact_verify_file_path;
     byte_exact_sample_bytes_ = cfg.byte_exact_verify_sample_bytes;
     byte_exact_max_resps_ = cfg.byte_exact_verify_max_resps;
@@ -2571,11 +2573,7 @@ void GatherBufferIF::verifyByteExactDenseRowcol_(uint64_t addr, const std::vecto
     if (byte_exact_base_addr_ == 0 || byte_exact_cols_ == 0 || byte_exact_rows_ == 0) return;
     if (addr < byte_exact_base_addr_) return;
 
-    const uint64_t total_floats =
-        static_cast<uint64_t>(byte_exact_rows_) * static_cast<uint64_t>(byte_exact_cols_);
-    const uint64_t total_bytes = total_floats * 4ull;
     const uint64_t off_bytes = addr - byte_exact_base_addr_;
-    if (off_bytes >= total_bytes) return;
     if ((off_bytes & 0x3ull) != 0ull) {
         out_.fatal(CALL_INFO, -1,
             "❌ [byte-exact] unaligned addr: node=%u core=%u base=0x%llx addr=0x%llx off=%" PRIu64 "\n",
@@ -2585,21 +2583,26 @@ void GatherBufferIF::verifyByteExactDenseRowcol_(uint64_t addr, const std::vecto
             off_bytes);
     }
 
-    const size_t nbytes = std::min<size_t>(data.size(), static_cast<size_t>(total_bytes - off_bytes));
-    const size_t nfloat = nbytes / 4u;
-    const uint64_t start_float = off_bytes / 4ull;
+    const std::string layout = toLowerCopy(byte_exact_dense_layout_mode_);
+    const uint64_t cols = static_cast<uint64_t>(byte_exact_cols_);
+    const uint64_t rows = static_cast<uint64_t>(byte_exact_rows_);
+    const uint64_t logical_total_bytes = rows * cols * 4ull;
 
-    for (size_t i = 0; i < nfloat; ++i) {
-        const uint64_t idx = start_float + static_cast<uint64_t>(i);
-        const uint32_t row = static_cast<uint32_t>(idx / static_cast<uint64_t>(byte_exact_cols_));
-        const uint32_t col = static_cast<uint32_t>(idx % static_cast<uint64_t>(byte_exact_cols_));
-        const uint64_t v =
-            static_cast<uint64_t>(row) * static_cast<uint64_t>(byte_exact_verify_row_scale_) +
-            static_cast<uint64_t>(col);
-        const float expect_f = static_cast<float>(v);
-        uint8_t expect_b[4];
-        std::memcpy(expect_b, &expect_f, sizeof(expect_b));
-        const uint8_t* got_b = data.data() + i * 4u;
+    auto alignUp = [&](uint64_t v, uint64_t a) -> uint64_t {
+        if (a == 0) return v;
+        return ((v + a - 1ull) / a) * a;
+    };
+
+    auto checkFloat = [&](uint32_t row, uint32_t col, const uint8_t* got_b, size_t float_i, bool padding_zero) {
+        uint8_t expect_b[4] = {0, 0, 0, 0};
+        float expect_f = 0.0f;
+        if (!padding_zero) {
+            const uint64_t v =
+                static_cast<uint64_t>(row) * static_cast<uint64_t>(byte_exact_verify_row_scale_) +
+                static_cast<uint64_t>(col);
+            expect_f = static_cast<float>(v);
+            std::memcpy(expect_b, &expect_f, sizeof(expect_b));
+        }
         if (std::memcmp(got_b, expect_b, 4u) != 0) {
             byte_exact_mismatch_count_ += 1;
             if (byte_exact_mismatch_logged_ < byte_exact_verify_max_mismatch_) {
@@ -2610,7 +2613,7 @@ void GatherBufferIF::verifyByteExactDenseRowcol_(uint64_t addr, const std::vecto
                     "[byte-exact] mismatch node=%u core=%u addr=0x%llx float_i=%zu row=%u col=%u got_f=%.9g expect_f=%.9g got=[%02x %02x %02x %02x] expect=[%02x %02x %02x %02x]\n",
                     node_id_param_, core_id_param_,
                     (unsigned long long)addr,
-                    i, row, col,
+                    float_i, row, col,
                     got_f, expect_f,
                     got_b[0], got_b[1], got_b[2], got_b[3],
                     expect_b[0], expect_b[1], expect_b[2], expect_b[3]);
@@ -2622,6 +2625,55 @@ void GatherBufferIF::verifyByteExactDenseRowcol_(uint64_t addr, const std::vecto
                     byte_exact_mismatch_count_, byte_exact_verify_max_mismatch_);
             }
         }
+    };
+
+    if (layout == "phys_v1" || layout == "physv1") {
+        const uint64_t line_bytes_u64 = granuleSize();
+        const uint64_t line_bytes = (line_bytes_u64 > 0 && line_bytes_u64 <= (1ull << 20)) ? line_bytes_u64 : 64ull;
+        const uint64_t dram_row_bytes = (byte_exact_dense_phys_dram_row_bytes_ > 0)
+                                           ? static_cast<uint64_t>(byte_exact_dense_phys_dram_row_bytes_)
+                                           : 0ull;
+        if (dram_row_bytes == 0 || cols == 0) return;
+
+        const uint64_t logical_row_bytes = cols * 4ull;
+        const uint64_t row_stride_bytes = alignUp(logical_row_bytes, line_bytes);
+        const uint64_t rows_per_dram_row = (row_stride_bytes <= dram_row_bytes)
+                                               ? std::max<uint64_t>(1ull, dram_row_bytes / row_stride_bytes)
+                                               : 1ull;
+        const uint64_t group_stride_bytes = (row_stride_bytes <= dram_row_bytes)
+                                                ? dram_row_bytes
+                                                : alignUp(row_stride_bytes, dram_row_bytes);
+        const uint64_t total_groups = (rows + rows_per_dram_row - 1ull) / rows_per_dram_row;
+        const uint64_t phys_total_bytes = total_groups * group_stride_bytes;
+        if (off_bytes >= phys_total_bytes) return;
+
+        const size_t nbytes = std::min<size_t>(data.size(), static_cast<size_t>(phys_total_bytes - off_bytes));
+        const size_t nfloat = nbytes / 4u;
+        for (size_t i = 0; i < nfloat; ++i) {
+            const uint64_t cur_off = off_bytes + static_cast<uint64_t>(i) * 4ull;
+            const uint64_t group = cur_off / group_stride_bytes;
+            const uint64_t within_group = cur_off % group_stride_bytes;
+            const uint64_t within = within_group / row_stride_bytes;
+            const uint64_t within_row = within_group % row_stride_bytes;
+            const uint64_t row_u64 = group * rows_per_dram_row + within;
+            const uint64_t col_u64 = within_row / 4ull;
+            const bool padding_zero = (row_u64 >= rows) || (within_row >= logical_row_bytes);
+            checkFloat(static_cast<uint32_t>(row_u64), static_cast<uint32_t>(col_u64), data.data() + i * 4u, i, padding_zero);
+        }
+        if (nfloat > 0) byte_exact_verified_frags_ += 1;
+        return;
+    }
+
+    // Default: legacy row-major decoding.
+    if (off_bytes >= logical_total_bytes) return;
+    const size_t nbytes = std::min<size_t>(data.size(), static_cast<size_t>(logical_total_bytes - off_bytes));
+    const size_t nfloat = nbytes / 4u;
+    const uint64_t start_float = off_bytes / 4ull;
+    for (size_t i = 0; i < nfloat; ++i) {
+        const uint64_t idx = start_float + static_cast<uint64_t>(i);
+        const uint32_t row = static_cast<uint32_t>(idx / cols);
+        const uint32_t col = static_cast<uint32_t>(idx % cols);
+        checkFloat(row, col, data.data() + i * 4u, i, /*padding_zero=*/false);
     }
 
     if (nfloat > 0) byte_exact_verified_frags_ += 1;

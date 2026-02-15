@@ -19,11 +19,13 @@ public:
         addCounter("tensor_compute_cycles_total");
         addCounter("tensor_compute_math_cycles_total");
         addCounter("tensor_compute_pipeline_cycles_total");
+        addCounter("tensor_mxu_wavefront_cycles_total");
         addCounter("tensor_compute_precision_profile_id");
         addCounter("tensor_mac_ops_total");
         addCounter("tensor_dma_stall_cycles_total");
         addCounter("tensor_iter_cycles_total");
         addCounter("tensor_stall_dma_budget_cycles_total");
+        addCounter("tensor_stall_dma_hbm_channel_budget_cycles_total");
         addCounter("tensor_stall_mem_outstanding_cycles_total");
         addCounter("tensor_stall_wait_read_cycles_total");
         addCounter("tensor_stall_wait_write_cycles_total");
@@ -35,6 +37,12 @@ public:
         addCounter("tensor_dma_cycles_total");
         addCounter("tensor_dram_bytes_total");
         addCounter("tensor_onchip_bytes_total");
+        addCounter("tensor_cfg_ub_bytes");
+        addCounter("tensor_cfg_weight_bytes");
+        addCounter("tensor_onchip_weight_occupancy_bytes_max");
+        addCounter("tensor_onchip_weight_bank_occupancy_bytes_max");
+        addCounter("tensor_onchip_a_resident_tiles_max");
+        addCounter("tensor_onchip_b_resident_tiles_max");
         addCounter("tensor_tile_count_total");
         addCounter("tensor_spill_bytes_total");
         addCounter("tensor_spill_pkts_total");
@@ -90,6 +98,7 @@ public:
         addCounter("tensor_program_fence_wait_cycles_total");
         addCounter("tensor_program_ub_stall_cycles_total");
         addCounter("tensor_program_mem_stall_cycles_total");
+        addCounter("tensor_program_ub_occupancy_bytes_max");
     }
 
     const char* name() const override { return "tensor"; }

@@ -11,6 +11,7 @@
 #include "synapse/weights/WeightCacheOps.h"
 #include "synapse/weights/SnnBcsrWeightManager.h"
 #include "synapse/weights/WeightMemorySubsystem.h"
+#include "synapse/weights/DenseWeightLayout.h"
 #include "synapse/route/SynapseRouteSubsystem.h"
 #include "synapse/route/SpikeCommSubsystem.h"
 #include "synapse/route/SpikeNocCodec.h"
@@ -378,8 +379,47 @@ void SnnWorkload::ensureWeightReaderOwned_() {
             });
 
         const uint64_t base_addr = params_->find<uint64_t>("base_addr", 0);
-        const uint64_t weight_region_end =
-            base_addr + static_cast<uint64_t>(num_neurons_) * static_cast<uint64_t>(weights_cols) * sizeof(float);
+        const uint32_t line_size_bytes = params_->find<uint32_t>("line_size_bytes", 64);
+        std::string dense_layout_mode = params_->find<std::string>("dense_layout_mode", "row_major");
+        for (auto& ch : dense_layout_mode) {
+            if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+        }
+        if (dense_layout_mode.empty()) dense_layout_mode = "row_major";
+        const bool dense_phys_enable = (dense_layout_mode == "phys_v1");
+        const uint32_t dense_phys_dram_row_bytes = params_->find<uint32_t>("dense_phys_dram_row_bytes", 0);
+
+        uint64_t weight_region_end = 0;
+        if (dense_phys_enable) {
+            const uint32_t cols = use_post_row_pre_col_ ? weights_cols : num_neurons_;
+            DensePhysV1Derived d{};
+            const bool ok = computeDensePhysV1Derived(num_neurons_, cols, line_size_bytes, dense_phys_dram_row_bytes, d);
+            if (!ok) {
+                if (rt_.log) {
+                    rt_.log->fatal(CALL_INFO, -1,
+                                   "SnnWorkload fatal: invalid dense phys_v1 layout rows=%u cols=%u line=%u row_bytes=%u\n",
+                                   static_cast<uint32_t>(num_neurons_),
+                                   cols,
+                                   line_size_bytes,
+                                   dense_phys_dram_row_bytes);
+                }
+                std::abort();
+            }
+            if (dense_phys_dram_row_bytes != 0 &&
+                (base_addr % static_cast<uint64_t>(dense_phys_dram_row_bytes)) != 0) {
+                if (rt_.log) {
+                    rt_.log->fatal(CALL_INFO, -1,
+                                   "SnnWorkload fatal: dense phys_v1 requires base_addr aligned to dram_row_bytes "
+                                   "(base=0x%llx row_bytes=%u)\n",
+                                   (unsigned long long)base_addr,
+                                   dense_phys_dram_row_bytes);
+                }
+                std::abort();
+            }
+            weight_region_end = base_addr + d.total_bytes;
+        } else {
+            weight_region_end =
+                base_addr + static_cast<uint64_t>(num_neurons_) * static_cast<uint64_t>(weights_cols) * sizeof(float);
+        }
 
         WeightMemorySubsystem::OrchestratorConfig ocfg{};
         ocfg.accessor = weight_accessor_.get();
@@ -451,6 +491,8 @@ void SnnWorkload::ensureWeightReaderOwned_() {
         ocfg.use_post_row_pre_col = use_post_row_pre_col_;
         ocfg.base_addr = base_addr;
         ocfg.weight_region_end = weight_region_end;
+        ocfg.dense_layout_mode = dense_phys_enable ? DenseLayoutMode::PhysV1 : DenseLayoutMode::RowMajor;
+        ocfg.dense_phys_dram_row_bytes = dense_phys_dram_row_bytes;
         ocfg.read_force_single = params_->find<int>("read_force_single", 0) != 0;
         ocfg.merge_read_cacheline = params_->find<int>("merge_read_cacheline", 1) != 0;
         ocfg.merge_read_row = params_->find<int>("merge_read_row", 0) != 0;

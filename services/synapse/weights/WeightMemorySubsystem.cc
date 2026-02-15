@@ -562,7 +562,15 @@ bool WeightMemorySubsystem::prepareDenseRead_(uint32_t row, uint32_t col, uint32
                                              uint64_t& req_addr, size_t& req_size,
                                              bool& is_row, uint32_t& col_start, uint32_t& count_floats) const {
     const uint32_t bpf = sizeof(float);
-    req_addr = orch_.base_addr + (static_cast<uint64_t>(row) * static_cast<uint64_t>(width) + col) * bpf;
+    auto denseAddr = [&](uint32_t r, uint32_t c) -> uint64_t {
+        if (!dense_phys_enable_) {
+            return orch_.base_addr +
+                   (static_cast<uint64_t>(r) * static_cast<uint64_t>(width) + static_cast<uint64_t>(c)) * bpf;
+        }
+        return orch_.base_addr + densePhysV1Offset(r, c, dense_phys_);
+    };
+
+    req_addr = denseAddr(row, col);
     req_size = sizeof(float);
     is_row = false;
     col_start = col;
@@ -582,13 +590,12 @@ bool WeightMemorySubsystem::prepareDenseRead_(uint32_t row, uint32_t col, uint32
             is_row = true;
             col_start = 0;
             count_floats = width;
-            req_addr = orch_.base_addr + static_cast<uint64_t>(row) * static_cast<uint64_t>(width) * bpf;
+            req_addr = denseAddr(row, 0);
             req_size = static_cast<size_t>(count_floats) * bpf;
         } else if (merge_cl) {
             col_start = (col / fpl) * fpl;
             count_floats = std::min<uint32_t>(fpl, width - col_start);
-            req_addr = orch_.base_addr +
-                       (static_cast<uint64_t>(row) * static_cast<uint64_t>(width) + col_start) * bpf;
+            req_addr = denseAddr(row, col_start);
             req_size = static_cast<size_t>(count_floats) * bpf;
         }
         return true;
@@ -598,7 +605,7 @@ bool WeightMemorySubsystem::prepareDenseRead_(uint32_t row, uint32_t col, uint32
         is_row = true;
         col_start = 0;
         count_floats = width;
-        req_addr = orch_.base_addr + static_cast<uint64_t>(row) * static_cast<uint64_t>(width) * bpf;
+        req_addr = denseAddr(row, 0);
         req_size = static_cast<size_t>(count_floats) * bpf;
         return true;
     }
@@ -607,8 +614,7 @@ bool WeightMemorySubsystem::prepareDenseRead_(uint32_t row, uint32_t col, uint32
         const uint32_t fpl = std::max<uint32_t>(1, orch_.line_size_bytes / bpf);
         col_start = (col / fpl) * fpl;
         count_floats = std::min<uint32_t>(fpl, width - col_start);
-        req_addr = orch_.base_addr +
-                   (static_cast<uint64_t>(row) * static_cast<uint64_t>(width) + col_start) * bpf;
+        req_addr = denseAddr(row, col_start);
         req_size = static_cast<size_t>(count_floats) * bpf;
         return true;
     }
@@ -1662,11 +1668,91 @@ void WeightMemorySubsystem::verifyDenseReadBytes_(uint64_t addr, size_t req_size
             off_bytes);
     }
 
-    const uint64_t total_floats = static_cast<uint64_t>(orch_.num_neurons) * static_cast<uint64_t>(width);
-    const uint64_t start_float = off_bytes / 4ull;
     const size_t nbytes = bytes.size();
     const size_t nfloat = nbytes / 4u;
 
+    if (dense_phys_enable_) {
+        const uint64_t phys_total_bytes = dense_phys_.total_bytes;
+        const uint64_t row_bytes_logical = static_cast<uint64_t>(dense_phys_.row_bytes_logical);
+        const uint64_t row_stride_bytes = static_cast<uint64_t>(dense_phys_.row_stride_bytes);
+        const uint64_t group_stride_bytes = static_cast<uint64_t>(dense_phys_.group_stride_bytes);
+        const uint64_t rows_per_dram_row = static_cast<uint64_t>(dense_phys_.rows_per_dram_row);
+        const uint64_t rows_total = static_cast<uint64_t>(orch_.num_neurons);
+
+        for (size_t i = 0; i < nfloat; ++i) {
+            const uint64_t p = off_bytes + static_cast<uint64_t>(i) * 4ull;
+            if (p >= phys_total_bytes) {
+                byte_exact_mismatch_count_ += 1;
+                if (byte_exact_mismatch_logged_ < orch_.byte_exact_verify_max_mismatch) {
+                    byte_exact_mismatch_logged_ += 1;
+                    out->verbose(CALL_INFO, 0, 0,
+                        "[byte-exact] oob-phys node=%u core=%u window=%u addr=0x%llx float_i=%zu off=%" PRIu64 " phys_total=%" PRIu64 "\n",
+                        orch_.node_id, orch_.core_id, window_seq_,
+                        (unsigned long long)addr, i, p, phys_total_bytes);
+                }
+                continue;
+            }
+
+            const uint64_t group = (group_stride_bytes != 0) ? (p / group_stride_bytes) : 0;
+            const uint64_t within_group = (group_stride_bytes != 0) ? (p % group_stride_bytes) : p;
+            const uint64_t row_in_group = (row_stride_bytes != 0) ? (within_group / row_stride_bytes) : 0;
+            const uint64_t within_row = (row_stride_bytes != 0) ? (within_group % row_stride_bytes) : within_group;
+            const uint64_t row64 = group * rows_per_dram_row + row_in_group;
+
+            uint8_t expect_b[4] = {0, 0, 0, 0};
+            uint32_t row = 0;
+            uint32_t col = 0;
+            bool padding = true;
+            if (row64 < rows_total && within_row < row_bytes_logical) {
+                padding = false;
+                row = static_cast<uint32_t>(row64);
+                col = static_cast<uint32_t>(within_row / 4ull);
+                const float expect_f = expectedDenseWeight_(row, col);
+                std::memcpy(expect_b, &expect_f, sizeof(expect_b));
+            }
+
+            const uint8_t* got_b = bytes.data() + i * 4u;
+            if (std::memcmp(got_b, expect_b, 4u) != 0) {
+                byte_exact_mismatch_count_ += 1;
+                if (byte_exact_mismatch_logged_ < orch_.byte_exact_verify_max_mismatch) {
+                    byte_exact_mismatch_logged_ += 1;
+                    if (padding) {
+                        out->verbose(CALL_INFO, 0, 0,
+                            "[byte-exact] pad-mismatch node=%u core=%u window=%u addr=0x%llx float_i=%zu off=%" PRIu64 " row=%" PRIu64 " within_row=%" PRIu64 " got=[%02x %02x %02x %02x] expect=[%02x %02x %02x %02x]\n",
+                            orch_.node_id, orch_.core_id, window_seq_,
+                            (unsigned long long)addr, i, p, row64, within_row,
+                            got_b[0], got_b[1], got_b[2], got_b[3],
+                            expect_b[0], expect_b[1], expect_b[2], expect_b[3]);
+                    } else {
+                        float got_f = 0.0f;
+                        float expect_f = 0.0f;
+                        std::memcpy(&got_f, got_b, sizeof(got_f));
+                        std::memcpy(&expect_f, expect_b, sizeof(expect_f));
+                        out->verbose(CALL_INFO, 0, 0,
+                            "[byte-exact] mismatch node=%u core=%u window=%u addr=0x%llx float_i=%zu row=%u col=%u got_f=%.9g expect_f=%.9g got=[%02x %02x %02x %02x] expect=[%02x %02x %02x %02x]\n",
+                            orch_.node_id, orch_.core_id, window_seq_,
+                            (unsigned long long)addr,
+                            i, row, col,
+                            got_f, expect_f,
+                            got_b[0], got_b[1], got_b[2], got_b[3],
+                            expect_b[0], expect_b[1], expect_b[2], expect_b[3]);
+                    }
+                }
+                if (byte_exact_mismatch_count_ >= orch_.byte_exact_verify_max_mismatch) {
+                    out->fatal(CALL_INFO, -1,
+                        "❌ [byte-exact] too many mismatches: node=%u core=%u window=%u mismatches=%u max=%u\n",
+                        orch_.node_id, orch_.core_id, window_seq_,
+                        byte_exact_mismatch_count_, orch_.byte_exact_verify_max_mismatch);
+                }
+            }
+        }
+
+        if (nfloat > 0) byte_exact_verified_reads_ += 1;
+        return;
+    }
+
+    const uint64_t total_floats = static_cast<uint64_t>(orch_.num_neurons) * static_cast<uint64_t>(width);
+    const uint64_t start_float = off_bytes / 4ull;
     for (size_t i = 0; i < nfloat; ++i) {
         const uint64_t idx = start_float + static_cast<uint64_t>(i);
         if (idx >= total_floats) {

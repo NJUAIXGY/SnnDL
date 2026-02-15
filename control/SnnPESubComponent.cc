@@ -21,6 +21,7 @@
 #include "synapse/weights/WeightMemorySubsystem.h"
 #include "synapse/weights/WeightCacheOps.h"
 #include "synapse/weights/WeightAccessor.h"
+#include "synapse/weights/DenseWeightLayout.h"
 #include "ISpikeTransport.h"
 #include "NocSpikeTransport.h"
 #include "NocPacketEvent.h"
@@ -38,6 +39,7 @@
 #include <cmath>
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <cstdlib>
 #include <cstdint>
@@ -566,9 +568,46 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
         static_cast<uint32_t>(weights_cols_),
         use_post_row_pre_col_
     });
-    // 预计算dense权重区域上界（按行*列*4B）
-    {
-        uint64_t bytes = static_cast<uint64_t>(num_neurons_) * static_cast<uint64_t>(weights_cols_) * static_cast<uint64_t>(sizeof(float));
+    // Dense 权重“物理布局”（实验性；默认 row_major）
+    dense_layout_mode_ = toLowerCopy(cfg.dense_layout_mode);
+    if (dense_layout_mode_.empty()) dense_layout_mode_ = "row_major";
+    dense_phys_dram_row_bytes_ = cfg.dense_phys_dram_row_bytes;
+    dense_phys_enable_ = (dense_layout_mode_ == "phys_v1");
+    dense_phys_row_stride_bytes_ = 0;
+    dense_phys_rows_per_dram_row_ = 1;
+    dense_phys_group_stride_bytes_ = 0;
+
+    if (dense_phys_enable_) {
+        const uint32_t cols = use_post_row_pre_col_ ? weights_cols_ : num_neurons_;
+        DensePhysV1Derived d{};
+        const bool ok = computeDensePhysV1Derived(num_neurons_, cols, line_size_bytes_, dense_phys_dram_row_bytes_, d);
+        if (!ok) {
+            if (output_) {
+                output_->fatal(CALL_INFO, -1,
+                               "SnnPESubComponent fatal: invalid dense phys_v1 layout rows=%u cols=%u line=%u row_bytes=%u\n",
+                               num_neurons_, cols, line_size_bytes_, dense_phys_dram_row_bytes_);
+            }
+            std::abort();
+        }
+        if (dense_phys_dram_row_bytes_ != 0 &&
+            (base_addr_ % static_cast<uint64_t>(dense_phys_dram_row_bytes_)) != 0) {
+            if (output_) {
+                output_->fatal(CALL_INFO, -1,
+                               "SnnPESubComponent fatal: dense phys_v1 requires base_addr aligned to dram_row_bytes "
+                               "(base=0x%llx row_bytes=%u)\n",
+                               (unsigned long long)base_addr_,
+                               dense_phys_dram_row_bytes_);
+            }
+            std::abort();
+        }
+        dense_phys_row_stride_bytes_ = d.row_stride_bytes;
+        dense_phys_rows_per_dram_row_ = d.rows_per_dram_row;
+        dense_phys_group_stride_bytes_ = d.group_stride_bytes;
+        weight_region_end_ = base_addr_ + d.total_bytes;
+    } else {
+        // 预计算dense权重区域上界（按行*列*4B）
+        uint64_t bytes = static_cast<uint64_t>(num_neurons_) * static_cast<uint64_t>(weights_cols_) *
+                         static_cast<uint64_t>(sizeof(float));
         weight_region_end_ = base_addr_ + bytes;
     }
     enable_detailed_map_log_ = cfg.enable_detailed_map_log;
@@ -1212,6 +1251,8 @@ void SnnPESubComponent::configureWeightReaderSubsystem_(const Params& params) {
             ocfg.use_post_row_pre_col = use_post_row_pre_col_;
             ocfg.base_addr = static_cast<uint64_t>(base_addr_);
             ocfg.weight_region_end = weight_region_end_;
+            ocfg.dense_layout_mode = dense_phys_enable_ ? DenseLayoutMode::PhysV1 : DenseLayoutMode::RowMajor;
+            ocfg.dense_phys_dram_row_bytes = dense_phys_dram_row_bytes_;
             ocfg.read_force_single = read_force_single_;
             ocfg.merge_read_cacheline = merge_read_cacheline_;
             ocfg.merge_read_row = merge_read_row_;

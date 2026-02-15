@@ -39,8 +39,12 @@ public:
         float compute_efficiency = 1.0f; // [0,1], applied to peak macs/cycle
         std::string compute_precision = "fp16"; // fp16/bf16/fp32/tf32/int8/fp8
         bool compute_profile_override_enable = false;
-        float compute_throughput_scale = 1.0f;
-        uint32_t compute_pipeline_latency_cycles = 0;
+	        float compute_throughput_scale = 1.0f;
+	        uint32_t compute_pipeline_latency_cycles = 0;
+	        // Optional TPU-like systolic wavefront (fill/drain) approximation.
+	        // When enabled, extra cycles are added per tile-seg beyond macs/peak throughput.
+	        bool mxu_wavefront_enable = false;
+	        float mxu_wavefront_alpha = 1.0f;
 
         // Runtime scheduling
         bool overlap_enable = true; // overlap DMA-read with compute
@@ -67,6 +71,11 @@ public:
         std::string program_dsl = "";
         bool program_loop = true;
         uint32_t program_issue_width = 4; // ops/cycle
+        // M18+: program-mode UB logical buffers (ping-pong prefetch). Does not change total ub_bytes;
+        // it only partitions dependency/overwrite semantics by buffer index.
+        uint32_t program_ub_buffers = 1;
+        // M20+: allow 1 DMA read + 1 DMA write op to overlap in program mode.
+        bool program_dma_dual_enable = false;
         std::string program_engine_priority = "dma>mxu>vec>coll";
         // Vector engine placeholder (for ops like softmax/eltwise) in program mode.
         uint32_t vector_elems_per_cycle = 64;
@@ -78,10 +87,12 @@ public:
         // Writeback policy (tile exec only)
         std::string writeback_policy = "at_end_of_k";
 
-        // On-chip buffer model (bytes)
-        uint64_t ub_bytes = 0;
-        uint64_t acc_bytes = 0;
-        bool onchip_model_enable = false;
+	        // On-chip buffer model (bytes)
+	        uint64_t ub_bytes = 0;
+	        // Optional dedicated on-chip weight pool capacity (bytes). When 0, ReadB uses the ub_bytes pool.
+	        uint64_t weight_bytes = 0;
+	        uint64_t acc_bytes = 0;
+	        bool onchip_model_enable = false;
         uint64_t ub_bank_bytes = 0;
         uint32_t ub_read_ports = 0;
         uint32_t ub_write_ports = 0;
@@ -105,6 +116,13 @@ public:
         // Optional shared DMA bandwidth budget across all cores in a PE (bytes/cycle). 0 = disabled.
         // When enabled, each core receives a per-cycle quota derived from this PE-level budget.
         uint64_t dma_shared_bandwidth_bytes_per_cycle = 0;
+        // Optional HBM channel budget model (shared across cores in a PE):
+        // - channels: number of independent channels
+        // - channel_bandwidth: per-channel budget (bytes/cycle); 0 = disabled
+        // - interleave_bytes: channel selection granularity for addr->channel mapping
+        uint32_t dma_hbm_channels = 1;
+        uint64_t dma_hbm_channel_bandwidth_bytes_per_cycle = 0;
+        uint64_t dma_hbm_channel_interleave_bytes = 256;
         bool double_buffer = false;
 
         std::string collective_type = "none";
@@ -174,7 +192,7 @@ private:
         uint32_t bytes = 0;
     };
 
-    struct TileSegState {
+	    struct TileSegState {
         bool valid = false;
         uint64_t epoch = 0;
         uint64_t seg_index = 0;
@@ -189,15 +207,18 @@ private:
         uint64_t done_a_bytes = 0;
         uint64_t done_b_bytes = 0;
 
-        uint64_t rem_compute_math_cycles = 0;
-        uint64_t rem_compute_pipeline_cycles = 0;
-        uint64_t rem_compute_cycles = 0;
-        uint64_t reserved_a_bytes = 0;
-        uint64_t reserved_b_bytes = 0;
-        std::vector<std::pair<uint32_t, uint64_t>> reserved_a_bank_allocs{};
-        std::vector<std::pair<uint32_t, uint64_t>> reserved_b_bank_allocs{};
-        bool acc_reserved = false;
-    };
+	        uint64_t rem_compute_math_cycles = 0;
+	        uint64_t rem_compute_pipeline_cycles = 0;
+	        uint64_t rem_compute_wavefront_cycles = 0;
+	        uint64_t rem_compute_cycles = 0;
+	        uint64_t reserved_a_bytes = 0;
+	        uint64_t reserved_b_bytes = 0;
+	        uint64_t reserved_b_weight_bytes = 0;
+	        std::vector<std::pair<uint32_t, uint64_t>> reserved_a_bank_allocs{};
+	        std::vector<std::pair<uint32_t, uint64_t>> reserved_b_bank_allocs{};
+	        std::vector<std::pair<uint32_t, uint64_t>> reserved_b_weight_bank_allocs{};
+	        bool acc_reserved = false;
+	    };
 
     struct WritebackState {
         uint64_t epoch = 0;
@@ -270,6 +291,21 @@ private:
         uint64_t cycles = 0;         // GemmUb
         uint64_t ub_read_bytes = 0;  // GemmUb
         uint64_t ub_write_bytes = 0; // GemmUb
+        // M18+: UB buffer selection + reuse semantics for program ops.
+        uint32_t buf = 0;     // DmaRead/DmaWrite/GemmUb
+        bool reset = false;   // DmaRead: if true, discard valid bytes in buf at issue (overwrite reuse)
+        bool consume = true;  // DmaWrite: if true, consume bytes from buf at issue
+        // M22+: address-aware UB regions for program ops.
+        bool ub_addr_present = false;       // DmaRead/DmaWrite
+        uint64_t ub_addr = 0;               // DmaRead/DmaWrite
+        bool ub_read_addr_present = false;  // GemmUb
+        uint64_t ub_read_addr = 0;          // GemmUb
+        bool ub_write_addr_present = false; // GemmUb
+        uint64_t ub_write_addr = 0;         // GemmUb
+        // M21+: auto-cycle estimation (when cycles=0) requires explicit op shape.
+        uint32_t m = 0;
+        uint32_t n = 0;
+        uint32_t k = 0;
     };
 
     static uint64_t ceilDivU64_(uint64_t a, uint64_t b);
@@ -352,6 +388,7 @@ private:
     bool onClockTickProgram_(uint64_t now_cycle);
     bool onClockTickProgramM7_(uint64_t now_cycle);
     bool parseProgramDsl_(const std::string& dsl, std::vector<ProgramOp>& out_ops) const;
+    uint64_t estimateGemmUbCycles_(uint32_t m, uint32_t n, uint32_t k) const;
     bool startProgramCollective_(uint64_t now_cycle, uint64_t bytes, bool blocking);
     uint32_t collectiveRingStepsPerChunk_() const;
     uint32_t collectiveRingParticipantCount_() const;
@@ -360,19 +397,28 @@ private:
     uint32_t collectiveRingNextDestNode_() const;
     Collective2dStage collective2dStageForStep_(uint32_t step_in_chunk) const;
     uint32_t collective2dNextDestNodeForStep_(uint32_t step_in_chunk) const;
-    void markCollectiveEpochDone_(uint64_t now_cycle);
-    uint32_t selectUbBank_(uint64_t tag_seed);
-    uint32_t selectAccBank_(uint64_t tag_seed);
+	    void markCollectiveEpochDone_(uint64_t now_cycle);
+	    uint32_t selectUbBank_(uint64_t tag_seed);
+	    uint32_t selectWeightBank_(uint64_t tag_seed);
+	    uint32_t selectAccBank_(uint64_t tag_seed);
     void updateBankQueueOccupancyMax_();
     void resetOnchipCycleState_(uint64_t now_cycle);
-    bool reserveUbBytes_(uint64_t bytes,
-                         uint64_t& spill_budget,
-                         bool& spilled,
-                         bool& spill_budget_blocked,
-                         bool& bank_conflict_blocked,
-                         std::vector<std::pair<uint32_t, uint64_t>>* bank_allocs = nullptr);
-    void releaseUbBytes_(uint64_t bytes);
-    void releaseUbBankAllocs_(std::vector<std::pair<uint32_t, uint64_t>>& bank_allocs);
+	    bool reserveUbBytes_(uint64_t bytes,
+	                         uint64_t& spill_budget,
+	                         bool& spilled,
+	                         bool& spill_budget_blocked,
+	                         bool& bank_conflict_blocked,
+	                         std::vector<std::pair<uint32_t, uint64_t>>* bank_allocs = nullptr);
+	    bool reserveWeightBytes_(uint64_t bytes,
+	                             uint64_t& spill_budget,
+	                             bool& spilled,
+	                             bool& spill_budget_blocked,
+	                             bool& bank_conflict_blocked,
+	                             std::vector<std::pair<uint32_t, uint64_t>>* bank_allocs = nullptr);
+	    void releaseUbBytes_(uint64_t bytes);
+	    void releaseUbBankAllocs_(std::vector<std::pair<uint32_t, uint64_t>>& bank_allocs);
+	    void releaseWeightBytes_(uint64_t bytes);
+	    void releaseWeightBankAllocs_(std::vector<std::pair<uint32_t, uint64_t>>& bank_allocs);
     bool reserveAccTile_(uint32_t mi,
                          uint32_t ni,
                          uint64_t& spill_budget,
@@ -384,6 +430,13 @@ private:
     bool acquireOnchipWritePorts_(uint32_t ub_ports_needed, uint32_t acc_ports_needed);
     uint64_t dmaSharedQuotaBytesPerCycle_(uint64_t now_cycle) const;
     uint64_t dmaBudgetBytesPerCycle_(uint64_t now_cycle) const;
+    bool hbmChannelBudgetEnabled_() const;
+    uint32_t hbmChannelCount_() const;
+    uint64_t peekNextMemAddr_(ReqKind kind, uint32_t bytes) const;
+    uint32_t memAddrToHbmChannel_(uint64_t addr) const;
+    uint64_t hbmChannelBudgetLeftBytes_(uint64_t now_cycle, uint32_t channel) const;
+    void consumeHbmChannelBudget_(uint64_t now_cycle, uint32_t channel, uint32_t bytes);
+    uint32_t clampBytesByHbmChannelBudget_(uint64_t now_cycle, ReqKind kind, uint32_t want, uint32_t& out_channel) const;
 
     inline bool commReady_() const { return cfg_.comm_enable && rt_.noc && cfg_.comm_period_cycles > 0 && cfg_.comm_payload_bytes > 0; }
     inline bool collectiveReady_() const {
@@ -391,12 +444,12 @@ private:
         if (cfg_.exec_mode == "program") return true; // explicit collectives via program ops
         return (cfg_.collective_bytes > 0 && cfg_.collective_period_cycles > 0);
     }
-    inline bool tileModelEnabled_() const {
-        return (cfg_.tile_m > 0 || cfg_.tile_n > 0 || cfg_.tile_k > 0 ||
-                cfg_.ub_bytes > 0 || cfg_.acc_bytes > 0 ||
-                cfg_.dma_bandwidth_bytes_per_cycle > 0 || cfg_.dma_shared_bandwidth_bytes_per_cycle > 0 ||
-                cfg_.onchip_model_enable);
-    }
+	    inline bool tileModelEnabled_() const {
+	        return (cfg_.tile_m > 0 || cfg_.tile_n > 0 || cfg_.tile_k > 0 ||
+	                cfg_.ub_bytes > 0 || cfg_.weight_bytes > 0 || cfg_.acc_bytes > 0 ||
+	                cfg_.dma_bandwidth_bytes_per_cycle > 0 || cfg_.dma_shared_bandwidth_bytes_per_cycle > 0 ||
+	                cfg_.onchip_model_enable);
+	    }
 
     Config cfg_{};
     Runtime rt_{};
@@ -480,11 +533,13 @@ private:
     uint64_t tensor_compute_cycles_total_ = 0;
     uint64_t tensor_compute_math_cycles_total_ = 0;
     uint64_t tensor_compute_pipeline_cycles_total_ = 0;
+    uint64_t tensor_mxu_wavefront_cycles_total_ = 0;
     uint64_t tensor_compute_precision_profile_id_ = 0;
     uint64_t tensor_mac_ops_total_ = 0;
     uint64_t tensor_dma_stall_cycles_total_ = 0;
     uint64_t tensor_iter_cycles_total_ = 0;
     uint64_t tensor_stall_dma_budget_cycles_total_ = 0;
+    uint64_t tensor_stall_dma_hbm_channel_budget_cycles_total_ = 0;
     uint64_t tensor_stall_mem_outstanding_cycles_total_ = 0;
     uint64_t tensor_stall_wait_read_cycles_total_ = 0;
     uint64_t tensor_stall_wait_write_cycles_total_ = 0;
@@ -547,6 +602,7 @@ private:
     uint64_t tensor_program_fence_wait_cycles_total_ = 0;
     uint64_t tensor_program_ub_stall_cycles_total_ = 0;
     uint64_t tensor_program_mem_stall_cycles_total_ = 0;
+    uint64_t tensor_program_ub_occupancy_bytes_max_ = 0;
 
     uint64_t comm_last_cycle_ = 0;
     uint64_t collective_last_cycle_ = 0;
@@ -593,13 +649,27 @@ private:
     std::unordered_set<CollectiveCreditKey, CollectiveCreditKeyHash> collective_credit_return_seen_{};
     std::unordered_map<CollectiveCreditKey, uint64_t, CollectiveCreditKeyHash> collective_credit_return_pending_credits_{};
     std::deque<CollectiveCreditKey> collective_credit_return_pending_queue_{};
+
+    enum class OnchipPoolKind : uint8_t { Ub = 0, Weight = 1 };
+    struct ResidentTileAlloc {
+        OnchipPoolKind pool = OnchipPoolKind::Ub;
+        uint64_t bytes = 0;
+        std::vector<std::pair<uint32_t, uint64_t>> bank_allocs{};
+    };
+    std::unordered_map<uint64_t, ResidentTileAlloc> a_resident_tiles_{}; // key=(mi<<32)|ki
+    std::unordered_map<uint64_t, ResidentTileAlloc> b_resident_tiles_{}; // key=(ni<<32)|ki
+
     uint64_t onchip_ub_occupancy_bytes_ = 0;
+    uint64_t onchip_weight_occupancy_bytes_ = 0;
     uint64_t onchip_acc_occupancy_bytes_ = 0;
     std::vector<uint64_t> onchip_ub_bank_occupancy_bytes_{};
+    std::vector<uint64_t> onchip_weight_bank_occupancy_bytes_{};
     std::vector<uint64_t> onchip_acc_bank_occupancy_bytes_{};
     std::vector<uint32_t> onchip_ub_bank_queue_occupancy_{};
+    std::vector<uint32_t> onchip_weight_bank_queue_occupancy_{};
     std::vector<uint32_t> onchip_acc_bank_queue_occupancy_{};
     uint32_t onchip_ub_bank_rr_ = 0;
+    uint32_t onchip_weight_bank_rr_ = 0;
     uint32_t onchip_acc_bank_rr_ = 0;
     uint64_t onchip_cycle_tag_ = 0;
     uint32_t onchip_ub_read_ports_used_ = 0;
@@ -610,6 +680,10 @@ private:
     uint64_t tensor_pkt_recv_total_ = 0;
     uint64_t tensor_pkt_bytes_sent_total_ = 0;
     uint64_t tensor_pkt_bytes_recv_total_ = 0;
+    uint64_t tensor_onchip_weight_occupancy_bytes_max_ = 0;
+    uint64_t tensor_onchip_weight_bank_occupancy_bytes_max_ = 0;
+    uint64_t tensor_onchip_a_resident_tiles_max_ = 0;
+    uint64_t tensor_onchip_b_resident_tiles_max_ = 0;
     float compute_throughput_scale_effective_ = 1.0f;
     uint32_t compute_pipeline_latency_cycles_effective_ = 0;
 
@@ -627,6 +701,9 @@ private:
     struct ProgramDmaSlot {
         bool active = false;
         bool is_read = true;
+        uint32_t buf = 0;
+        bool ub_addr_present = false;
+        uint64_t ub_addr = 0;
         uint64_t epoch = 0;
         uint64_t total_bytes = 0;
         uint64_t issued_bytes = 0;
@@ -635,6 +712,9 @@ private:
 
     struct ProgramMxuSlot {
         bool active = false;
+        uint32_t buf = 0;
+        bool ub_write_addr_present = false;
+        uint64_t ub_write_addr = 0;
         uint64_t rem_cycles = 0;
         uint64_t ub_read_bytes = 0;
         uint64_t ub_write_bytes = 0;
@@ -652,12 +732,21 @@ private:
         bool blocking = true;
     };
 
+    struct ProgramUbRegion {
+        uint64_t size_bytes = 0;
+        uint64_t reserved_bytes = 0;
+        uint64_t valid_bytes = 0;
+    };
+
     bool program_m7_enable_ = false;
     bool program_fence_pending_ = false;
-    uint64_t program_ub_reserved_bytes_ = 0;
-    uint64_t program_ub_valid_bytes_ = 0;
+    bool program_addr_aware_enable_ = false;
+    std::vector<uint64_t> program_ub_reserved_bytes_by_buf_{};
+    std::vector<uint64_t> program_ub_valid_bytes_by_buf_{};
+    std::vector<std::unordered_map<uint64_t, ProgramUbRegion>> program_ub_regions_by_buf_{};
     uint64_t program_dma_epoch_next_ = 1;
-    ProgramDmaSlot program_dma_slot_{};
+    ProgramDmaSlot program_dma_read_slot_{};
+    ProgramDmaSlot program_dma_write_slot_{};
     ProgramMxuSlot program_mxu_slot_{};
     ProgramVecSlot program_vec_slot_{};
     ProgramCollSlot program_coll_slot_{};

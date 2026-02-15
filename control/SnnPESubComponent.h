@@ -180,6 +180,9 @@ public:
         {"merge_read_cacheline", "Merge memory reads to cache line size", "1"},
         {"merge_read_row", "Merge memory reads to a full row", "0"},
         {"line_size_bytes", "Cache line size in bytes", "64"},
+        // Dense weights physical layout (experiment; default row_major)
+        {"dense_layout_mode", "Dense weights layout: row_major (default) | phys_v1", "row_major"},
+        {"dense_phys_dram_row_bytes", "Dense weights phys_v1: DRAM row bytes (must match weights_phys generator; 0 disables)", "0"},
         {"weights_cols", "Number of columns in weight matrix when using global read (post_row_pre_col)", "0"},
         {"index_mode", "Indexing mode: pre_row_post_col (default) or post_row_pre_col", "pre_row_post_col"},
         {"use_soa_neuron_state", "Use Structure-of-Arrays layout for neuron state (0=AoS,1=SoA)", "0"},
@@ -367,6 +370,10 @@ private:
 
     // Helper modules extracted to standalone files; keep private access via friends.
     friend struct WeightAccessor;
+
+    // Dense 权重地址映射（用于 naive/legacy 辅助路径；与 WeightMemorySubsystem 的配置保持一致）
+    uint64_t denseWeightAddr_(uint32_t row, uint32_t col, uint32_t width) const;
+
     struct Impl;
     std::unique_ptr<Impl> impl_;
 
@@ -810,6 +817,13 @@ private:
 
     // Dense 权重区域上界（用于区域分组）；BCSR 通过 bcsr_kind 判别
     uint64_t weight_region_end_ = 0; // [base_addr_, weight_region_end_) 视为权重区（dense）
+    // Dense 权重“物理布局”（实验性；默认 row_major）
+    std::string dense_layout_mode_ = "row_major"; // row_major|phys_v1
+    uint32_t dense_phys_dram_row_bytes_ = 0;
+    bool dense_phys_enable_ = false;
+    uint32_t dense_phys_row_stride_bytes_ = 0;
+    uint32_t dense_phys_rows_per_dram_row_ = 1;
+    uint32_t dense_phys_group_stride_bytes_ = 0;
 
     // BCSR 布局描述（集中校验与寻址）
     struct BcsrLayout {

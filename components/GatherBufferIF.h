@@ -96,6 +96,9 @@ public:
         {"byte_exact_verify_rows", "dense_rowcol_v1 rows（用于范围约束）", "0"},
         {"byte_exact_verify_cols", "dense_rowcol_v1 cols（用于 row/col 反推）", "0"}
         ,
+        {"byte_exact_dense_layout_mode", "dense_rowcol_v1 的 layout 解释: row_major|phys_v1（默认 row_major）", "row_major"},
+        {"byte_exact_dense_phys_dram_row_bytes", "phys_v1: DRAM row bytes（例如 8192）", "0"}
+        ,
         // BCSR merge-read correctness (raw file slice compare; off by default).
         {"byte_exact_verify_file_path", "raw_bcsr_v1: raw bcsr.bin 文件路径", ""},
         {"byte_exact_verify_sample_bytes", "raw_bcsr_v1: 每个 ReadResp 抽样校验的字节数", "64"},
@@ -362,6 +365,8 @@ private:
     uint64_t byte_exact_base_addr_ = 0;
     uint32_t byte_exact_rows_ = 0;
     uint32_t byte_exact_cols_ = 0;
+    std::string byte_exact_dense_layout_mode_ = "row_major";
+    uint32_t byte_exact_dense_phys_dram_row_bytes_ = 0;
     // raw_bcsr_v1 (optional; byte_exact_* reused to avoid another config namespace)
     std::string byte_exact_file_path_;
     uint64_t byte_exact_file_size_ = 0;

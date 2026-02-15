@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cinttypes>
+#include <cstdlib>
 #include <functional>
 #include <deque>
 #include <memory>
@@ -24,6 +25,7 @@
 #include "SnnWeightReader.h"
 #include "IMemoryAccess.h"
 #include "WeightAccessor.h"
+#include "DenseWeightLayout.h"
 
 namespace SST { class Output; }
 
@@ -108,6 +110,10 @@ public:
         bool use_post_row_pre_col = false;
         uint64_t base_addr = 0;
         uint64_t weight_region_end = 0;
+        // Dense weights layout (default: row_major).
+        DenseLayoutMode dense_layout_mode = DenseLayoutMode::RowMajor;
+        // Required when dense_layout_mode=PhysV1. Must match the offline weights_phys generator.
+        uint32_t dense_phys_dram_row_bytes = 0;
         bool read_force_single = false;
         bool merge_read_cacheline = true;
         bool merge_read_row = false;
@@ -154,6 +160,40 @@ public:
 
     void configureOrchestrator(OrchestratorConfig cfg) {
         orch_ = std::move(cfg);
+        dense_cols_effective_ = orch_.use_post_row_pre_col ? orch_.weights_cols : orch_.num_neurons;
+        dense_phys_enable_ = (orch_.dense_layout_mode == DenseLayoutMode::PhysV1);
+        if (dense_phys_enable_) {
+            if (orch_.dense_phys_dram_row_bytes == 0) {
+                diagOutOrFallback_()->fatal(CALL_INFO, -1,
+                                            "WeightMemorySubsystem fatal: dense_layout_mode=phys_v1 requires dense_phys_dram_row_bytes>0\n");
+                std::abort();
+            }
+            if (orch_.line_size_bytes == 0) orch_.line_size_bytes = 64;
+            const bool ok = computeDensePhysV1Derived(
+                orch_.num_neurons,
+                dense_cols_effective_,
+                orch_.line_size_bytes,
+                orch_.dense_phys_dram_row_bytes,
+                dense_phys_);
+            if (!ok) {
+                diagOutOrFallback_()->fatal(CALL_INFO, -1,
+                                            "WeightMemorySubsystem fatal: invalid dense phys_v1 layout params rows=%u cols=%u line=%u row_bytes=%u\n",
+                                            orch_.num_neurons,
+                                            dense_cols_effective_,
+                                            orch_.line_size_bytes,
+                                            orch_.dense_phys_dram_row_bytes);
+                std::abort();
+            }
+            if (orch_.dense_phys_dram_row_bytes != 0 &&
+                (orch_.base_addr % static_cast<uint64_t>(orch_.dense_phys_dram_row_bytes)) != 0) {
+                diagOutOrFallback_()->fatal(CALL_INFO, -1,
+                                            "WeightMemorySubsystem fatal: phys_v1 requires base_addr aligned to dram_row_bytes "
+                                            "(base=0x%llx row_bytes=%u)\n",
+                                            (unsigned long long)orch_.base_addr,
+                                            orch_.dense_phys_dram_row_bytes);
+                std::abort();
+            }
+        }
         ensureWindowTracking(orch_.num_neurons);
         if (orch_.bcsr_semantic_verify_enable) {
             bcsr_sem_verified_edges_ = 0;
@@ -648,6 +688,11 @@ private:
 
     // Orchestrator config
     OrchestratorConfig orch_{};
+
+    // Dense layout (derived). Cached to avoid recomputing row_stride/packing per request.
+    bool dense_phys_enable_ = false;
+    uint32_t dense_cols_effective_ = 0;
+    DensePhysV1Derived dense_phys_{};
 
     // ===== Deterministic retire for edge-driven acc_update =====
     // 由于 StandardMem 回调到达顺序可能在 MPI 多 rank 下抖动，直接在回调里 acc_update

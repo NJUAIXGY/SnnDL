@@ -90,6 +90,9 @@ struct GatherBufferIFConfig {
     uint64_t byte_exact_verify_base_addr = 0;
     uint32_t byte_exact_verify_rows = 0;
     uint32_t byte_exact_verify_cols = 0;
+    // Dense layout interpretation for dense_rowcol_v1 (default preserves legacy row-major decoding).
+    std::string byte_exact_dense_layout_mode = "row_major"; // row_major|phys_v1
+    uint32_t byte_exact_dense_phys_dram_row_bytes = 0;      // phys_v1: DRAM row bytes (e.g., 8192)
     std::string byte_exact_verify_file_path;
     uint32_t byte_exact_verify_sample_bytes = 64;
     uint32_t byte_exact_verify_max_resps = 8;

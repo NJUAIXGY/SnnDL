@@ -38,6 +38,15 @@ struct DmaSharedBudgetState_ {
 // This models a PE-local shared DMA/HBM bandwidth budget; no cross-rank coherence is required.
 static std::unordered_map<uint64_t, DmaSharedBudgetState_> g_dma_shared_budget_state_;
 
+struct HbmChannelBudgetState_ {
+    uint64_t cycle_tag = 0;
+    std::vector<uint64_t> left{};
+};
+
+// Per-rank (per-process) shared HBM channel budget state keyed by PE/node_id.
+// This models per-channel bandwidth contention inside a PE; no cross-rank coherence is required.
+static std::unordered_map<uint64_t, HbmChannelBudgetState_> g_hbm_channel_budget_state_;
+
 inline std::string to_lower_copy_(const std::string& s) {
     std::string out;
     out.reserve(s.size());
@@ -190,6 +199,10 @@ void TensorWorkload::configureFromParams(const SST::Params& params) {
     cfg_.compute_throughput_scale = params.find<float>("tensor_compute_throughput_scale", cfg_.compute_throughput_scale);
     cfg_.compute_pipeline_latency_cycles =
         params.find<uint32_t>("tensor_compute_pipeline_latency_cycles", cfg_.compute_pipeline_latency_cycles);
+    cfg_.mxu_wavefront_enable =
+        params.find<int>("tensor_mxu_wavefront_enable", cfg_.mxu_wavefront_enable ? 1 : 0) != 0;
+    cfg_.mxu_wavefront_alpha = params.find<float>("tensor_mxu_wavefront_alpha", cfg_.mxu_wavefront_alpha);
+    if (!(cfg_.mxu_wavefront_alpha >= 0.0f)) cfg_.mxu_wavefront_alpha = 0.0f;
 
     cfg_.overlap_enable = params.find<int>("tensor_overlap_enable", cfg_.overlap_enable ? 1 : 0) != 0;
     cfg_.start_cycle = params.find<uint64_t>("tensor_start_cycle", cfg_.start_cycle);
@@ -208,6 +221,9 @@ void TensorWorkload::configureFromParams(const SST::Params& params) {
     cfg_.program_dsl = params.find<std::string>("tensor_program_dsl", cfg_.program_dsl);
     cfg_.program_loop = params.find<int>("tensor_program_loop", cfg_.program_loop ? 1 : 0) != 0;
     cfg_.program_issue_width = params.find<uint32_t>("tensor_program_issue_width", cfg_.program_issue_width);
+    cfg_.program_ub_buffers = std::max<uint32_t>(1u, params.find<uint32_t>("tensor_program_ub_buffers", cfg_.program_ub_buffers));
+    cfg_.program_dma_dual_enable =
+        params.find<int>("tensor_program_dma_dual_enable", cfg_.program_dma_dual_enable ? 1 : 0) != 0;
     cfg_.program_engine_priority =
         to_lower_copy_(params.find<std::string>("tensor_program_engine_priority", cfg_.program_engine_priority));
     cfg_.vector_elems_per_cycle =
@@ -217,6 +233,7 @@ void TensorWorkload::configureFromParams(const SST::Params& params) {
     cfg_.tile_schedule = to_lower_copy_(params.find<std::string>("tensor_tile_schedule", cfg_.tile_schedule));
     cfg_.writeback_policy = to_lower_copy_(params.find<std::string>("tensor_writeback_policy", cfg_.writeback_policy));
     cfg_.ub_bytes = params.find<uint64_t>("tensor_ub_bytes", cfg_.ub_bytes);
+    cfg_.weight_bytes = params.find<uint64_t>("tensor_weight_bytes", cfg_.weight_bytes);
     cfg_.acc_bytes = params.find<uint64_t>("tensor_acc_bytes", cfg_.acc_bytes);
     cfg_.onchip_model_enable =
         params.find<int>("tensor_onchip_model_enable", cfg_.onchip_model_enable ? 1 : 0) != 0;
@@ -247,6 +264,19 @@ void TensorWorkload::configureFromParams(const SST::Params& params) {
         params.find<uint64_t>("tensor_dma_bandwidth_bytes_per_cycle", cfg_.dma_bandwidth_bytes_per_cycle);
     cfg_.dma_shared_bandwidth_bytes_per_cycle =
         params.find<uint64_t>("tensor_dma_shared_bandwidth_bytes_per_cycle", cfg_.dma_shared_bandwidth_bytes_per_cycle);
+    cfg_.dma_hbm_channels = std::max<uint32_t>(
+        1u, params.find<uint32_t>("tensor_dma_hbm_channels", cfg_.dma_hbm_channels));
+    cfg_.dma_hbm_channel_bandwidth_bytes_per_cycle =
+        params.find<uint64_t>(
+            "tensor_dma_hbm_channel_bandwidth_bytes_per_cycle",
+            cfg_.dma_hbm_channel_bandwidth_bytes_per_cycle);
+    cfg_.dma_hbm_channel_interleave_bytes =
+        params.find<uint64_t>(
+            "tensor_dma_hbm_channel_interleave_bytes",
+            cfg_.dma_hbm_channel_interleave_bytes);
+    if (cfg_.dma_hbm_channel_interleave_bytes == 0) {
+        cfg_.dma_hbm_channel_interleave_bytes = 1;
+    }
     cfg_.double_buffer = params.find<int>("tensor_double_buffer", cfg_.double_buffer ? 1 : 0) != 0;
     if (cfg_.exec_mode != "bulk" && cfg_.exec_mode != "tile" && cfg_.exec_mode != "program") {
         cfg_.exec_mode = "bulk";
@@ -492,8 +522,12 @@ void TensorWorkload::configureFromParams(const SST::Params& params) {
         tile_schedule_eff_ = "mnk";
     }
 
-    const bool can_keep_a = (cfg_.ub_bytes > 0 && cfg_.ub_bytes >= a_tile);
-    const bool can_keep_b = (cfg_.ub_bytes > 0 && cfg_.ub_bytes >= b_tile);
+    const bool ub_can_hold_a = (cfg_.ub_bytes > 0 && cfg_.ub_bytes >= a_tile);
+    const bool ub_can_hold_a_and_b = (cfg_.ub_bytes > 0 && cfg_.ub_bytes >= saturatingAddU64_(a_tile, b_tile));
+    const uint64_t b_pool_cap = (cfg_.weight_bytes > 0) ? cfg_.weight_bytes : cfg_.ub_bytes;
+    const bool b_pool_can_hold_b = (b_pool_cap > 0 && b_pool_cap >= b_tile);
+    const bool can_keep_a = ub_can_hold_a && (cfg_.weight_bytes > 0 ? b_pool_can_hold_b : ub_can_hold_a_and_b);
+    const bool can_keep_b = b_pool_can_hold_b && (cfg_.weight_bytes > 0 ? ub_can_hold_a : ub_can_hold_a_and_b);
     tile_keep_a_ = (tile_like && dataflow_is && can_keep_a && tile_schedule_eff_ == "mkn");
     tile_keep_b_ = (tile_like && dataflow_ws && can_keep_b && tile_schedule_eff_ == "nkm");
     const bool keep_a = tile_like ? tile_keep_a_ : can_keep_a;
@@ -547,10 +581,13 @@ void TensorWorkload::configureFromParams(const SST::Params& params) {
     }
 
     onchip_ub_bank_occupancy_bytes_.assign(std::max<uint32_t>(cfg_.ub_bank_count, 1u), 0ull);
+    onchip_weight_bank_occupancy_bytes_.assign(std::max<uint32_t>(cfg_.ub_bank_count, 1u), 0ull);
     onchip_acc_bank_occupancy_bytes_.assign(std::max<uint32_t>(cfg_.acc_bank_count, 1u), 0ull);
     onchip_ub_bank_queue_occupancy_.assign(std::max<uint32_t>(cfg_.ub_bank_count, 1u), 0u);
+    onchip_weight_bank_queue_occupancy_.assign(std::max<uint32_t>(cfg_.ub_bank_count, 1u), 0u);
     onchip_acc_bank_queue_occupancy_.assign(std::max<uint32_t>(cfg_.acc_bank_count, 1u), 0u);
     onchip_ub_bank_rr_ = 0;
+    onchip_weight_bank_rr_ = 0;
     onchip_acc_bank_rr_ = 0;
     collective_credit_inflight_chunks_ = 0;
     collective_credit_outstanding_.clear();
@@ -604,6 +641,88 @@ uint64_t TensorWorkload::dmaBudgetBytesPerCycle_(uint64_t now_cycle) const {
     return std::min<uint64_t>(local, shared);
 }
 
+bool TensorWorkload::hbmChannelBudgetEnabled_() const {
+    return cfg_.dma_hbm_channel_bandwidth_bytes_per_cycle > 0;
+}
+
+uint32_t TensorWorkload::hbmChannelCount_() const {
+    return std::max<uint32_t>(cfg_.dma_hbm_channels, 1u);
+}
+
+uint64_t TensorWorkload::peekNextMemAddr_(ReqKind kind, uint32_t bytes) const {
+    const uint64_t region = clampNonZero_(cfg_.mem_region_bytes, 4096);
+    uint64_t off = (kind == ReqKind::Read) ? read_off_ : write_off_;
+    if (off + static_cast<uint64_t>(bytes) > region) off = 0;
+    return rt_.base_addr + off;
+}
+
+uint32_t TensorWorkload::memAddrToHbmChannel_(uint64_t addr) const {
+    const uint64_t interleave = std::max<uint64_t>(cfg_.dma_hbm_channel_interleave_bytes, 1ull);
+    const uint32_t channels = hbmChannelCount_();
+    if (channels <= 1u) return 0;
+    const uint64_t idx = addr / interleave;
+    return static_cast<uint32_t>(idx % static_cast<uint64_t>(channels));
+}
+
+uint64_t TensorWorkload::hbmChannelBudgetLeftBytes_(uint64_t now_cycle, uint32_t channel) const {
+    if (!hbmChannelBudgetEnabled_()) return std::numeric_limits<uint64_t>::max();
+
+    const uint32_t channels = hbmChannelCount_();
+    const uint64_t key = static_cast<uint64_t>(rt_.node_id);
+    HbmChannelBudgetState_& st = g_hbm_channel_budget_state_[key];
+    if (st.cycle_tag != now_cycle || st.left.size() != static_cast<size_t>(channels)) {
+        st.cycle_tag = now_cycle;
+        st.left.assign(static_cast<size_t>(channels), cfg_.dma_hbm_channel_bandwidth_bytes_per_cycle);
+    }
+    if (st.left.empty()) return 0;
+    const uint32_t ch = (channels > 0u) ? (channel % channels) : 0u;
+    const size_t idx = static_cast<size_t>(ch);
+    if (idx >= st.left.size()) return 0;
+    return st.left[idx];
+}
+
+void TensorWorkload::consumeHbmChannelBudget_(uint64_t now_cycle, uint32_t channel, uint32_t bytes) {
+    if (!hbmChannelBudgetEnabled_()) return;
+
+    const uint32_t channels = hbmChannelCount_();
+    const uint64_t key = static_cast<uint64_t>(rt_.node_id);
+    HbmChannelBudgetState_& st = g_hbm_channel_budget_state_[key];
+    if (st.cycle_tag != now_cycle || st.left.size() != static_cast<size_t>(channels)) {
+        st.cycle_tag = now_cycle;
+        st.left.assign(static_cast<size_t>(channels), cfg_.dma_hbm_channel_bandwidth_bytes_per_cycle);
+    }
+    if (st.left.empty()) return;
+    const uint32_t ch = (channels > 0u) ? (channel % channels) : 0u;
+    const size_t idx = static_cast<size_t>(ch);
+    if (idx >= st.left.size()) return;
+    uint64_t& left = st.left[idx];
+    const uint64_t cut = std::min<uint64_t>(left, static_cast<uint64_t>(bytes));
+    left -= cut;
+}
+
+uint32_t TensorWorkload::clampBytesByHbmChannelBudget_(uint64_t now_cycle,
+                                                      ReqKind kind,
+                                                      uint32_t want,
+                                                      uint32_t& out_channel) const {
+    out_channel = 0;
+    if (!hbmChannelBudgetEnabled_() || want == 0) return want;
+
+    uint32_t bytes = want;
+    // The address depends on wrap-around (off+bytes>region). Clamping bytes can change
+    // whether wrap-around happens, so iterate to reach a stable (addr,channel,bytes).
+    for (int it = 0; it < 3; ++it) {
+        if (bytes == 0) return 0;
+        const uint64_t addr = peekNextMemAddr_(kind, bytes);
+        const uint32_t ch = memAddrToHbmChannel_(addr);
+        out_channel = ch;
+        const uint64_t left = hbmChannelBudgetLeftBytes_(now_cycle, ch);
+        const uint32_t clamped = static_cast<uint32_t>(std::min<uint64_t>(static_cast<uint64_t>(bytes), left));
+        if (clamped == bytes) return bytes;
+        bytes = clamped;
+    }
+    return bytes;
+}
+
 void TensorWorkload::bindRuntime(const Runtime& rt) {
     rt_ = rt;
     if (inflight_.size() > static_cast<size_t>(cfg_.mem_max_outstanding) * 8u) {
@@ -621,10 +740,15 @@ void TensorWorkload::bindRuntime(const Runtime& rt) {
     program_collective_started_ = false;
     program_m7_enable_ = false;
     program_fence_pending_ = false;
-    program_ub_reserved_bytes_ = 0;
-    program_ub_valid_bytes_ = 0;
+    program_addr_aware_enable_ = false;
+    const uint32_t ub_bufs = std::max<uint32_t>(cfg_.program_ub_buffers, 1u);
+    program_ub_reserved_bytes_by_buf_.assign(ub_bufs, 0ull);
+    program_ub_valid_bytes_by_buf_.assign(ub_bufs, 0ull);
+    program_ub_regions_by_buf_.assign(ub_bufs, std::unordered_map<uint64_t, ProgramUbRegion>{});
+    tensor_program_ub_occupancy_bytes_max_ = 0;
     program_dma_epoch_next_ = 1;
-    program_dma_slot_ = ProgramDmaSlot{};
+    program_dma_read_slot_ = ProgramDmaSlot{};
+    program_dma_write_slot_ = ProgramDmaSlot{};
     program_mxu_slot_ = ProgramMxuSlot{};
     program_vec_slot_ = ProgramVecSlot{};
     program_coll_slot_ = ProgramCollSlot{};
@@ -635,12 +759,31 @@ void TensorWorkload::bindRuntime(const Runtime& rt) {
         if (!dsl.empty() && parseProgramDsl_(dsl, ops)) {
             program_ops_ = std::move(ops);
             for (const auto& op : program_ops_) {
+                if (op.ub_addr_present || op.ub_read_addr_present || op.ub_write_addr_present) {
+                    program_addr_aware_enable_ = true;
+                }
                 if (op.kind == ProgramOpKind::DmaRead ||
                     op.kind == ProgramOpKind::DmaWrite ||
                     op.kind == ProgramOpKind::Fence ||
                     op.kind == ProgramOpKind::GemmUb) {
                     program_m7_enable_ = true;
-                    break;
+                }
+            }
+
+            if (program_addr_aware_enable_) {
+                const uint64_t ub_bytes = cfg_.ub_bytes;
+                if (ub_bytes == 0 || (ub_bytes % static_cast<uint64_t>(ub_bufs)) != 0) {
+                    if (cfg_.strict && rt_.log) {
+                        rt_.log->fatal(
+                            CALL_INFO,
+                            -1,
+                            "tensor fatal: program address-aware mode requires tensor_ub_bytes divisible by tensor_program_ub_buffers "
+                            "(core=%u ub_bytes=%llu ub_buffers=%u)\n",
+                            rt_.core_id,
+                            (unsigned long long)ub_bytes,
+                            ub_bufs);
+                    }
+                    program_addr_aware_enable_ = false;
                 }
             }
         } else if (cfg_.strict && rt_.log) {
@@ -776,13 +919,41 @@ bool TensorWorkload::parseProgramDsl_(const std::string& dsl, std::vector<Progra
                         uint64_t bv = 0;
                         if (!parse_u64(v, bv) || bv == 0) return false;
                         out.bytes = bv;
+                    } else if (k == "buf") {
+                        uint64_t bv = 0;
+                        if (!parse_u64(v, bv)) return false;
+                        if (bv > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) return false;
+                        const uint32_t buf = static_cast<uint32_t>(bv);
+                        if (buf >= std::max<uint32_t>(cfg_.program_ub_buffers, 1u)) return false;
+                        out.buf = buf;
+                    } else if (k == "ub_addr") {
+                        uint64_t av = 0;
+                        if (!parse_u64(v, av)) return false;
+                        out.ub_addr_present = true;
+                        out.ub_addr = av;
+                    } else if (out.kind == ProgramOpKind::DmaRead && k == "reset") {
+                        bool b = true;
+                        if (v.empty()) {
+                            b = true;
+                        } else if (!parse_bool01(v, b)) {
+                            return false;
+                        }
+                        out.reset = b;
+                    } else if (out.kind == ProgramOpKind::DmaWrite && k == "consume") {
+                        bool b = true;
+                        if (v.empty()) {
+                            b = true;
+                        } else if (!parse_bool01(v, b)) {
+                            return false;
+                        }
+                        out.consume = b;
                     } else {
                         return false;
                     }
                 } else if (out.kind == ProgramOpKind::GemmUb) {
                     if (k == "cycles") {
                         uint64_t cv = 0;
-                        if (!parse_u64(v, cv) || cv == 0) return false;
+                        if (!parse_u64(v, cv)) return false;
                         out.cycles = cv;
                     } else if (k == "ub_read" || k == "ub_read_bytes") {
                         uint64_t bv = 0;
@@ -792,6 +963,38 @@ bool TensorWorkload::parseProgramDsl_(const std::string& dsl, std::vector<Progra
                         uint64_t bv = 0;
                         if (!parse_u64(v, bv)) return false;
                         out.ub_write_bytes = bv;
+                    } else if (k == "buf") {
+                        uint64_t bv = 0;
+                        if (!parse_u64(v, bv)) return false;
+                        if (bv > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) return false;
+                        const uint32_t buf = static_cast<uint32_t>(bv);
+                        if (buf >= std::max<uint32_t>(cfg_.program_ub_buffers, 1u)) return false;
+                        out.buf = buf;
+                    } else if (k == "ub_read_addr") {
+                        uint64_t av = 0;
+                        if (!parse_u64(v, av)) return false;
+                        out.ub_read_addr_present = true;
+                        out.ub_read_addr = av;
+                    } else if (k == "ub_write_addr") {
+                        uint64_t av = 0;
+                        if (!parse_u64(v, av)) return false;
+                        out.ub_write_addr_present = true;
+                        out.ub_write_addr = av;
+                    } else if (k == "m" || k == "tm") {
+                        uint64_t mv = 0;
+                        if (!parse_u64(v, mv)) return false;
+                        if (mv > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) return false;
+                        out.m = static_cast<uint32_t>(mv);
+                    } else if (k == "n" || k == "tn") {
+                        uint64_t nv = 0;
+                        if (!parse_u64(v, nv)) return false;
+                        if (nv > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) return false;
+                        out.n = static_cast<uint32_t>(nv);
+                    } else if (k == "k" || k == "tk") {
+                        uint64_t kvv = 0;
+                        if (!parse_u64(v, kvv)) return false;
+                        if (kvv > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) return false;
+                        out.k = static_cast<uint32_t>(kvv);
                     } else {
                         return false;
                     }
@@ -806,17 +1009,56 @@ bool TensorWorkload::parseProgramDsl_(const std::string& dsl, std::vector<Progra
             }
         }
 
+        if ((out.kind == ProgramOpKind::DmaRead || out.kind == ProgramOpKind::DmaWrite) && out.bytes == 0) {
+            return false;
+        }
         if (out.kind == ProgramOpKind::Softmax && out.elems == 0) {
             return false;
         }
         if (out.kind == ProgramOpKind::GemmUb && out.cycles == 0) {
-            return false;
+            if (out.m == 0 || out.n == 0 || out.k == 0) {
+                return false;
+            }
         }
 
         out_ops.push_back(out);
     }
 
     return !out_ops.empty();
+}
+
+uint64_t TensorWorkload::estimateGemmUbCycles_(uint32_t m, uint32_t n, uint32_t k) const {
+    if (m == 0u || n == 0u || k == 0u) return 1ull;
+
+    const uint64_t mm = static_cast<uint64_t>(m);
+    const uint64_t nn = static_cast<uint64_t>(n);
+    const uint64_t kk = static_cast<uint64_t>(k);
+    const uint64_t macs = saturatingMulU64_(saturatingMulU64_(mm, nn), kk);
+    const uint64_t thr = effectivePeakMacsPerCycle_();
+    const uint64_t math = ceilDivU64_(std::max<uint64_t>(1ull, macs), std::max<uint64_t>(1ull, thr));
+    const uint64_t pipe = static_cast<uint64_t>(compute_pipeline_latency_cycles_effective_);
+    const uint64_t base_total = saturatingAddU64_(math ? math : 1ull, pipe);
+
+    uint64_t extra = 0;
+    if (cfg_.mxu_wavefront_enable && cfg_.mxu_wavefront_alpha > 0.0f) {
+        const uint64_t am = clampNonZero_(static_cast<uint64_t>(cfg_.array_m), 1ull);
+        const uint64_t an = clampNonZero_(static_cast<uint64_t>(cfg_.array_n), 1ull);
+        const uint64_t mb = ceilDivU64_(mm, am);
+        const uint64_t nb = ceilDivU64_(nn, an);
+        const uint64_t m_blk = std::min<uint64_t>(mm, am);
+        const uint64_t n_blk = std::min<uint64_t>(nn, an);
+        const uint64_t span_blk = (m_blk > 0 && n_blk > 0 && kk > 0) ? (m_blk + n_blk + kk - 2ull) : 0ull;
+        const uint64_t wf_span = saturatingMulU64_(saturatingMulU64_(mb, nb), span_blk);
+        const double wf_body_d = static_cast<double>(cfg_.mxu_wavefront_alpha) * static_cast<double>(wf_span);
+        const uint64_t wf_body = static_cast<uint64_t>(std::ceil(std::max(0.0, wf_body_d)));
+        const uint64_t wf_total = saturatingAddU64_((wf_body ? wf_body : 1ull), pipe);
+        if (wf_total > base_total) {
+            extra = wf_total - base_total;
+        }
+    }
+
+    const uint64_t total = saturatingAddU64_(base_total, extra);
+    return total ? total : 1ull;
 }
 
 bool TensorWorkload::startProgramCollective_(uint64_t now_cycle, uint64_t bytes, bool blocking) {
@@ -1006,12 +1248,16 @@ void TensorWorkload::startIteration_() {
     tensor_onchip_bytes_total_ += onchip_bytes_per_iter_;
     tensor_dma_cycles_total_ += dma_cycles_per_iter_;
     onchip_ub_occupancy_bytes_ = 0;
+    onchip_weight_occupancy_bytes_ = 0;
     onchip_acc_occupancy_bytes_ = 0;
     std::fill(onchip_ub_bank_occupancy_bytes_.begin(), onchip_ub_bank_occupancy_bytes_.end(), 0ull);
+    std::fill(onchip_weight_bank_occupancy_bytes_.begin(), onchip_weight_bank_occupancy_bytes_.end(), 0ull);
     std::fill(onchip_acc_bank_occupancy_bytes_.begin(), onchip_acc_bank_occupancy_bytes_.end(), 0ull);
     std::fill(onchip_ub_bank_queue_occupancy_.begin(), onchip_ub_bank_queue_occupancy_.end(), 0u);
+    std::fill(onchip_weight_bank_queue_occupancy_.begin(), onchip_weight_bank_queue_occupancy_.end(), 0u);
     std::fill(onchip_acc_bank_queue_occupancy_.begin(), onchip_acc_bank_queue_occupancy_.end(), 0u);
     onchip_ub_bank_rr_ = 0;
+    onchip_weight_bank_rr_ = 0;
     onchip_acc_bank_rr_ = 0;
     if (!collectiveUseEventCreditReturn_()) {
         collective_credit_inflight_chunks_ = 0;
@@ -1021,6 +1267,8 @@ void TensorWorkload::startIteration_() {
         collective_credit_return_pending_queue_.clear();
     }
     acc_reserved_tiles_.clear();
+    a_resident_tiles_.clear();
+    b_resident_tiles_.clear();
 
     tile_mode_active_ = (cfg_.exec_mode == "tile" || cfg_.exec_mode == "program");
     if (tile_mode_active_) {
@@ -1133,7 +1381,37 @@ bool TensorWorkload::generateNextTileSeg_(TileSegState& out) {
     out.need_b_bytes = tileNeedReadBBytes_(out.mi, out.ni, out.ki);
     out.rem_compute_math_cycles = tileSegMathCycles_(out.seg_index);
     out.rem_compute_pipeline_cycles = static_cast<uint64_t>(compute_pipeline_latency_cycles_effective_);
-    out.rem_compute_cycles = tileSegComputeCycles_(out.seg_index);
+    out.rem_compute_wavefront_cycles = 0;
+    const uint64_t base_total = out.rem_compute_math_cycles + out.rem_compute_pipeline_cycles;
+    if (cfg_.mxu_wavefront_enable && cfg_.mxu_wavefront_alpha > 0.0f) {
+        const uint64_t m0 = static_cast<uint64_t>(out.mi) * static_cast<uint64_t>(tile_tm_);
+        const uint64_t n0 = static_cast<uint64_t>(out.ni) * static_cast<uint64_t>(tile_tn_);
+        const uint64_t k0 = static_cast<uint64_t>(out.ki) * static_cast<uint64_t>(tile_tk_);
+        const uint64_t m_eff = (m0 < cfg_.m) ? std::min<uint64_t>(tile_tm_, static_cast<uint64_t>(cfg_.m) - m0) : 0ull;
+        const uint64_t n_eff = (n0 < cfg_.n) ? std::min<uint64_t>(tile_tn_, static_cast<uint64_t>(cfg_.n) - n0) : 0ull;
+        const uint64_t k_eff = (k0 < cfg_.k) ? std::min<uint64_t>(tile_tk_, static_cast<uint64_t>(cfg_.k) - k0) : 0ull;
+        uint64_t wf_span = 0;
+        if (m_eff > 0 && n_eff > 0 && k_eff > 0) {
+            // Approximate systolic fill/drain latency. If the tile exceeds the physical
+            // array dimensions, model it as multiple array-sized blocks (e.g., 64x64 on
+            // a 32x32 array => 2x2 blocks).
+            const uint64_t am = clampNonZero_(static_cast<uint64_t>(cfg_.array_m), 1ull);
+            const uint64_t an = clampNonZero_(static_cast<uint64_t>(cfg_.array_n), 1ull);
+            const uint64_t mb = ceilDivU64_(m_eff, am);
+            const uint64_t nb = ceilDivU64_(n_eff, an);
+            const uint64_t m_blk = std::min<uint64_t>(m_eff, am);
+            const uint64_t n_blk = std::min<uint64_t>(n_eff, an);
+            const uint64_t span_blk = m_blk + n_blk + k_eff - 2ull;
+            wf_span = saturatingMulU64_(saturatingMulU64_(mb, nb), span_blk);
+        }
+        const double wf_body_d = static_cast<double>(cfg_.mxu_wavefront_alpha) * static_cast<double>(wf_span);
+        const uint64_t wf_body = static_cast<uint64_t>(std::ceil(std::max(0.0, wf_body_d)));
+        const uint64_t wf_total = (wf_body ? wf_body : 1ull) + out.rem_compute_pipeline_cycles;
+        if (wf_total > base_total) {
+            out.rem_compute_wavefront_cycles = wf_total - base_total;
+        }
+    }
+    out.rem_compute_cycles = out.rem_compute_math_cycles + out.rem_compute_pipeline_cycles + out.rem_compute_wavefront_cycles;
 
     tile_seg_gen_index_++;
     const bool ok = advanceTileIndices_(tile_gen_mi_, tile_gen_ni_, tile_gen_ki_);
@@ -1295,15 +1573,18 @@ uint32_t TensorWorkload::issueMemWriteTagged_(uint32_t max_bytes, MemTag tag, ui
 void TensorWorkload::onMemComplete_(ReqKind kind, MemTag tag, uint64_t epoch, uint32_t bytes) {
     // Program-mode explicit DMA (M7): update slot progress even when tile model is disabled.
     if (cfg_.exec_mode == "program" && program_m7_enable_) {
-        if (program_dma_slot_.active && program_dma_slot_.epoch == epoch) {
-            if (kind == ReqKind::Read && tag == MemTag::ProgramDmaRead && program_dma_slot_.is_read) {
-                program_dma_slot_.done_bytes = std::min<uint64_t>(
-                    program_dma_slot_.total_bytes,
-                    program_dma_slot_.done_bytes + static_cast<uint64_t>(bytes));
-            } else if (kind == ReqKind::Write && tag == MemTag::ProgramDmaWrite && !program_dma_slot_.is_read) {
-                program_dma_slot_.done_bytes = std::min<uint64_t>(
-                    program_dma_slot_.total_bytes,
-                    program_dma_slot_.done_bytes + static_cast<uint64_t>(bytes));
+        if (program_dma_read_slot_.active && program_dma_read_slot_.epoch == epoch) {
+            if (kind == ReqKind::Read && tag == MemTag::ProgramDmaRead) {
+                program_dma_read_slot_.done_bytes = std::min<uint64_t>(
+                    program_dma_read_slot_.total_bytes,
+                    program_dma_read_slot_.done_bytes + static_cast<uint64_t>(bytes));
+            }
+        }
+        if (program_dma_write_slot_.active && program_dma_write_slot_.epoch == epoch) {
+            if (kind == ReqKind::Write && tag == MemTag::ProgramDmaWrite) {
+                program_dma_write_slot_.done_bytes = std::min<uint64_t>(
+                    program_dma_write_slot_.total_bytes,
+                    program_dma_write_slot_.done_bytes + static_cast<uint64_t>(bytes));
             }
         }
     }
@@ -1563,6 +1844,25 @@ uint32_t TensorWorkload::selectUbBank_(uint64_t tag_seed) {
     return static_cast<uint32_t>((tag_seed / gran) % static_cast<uint64_t>(banks));
 }
 
+uint32_t TensorWorkload::selectWeightBank_(uint64_t tag_seed) {
+    const uint32_t banks = std::max<uint32_t>(cfg_.ub_bank_count, 1u);
+    if (banks <= 1u) return 0u;
+
+    if (cfg_.ub_bank_select_policy == "rr") {
+        const uint32_t bank = onchip_weight_bank_rr_ % banks;
+        onchip_weight_bank_rr_ = (bank + 1u) % banks;
+        return bank;
+    }
+    if (cfg_.ub_bank_select_policy == "hash") {
+        uint64_t x = tag_seed ^ (static_cast<uint64_t>(rt_.node_id) << 32) ^
+                     (static_cast<uint64_t>(rt_.core_id) << 16) ^ cfg_.seed_base;
+        return static_cast<uint32_t>(splitmix64_next_(x) % static_cast<uint64_t>(banks));
+    }
+
+    const uint64_t gran = std::max<uint64_t>(cfg_.mem_req_bytes, 1u);
+    return static_cast<uint32_t>((tag_seed / gran) % static_cast<uint64_t>(banks));
+}
+
 uint32_t TensorWorkload::selectAccBank_(uint64_t tag_seed) {
     const uint32_t banks = std::max<uint32_t>(cfg_.acc_bank_count, 1u);
     if (banks <= 1u) return 0u;
@@ -1588,6 +1888,9 @@ void TensorWorkload::updateBankQueueOccupancyMax_() {
     for (uint32_t v : onchip_ub_bank_queue_occupancy_) {
         if (static_cast<uint64_t>(v) > max_occ) max_occ = static_cast<uint64_t>(v);
     }
+    for (uint32_t v : onchip_weight_bank_queue_occupancy_) {
+        if (static_cast<uint64_t>(v) > max_occ) max_occ = static_cast<uint64_t>(v);
+    }
     for (uint32_t v : onchip_acc_bank_queue_occupancy_) {
         if (static_cast<uint64_t>(v) > max_occ) max_occ = static_cast<uint64_t>(v);
     }
@@ -1605,6 +1908,9 @@ void TensorWorkload::resetOnchipCycleState_(uint64_t now_cycle) {
     onchip_acc_write_ports_used_ = 0;
     if (cfg_.onchip_bank_model_enable) {
         for (uint32_t& v : onchip_ub_bank_queue_occupancy_) {
+            if (v > 0) v -= 1;
+        }
+        for (uint32_t& v : onchip_weight_bank_queue_occupancy_) {
             if (v > 0) v -= 1;
         }
         for (uint32_t& v : onchip_acc_bank_queue_occupancy_) {
@@ -1722,6 +2028,100 @@ bool TensorWorkload::reserveUbBytes_(uint64_t bytes,
     return spill_or_fail(!bank_fit);
 }
 
+bool TensorWorkload::reserveWeightBytes_(uint64_t bytes,
+                                         uint64_t& spill_budget,
+                                         bool& spilled,
+                                         bool& spill_budget_blocked,
+                                         bool& bank_conflict_blocked,
+                                         std::vector<std::pair<uint32_t, uint64_t>>* bank_allocs) {
+    spilled = false;
+    spill_budget_blocked = false;
+    bank_conflict_blocked = false;
+    if (bytes == 0) return true;
+    if (!cfg_.onchip_model_enable || cfg_.weight_bytes == 0) return true;
+
+    auto spill_or_fail = [&](bool bank_conflict) -> bool {
+        if (!cfg_.spill_enable) {
+            bank_conflict_blocked = bank_conflict;
+            return false;
+        }
+        const bool spill_budget_capped =
+            cfg_.spill_share_noc_budget &&
+            cfg_.noc_bandwidth_bytes_per_cycle > 0 &&
+            spill_budget != std::numeric_limits<uint64_t>::max();
+        if (spill_budget_capped && spill_budget < bytes) {
+            spill_budget_blocked = true;
+            return false;
+        }
+
+        spilled = true;
+        tensor_spill_bytes_total_ += bytes;
+        tensor_spill_pkts_total_ += ceilDivU64_(bytes, std::max<uint64_t>(cfg_.spill_packet_bytes, 8ull));
+        if (spill_budget_capped) {
+            spill_budget -= bytes;
+        }
+        return true;
+    };
+
+    if (!cfg_.onchip_bank_model_enable || onchip_weight_bank_occupancy_bytes_.empty()) {
+        if (onchip_weight_occupancy_bytes_ + bytes <= cfg_.weight_bytes) {
+            onchip_weight_occupancy_bytes_ += bytes;
+            if (onchip_weight_occupancy_bytes_ > tensor_onchip_weight_occupancy_bytes_max_) {
+                tensor_onchip_weight_occupancy_bytes_max_ = onchip_weight_occupancy_bytes_;
+            }
+            return true;
+        }
+        return spill_or_fail(false);
+    }
+
+    const uint32_t bank = selectWeightBank_(onchip_weight_occupancy_bytes_ + bytes + tensor_mem_reads_issued_total_);
+    if (bank >= onchip_weight_bank_occupancy_bytes_.size() || bank >= onchip_weight_bank_queue_occupancy_.size()) {
+        return spill_or_fail(false);
+    }
+
+    bool queue_marked = false;
+    if (cfg_.ub_bank_conflict_mode == "queue") {
+        if (onchip_weight_bank_queue_occupancy_[bank] >= cfg_.bank_queue_depth) {
+            bank_conflict_blocked = true;
+            return false;
+        }
+        onchip_weight_bank_queue_occupancy_[bank] += 1;
+        queue_marked = true;
+        updateBankQueueOccupancyMax_();
+    } else {
+        if (onchip_weight_bank_queue_occupancy_[bank] > 0) {
+            bank_conflict_blocked = true;
+            return false;
+        }
+        onchip_weight_bank_queue_occupancy_[bank] = 1;
+        queue_marked = true;
+        updateBankQueueOccupancyMax_();
+    }
+
+    const uint64_t bank_cap = (cfg_.ub_bank_bytes > 0)
+                                  ? cfg_.ub_bank_bytes
+                                  : ceilDivU64_(cfg_.weight_bytes, static_cast<uint64_t>(std::max<uint32_t>(cfg_.ub_bank_count, 1u)));
+    const bool global_fit = onchip_weight_occupancy_bytes_ + bytes <= cfg_.weight_bytes;
+    const bool bank_fit = onchip_weight_bank_occupancy_bytes_[bank] + bytes <= bank_cap;
+    if (global_fit && bank_fit) {
+        onchip_weight_occupancy_bytes_ += bytes;
+        onchip_weight_bank_occupancy_bytes_[bank] += bytes;
+        if (onchip_weight_occupancy_bytes_ > tensor_onchip_weight_occupancy_bytes_max_) {
+            tensor_onchip_weight_occupancy_bytes_max_ = onchip_weight_occupancy_bytes_;
+        }
+        if (onchip_weight_bank_occupancy_bytes_[bank] > tensor_onchip_weight_bank_occupancy_bytes_max_) {
+            tensor_onchip_weight_bank_occupancy_bytes_max_ = onchip_weight_bank_occupancy_bytes_[bank];
+        }
+        if (bank_allocs) bank_allocs->emplace_back(bank, bytes);
+        return true;
+    }
+
+    if (queue_marked && onchip_weight_bank_queue_occupancy_[bank] > 0) {
+        onchip_weight_bank_queue_occupancy_[bank] -= 1;
+    }
+    return spill_or_fail(!bank_fit);
+}
+
 void TensorWorkload::releaseUbBytes_(uint64_t bytes) {
     if (!cfg_.onchip_model_enable || cfg_.ub_bytes == 0 || bytes == 0) return;
     onchip_ub_occupancy_bytes_ = (onchip_ub_occupancy_bytes_ >= bytes) ? (onchip_ub_occupancy_bytes_ - bytes) : 0;
@@ -1739,6 +2139,31 @@ void TensorWorkload::releaseUbBankAllocs_(std::vector<std::pair<uint32_t, uint64
         onchip_ub_occupancy_bytes_ = (onchip_ub_occupancy_bytes_ >= bytes) ? (onchip_ub_occupancy_bytes_ - bytes) : 0;
         if (bank < onchip_ub_bank_occupancy_bytes_.size()) {
             uint64_t& occ = onchip_ub_bank_occupancy_bytes_[bank];
+            occ = (occ >= bytes) ? (occ - bytes) : 0;
+        }
+    }
+    bank_allocs.clear();
+}
+
+void TensorWorkload::releaseWeightBytes_(uint64_t bytes) {
+    if (!cfg_.onchip_model_enable || cfg_.weight_bytes == 0 || bytes == 0) return;
+    onchip_weight_occupancy_bytes_ =
+        (onchip_weight_occupancy_bytes_ >= bytes) ? (onchip_weight_occupancy_bytes_ - bytes) : 0;
+}
+
+void TensorWorkload::releaseWeightBankAllocs_(std::vector<std::pair<uint32_t, uint64_t>>& bank_allocs) {
+    if (!cfg_.onchip_model_enable || cfg_.weight_bytes == 0) {
+        bank_allocs.clear();
+        return;
+    }
+    for (const auto& alloc : bank_allocs) {
+        const uint32_t bank = alloc.first;
+        const uint64_t bytes = alloc.second;
+        if (bytes == 0) continue;
+        onchip_weight_occupancy_bytes_ =
+            (onchip_weight_occupancy_bytes_ >= bytes) ? (onchip_weight_occupancy_bytes_ - bytes) : 0;
+        if (bank < onchip_weight_bank_occupancy_bytes_.size()) {
+            uint64_t& occ = onchip_weight_bank_occupancy_bytes_[bank];
             occ = (occ >= bytes) ? (occ - bytes) : 0;
         }
     }
@@ -3001,6 +3426,7 @@ bool TensorWorkload::onClockTickTile_(uint64_t now_cycle) {
     uint64_t budget = dmaBudgetBytesPerCycle_(now_cycle);
     const bool dma_capped = (budget != kUncapped);
     bool blocked_budget = dma_capped && (budget == 0);
+    bool blocked_hbm_channel_budget = false;
     bool blocked_outstanding = false;
     bool blocked_onchip_capacity = false;
     bool blocked_onchip_port = false;
@@ -3021,6 +3447,26 @@ bool TensorWorkload::onClockTickTile_(uint64_t now_cycle) {
                 onchip_ub_occupancy_bytes_ = (onchip_ub_occupancy_bytes_ >= cut) ? (onchip_ub_occupancy_bytes_ - cut) : 0;
                 if (tail.first < onchip_ub_bank_occupancy_bytes_.size()) {
                     uint64_t& occ = onchip_ub_bank_occupancy_bytes_[tail.first];
+                    occ = (occ >= cut) ? (occ - cut) : 0;
+                }
+                tail.second -= cut;
+                rem -= cut;
+            } else {
+                rem = 0;
+            }
+            if (tail.second == 0) allocs.pop_back();
+        }
+    };
+    auto rollback_weight_alloc = [&](std::vector<std::pair<uint32_t, uint64_t>>& allocs, uint64_t bytes) {
+        uint64_t rem = bytes;
+        while (rem > 0 && !allocs.empty()) {
+            std::pair<uint32_t, uint64_t>& tail = allocs.back();
+            const uint64_t cut = std::min<uint64_t>(rem, tail.second);
+            if (cut > 0) {
+                onchip_weight_occupancy_bytes_ =
+                    (onchip_weight_occupancy_bytes_ >= cut) ? (onchip_weight_occupancy_bytes_ - cut) : 0;
+                if (tail.first < onchip_weight_bank_occupancy_bytes_.size()) {
+                    uint64_t& occ = onchip_weight_bank_occupancy_bytes_[tail.first];
                     occ = (occ >= cut) ? (occ - cut) : 0;
                 }
                 tail.second -= cut;
@@ -3054,14 +3500,22 @@ bool TensorWorkload::onClockTickTile_(uint64_t now_cycle) {
                 break;
             }
 
-            const uint32_t chunk = static_cast<uint32_t>(std::min<uint64_t>(cfg_.mem_req_bytes, pending));
+            uint32_t chunk = static_cast<uint32_t>(std::min<uint64_t>(cfg_.mem_req_bytes, pending));
             if (chunk == 0) break;
             if (chunk > budget) {
                 blocked_budget = true;
                 break;
             }
 
-            bool ub_spilled = false;
+            uint32_t hbm_ch = 0;
+            chunk = clampBytesByHbmChannelBudget_(now_cycle, ReqKind::Read, chunk, hbm_ch);
+            if (chunk == 0) {
+                blocked_hbm_channel_budget = true;
+                break;
+            }
+
+            const bool use_weight_pool = (tag == MemTag::ReadB && cfg_.weight_bytes > 0);
+            bool onchip_spilled = false;
             if (cfg_.onchip_model_enable) {
                 if (!acquireOnchipWritePorts_(1, 0)) {
                     blocked_onchip_port = true;
@@ -3071,14 +3525,24 @@ bool TensorWorkload::onClockTickTile_(uint64_t now_cycle) {
                 bool bank_conflict_blocked_local = false;
                 std::vector<std::pair<uint32_t, uint64_t>>* bank_allocs =
                     (cfg_.onchip_bank_model_enable
-                         ? ((tag == MemTag::ReadA) ? &tile_cur_.reserved_a_bank_allocs : &tile_cur_.reserved_b_bank_allocs)
+                         ? ((tag == MemTag::ReadA) ? &tile_cur_.reserved_a_bank_allocs
+                                                   : (use_weight_pool ? &tile_cur_.reserved_b_weight_bank_allocs
+                                                                      : &tile_cur_.reserved_b_bank_allocs))
                          : nullptr);
-                if (!reserveUbBytes_(chunk,
-                                     spill_budget,
-                                     ub_spilled,
-                                     spill_budget_blocked_local,
-                                     bank_conflict_blocked_local,
-                                     bank_allocs)) {
+                const bool ok = use_weight_pool
+                                    ? reserveWeightBytes_(chunk,
+                                                          spill_budget,
+                                                          onchip_spilled,
+                                                          spill_budget_blocked_local,
+                                                          bank_conflict_blocked_local,
+                                                          bank_allocs)
+                                    : reserveUbBytes_(chunk,
+                                                      spill_budget,
+                                                      onchip_spilled,
+                                                      spill_budget_blocked_local,
+                                                      bank_conflict_blocked_local,
+                                                      bank_allocs);
+                if (!ok) {
                     if (spill_budget_blocked_local) {
                         blocked_spill_budget = true;
                     } else if (bank_conflict_blocked_local) {
@@ -3092,41 +3556,62 @@ bool TensorWorkload::onClockTickTile_(uint64_t now_cycle) {
 
             const uint32_t issued = issueMemReadTagged_(chunk, tag, tile_cur_.epoch);
             if (issued == 0) {
-                if (cfg_.onchip_model_enable && !ub_spilled) {
+                if (cfg_.onchip_model_enable && !onchip_spilled) {
                     if (cfg_.onchip_bank_model_enable) {
                         if (tag == MemTag::ReadA) {
                             rollback_ub_alloc(tile_cur_.reserved_a_bank_allocs, chunk);
                         } else if (tag == MemTag::ReadB) {
-                            rollback_ub_alloc(tile_cur_.reserved_b_bank_allocs, chunk);
+                            if (use_weight_pool) {
+                                rollback_weight_alloc(tile_cur_.reserved_b_weight_bank_allocs, chunk);
+                            } else {
+                                rollback_ub_alloc(tile_cur_.reserved_b_bank_allocs, chunk);
+                            }
                         }
                     } else {
-                        releaseUbBytes_(chunk);
+                        if (use_weight_pool) {
+                            releaseWeightBytes_(chunk);
+                        } else {
+                            releaseUbBytes_(chunk);
+                        }
                     }
                 }
                 if (inflight_.size() >= max_out) blocked_outstanding = true;
                 break;
             }
-            if (cfg_.onchip_model_enable && !ub_spilled && issued < chunk) {
+            consumeHbmChannelBudget_(now_cycle, hbm_ch, issued);
+            if (cfg_.onchip_model_enable && !onchip_spilled && issued < chunk) {
                 const uint64_t rollback = static_cast<uint64_t>(chunk - issued);
                 if (cfg_.onchip_bank_model_enable) {
                     if (tag == MemTag::ReadA) {
                         rollback_ub_alloc(tile_cur_.reserved_a_bank_allocs, rollback);
                     } else if (tag == MemTag::ReadB) {
-                        rollback_ub_alloc(tile_cur_.reserved_b_bank_allocs, rollback);
+                        if (use_weight_pool) {
+                            rollback_weight_alloc(tile_cur_.reserved_b_weight_bank_allocs, rollback);
+                        } else {
+                            rollback_ub_alloc(tile_cur_.reserved_b_bank_allocs, rollback);
+                        }
                     }
                 } else {
-                    releaseUbBytes_(rollback);
+                    if (use_weight_pool) {
+                        releaseWeightBytes_(rollback);
+                    } else {
+                        releaseUbBytes_(rollback);
+                    }
                 }
             }
             if (tag == MemTag::ReadA) {
                 tile_cur_.issued_a_bytes += issued;
-                if (cfg_.onchip_model_enable && !ub_spilled) {
+                if (cfg_.onchip_model_enable && !onchip_spilled) {
                     tile_cur_.reserved_a_bytes += issued;
                 }
             } else if (tag == MemTag::ReadB) {
                 tile_cur_.issued_b_bytes += issued;
-                if (cfg_.onchip_model_enable && !ub_spilled) {
-                    tile_cur_.reserved_b_bytes += issued;
+                if (cfg_.onchip_model_enable && !onchip_spilled) {
+                    if (use_weight_pool) {
+                        tile_cur_.reserved_b_weight_bytes += issued;
+                    } else {
+                        tile_cur_.reserved_b_bytes += issued;
+                    }
                 }
             }
             rem_read_bytes_ = (rem_read_bytes_ >= issued) ? (rem_read_bytes_ - issued) : 0;
@@ -3155,10 +3640,17 @@ bool TensorWorkload::onClockTickTile_(uint64_t now_cycle) {
                 break;
             }
             const uint64_t pending = st.total_bytes - st.issued_bytes;
-            const uint32_t chunk = static_cast<uint32_t>(std::min<uint64_t>(cfg_.mem_req_bytes, pending));
+            uint32_t chunk = static_cast<uint32_t>(std::min<uint64_t>(cfg_.mem_req_bytes, pending));
             if (chunk == 0) break;
             if (chunk > budget) {
                 blocked_budget = true;
+                break;
+            }
+
+            uint32_t hbm_ch = 0;
+            chunk = clampBytesByHbmChannelBudget_(now_cycle, ReqKind::Write, chunk, hbm_ch);
+            if (chunk == 0) {
+                blocked_hbm_channel_budget = true;
                 break;
             }
             if (cfg_.onchip_model_enable && cfg_.acc_bytes > 0) {
@@ -3175,6 +3667,7 @@ bool TensorWorkload::onClockTickTile_(uint64_t now_cycle) {
                 if (inflight_.size() >= max_out) blocked_outstanding = true;
                 break;
             }
+            consumeHbmChannelBudget_(now_cycle, hbm_ch, issued);
             st.issued_bytes += issued;
             rem_write_bytes_ = (rem_write_bytes_ >= issued) ? (rem_write_bytes_ - issued) : 0;
             budget -= issued;
@@ -3203,14 +3696,22 @@ bool TensorWorkload::onClockTickTile_(uint64_t now_cycle) {
                 break;
             }
 
-            const uint32_t chunk = static_cast<uint32_t>(std::min<uint64_t>(cfg_.mem_req_bytes, pending));
+            uint32_t chunk = static_cast<uint32_t>(std::min<uint64_t>(cfg_.mem_req_bytes, pending));
             if (chunk == 0) break;
             if (chunk > budget) {
                 blocked_budget = true;
                 break;
             }
 
-            bool ub_spilled = false;
+            uint32_t hbm_ch = 0;
+            chunk = clampBytesByHbmChannelBudget_(now_cycle, ReqKind::Read, chunk, hbm_ch);
+            if (chunk == 0) {
+                blocked_hbm_channel_budget = true;
+                break;
+            }
+
+            const bool use_weight_pool = (tag == MemTag::ReadB && cfg_.weight_bytes > 0);
+            bool onchip_spilled = false;
             if (cfg_.onchip_model_enable) {
                 if (!acquireOnchipWritePorts_(1, 0)) {
                     blocked_onchip_port = true;
@@ -3220,14 +3721,24 @@ bool TensorWorkload::onClockTickTile_(uint64_t now_cycle) {
                 bool bank_conflict_blocked_local = false;
                 std::vector<std::pair<uint32_t, uint64_t>>* bank_allocs =
                     (cfg_.onchip_bank_model_enable
-                         ? ((tag == MemTag::ReadA) ? &tile_next_.reserved_a_bank_allocs : &tile_next_.reserved_b_bank_allocs)
+                         ? ((tag == MemTag::ReadA) ? &tile_next_.reserved_a_bank_allocs
+                                                   : (use_weight_pool ? &tile_next_.reserved_b_weight_bank_allocs
+                                                                      : &tile_next_.reserved_b_bank_allocs))
                          : nullptr);
-                if (!reserveUbBytes_(chunk,
-                                     spill_budget,
-                                     ub_spilled,
-                                     spill_budget_blocked_local,
-                                     bank_conflict_blocked_local,
-                                     bank_allocs)) {
+                const bool ok = use_weight_pool
+                                    ? reserveWeightBytes_(chunk,
+                                                          spill_budget,
+                                                          onchip_spilled,
+                                                          spill_budget_blocked_local,
+                                                          bank_conflict_blocked_local,
+                                                          bank_allocs)
+                                    : reserveUbBytes_(chunk,
+                                                      spill_budget,
+                                                      onchip_spilled,
+                                                      spill_budget_blocked_local,
+                                                      bank_conflict_blocked_local,
+                                                      bank_allocs);
+                if (!ok) {
                     if (spill_budget_blocked_local) {
                         blocked_spill_budget = true;
                     } else if (bank_conflict_blocked_local) {
@@ -3241,41 +3752,62 @@ bool TensorWorkload::onClockTickTile_(uint64_t now_cycle) {
 
             const uint32_t issued = issueMemReadTagged_(chunk, tag, tile_next_.epoch);
             if (issued == 0) {
-                if (cfg_.onchip_model_enable && !ub_spilled) {
+                if (cfg_.onchip_model_enable && !onchip_spilled) {
                     if (cfg_.onchip_bank_model_enable) {
                         if (tag == MemTag::ReadA) {
                             rollback_ub_alloc(tile_next_.reserved_a_bank_allocs, chunk);
                         } else if (tag == MemTag::ReadB) {
-                            rollback_ub_alloc(tile_next_.reserved_b_bank_allocs, chunk);
+                            if (use_weight_pool) {
+                                rollback_weight_alloc(tile_next_.reserved_b_weight_bank_allocs, chunk);
+                            } else {
+                                rollback_ub_alloc(tile_next_.reserved_b_bank_allocs, chunk);
+                            }
                         }
                     } else {
-                        releaseUbBytes_(chunk);
+                        if (use_weight_pool) {
+                            releaseWeightBytes_(chunk);
+                        } else {
+                            releaseUbBytes_(chunk);
+                        }
                     }
                 }
                 if (inflight_.size() >= max_out) blocked_outstanding = true;
                 break;
             }
-            if (cfg_.onchip_model_enable && !ub_spilled && issued < chunk) {
+            consumeHbmChannelBudget_(now_cycle, hbm_ch, issued);
+            if (cfg_.onchip_model_enable && !onchip_spilled && issued < chunk) {
                 const uint64_t rollback = static_cast<uint64_t>(chunk - issued);
                 if (cfg_.onchip_bank_model_enable) {
                     if (tag == MemTag::ReadA) {
                         rollback_ub_alloc(tile_next_.reserved_a_bank_allocs, rollback);
                     } else if (tag == MemTag::ReadB) {
-                        rollback_ub_alloc(tile_next_.reserved_b_bank_allocs, rollback);
+                        if (use_weight_pool) {
+                            rollback_weight_alloc(tile_next_.reserved_b_weight_bank_allocs, rollback);
+                        } else {
+                            rollback_ub_alloc(tile_next_.reserved_b_bank_allocs, rollback);
+                        }
                     }
                 } else {
-                    releaseUbBytes_(rollback);
+                    if (use_weight_pool) {
+                        releaseWeightBytes_(rollback);
+                    } else {
+                        releaseUbBytes_(rollback);
+                    }
                 }
             }
             if (tag == MemTag::ReadA) {
                 tile_next_.issued_a_bytes += issued;
-                if (cfg_.onchip_model_enable && !ub_spilled) {
+                if (cfg_.onchip_model_enable && !onchip_spilled) {
                     tile_next_.reserved_a_bytes += issued;
                 }
             } else if (tag == MemTag::ReadB) {
                 tile_next_.issued_b_bytes += issued;
-                if (cfg_.onchip_model_enable && !ub_spilled) {
-                    tile_next_.reserved_b_bytes += issued;
+                if (cfg_.onchip_model_enable && !onchip_spilled) {
+                    if (use_weight_pool) {
+                        tile_next_.reserved_b_weight_bytes += issued;
+                    } else {
+                        tile_next_.reserved_b_bytes += issued;
+                    }
                 }
             }
             rem_read_bytes_ = (rem_read_bytes_ >= issued) ? (rem_read_bytes_ - issued) : 0;
@@ -3317,7 +3849,7 @@ bool TensorWorkload::onClockTickTile_(uint64_t now_cycle) {
         }
         if (onchip_compute_ready) {
             const uint32_t ub_ports_needed =
-                std::max<uint32_t>(1u, ((tile_cur_.need_a_bytes > 0) ? 1u : 0u) + ((tile_cur_.need_b_bytes > 0) ? 1u : 0u));
+                std::max<uint32_t>(1u, ((tile_a_bytes_ > 0) ? 1u : 0u) + ((tile_b_bytes_ > 0) ? 1u : 0u));
             if (!acquireOnchipReadPorts_(ub_ports_needed, 1)) {
                 onchip_compute_ready = false;
                 blocked_onchip_port = true;
@@ -3343,9 +3875,12 @@ bool TensorWorkload::onClockTickTile_(uint64_t now_cycle) {
         } else if (tile_cur_.rem_compute_pipeline_cycles > 0) {
             tile_cur_.rem_compute_pipeline_cycles--;
             tensor_compute_pipeline_cycles_total_ += 1;
+        } else if (tile_cur_.rem_compute_wavefront_cycles > 0) {
+            tile_cur_.rem_compute_wavefront_cycles--;
+            tensor_mxu_wavefront_cycles_total_ += 1;
         }
         tile_cur_.rem_compute_cycles =
-            tile_cur_.rem_compute_math_cycles + tile_cur_.rem_compute_pipeline_cycles;
+            tile_cur_.rem_compute_math_cycles + tile_cur_.rem_compute_pipeline_cycles + tile_cur_.rem_compute_wavefront_cycles;
 
         did = true;
         did_compute = true;
@@ -3356,12 +3891,100 @@ bool TensorWorkload::onClockTickTile_(uint64_t now_cycle) {
     // === Tile-seg complete → advance ===
     if (tile_cur_.valid && cur_reads_ready && tile_cur_.rem_compute_cycles == 0) {
         tile_seg_done_ += 1;
+
+        // M15: materialize keep-a/keep-b as real on-chip residency (not just reduced DRAM reads).
+        if (cfg_.onchip_model_enable) {
+            if (cfg_.dataflow == "is" && tile_keep_a_ && tile_cur_.ni == 0) {
+                const uint64_t key = (static_cast<uint64_t>(tile_cur_.mi) << 32) | static_cast<uint64_t>(tile_cur_.ki);
+                if (tile_cur_.reserved_a_bytes > 0 || !tile_cur_.reserved_a_bank_allocs.empty()) {
+                    ResidentTileAlloc& alloc = a_resident_tiles_[key];
+                    alloc.pool = OnchipPoolKind::Ub;
+                    alloc.bytes += tile_cur_.reserved_a_bytes;
+                    for (const auto& p : tile_cur_.reserved_a_bank_allocs) {
+                        alloc.bank_allocs.emplace_back(p);
+                    }
+                    tile_cur_.reserved_a_bytes = 0;
+                    tile_cur_.reserved_a_bank_allocs.clear();
+                    if (static_cast<uint64_t>(a_resident_tiles_.size()) > tensor_onchip_a_resident_tiles_max_) {
+                        tensor_onchip_a_resident_tiles_max_ = static_cast<uint64_t>(a_resident_tiles_.size());
+                    }
+                }
+            }
+            if (cfg_.dataflow == "ws" && tile_keep_b_ && tile_cur_.mi == 0) {
+                const uint64_t key = (static_cast<uint64_t>(tile_cur_.ni) << 32) | static_cast<uint64_t>(tile_cur_.ki);
+                const bool b_is_weight = (cfg_.weight_bytes > 0);
+                const bool has_b_alloc = b_is_weight
+                                            ? (tile_cur_.reserved_b_weight_bytes > 0 || !tile_cur_.reserved_b_weight_bank_allocs.empty())
+                                            : (tile_cur_.reserved_b_bytes > 0 || !tile_cur_.reserved_b_bank_allocs.empty());
+                if (has_b_alloc) {
+                    ResidentTileAlloc& alloc = b_resident_tiles_[key];
+                    alloc.pool = b_is_weight ? OnchipPoolKind::Weight : OnchipPoolKind::Ub;
+                    if (b_is_weight) {
+                        alloc.bytes += tile_cur_.reserved_b_weight_bytes;
+                        for (const auto& p : tile_cur_.reserved_b_weight_bank_allocs) {
+                            alloc.bank_allocs.emplace_back(p);
+                        }
+                        tile_cur_.reserved_b_weight_bytes = 0;
+                        tile_cur_.reserved_b_weight_bank_allocs.clear();
+                    } else {
+                        alloc.bytes += tile_cur_.reserved_b_bytes;
+                        for (const auto& p : tile_cur_.reserved_b_bank_allocs) {
+                            alloc.bank_allocs.emplace_back(p);
+                        }
+                        tile_cur_.reserved_b_bytes = 0;
+                        tile_cur_.reserved_b_bank_allocs.clear();
+                    }
+                    if (static_cast<uint64_t>(b_resident_tiles_.size()) > tensor_onchip_b_resident_tiles_max_) {
+                        tensor_onchip_b_resident_tiles_max_ = static_cast<uint64_t>(b_resident_tiles_.size());
+                    }
+                }
+            }
+        }
+
         if (cfg_.onchip_bank_model_enable) {
             releaseUbBankAllocs_(tile_cur_.reserved_a_bank_allocs);
             releaseUbBankAllocs_(tile_cur_.reserved_b_bank_allocs);
+            releaseWeightBankAllocs_(tile_cur_.reserved_b_weight_bank_allocs);
         } else {
             releaseUbBytes_(tile_cur_.reserved_a_bytes);
             releaseUbBytes_(tile_cur_.reserved_b_bytes);
+            releaseWeightBytes_(tile_cur_.reserved_b_weight_bytes);
+        }
+
+        // Release resident tiles at their last reuse point.
+        if (cfg_.onchip_model_enable) {
+            if (cfg_.dataflow == "is" && tile_keep_a_ && (tile_cur_.ni + 1u == tile_nt_)) {
+                const uint64_t key = (static_cast<uint64_t>(tile_cur_.mi) << 32) | static_cast<uint64_t>(tile_cur_.ki);
+                auto it = a_resident_tiles_.find(key);
+                if (it != a_resident_tiles_.end()) {
+                    if (cfg_.onchip_bank_model_enable) {
+                        releaseUbBankAllocs_(it->second.bank_allocs);
+                    } else {
+                        releaseUbBytes_(it->second.bytes);
+                    }
+                    a_resident_tiles_.erase(it);
+                }
+            }
+            if (cfg_.dataflow == "ws" && tile_keep_b_ && (tile_cur_.mi + 1u == tile_mt_)) {
+                const uint64_t key = (static_cast<uint64_t>(tile_cur_.ni) << 32) | static_cast<uint64_t>(tile_cur_.ki);
+                auto it = b_resident_tiles_.find(key);
+                if (it != b_resident_tiles_.end()) {
+                    if (it->second.pool == OnchipPoolKind::Weight) {
+                        if (cfg_.onchip_bank_model_enable) {
+                            releaseWeightBankAllocs_(it->second.bank_allocs);
+                        } else {
+                            releaseWeightBytes_(it->second.bytes);
+                        }
+                    } else {
+                        if (cfg_.onchip_bank_model_enable) {
+                            releaseUbBankAllocs_(it->second.bank_allocs);
+                        } else {
+                            releaseUbBytes_(it->second.bytes);
+                        }
+                    }
+                    b_resident_tiles_.erase(it);
+                }
+            }
         }
         if (tile_cur_.ki + 1u == tile_kt_) {
             scheduleWriteback_(tile_cur_.mi, tile_cur_.ni);
@@ -3405,12 +4028,20 @@ bool TensorWorkload::onClockTickTile_(uint64_t now_cycle) {
         tile_writeback_queue_.clear();
         tile_writebacks_.clear();
         acc_reserved_tiles_.clear();
+        a_resident_tiles_.clear();
+        b_resident_tiles_.clear();
         onchip_ub_occupancy_bytes_ = 0;
+        onchip_weight_occupancy_bytes_ = 0;
         onchip_acc_occupancy_bytes_ = 0;
         std::fill(onchip_ub_bank_occupancy_bytes_.begin(), onchip_ub_bank_occupancy_bytes_.end(), 0ull);
+        std::fill(onchip_weight_bank_occupancy_bytes_.begin(), onchip_weight_bank_occupancy_bytes_.end(), 0ull);
         std::fill(onchip_acc_bank_occupancy_bytes_.begin(), onchip_acc_bank_occupancy_bytes_.end(), 0ull);
         std::fill(onchip_ub_bank_queue_occupancy_.begin(), onchip_ub_bank_queue_occupancy_.end(), 0u);
+        std::fill(onchip_weight_bank_queue_occupancy_.begin(), onchip_weight_bank_queue_occupancy_.end(), 0u);
         std::fill(onchip_acc_bank_queue_occupancy_.begin(), onchip_acc_bank_queue_occupancy_.end(), 0u);
+        onchip_ub_bank_rr_ = 0;
+        onchip_weight_bank_rr_ = 0;
+        onchip_acc_bank_rr_ = 0;
         if (step_gated_ && close_step_on_iter_done_) {
             step_open_ = false;
         }
@@ -3437,6 +4068,8 @@ bool TensorWorkload::onClockTickTile_(uint64_t now_cycle) {
             tensor_stall_onchip_bank_conflict_cycles_total_ += 1;
         } else if (blocked_onchip_capacity) {
             tensor_stall_onchip_capacity_cycles_total_ += 1;
+        } else if (blocked_hbm_channel_budget && pending_mem_issue) {
+            tensor_stall_dma_hbm_channel_budget_cycles_total_ += 1;
         } else if (blocked_outstanding && pending_mem_issue) {
             tensor_stall_mem_outstanding_cycles_total_ += 1;
         } else if (blocked_budget && pending_mem_issue) {
@@ -3469,11 +4102,39 @@ bool TensorWorkload::onClockTickProgramM7_(uint64_t now_cycle) {
     uint64_t noc_budget = (cfg_.noc_bandwidth_bytes_per_cycle > 0)
                               ? cfg_.noc_bandwidth_bytes_per_cycle
                               : std::numeric_limits<uint64_t>::max();
+    resetOnchipCycleState_(now_cycle);
 
     auto issue_noc = [&]() {
         issueNocTraffic_(now_cycle, noc_budget, did, did_collective, did_comm, noc_budget_blocked);
         if (noc_budget_blocked && !did_collective && !did_comm) {
             tensor_stall_noc_budget_cycles_total_ += 1;
+        }
+    };
+
+    auto program_ub_total_occupancy_bytes = [&]() -> uint64_t {
+        if (!program_addr_aware_enable_) {
+            uint64_t sum = 0;
+            for (const uint64_t v : program_ub_reserved_bytes_by_buf_) {
+                sum = saturatingAddU64_(sum, v);
+            }
+            for (const uint64_t v : program_ub_valid_bytes_by_buf_) {
+                sum = saturatingAddU64_(sum, v);
+            }
+            return sum;
+        }
+        uint64_t sum = 0;
+        for (const auto& mp : program_ub_regions_by_buf_) {
+            for (const auto& kv : mp) {
+                sum = saturatingAddU64_(sum, kv.second.reserved_bytes);
+                sum = saturatingAddU64_(sum, kv.second.valid_bytes);
+            }
+        }
+        return sum;
+    };
+    auto update_program_ub_occupancy_max = [&]() {
+        const uint64_t occ = program_ub_total_occupancy_bytes();
+        if (occ > tensor_program_ub_occupancy_bytes_max_) {
+            tensor_program_ub_occupancy_bytes_max_ = occ;
         }
     };
 
@@ -3513,58 +4174,207 @@ bool TensorWorkload::onClockTickProgramM7_(uint64_t now_cycle) {
         (!cfg_.collective_overlap_with_compute && (program_coll_slot_.active || collectivePendingActive_()));
 
     // === Execute: DMA ===
-    if (program_dma_slot_.active) {
+    if (program_dma_read_slot_.active || program_dma_write_slot_.active) {
         tensor_program_dma_busy_cycles_total_ += 1;
         tensor_dma_cycles_total_ += 1;
 
         const uint64_t kUncapped = std::numeric_limits<uint64_t>::max();
         uint64_t budget = dmaBudgetBytesPerCycle_(now_cycle);
         const bool capped = (budget != kUncapped);
-        while (program_dma_slot_.issued_bytes < program_dma_slot_.total_bytes) {
-            const uint64_t rem = program_dma_slot_.total_bytes - program_dma_slot_.issued_bytes;
-            uint32_t want = static_cast<uint32_t>(std::min<uint64_t>(cfg_.mem_req_bytes, rem));
-            if (want == 0) break;
-            if (capped) {
-                if (budget == 0) {
-                    tensor_stall_dma_budget_cycles_total_ += 1;
-                    tensor_program_mem_stall_cycles_total_ += 1;
-                    break;
-                }
-                want = static_cast<uint32_t>(std::min<uint64_t>(want, budget));
-                if (want == 0) {
-                    tensor_stall_dma_budget_cycles_total_ += 1;
-                    tensor_program_mem_stall_cycles_total_ += 1;
-                    break;
-                }
-            }
-            uint32_t issued = 0;
-            if (program_dma_slot_.is_read) {
-                issued = issueMemReadTagged_(want, MemTag::ProgramDmaRead, program_dma_slot_.epoch);
-            } else {
-                issued = issueMemWriteTagged_(want, MemTag::ProgramDmaWrite, program_dma_slot_.epoch);
-            }
-            if (issued == 0) {
-                tensor_stall_mem_outstanding_cycles_total_ += 1;
+        const bool budget_initially_zero = capped && (budget == 0);
+        const auto max_out = static_cast<size_t>(cfg_.mem_max_outstanding);
+
+        bool program_mem_stall_marked = false;
+        bool budget_stall_marked = false;
+        bool outstanding_stall_marked = false;
+        bool onchip_port_stall_marked = false;
+        bool onchip_bank_stall_marked = false;
+        bool hbm_channel_stall_marked = false;
+        auto mark_program_mem_stall = [&]() {
+            if (!program_mem_stall_marked) {
                 tensor_program_mem_stall_cycles_total_ += 1;
-                break;
+                program_mem_stall_marked = true;
             }
-            program_dma_slot_.issued_bytes += static_cast<uint64_t>(issued);
-            did = true;
-            did_mem = true;
-            if (capped) {
-                budget = (budget >= issued) ? (budget - issued) : 0;
-                if (budget == 0) break;
+        };
+        auto mark_budget_stall = [&]() {
+            if (!budget_stall_marked) {
+                tensor_stall_dma_budget_cycles_total_ += 1;
+                budget_stall_marked = true;
             }
-        }
-        if (program_dma_slot_.done_bytes >= program_dma_slot_.total_bytes) {
-            if (program_dma_slot_.is_read) {
-                const uint64_t total = program_dma_slot_.total_bytes;
-                program_ub_reserved_bytes_ = (program_ub_reserved_bytes_ >= total) ? (program_ub_reserved_bytes_ - total) : 0;
-                program_ub_valid_bytes_ = saturatingAddU64_(program_ub_valid_bytes_, total);
+            mark_program_mem_stall();
+        };
+        auto mark_outstanding_stall = [&]() {
+            if (!outstanding_stall_marked) {
+                tensor_stall_mem_outstanding_cycles_total_ += 1;
+                outstanding_stall_marked = true;
             }
-            program_dma_slot_ = ProgramDmaSlot{};
-            tensor_program_ops_total_ += 1;
-        }
+            mark_program_mem_stall();
+        };
+        auto mark_onchip_port_stall = [&]() {
+            if (!onchip_port_stall_marked) {
+                tensor_stall_onchip_port_cycles_total_ += 1;
+                onchip_port_stall_marked = true;
+            }
+            mark_program_mem_stall();
+        };
+        auto mark_onchip_bank_stall = [&]() {
+            if (!onchip_bank_stall_marked) {
+                tensor_stall_onchip_bank_conflict_cycles_total_ += 1;
+                onchip_bank_stall_marked = true;
+            }
+            mark_program_mem_stall();
+        };
+        auto mark_hbm_channel_stall = [&]() {
+            if (!hbm_channel_stall_marked) {
+                tensor_stall_dma_hbm_channel_budget_cycles_total_ += 1;
+                hbm_channel_stall_marked = true;
+            }
+            mark_program_mem_stall();
+        };
+
+        auto try_mark_ub_bank_access = [&](uint64_t tag_seed) -> bool {
+            if (!cfg_.onchip_model_enable) return true;
+            if (!cfg_.onchip_bank_model_enable) return true;
+            const uint32_t bank = selectUbBank_(tag_seed);
+            if (bank >= onchip_ub_bank_queue_occupancy_.size()) return true;
+
+            if (cfg_.ub_bank_conflict_mode == "queue") {
+                if (onchip_ub_bank_queue_occupancy_[bank] >= cfg_.bank_queue_depth) return false;
+                onchip_ub_bank_queue_occupancy_[bank] += 1;
+                updateBankQueueOccupancyMax_();
+                return true;
+            }
+
+            // hard: only 1 access per bank per cycle
+            if (onchip_ub_bank_queue_occupancy_[bank] > 0) return false;
+            onchip_ub_bank_queue_occupancy_[bank] = 1;
+            updateBankQueueOccupancyMax_();
+            return true;
+        };
+
+        auto service_dma_slot = [&](ProgramDmaSlot& slot, MemTag tag) {
+            if (!slot.active) return;
+            bool slot_issued_this_cycle = false;
+            while (slot.issued_bytes < slot.total_bytes) {
+                const uint64_t rem = slot.total_bytes - slot.issued_bytes;
+                uint32_t want = static_cast<uint32_t>(std::min<uint64_t>(cfg_.mem_req_bytes, rem));
+                if (want == 0) break;
+                if (capped) {
+                    if (budget == 0) {
+                        if (budget_initially_zero) {
+                            mark_budget_stall();
+                        }
+                        break;
+                    }
+                    want = static_cast<uint32_t>(std::min<uint64_t>(want, budget));
+                    if (want == 0) {
+                        if (budget_initially_zero) {
+                            mark_budget_stall();
+                        }
+                        break;
+                    }
+                }
+                if (inflight_.size() >= max_out) {
+                    mark_outstanding_stall();
+                    break;
+                }
+
+                uint32_t hbm_ch = 0;
+                want = clampBytesByHbmChannelBudget_(
+                    now_cycle,
+                    slot.is_read ? ReqKind::Read : ReqKind::Write,
+                    want,
+                    hbm_ch);
+                if (want == 0) {
+                    // Mirror "budget_initially_zero" semantics: only count stall when this slot
+                    // cannot issue any bytes in this cycle due to channel budget contention.
+                    if (!slot_issued_this_cycle) {
+                        mark_hbm_channel_stall();
+                    }
+                    break;
+                }
+
+                // M19: program-mode on-chip UB port + bank conflict modeling.
+                if (cfg_.onchip_model_enable) {
+                    if (slot.is_read) {
+                        // DRAM -> UB: consumes UB write ports.
+                        if (!acquireOnchipWritePorts_(1, 0)) {
+                            mark_onchip_port_stall();
+                            break;
+                        }
+                    } else {
+                        // UB -> DRAM: consumes UB read ports.
+                        if (!acquireOnchipReadPorts_(1, 0)) {
+                            mark_onchip_port_stall();
+                            break;
+                        }
+                    }
+                    const uint64_t addr_seed = (slot.ub_addr_present ? slot.ub_addr : 0ull) + slot.issued_bytes;
+                    const uint64_t tag_seed =
+                        (static_cast<uint64_t>(slot.buf) << 48) ^ addr_seed ^ (static_cast<uint64_t>(slot.epoch) << 1);
+                    if (!try_mark_ub_bank_access(tag_seed)) {
+                        mark_onchip_bank_stall();
+                        break;
+                    }
+                }
+
+                uint32_t issued = 0;
+                if (slot.is_read) {
+                    issued = issueMemReadTagged_(want, tag, slot.epoch);
+                } else {
+                    issued = issueMemWriteTagged_(want, tag, slot.epoch);
+                }
+                if (issued == 0) {
+                    mark_outstanding_stall();
+                    break;
+                }
+
+                slot.issued_bytes += static_cast<uint64_t>(issued);
+                consumeHbmChannelBudget_(now_cycle, hbm_ch, issued);
+                did = true;
+                did_mem = true;
+                slot_issued_this_cycle = true;
+                if (capped) {
+                    budget = (budget >= issued) ? (budget - issued) : 0;
+                    if (budget == 0) break;
+                }
+            }
+
+            if (slot.done_bytes >= slot.total_bytes) {
+                if (slot.is_read) {
+                    const uint64_t total = slot.total_bytes;
+                    const uint32_t buf = slot.buf;
+                    if (!program_addr_aware_enable_) {
+                        if (buf < program_ub_reserved_bytes_by_buf_.size() && buf < program_ub_valid_bytes_by_buf_.size()) {
+                            auto& rsv = program_ub_reserved_bytes_by_buf_[buf];
+                            auto& val = program_ub_valid_bytes_by_buf_[buf];
+                            rsv = (rsv >= total) ? (rsv - total) : 0;
+                            val = saturatingAddU64_(val, total);
+                            update_program_ub_occupancy_max();
+                        }
+                    } else if (buf < program_ub_regions_by_buf_.size() && slot.ub_addr_present) {
+                        auto& mp = program_ub_regions_by_buf_[buf];
+                        auto it = mp.find(slot.ub_addr);
+                        if (it != mp.end()) {
+                            auto& reg = it->second;
+                            reg.reserved_bytes = (reg.reserved_bytes >= total) ? (reg.reserved_bytes - total) : 0;
+                            reg.valid_bytes = saturatingAddU64_(reg.valid_bytes, total);
+                            if (reg.size_bytes > 0 && reg.valid_bytes > reg.size_bytes) {
+                                reg.valid_bytes = reg.size_bytes;
+                            }
+                            update_program_ub_occupancy_max();
+                        }
+                    }
+                }
+
+                slot = ProgramDmaSlot{};
+                tensor_program_ops_total_ += 1;
+            }
+        };
+
+        // Shared DMA budget across read+write slots: issue reads first, then writes.
+        service_dma_slot(program_dma_read_slot_, MemTag::ProgramDmaRead);
+        service_dma_slot(program_dma_write_slot_, MemTag::ProgramDmaWrite);
     }
 
     // === Execute: MXU (compute placeholder) ===
@@ -3583,11 +4393,35 @@ bool TensorWorkload::onClockTickProgramM7_(uint64_t now_cycle) {
         if (program_mxu_slot_.active && program_mxu_slot_.rem_cycles == 0) {
             const uint64_t w = program_mxu_slot_.ub_write_bytes;
             const uint64_t rsv = program_mxu_slot_.ub_write_reserved_bytes;
-            if (rsv > 0) {
-                program_ub_reserved_bytes_ = (program_ub_reserved_bytes_ >= rsv) ? (program_ub_reserved_bytes_ - rsv) : 0;
-            }
-            if (w > 0) {
-                program_ub_valid_bytes_ = saturatingAddU64_(program_ub_valid_bytes_, w);
+            const uint32_t buf = program_mxu_slot_.buf;
+            if (!program_addr_aware_enable_) {
+                if (buf < program_ub_reserved_bytes_by_buf_.size() && buf < program_ub_valid_bytes_by_buf_.size()) {
+                    auto& rsv_bytes = program_ub_reserved_bytes_by_buf_[buf];
+                    auto& val_bytes = program_ub_valid_bytes_by_buf_[buf];
+                    if (rsv > 0) {
+                        rsv_bytes = (rsv_bytes >= rsv) ? (rsv_bytes - rsv) : 0;
+                    }
+                    if (w > 0) {
+                        val_bytes = saturatingAddU64_(val_bytes, w);
+                    }
+                    update_program_ub_occupancy_max();
+                }
+            } else if (buf < program_ub_regions_by_buf_.size() && program_mxu_slot_.ub_write_addr_present) {
+                auto& mp = program_ub_regions_by_buf_[buf];
+                auto it = mp.find(program_mxu_slot_.ub_write_addr);
+                if (it != mp.end()) {
+                    auto& reg = it->second;
+                    if (rsv > 0) {
+                        reg.reserved_bytes = (reg.reserved_bytes >= rsv) ? (reg.reserved_bytes - rsv) : 0;
+                    }
+                    if (w > 0) {
+                        reg.valid_bytes = saturatingAddU64_(reg.valid_bytes, w);
+                        if (reg.size_bytes > 0 && reg.valid_bytes > reg.size_bytes) {
+                            reg.valid_bytes = reg.size_bytes;
+                        }
+                    }
+                    update_program_ub_occupancy_max();
+                }
             }
             program_mxu_slot_ = ProgramMxuSlot{};
             tensor_program_ops_total_ += 1;
@@ -3639,7 +4473,9 @@ bool TensorWorkload::onClockTickProgramM7_(uint64_t now_cycle) {
     // === Fence ===
     if (program_fence_pending_) {
         bool ok = true;
-        if (program_dma_slot_.active || program_mxu_slot_.active || program_vec_slot_.active || program_coll_slot_.active) ok = false;
+        if (program_dma_read_slot_.active || program_dma_write_slot_.active || program_mxu_slot_.active || program_vec_slot_.active ||
+            program_coll_slot_.active)
+            ok = false;
         if (!inflight_.empty()) ok = false;
         if (collectivePendingActive_()) ok = false;
         if (ok) {
@@ -3653,6 +4489,40 @@ bool TensorWorkload::onClockTickProgramM7_(uint64_t now_cycle) {
 
     // === Issue ===
     if (!program_fence_pending_) {
+        const uint32_t ub_bufs = std::max<uint32_t>(cfg_.program_ub_buffers, 1u);
+        const uint64_t ub_part =
+            (program_addr_aware_enable_ && ub_bufs > 0) ? (cfg_.ub_bytes / static_cast<uint64_t>(ub_bufs)) : 0ull;
+        auto clear_valid_in_buf = [&](uint32_t buf) {
+            if (buf >= program_ub_regions_by_buf_.size()) return;
+            auto& mp = program_ub_regions_by_buf_[buf];
+            for (auto& kv : mp) {
+                kv.second.valid_bytes = 0;
+            }
+        };
+        auto get_or_create_region = [&](uint32_t buf, uint64_t addr, uint64_t size_bytes) -> ProgramUbRegion* {
+            if (buf >= program_ub_regions_by_buf_.size()) return nullptr;
+            auto& mp = program_ub_regions_by_buf_[buf];
+            auto it = mp.find(addr);
+            if (it == mp.end()) {
+                auto ins = mp.emplace(addr, ProgramUbRegion{size_bytes, 0ull, 0ull});
+                it = ins.first;
+            } else if (it->second.size_bytes != size_bytes) {
+                if (cfg_.strict && rt_.log) {
+                    rt_.log->fatal(
+                        CALL_INFO,
+                        -1,
+                        "tensor fatal: program addr-aware region size mismatch (core=%u buf=%u ub_addr=%llu expected=%llu got=%llu)\n",
+                        rt_.core_id,
+                        buf,
+                        (unsigned long long)addr,
+                        (unsigned long long)it->second.size_bytes,
+                        (unsigned long long)size_bytes);
+                }
+                return nullptr;
+            }
+            return &it->second;
+        };
+
         uint32_t issued = 0;
         while (issued < cfg_.program_issue_width && program_pc_ < program_ops_.size()) {
             const ProgramOp& op = program_ops_[program_pc_];
@@ -3664,58 +4534,251 @@ bool TensorWorkload::onClockTickProgramM7_(uint64_t now_cycle) {
 
             bool ok = false;
             if (op.kind == ProgramOpKind::DmaRead) {
-                if (program_dma_slot_.active) {
-                    ok = false;
-                } else if (cfg_.ub_bytes > 0 &&
-                           saturatingAddU64_(program_ub_reserved_bytes_, program_ub_valid_bytes_) + op.bytes > cfg_.ub_bytes) {
-                    tensor_program_ub_stall_cycles_total_ += 1;
+                const uint32_t buf = op.buf;
+                const bool any_dma_active = program_dma_read_slot_.active || program_dma_write_slot_.active;
+                if (program_dma_read_slot_.active || (!cfg_.program_dma_dual_enable && any_dma_active)) {
                     ok = false;
                 } else {
-                    program_dma_slot_.active = true;
-                    program_dma_slot_.is_read = true;
-                    program_dma_slot_.epoch = program_dma_epoch_next_++;
-                    program_dma_slot_.total_bytes = op.bytes;
-                    program_dma_slot_.issued_bytes = 0;
-                    program_dma_slot_.done_bytes = 0;
-                    program_ub_reserved_bytes_ = saturatingAddU64_(program_ub_reserved_bytes_, op.bytes);
-                    ok = true;
+                    if (!program_addr_aware_enable_) {
+                        if (buf >= program_ub_reserved_bytes_by_buf_.size() || buf >= program_ub_valid_bytes_by_buf_.size()) {
+                            ok = false;
+                        } else if (cfg_.ub_bytes > 0 &&
+                                   ([&]() -> bool {
+                                       uint64_t occ = program_ub_total_occupancy_bytes();
+                                       if (op.reset) {
+                                           const uint64_t v = program_ub_valid_bytes_by_buf_[buf];
+                                           occ = (occ >= v) ? (occ - v) : 0;
+                                       }
+                                       return saturatingAddU64_(occ, op.bytes) > cfg_.ub_bytes;
+                                   })()) {
+                            tensor_program_ub_stall_cycles_total_ += 1;
+                            ok = false;
+                        } else {
+                            program_dma_read_slot_.active = true;
+                            program_dma_read_slot_.is_read = true;
+                            program_dma_read_slot_.buf = buf;
+                            program_dma_read_slot_.ub_addr_present = op.ub_addr_present;
+                            program_dma_read_slot_.ub_addr = op.ub_addr;
+                            program_dma_read_slot_.epoch = program_dma_epoch_next_++;
+                            program_dma_read_slot_.total_bytes = op.bytes;
+                            program_dma_read_slot_.issued_bytes = 0;
+                            program_dma_read_slot_.done_bytes = 0;
+                            if (op.reset) {
+                                program_ub_valid_bytes_by_buf_[buf] = 0;
+                            }
+                            program_ub_reserved_bytes_by_buf_[buf] =
+                                saturatingAddU64_(program_ub_reserved_bytes_by_buf_[buf], op.bytes);
+                            update_program_ub_occupancy_max();
+                            ok = true;
+                        }
+                    } else {
+                        if (buf >= program_ub_regions_by_buf_.size() || !op.ub_addr_present) {
+                            ok = false;
+                        } else if (ub_part == 0 || op.ub_addr + op.bytes > ub_part) {
+                            if (cfg_.strict && rt_.log) {
+                                rt_.log->fatal(
+                                    CALL_INFO,
+                                    -1,
+                                    "tensor fatal: program dma_read ub_addr range overflow (core=%u buf=%u ub_addr=%llu bytes=%llu ub_part=%llu)\n",
+                                    rt_.core_id,
+                                    buf,
+                                    (unsigned long long)op.ub_addr,
+                                    (unsigned long long)op.bytes,
+                                    (unsigned long long)ub_part);
+                            }
+                            ok = false;
+                        } else {
+                            if (op.reset) {
+                                clear_valid_in_buf(buf);
+                            }
+                            ProgramUbRegion* reg = get_or_create_region(buf, op.ub_addr, op.bytes);
+                            if (!reg) {
+                                ok = false;
+                            } else if (reg->reserved_bytes > 0 || reg->valid_bytes > 0) {
+                                tensor_program_ub_stall_cycles_total_ += 1;
+                                ok = false;
+                            } else {
+                                reg->reserved_bytes = saturatingAddU64_(reg->reserved_bytes, op.bytes);
+                                if (reg->size_bytes > 0 && reg->reserved_bytes > reg->size_bytes) {
+                                    reg->reserved_bytes = reg->size_bytes;
+                                }
+                                update_program_ub_occupancy_max();
+
+                                program_dma_read_slot_.active = true;
+                                program_dma_read_slot_.is_read = true;
+                                program_dma_read_slot_.buf = buf;
+                                program_dma_read_slot_.ub_addr_present = true;
+                                program_dma_read_slot_.ub_addr = op.ub_addr;
+                                program_dma_read_slot_.epoch = program_dma_epoch_next_++;
+                                program_dma_read_slot_.total_bytes = op.bytes;
+                                program_dma_read_slot_.issued_bytes = 0;
+                                program_dma_read_slot_.done_bytes = 0;
+                                ok = true;
+                            }
+                        }
+                    }
                 }
             } else if (op.kind == ProgramOpKind::DmaWrite) {
-                if (program_dma_slot_.active) {
-                    ok = false;
-                } else if (program_ub_valid_bytes_ < op.bytes) {
-                    tensor_program_ub_stall_cycles_total_ += 1;
+                const uint32_t buf = op.buf;
+                const bool any_dma_active = program_dma_read_slot_.active || program_dma_write_slot_.active;
+                if (program_dma_write_slot_.active || (!cfg_.program_dma_dual_enable && any_dma_active)) {
                     ok = false;
                 } else {
-                    program_ub_valid_bytes_ -= op.bytes;
-                    program_dma_slot_.active = true;
-                    program_dma_slot_.is_read = false;
-                    program_dma_slot_.epoch = program_dma_epoch_next_++;
-                    program_dma_slot_.total_bytes = op.bytes;
-                    program_dma_slot_.issued_bytes = 0;
-                    program_dma_slot_.done_bytes = 0;
-                    ok = true;
+                    if (!program_addr_aware_enable_) {
+                        if (buf >= program_ub_valid_bytes_by_buf_.size()) {
+                            ok = false;
+                        } else if (program_ub_valid_bytes_by_buf_[buf] < op.bytes) {
+                            tensor_program_ub_stall_cycles_total_ += 1;
+                            ok = false;
+                        } else {
+                            if (op.consume) {
+                                program_ub_valid_bytes_by_buf_[buf] -= op.bytes;
+                            }
+                            program_dma_write_slot_.active = true;
+                            program_dma_write_slot_.is_read = false;
+                            program_dma_write_slot_.buf = buf;
+                            program_dma_write_slot_.ub_addr_present = op.ub_addr_present;
+                            program_dma_write_slot_.ub_addr = op.ub_addr;
+                            program_dma_write_slot_.epoch = program_dma_epoch_next_++;
+                            program_dma_write_slot_.total_bytes = op.bytes;
+                            program_dma_write_slot_.issued_bytes = 0;
+                            program_dma_write_slot_.done_bytes = 0;
+                            ok = true;
+                        }
+                    } else {
+                        if (buf >= program_ub_regions_by_buf_.size() || !op.ub_addr_present) {
+                            ok = false;
+                        } else if (ub_part == 0 || op.ub_addr + op.bytes > ub_part) {
+                            if (cfg_.strict && rt_.log) {
+                                rt_.log->fatal(
+                                    CALL_INFO,
+                                    -1,
+                                    "tensor fatal: program dma_write ub_addr range overflow (core=%u buf=%u ub_addr=%llu bytes=%llu ub_part=%llu)\n",
+                                    rt_.core_id,
+                                    buf,
+                                    (unsigned long long)op.ub_addr,
+                                    (unsigned long long)op.bytes,
+                                    (unsigned long long)ub_part);
+                            }
+                            ok = false;
+                        } else {
+                            ProgramUbRegion* reg = get_or_create_region(buf, op.ub_addr, op.bytes);
+                            if (!reg) {
+                                ok = false;
+                            } else if (reg->valid_bytes < op.bytes) {
+                                tensor_program_ub_stall_cycles_total_ += 1;
+                                ok = false;
+                            } else {
+                                if (op.consume) {
+                                    reg->valid_bytes -= op.bytes;
+                                }
+                                update_program_ub_occupancy_max();
+
+                                program_dma_write_slot_.active = true;
+                                program_dma_write_slot_.is_read = false;
+                                program_dma_write_slot_.buf = buf;
+                                program_dma_write_slot_.ub_addr_present = true;
+                                program_dma_write_slot_.ub_addr = op.ub_addr;
+                                program_dma_write_slot_.epoch = program_dma_epoch_next_++;
+                                program_dma_write_slot_.total_bytes = op.bytes;
+                                program_dma_write_slot_.issued_bytes = 0;
+                                program_dma_write_slot_.done_bytes = 0;
+                                ok = true;
+                            }
+                        }
+                    }
                 }
             } else if (op.kind == ProgramOpKind::GemmUb) {
+                const uint32_t buf = op.buf;
                 if (program_mxu_slot_.active) {
                     ok = false;
-                } else if (program_ub_valid_bytes_ < op.ub_read_bytes) {
-                    tensor_program_ub_stall_cycles_total_ += 1;
-                    ok = false;
-                } else if (cfg_.ub_bytes > 0 &&
-                           saturatingAddU64_(program_ub_reserved_bytes_, program_ub_valid_bytes_) + op.ub_write_bytes > cfg_.ub_bytes) {
-                    tensor_program_ub_stall_cycles_total_ += 1;
-                    ok = false;
                 } else {
-                    if (op.ub_write_bytes > 0) {
-                        program_ub_reserved_bytes_ = saturatingAddU64_(program_ub_reserved_bytes_, op.ub_write_bytes);
+                    uint64_t cycles = op.cycles;
+                    if (cycles == 0) {
+                        cycles = estimateGemmUbCycles_(op.m, op.n, op.k);
                     }
-                    program_mxu_slot_.active = true;
-                    program_mxu_slot_.rem_cycles = op.cycles;
-                    program_mxu_slot_.ub_read_bytes = op.ub_read_bytes;
-                    program_mxu_slot_.ub_write_bytes = op.ub_write_bytes;
-                    program_mxu_slot_.ub_write_reserved_bytes = op.ub_write_bytes;
-                    ok = true;
+
+                    if (!program_addr_aware_enable_) {
+                        if (buf >= program_ub_reserved_bytes_by_buf_.size() || buf >= program_ub_valid_bytes_by_buf_.size()) {
+                            ok = false;
+                        } else if (program_ub_valid_bytes_by_buf_[buf] < op.ub_read_bytes) {
+                            tensor_program_ub_stall_cycles_total_ += 1;
+                            ok = false;
+                        } else if (cfg_.ub_bytes > 0 &&
+                                   saturatingAddU64_(program_ub_total_occupancy_bytes(), op.ub_write_bytes) > cfg_.ub_bytes) {
+                            tensor_program_ub_stall_cycles_total_ += 1;
+                            ok = false;
+                        } else {
+                            if (op.ub_write_bytes > 0) {
+                                program_ub_reserved_bytes_by_buf_[buf] =
+                                    saturatingAddU64_(program_ub_reserved_bytes_by_buf_[buf], op.ub_write_bytes);
+                                update_program_ub_occupancy_max();
+                            }
+                            program_mxu_slot_.active = true;
+                            program_mxu_slot_.buf = buf;
+                            program_mxu_slot_.ub_write_addr_present = op.ub_write_addr_present;
+                            program_mxu_slot_.ub_write_addr = op.ub_write_addr;
+                            program_mxu_slot_.rem_cycles = cycles;
+                            program_mxu_slot_.ub_read_bytes = op.ub_read_bytes;
+                            program_mxu_slot_.ub_write_bytes = op.ub_write_bytes;
+                            program_mxu_slot_.ub_write_reserved_bytes = op.ub_write_bytes;
+                            ok = true;
+                        }
+                    } else {
+                        if (buf >= program_ub_regions_by_buf_.size() || !op.ub_read_addr_present || !op.ub_write_addr_present) {
+                            ok = false;
+                        } else if (ub_part == 0 ||
+                                   (op.ub_read_bytes > 0 && op.ub_read_addr + op.ub_read_bytes > ub_part) ||
+                                   (op.ub_write_bytes > 0 && op.ub_write_addr + op.ub_write_bytes > ub_part)) {
+                            if (cfg_.strict && rt_.log) {
+                                rt_.log->fatal(
+                                    CALL_INFO,
+                                    -1,
+                                    "tensor fatal: program gemm_ub ub_addr range overflow (core=%u buf=%u ub_part=%llu)\n",
+                                    rt_.core_id,
+                                    buf,
+                                    (unsigned long long)ub_part);
+                            }
+                            ok = false;
+                        } else {
+                            ok = true;
+                            if (op.ub_read_bytes > 0) {
+                                ProgramUbRegion* in = get_or_create_region(buf, op.ub_read_addr, op.ub_read_bytes);
+                                if (!in) {
+                                    ok = false;
+                                } else if (in->valid_bytes < op.ub_read_bytes) {
+                                    tensor_program_ub_stall_cycles_total_ += 1;
+                                    ok = false;
+                                }
+                            }
+                            if (ok && op.ub_write_bytes > 0) {
+                                ProgramUbRegion* out = get_or_create_region(buf, op.ub_write_addr, op.ub_write_bytes);
+                                if (!out) {
+                                    ok = false;
+                                } else if (out->reserved_bytes > 0 || out->valid_bytes > 0) {
+                                    tensor_program_ub_stall_cycles_total_ += 1;
+                                    ok = false;
+                                } else {
+                                    out->reserved_bytes = saturatingAddU64_(out->reserved_bytes, op.ub_write_bytes);
+                                    if (out->size_bytes > 0 && out->reserved_bytes > out->size_bytes) {
+                                        out->reserved_bytes = out->size_bytes;
+                                    }
+                                    update_program_ub_occupancy_max();
+                                }
+                            }
+                            if (ok) {
+                                program_mxu_slot_.active = true;
+                                program_mxu_slot_.buf = buf;
+                                program_mxu_slot_.ub_write_addr_present = op.ub_write_addr_present;
+                                program_mxu_slot_.ub_write_addr = op.ub_write_addr;
+                                program_mxu_slot_.rem_cycles = cycles;
+                                program_mxu_slot_.ub_read_bytes = op.ub_read_bytes;
+                                program_mxu_slot_.ub_write_bytes = op.ub_write_bytes;
+                                program_mxu_slot_.ub_write_reserved_bytes = op.ub_write_bytes;
+                                ok = true;
+                            }
+                        }
+                    }
                 }
             } else if (op.kind == ProgramOpKind::Softmax) {
                 if (program_vec_slot_.active) {
@@ -3761,7 +4824,8 @@ bool TensorWorkload::onClockTickProgramM7_(uint64_t now_cycle) {
     // === Iteration completion ===
     if (program_pc_ >= program_ops_.size() &&
         !program_fence_pending_ &&
-        !program_dma_slot_.active &&
+        !program_dma_read_slot_.active &&
+        !program_dma_write_slot_.active &&
         !program_mxu_slot_.active &&
         !program_vec_slot_.active &&
         !program_coll_slot_.active &&
@@ -4196,11 +5260,13 @@ void TensorWorkload::getStatistics(std::map<std::string, uint64_t>& stats) const
     stats["tensor_compute_cycles_total"] = tensor_compute_cycles_total_;
     stats["tensor_compute_math_cycles_total"] = tensor_compute_math_cycles_total_;
     stats["tensor_compute_pipeline_cycles_total"] = tensor_compute_pipeline_cycles_total_;
+    stats["tensor_mxu_wavefront_cycles_total"] = tensor_mxu_wavefront_cycles_total_;
     stats["tensor_compute_precision_profile_id"] = tensor_compute_precision_profile_id_;
     stats["tensor_mac_ops_total"] = tensor_mac_ops_total_;
     stats["tensor_dma_stall_cycles_total"] = tensor_dma_stall_cycles_total_;
     stats["tensor_iter_cycles_total"] = tensor_iter_cycles_total_;
     stats["tensor_stall_dma_budget_cycles_total"] = tensor_stall_dma_budget_cycles_total_;
+    stats["tensor_stall_dma_hbm_channel_budget_cycles_total"] = tensor_stall_dma_hbm_channel_budget_cycles_total_;
     stats["tensor_stall_mem_outstanding_cycles_total"] = tensor_stall_mem_outstanding_cycles_total_;
     stats["tensor_stall_wait_read_cycles_total"] = tensor_stall_wait_read_cycles_total_;
     stats["tensor_stall_wait_write_cycles_total"] = tensor_stall_wait_write_cycles_total_;
@@ -4212,6 +5278,12 @@ void TensorWorkload::getStatistics(std::map<std::string, uint64_t>& stats) const
     stats["tensor_dma_cycles_total"] = tensor_dma_cycles_total_;
     stats["tensor_dram_bytes_total"] = tensor_dram_bytes_total_;
     stats["tensor_onchip_bytes_total"] = tensor_onchip_bytes_total_;
+    stats["tensor_cfg_ub_bytes"] = cfg_.ub_bytes;
+    stats["tensor_cfg_weight_bytes"] = cfg_.weight_bytes;
+    stats["tensor_onchip_weight_occupancy_bytes_max"] = tensor_onchip_weight_occupancy_bytes_max_;
+    stats["tensor_onchip_weight_bank_occupancy_bytes_max"] = tensor_onchip_weight_bank_occupancy_bytes_max_;
+    stats["tensor_onchip_a_resident_tiles_max"] = tensor_onchip_a_resident_tiles_max_;
+    stats["tensor_onchip_b_resident_tiles_max"] = tensor_onchip_b_resident_tiles_max_;
     stats["tensor_tile_count_total"] = tensor_tile_count_total_;
     stats["tensor_spill_bytes_total"] = tensor_spill_bytes_total_;
     stats["tensor_spill_pkts_total"] = tensor_spill_pkts_total_;
@@ -4270,6 +5342,7 @@ void TensorWorkload::getStatistics(std::map<std::string, uint64_t>& stats) const
     stats["tensor_program_fence_wait_cycles_total"] = tensor_program_fence_wait_cycles_total_;
     stats["tensor_program_ub_stall_cycles_total"] = tensor_program_ub_stall_cycles_total_;
     stats["tensor_program_mem_stall_cycles_total"] = tensor_program_mem_stall_cycles_total_;
+    stats["tensor_program_ub_occupancy_bytes_max"] = tensor_program_ub_occupancy_bytes_max_;
 }
 
 }} // namespace SST::SnnDL
