@@ -46,6 +46,7 @@ struct SnnPESubComponentConfig {
     float init_default_weight = 0.5f;
     bool readresp_zero_fallback = false;
     uint32_t max_outstanding_requests = 16;
+    std::string synapse_weight_mode = "bcsr_gas"; // bcsr_gas | gcss_valueonly_dstcore | gcss_valueonly_dstcore_idx2 | gcss_valueonly_dstcore_vlf_premphf | gcss_valueonly_dstcore_vlf_premphf_plp
 
     // Weight cache
     uint32_t max_cache_entries = 65536;
@@ -117,6 +118,11 @@ struct SnnPESubComponentConfig {
     uint64_t bcsr_colidx_offset = 0;
     uint64_t bcsr_blockdata_offset = 0;
     uint64_t bcsr_blockids_offset = 0;
+    std::string bcsr_layout_mode = "flat"; // flat|rowpack_v1
+    uint32_t bcsr_colidx_row_stride_bytes = 0;
+    uint32_t bcsr_blockdata_row_stride_bytes = 0;
+    uint32_t bcsr_blockids_row_stride_bytes = 0;
+    std::string bcsr_block_fetch_mode = "full_block"; // full_block|row_cacheline
     uint64_t per_core_stride = 0;
     uint32_t bcsr_row_index_cache_cap = 64;
     uint32_t bcsr_block_cache_cap = 256;
@@ -143,6 +149,7 @@ struct SnnPESubComponentConfig {
 
     // Misc cached paths
     std::string weights_template;
+    std::string gcss_index_template;
     uint32_t neurons_per_pe = 0;
     std::string weights_file;
 
@@ -182,6 +189,25 @@ inline SnnPESubComponentConfig parseSnnPESubComponentConfig(const SST::Params& p
     c.init_default_weight = params.find<float>("init_default_weight", 0.5f);
     c.readresp_zero_fallback = params.find<int>("readresp_zero_fallback", 0) != 0;
     c.max_outstanding_requests = params.find<uint32_t>("max_outstanding_requests", 16);
+    {
+        std::string mode = params.find<std::string>("synapse_weight_mode", "bcsr_gas");
+        for (char& ch : mode) {
+            if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+        }
+        if (mode == "gscc_valueonly_dstcore") mode = "gcss_valueonly_dstcore";
+        if (mode == "gscc_valueonly_dstcore_vlf_premphf") mode = "gcss_valueonly_dstcore_vlf_premphf";
+        if (mode == "gscc_valueonly_dstcore_vlf_premphf_plp") mode = "gcss_valueonly_dstcore_vlf_premphf_plp";
+        if (mode != "bcsr_gas" &&
+            mode != "gcss_valueonly_dstcore" &&
+            mode != "gcss_valueonly_dstcore_idx2" &&
+            mode != "gcss_idx2_rowmphf" &&
+            mode != "gcss_valueonly_dstcore_vlf_premphf" &&
+            mode != "gcss_valueonly_dstcore_vlf_premphf_plp" &&
+            mode != "gcss_valueonly_dstblock_naive_tass") {
+            mode = "bcsr_gas";
+        }
+        c.synapse_weight_mode = mode;
+    }
 
     c.max_cache_entries = params.find<uint32_t>("max_cache_entries", 65536);
     c.use_clock_weight_cache = params.find<int>("use_clock_weight_cache", 0) != 0;
@@ -239,6 +265,11 @@ inline SnnPESubComponentConfig parseSnnPESubComponentConfig(const SST::Params& p
     c.bcsr_colidx_offset = params.find<uint64_t>("bcsr_colidx_offset", 0);
     c.bcsr_blockdata_offset = params.find<uint64_t>("bcsr_blockdata_offset", 0);
     c.bcsr_blockids_offset = params.find<uint64_t>("bcsr_blockids_offset", 0);
+    c.bcsr_layout_mode = params.find<std::string>("bcsr_layout_mode", "flat");
+    c.bcsr_colidx_row_stride_bytes = params.find<uint32_t>("bcsr_colidx_row_stride_bytes", 0);
+    c.bcsr_blockdata_row_stride_bytes = params.find<uint32_t>("bcsr_blockdata_row_stride_bytes", 0);
+    c.bcsr_blockids_row_stride_bytes = params.find<uint32_t>("bcsr_blockids_row_stride_bytes", 0);
+    c.bcsr_block_fetch_mode = params.find<std::string>("bcsr_block_fetch_mode", "full_block");
     c.per_core_stride = params.find<uint64_t>("per_core_stride", 0);
 
     c.bcsr_row_index_cache_cap = params.find<uint32_t>("bcsr_row_index_cache_cap", 64);
@@ -269,6 +300,7 @@ inline SnnPESubComponentConfig parseSnnPESubComponentConfig(const SST::Params& p
         c.apply_dense_acc_enable && (params.find<int>("acc_shadow_verify_enable", 0) != 0);
 
     c.weights_template = params.find<std::string>("weights_template", "");
+    c.gcss_index_template = params.find<std::string>("gcss_index_template", "");
     c.neurons_per_pe = params.find<uint32_t>("neurons_per_pe", 0);
     c.weights_file = params.find<std::string>("weights_file", "");
 

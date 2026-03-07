@@ -30,6 +30,7 @@ libSnnDL_la_SOURCES = \
 	api/IGasStageSink.h \
 	api/IGasStepGate.h \
 	api/IGlobalStepHooks.h \
+	api/ITassLfP0Hooks.h \
 	api/ICoreMemoryLink.h \
 	api/IMemoryAccess.h \
 	api/ICoreWorkload.h \
@@ -59,8 +60,6 @@ libSnnDL_la_SOURCES = \
 	components/gather/GatherBufferIFConfig.h \
 	components/gather/apply/DramAwareModel.cc \
 	components/gather/apply/DramAwareModel.h \
-	components/gather/apply/DramAwareTuner.cc \
-	components/gather/apply/DramAwareTuner.h \
 	components/GatingPE.cc \
 	components/GatingPE.h \
 	components/MemKCalBench.cc \
@@ -162,6 +161,9 @@ libSnnDL_la_SOURCES = \
 	services/workload/traffic/TrafficWorkload.h \
 	services/workload/tensor/TensorWorkload.cc \
 	services/workload/tensor/TensorWorkload.h \
+	services/memory/sram_sim/layout/VirtualSramLayout.h \
+	services/memory/sram_sim/model/BankedSramModel.cc \
+	services/memory/sram_sim/model/BankedSramModel.h \
 	services/memory/StandardMemAccess.cc \
 	services/memory/StandardMemAccess.h
 

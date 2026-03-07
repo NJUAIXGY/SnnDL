@@ -143,6 +143,51 @@ SnnDL 的默认内存建模语义与 `memHierarchy` 保持一致：**以 cacheli
   - 其中 `memory_bytes` 为对 core 侧统计 `mem_req_size_bytes` 的汇总派生指标；
 - 若切换到 row-streaming/DMA 假设，必须显式标注并单列结果（不得与 cacheline 模式混算）。
 
+### GAS Apply 发射策略（DRAM-aware，可选）
+
+`components/GatherBufferIF` 在 Apply 阶段会把“已构建的 granule 列表”向下游发起读请求。默认策略 `apply_issue_policy=order` 保持确定性与可回归；当需要研究
+DRAM 行局部性/BLP（bank-level parallelism）时，可显式开启 DRAM-aware 发射策略（探索性优化，默认关闭）：
+
+- `bank_rr_row_sticky_age`：按 bank 轮转发射；同 bank 内尽量保持 row stickiness，并以 `apply_age_fair_ns` 做老化公平，避免饥饿。
+- `dram_aware_v1`：更激进的探索策略（带 cost/overfetch 约束），仅建议在 microbench/sweep 中使用。
+- `cmd_aware_v1`：实验性命令感知策略（shadow command model）；根据 bank busy 与预测 row-hit/row-miss 代价选择发射顺序。默认关闭，仅用于实验分支。
+
+重要：上述策略依赖 `bank_bits/bank_shift/row_bytes_guess` 对地址做 bank×row 分桶/排序；若这些参数与后端 DRAM 地址映射不对齐，可能出现明显退化（因为调度器在
+“伪 bank/伪 row”上做优化）。使用 Ramulator2（`AddrMapper=ChRaBaRoCo`）时建议显式校准并固定参数：
+
+| backend（Ramulator2 preset） | 推荐 env（mesh_template） |
+| --- | --- |
+| DDR5（`DDR5_8Gb_x8`，见 `sst_dram_si/configs/ramulator2_ddr5.cfg`） | `MESH_GAS_ROW_BYTES_GUESS=4096` `MESH_GAS_BANK_BITS=4` `MESH_GAS_BANK_SHIFT=28` |
+| HBM2（`HBM2_4Gb`，见 `sst_dram_si/configs/ramulator2_hbm2.cfg`） | `MESH_GAS_ROW_BYTES_GUESS=512` `MESH_GAS_BANK_BITS=5` `MESH_GAS_BANK_SHIFT=23` |
+
+配套建议（避免“策略被节流成串行”）：
+- `MESH_GAS_SORT_POLICY="bank_row"`（让排序键与调度策略一致）
+- `MESH_GAS_APPLY_BANK_CREDIT="0"`（禁用 per-bank credit 限制；否则 bank_rr 可能无法并行）
+
+`cmd_aware_v1` 的实验参数（仅在 `MESH_EXPERIMENTAL_ENABLE=1` + `MESH_GAS_APPLY_ISSUE_POLICY=cmd_aware_v1` 时生效）：
+- `MESH_GAS_APPLY_CMD_PROBE_DEPTH`
+- `MESH_GAS_APPLY_CMD_T_ROW_HIT_NS`
+- `MESH_GAS_APPLY_CMD_T_ROW_MISS_NS`
+- `MESH_GAS_APPLY_CMD_MISS_PENALTY_NS`
+- `MESH_GAS_APPLY_CMD_ENABLE_ROW_LOCALITY`
+- `MESH_GAS_APPLY_CMD_ENABLE_BANK_BUSY`
+
+#### GAS 段构建：DRAM 命令代价护栏（实验，默认关闭）
+
+在 `components/GatherBufferIF` 的段构建阶段（`buildGranulesWithGapMergeBuf_()`），可启用一个 **deterministic** 的“DRAM 命令代价”护栏，用于抑制吸洞/粗合并造成的病态 over-fetch：
+
+- 作用范围：仅影响 **段构建决策**（是否吸洞、row-window 粗合并是否允许吸洞）；**不跨 DRAM row**（仍按 bank×row 分桶，row 由 `row_bytes_guess`/`dram_row_bytes` 定义）。
+- 代价模型：把“吸洞的额外 cacheline row-hit 代价”与“避免一次 row-miss 的收益”做比较；由 `{t_row_hit_ns,t_row_miss_ns,line_bytes}` 计算可接受 gap（k）并用于 veto。
+- 开关（仅在 `MESH_EXPERIMENTAL_ENABLE=1` 时允许脚本层覆盖）：
+  - `MESH_GAS_DRAM_CMD_COST_MERGE_ENABLE=1`
+  - `MESH_GAS_DRAM_CMD_T_ROW_HIT_NS`（默认 30）
+  - `MESH_GAS_DRAM_CMD_T_ROW_MISS_NS`（默认 120）
+
+复现脚本（dense microbench，快速验证映射/策略是否合理）：
+- `sst_dram_si/tools/run_dense_microbench_4x4_npc_sweep_apply_policy_matrix.sh`
+
+更多背景与校准说明见：`components/gather/README.md` 与 `docs/plans/2026-02-14-gas-ab-weights-phys-layout-v1.md`。
+
 ---
 
 ## Native Multicast（SpikeKey / blocked multicast）

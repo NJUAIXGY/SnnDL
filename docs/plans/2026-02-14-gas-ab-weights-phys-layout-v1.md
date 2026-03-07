@@ -227,3 +227,117 @@ python3 "tools/validate_essential_summary_mesh.py" --run-dir "$RUN_DIR"
   - `byte_exact_dense_layout_mode=phys_v1`
   - `byte_exact_dense_phys_dram_row_bytes=<与生成器一致，例如 8192>`
   - dense microbench 入口（`sst_dram_si/microbench_dense/entry.py`）在 `dense_layout_mode=phys_v1` 时会自动注入该 override；其它装配入口若需要启用 gatherbuf 的 dense byte-exact，请显式注入上述参数。
+
+---
+
+## 2026-02-17 更新：BCSR A/B 严格隔离矩阵（4x4, GAS, step=1）
+
+### 目的
+
+把 BCSR 路径中的 A/B 改动做成可复现、可审计的四格隔离实验：
+
+- baseline：`flat + full_block`
+- A：`flat + row_cacheline`
+- B：`rowpack_v1 + full_block`
+- AB：`rowpack_v1 + row_cacheline`
+
+### 统一口径
+
+- `MESH_EXEC_MODE=gas`
+- `MESH_MAX_STEPS=1`
+- `MESH_STEP_ACTIVATION_FRACTION=0.01`
+- `MESH_STEP_ACTIVATION_SEED=314159`
+- `MESH_L1_ENABLE=0`
+- `MESH_SST_NPROC=32`
+- 其余配置保持一致（同一 `local_run_config.json` 哈希）
+
+### 运行脚本（新增）
+
+```bash
+cd "sst_dram_si"
+./tools/run_mesh_bcsr_ab_isolation_matrix.sh
+```
+
+脚本会写入：
+- `outputs_large/paper2/dram_mesh_4x4_ab_isolation_baseline/*`
+- `outputs_large/paper2/dram_mesh_4x4_ab_isolation_A_row_cacheline/*`
+- `outputs_large/paper2/dram_mesh_4x4_ab_isolation_B_rowpack_v2/*`
+- `outputs_large/paper2/dram_mesh_4x4_ab_isolation_AB_rowpack_rowcacheline/*`
+
+并在 stdout 打印最新四组汇总。
+
+### 结果（最新一轮）
+
+| variant | run_dir | memory.memory_bytes | memctrl.bytes_est_total | gas.apply_ns_avg | model.sim_time_actual_ns | spikes_injected_total |
+|---|---|---:|---:|---:|---:|---:|
+| baseline | `sst_dram_si/outputs_large/paper2/dram_mesh_4x4_ab_isolation_baseline/20260217-022746` | 86492246 | 91542976 | 87919.3125 | 540471 | 402176 |
+| A | `sst_dram_si/outputs_large/paper2/dram_mesh_4x4_ab_isolation_A_row_cacheline/20260217-023114` | 86492246 | 91542976 | 87919.3125 | 540471 | 402176 |
+| B | `sst_dram_si/outputs_large/paper2/dram_mesh_4x4_ab_isolation_B_rowpack_v2/20260217-023451` | 9144058 | 25998464 | 24832.0625 | 82414 | 402176 |
+| AB | `sst_dram_si/outputs_large/paper2/dram_mesh_4x4_ab_isolation_AB_rowpack_rowcacheline/20260217-023604` | 9144058 | 25998464 | 24832.0625 | 82414 | 402176 |
+
+### 结论（这一组口径下）
+
+- `A == baseline`：该数据集 `br=1`，`full_block` 与 `row_cacheline` 等价，A 单独不产生可见差异。
+- `B == AB`：主收益来自 B（rowpack 布局）；A 在该数据集上不叠加额外收益。
+- 相对 baseline，B/AB：
+  - `memory_bytes` 下降约 `89.43%`
+  - `memctrl.bytes_est_total` 下降约 `71.60%`
+  - `apply_ns_avg` 下降约 `71.76%`
+  - `sim_time_actual_ns` 下降约 `84.75%`
+
+### 审计性增强（本次补丁）
+
+- `meta.json.environment` 新增：
+  - `MESH_BCSR_BLOCK_FETCH_MODE`
+  - `MESH_BCSR_LAYOUT_MODE`
+
+因此四组 run 的关键隔离开关可以直接从 `meta.json` 读取，不再依赖外部命令历史推断。
+
+---
+
+## 2026-02-17 更新：`br=2` 复现实验（验证 A 在 `br>1` 下的独立收益）
+
+### 生成数据集
+
+```bash
+python3 "sst_dram_si/tools/gen_bcsr_global_mesh.py" \
+  --num-pes 16 --neurons-per-pe 10000 --cores-per-pe 20 --rows-per-core 500 \
+  --fanout 256 --local-ratio 0.85 --br 2 --bc 16 --idx-bytes 4 --val-bytes 4 \
+  --weights-cols 160000 --weight-value 1.0 --seed 271828 --mode outgoing \
+  --layout flat \
+  --out-dir "sst_dram_si/weights/bcsr_global_16pe_fanout256_10k_br2"
+
+python3 "sst_dram_si/tools/gen_bcsr_global_mesh.py" \
+  --num-pes 16 --neurons-per-pe 10000 --cores-per-pe 20 --rows-per-core 500 \
+  --fanout 256 --local-ratio 0.85 --br 2 --bc 16 --idx-bytes 4 --val-bytes 4 \
+  --weights-cols 160000 --weight-value 1.0 --seed 271828 --mode outgoing \
+  --layout rowpack_v1 \
+  --out-dir "sst_dram_si/weights/bcsr_global_16pe_fanout256_10k_br2_rowpack_v1"
+```
+
+### 运行矩阵
+
+```bash
+cd "sst_dram_si"
+MESH_BCSR_DIR_FLAT="/home/xgy/remote/sst_dram_si/weights/bcsr_global_16pe_fanout256_10k_br2" \
+MESH_BCSR_DIR_ROWPACK="/home/xgy/remote/sst_dram_si/weights/bcsr_global_16pe_fanout256_10k_br2_rowpack_v1" \
+MESH_SWEEP_REPEATS=1 MESH_MAX_STEPS=1 MESH_STEP_ACTIVATION_FRACTION=0.01 \
+MESH_STEP_ACTIVATION_SEED=314159 MESH_L1_ENABLE=0 MESH_SST_NPROC=32 \
+./tools/run_mesh_bcsr_ab_isolation_matrix.sh
+```
+
+### 结果（最新一轮）
+
+| variant | run_dir | memory.memory_bytes | memctrl.bytes_est_total | model.sim_time_actual_ns |
+|---|---|---:|---:|---:|
+| baseline | `sst_dram_si/outputs_large/paper2/dram_mesh_4x4_ab_isolation_baseline/20260217-112206` | 288510384 | 139518016 | 584890 |
+| A | `sst_dram_si/outputs_large/paper2/dram_mesh_4x4_ab_isolation_A_row_cacheline/20260217-112550` | 279640796 | 139581824 | 582397 |
+| B | `sst_dram_si/outputs_large/paper2/dram_mesh_4x4_ab_isolation_B_rowpack_v2/20260217-112941` | 23886972 | 28848576 | 68159 |
+| AB | `sst_dram_si/outputs_large/paper2/dram_mesh_4x4_ab_isolation_AB_rowpack_rowcacheline/20260217-113110` | 23426876 | 28425536 | 67853 |
+
+### 结论
+
+- 与 `br=1` 不同，`br=2` 下 **A 不再是 0 收益**：
+  - 相对 baseline：`memory_bytes -3.07%`，`sim_time -0.43%`。
+- AB 相对 B 继续有小幅下降：
+  - `memory_bytes -1.93%`，`memctrl -1.47%`，`sim_time -0.45%`。

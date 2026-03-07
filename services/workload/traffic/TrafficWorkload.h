@@ -59,6 +59,15 @@ private:
     uint32_t traffic_pre_end_ = 0;
     uint64_t traffic_stop_cycle_ = 0; // 0=never stop (until sim ends)
 
+    // Experimental: sender-side SpikeTileKey aggregation knobs (forwarded to SpikeCommSubsystem).
+    bool experimental_spiketile_enable_ = false;
+    uint32_t experimental_spiketile_max_pre_bits_ = 64;
+    uint32_t experimental_spiketile_block_cols_ = 0;
+    bool experimental_compact_mask_enable_ = false;
+    bool experimental_inter_bundle_enable_ = false;
+    uint32_t experimental_inter_bundle_max_entries_ = 64;
+    bool experimental_inter_bundle_v2_enable_ = false;
+
     bool spikekey_check_enable_ = true;
     bool spikekey_check_fatal_ = false;
     uint32_t spikekey_check_log_cap_ = 8;
@@ -71,7 +80,11 @@ private:
     uint64_t tx_batches_ = 0;
     uint64_t tx_pres_total_ = 0;
     uint64_t rx_spike_total_ = 0;
+    // Key-like packets delivered to this core (SpikeKey + SpikeTileKey).
     uint64_t rx_spikekey_total_ = 0;
+    // Subset counter for SpikeTileKey.
+    uint64_t rx_spiketilekey_total_ = 0;
+    uint64_t rx_spiketilekey_bad_decode_ = 0;
     uint64_t rx_spike_hops_sum_ = 0;
     uint64_t rx_spike_hops_max_ = 0;
     uint64_t rx_spikekey_hops_sum_ = 0;

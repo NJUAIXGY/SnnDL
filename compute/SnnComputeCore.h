@@ -20,6 +20,8 @@
 #include "SnnLearningCore.h"
 #include "IWeightAwareComputeCore.h"
 #include "ISnnComputeCore.h"
+#include "services/memory/sram_sim/layout/VirtualSramLayout.h"
+#include "services/memory/sram_sim/model/BankedSramModel.h"
 
 namespace SST { namespace SnnDL {
 
@@ -86,6 +88,10 @@ private:
     bool use_soa_state_ = false;
     bool use_aosoa_state_ = false;
     uint32_t aosoa_block_rows_ = 16;
+    bool state_sram_enable_ = false;
+    uint64_t state_sram_current_cycle_ = 0;
+    VirtualSramLayout state_sram_layout_{};
+    BankedSramModel state_sram_model_{};
 
     // 阈值/电生理参数
     float v_thresh_ = 1.0f;

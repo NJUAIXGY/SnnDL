@@ -8,13 +8,16 @@
 #pragma once
 
 #include <algorithm>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <cinttypes>
+#include <cmath>
 #include <cstdlib>
 #include <functional>
 #include <deque>
 #include <memory>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -22,10 +25,16 @@
 #include <vector>
 
 #include "synapse/gas/GasEdgeCollector.h"
+#include "synapse/weights/GcssIndexTable.h"
+#include "synapse/weights/GcssIndexRowMphf.h"
+#include "synapse/weights/GcssIndexPreMphf.h"
 #include "SnnWeightReader.h"
 #include "IMemoryAccess.h"
 #include "WeightAccessor.h"
 #include "DenseWeightLayout.h"
+#include "services/memory/sram_sim/layout/VirtualSramLayout.h"
+#include "services/memory/sram_sim/model/BankedSramModel.h"
+#include "IPeAggregation.h"
 
 namespace SST { class Output; }
 
@@ -49,6 +58,8 @@ public:
     using MemLatencyFn = std::function<void(uint64_t,bool)>;
     using VoidFn = std::function<void()>;
     using EnsureRowptrFn = std::function<void(const char*)>;
+    using SubmitTassLfP0WindowReportFn = std::function<void(const TassLfP0WindowReport&)>;
+    using SubmitTassNaiveWindowRequestFn = std::function<void(const TassNaiveWindowRequest&)>;
 
     struct WindowCounters {
         uint32_t budget = 0;
@@ -83,10 +94,33 @@ public:
         // PhaseX: naive baseline needs a way to disable in-flight coalescing without disabling BCSR format.
         bool bcsr_colidx_inflight_coalesce_enable = true;
         bool bcsr_block_inflight_coalesce_enable = true;
+        // BCSR blockdata fetch granularity:
+        // - full_block: read full br*bc block bytes (legacy behavior)
+        // - row_cacheline: read only one block-row slice (intra_row), typically bc*val_bytes
+        std::string bcsr_block_fetch_mode = "full_block"; // full_block|row_cacheline
         // RowIndex(colidx) 冷启动/热路径优化：默认启用 "auto"（当 colidx 总量很小才用 all_rows；否则用 posts_prev）。
         std::string bcsr_row_index_prefetch_mode = "auto"; // off/all_rows/posts_prev/auto
         uint32_t bcsr_row_index_prefetch_all_rows_threshold = 1024;
         uint64_t bcsr_row_index_prefetch_all_rows_max_bytes = 64ull * 1024ull;
+        // Experimental NoC×memory coupling (STORM-PIF): prefetch BCSR row-index (colidx)
+        // rows from Gather-stage touch signals before Apply critical path.
+        bool experimental_noc_rowidx_prefetch_enable = false;
+        uint32_t experimental_noc_rowidx_prefetch_budget_per_tick = 4;
+        uint32_t experimental_noc_rowidx_cache_rows = 1024;
+        bool experimental_noc_rowidx_prefetch_gather_only = true;
+        // STORM-PIF v8: only enqueue block_row prefetch after it is touched N times in-window.
+        uint32_t experimental_noc_rowidx_hot_touch_min = 1;
+        // STORM-PIF v8: adapt prefetch budget by queue depth / inflight headroom.
+        bool experimental_noc_rowidx_budget_adapt_enable = false;
+        uint32_t experimental_noc_rowidx_budget_adapt_max_per_tick = 32;
+        uint32_t experimental_noc_rowidx_budget_adapt_q_depth = 16;
+        // Experimental NoC×memory coupling (STORM-NIP p0):
+        // prefetch GCSSIDX2 values as soon as ingress touches are observed in Gather.
+        bool experimental_idx2_ingress_prefetch_enable = false;
+        uint32_t experimental_idx2_ingress_prefetch_budget_per_tick = 4;
+        uint32_t experimental_idx2_ingress_prefetch_cache_entries = 4096;
+        bool experimental_idx2_ingress_prefetch_gather_only = true;
+        bool experimental_idx2_ingress_tail_guard_enable = false;
         // Block 缓存稳定性/性能：默认启用 LRU（由 BcsrWeightManager 托管），并允许按 miss 比率自适应扩容。
         bool bcsr_block_cache_auto_tune = true;
         uint64_t bcsr_block_cache_max_bytes = 64ull * 1024ull * 1024ull;
@@ -129,6 +163,37 @@ public:
         std::string byte_exact_verify_mode;
         uint32_t byte_exact_verify_row_scale = 1024;
         uint32_t byte_exact_verify_max_mismatch = 8;
+        std::string gcss_index_template;
+        std::string synapse_weight_mode = "bcsr_gas"; // bcsr_gas | gcss_valueonly_dstcore | gcss_valueonly_dstcore_idx2 | gcss_valueonly_dstcore_vlf_premphf
+        // Observe-only SRAM model for weight-side index/L0 studies.
+        bool weight_sram_model_enable = false;
+        bool weight_idx_sram_enable = false;
+        bool weight_l0_sram_enable = false;
+        uint64_t weight_idx_sram_capacity_bytes = 0;
+        uint64_t weight_l0_sram_capacity_bytes = 0;
+        uint32_t weight_idx_sram_banks = 16;
+        uint32_t weight_l0_sram_banks = 8;
+        uint32_t weight_sram_ports_per_bank = 1;
+        uint64_t weight_sram_bank_interleave_bytes = 4;
+        uint32_t weight_sram_t_read_cycles = 1;
+        uint32_t weight_sram_t_write_cycles = 1;
+        uint32_t weight_sram_sample_log2 = 0;
+        uint64_t weight_idx_sram_base = 0x100000000ull;
+        uint64_t weight_l0_sram_base = 0x200000000ull;
+        uint64_t weight_l0_sram_slots = (1ull << 20);
+        // Experimental retire policy (default keeps historical global in-order semantics).
+        // Allowed values: global_inorder | per_post
+        std::string experimental_retire_policy = "global_inorder";
+        bool experimental_pre_window_profile_export_enable = false;
+        std::string experimental_pre_window_profile_export_dir;
+        bool experimental_tass_lf_p0_enable = false;
+        uint32_t tass_lf_p0_mesh_rows = 1;
+        uint32_t tass_lf_p0_mesh_cols = 1;
+        uint32_t tass_lf_p0_block_h = 2;
+        uint32_t tass_lf_p0_block_w = 2;
+        uint32_t tass_lf_p0_cores_per_pe = 1;
+        SubmitTassLfP0WindowReportFn submit_tass_lf_p0_window_report;
+        SubmitTassNaiveWindowRequestFn submit_tass_naive_window_request;
     };
 
     WeightMemorySubsystem() = default;
@@ -141,12 +206,172 @@ public:
                row_index_prefetch_bulk_pending_ ||
                row_index_prefetch_bulk_inflight_ ||
                !row_index_prefetch_rows_.empty() ||
+               !experimental_noc_rowidx_pending_rows_.empty() ||
+               !experimental_idx2_ingress_pending_addrs_.empty() ||
+               !experimental_idx2_ingress_inflight_.empty() ||
+               !gcss_vlf_issue_queue_.empty() ||
                !pending_colidx_reads_.empty() ||
                !pending_block_reads_.empty() ||
-               !pending_direct_reads_.empty();
+               !pending_direct_reads_.empty() ||
+               (retired_edges_count_ < edge_retire_.size()) ||
+               pending_tass_naive_responses_ != 0;
     }
     void setNowCycle(uint64_t now_cycle) { now_cycle_ = now_cycle; }
     void onClockTick(uint64_t now_cycle);
+    struct ExperimentalNocRowidxStats {
+        uint64_t touch_events_total = 0;
+        uint64_t rows_touched_enqueued = 0;
+        uint64_t rows_filtered_cold = 0;
+        uint64_t prefetch_rows_issued = 0;
+        uint64_t prefetch_rows_deferred = 0;
+        uint64_t prefetch_rows_failed = 0;
+        uint64_t prefetch_bytes_issued = 0;
+        uint64_t budget_ticks_total = 0;
+        uint64_t budget_effective_total = 0;
+        uint64_t budget_adapt_ticks = 0;
+        uint64_t cache_hits = 0;
+        uint64_t cache_misses = 0;
+        uint64_t cache_fills = 0;
+        uint64_t cache_full_drop = 0;
+        uint64_t cache_entries = 0;
+    };
+    ExperimentalNocRowidxStats experimentalNocRowidxStats() const {
+        ExperimentalNocRowidxStats s = experimental_noc_rowidx_stats_;
+        s.cache_entries = static_cast<uint64_t>(experimental_noc_rowidx_cache_.size());
+        return s;
+    }
+    struct ExperimentalIdx2IngressStats {
+        uint64_t touch_events_total = 0;
+        uint64_t lookup_miss_total = 0;
+        uint64_t enqueued_total = 0;
+        uint64_t dedup_pending_total = 0;
+        uint64_t dedup_inflight_total = 0;
+        uint64_t dedup_cache_total = 0;
+        uint64_t prefetch_issued_total = 0;
+        uint64_t prefetch_bytes_total = 0;
+        uint64_t prefetch_deferred_total = 0;
+        uint64_t prefetch_failed_total = 0;
+        uint64_t prefetch_resp_ok_total = 0;
+        uint64_t prefetch_resp_short_total = 0;
+        uint64_t prefetch_resp_drop_tail_total = 0;
+        uint64_t prefetch_complete_inflight_miss_total = 0;
+        uint64_t prefetch_complete_zero_waiters_total = 0;
+        uint64_t prefetch_complete_waiters_total = 0;
+        uint64_t demand_hit_total = 0;
+        uint64_t demand_join_total = 0;
+        uint64_t demand_join_cb_nonnull_total = 0;
+        uint64_t demand_join_cb_null_total = 0;
+        uint64_t demand_fallback_total = 0;
+        uint64_t waiters_served_total = 0;
+        uint64_t cache_fill_total = 0;
+        uint64_t cache_evict_total = 0;
+        uint64_t cache_entries = 0;
+    };
+    ExperimentalIdx2IngressStats experimentalIdx2IngressStats() const {
+        ExperimentalIdx2IngressStats s = experimental_idx2_ingress_stats_;
+        s.cache_entries = static_cast<uint64_t>(experimental_idx2_ingress_value_cache_.size());
+        return s;
+    }
+    struct GcssLookupStats {
+        uint64_t hit_total = 0;
+        uint64_t miss_total = 0;
+    };
+    GcssLookupStats gcssLookupStats() const {
+        GcssLookupStats s{};
+        s.hit_total = gcss_lookup_hit_;
+        s.miss_total = gcss_lookup_miss_;
+        return s;
+    }
+    struct ReadSourceStats {
+        uint64_t dense_reqs_total = 0;
+        uint64_t dense_bytes_total = 0;
+        uint64_t rowptr_reqs_total = 0;
+        uint64_t rowptr_bytes_total = 0;
+        uint64_t colidx_reqs_total = 0;
+        uint64_t colidx_bytes_total = 0;
+        uint64_t blockdata_reqs_total = 0;
+        uint64_t blockdata_bytes_total = 0;
+        uint64_t gcss_reqs_total = 0;
+        uint64_t gcss_bytes_total = 0;
+    };
+    ReadSourceStats readSourceStats() const {
+        ReadSourceStats s{};
+        s.dense_reqs_total = read_src_dense_reqs_;
+        s.dense_bytes_total = read_src_dense_bytes_;
+        s.rowptr_reqs_total = read_src_rowptr_reqs_;
+        s.rowptr_bytes_total = read_src_rowptr_bytes_;
+        s.colidx_reqs_total = read_src_colidx_reqs_;
+        s.colidx_bytes_total = read_src_colidx_bytes_;
+        s.blockdata_reqs_total = read_src_blockdata_reqs_;
+        s.blockdata_bytes_total = read_src_blockdata_bytes_;
+        s.gcss_reqs_total = read_src_gcss_reqs_;
+        s.gcss_bytes_total = read_src_gcss_bytes_;
+        return s;
+    }
+    struct SramObservabilityStats {
+        BankedSramStats idx_sram{};
+        BankedSramStats l0_sram{};
+        uint64_t idx_lookup_total = 0;
+        uint64_t idx_lookup_idx2_total = 0;
+        uint64_t idx_lookup_legacy_total = 0;
+        uint64_t l0_lookup_total = 0;
+        uint64_t l0_hit_total = 0;
+        uint64_t l0_miss_total = 0;
+        uint64_t l0_fill_total = 0;
+        uint64_t l0_evict_total = 0;
+    };
+    SramObservabilityStats sramObservabilityStats() const {
+        SramObservabilityStats s{};
+        s.idx_sram = idx_sram_model_.stats();
+        s.l0_sram = l0_sram_model_.stats();
+        s.idx_lookup_total = idx_lookup_total_;
+        s.idx_lookup_idx2_total = idx_lookup_idx2_total_;
+        s.idx_lookup_legacy_total = idx_lookup_legacy_total_;
+        s.l0_lookup_total = l0_lookup_total_;
+        s.l0_hit_total = l0_hit_total_;
+        s.l0_miss_total = l0_miss_total_;
+        s.l0_fill_total = l0_fill_total_;
+        s.l0_evict_total = l0_evict_total_;
+        return s;
+    }
+    struct RetireObservabilityStats {
+        uint64_t global_hol_cycles_total = 0;
+        uint64_t ready_but_blocked_edges_total = 0;
+        uint64_t per_post_progress_total = 0;
+    };
+    RetireObservabilityStats retireObservabilityStats() const {
+        RetireObservabilityStats s{};
+        s.global_hol_cycles_total = retire_global_hol_cycles_total_;
+        s.ready_but_blocked_edges_total = retire_ready_but_blocked_edges_total_;
+        s.per_post_progress_total = retire_per_post_progress_total_;
+        return s;
+    }
+    struct TassLfP0Stats {
+        uint64_t block_epochs_total = 0;
+        uint64_t block_active_pres_total = 0;
+        uint64_t block_shared_pres_total = 0;
+        uint64_t cross_core_joins_total = 0;
+        uint64_t payload_bytes_total = 0;
+        uint64_t current_vlf_line_groups_total = 0;
+        uint64_t block_naive_line_count_total = 0;
+        uint64_t block_fused_lb_line_count_total = 0;
+        uint64_t response_fanout_total = 0;
+        uint64_t reports_flushed_total = 0;
+        uint64_t reports_nonzero_payload_total = 0;
+        uint64_t reports_pre_entries_total = 0;
+        uint64_t reports_via_callback_total = 0;
+        uint64_t reports_via_fallback_total = 0;
+    };
+    TassLfP0Stats tassLfP0Stats() {
+        flushTassLfP0WindowIfNeeded_(true);
+        harvestTassLfP0Completions_();
+        return tass_lf_p0_stats_;
+    }
+    void flushSramObservability(uint64_t now_cycle) {
+        if (!weight_sram_enable_) return;
+        idx_sram_model_.onClockTick(now_cycle + 1);
+        l0_sram_model_.onClockTick(now_cycle + 1);
+    }
     // 低层 dense 预取发起（scheme1 baseline 使用）：由调用方提供地址/大小与 row/col 起点。
     bool issueDensePrefetchRaw(uint64_t req_addr, size_t req_size,
                                uint32_t row, uint32_t col_start, uint32_t count_floats,
@@ -160,6 +385,119 @@ public:
 
     void configureOrchestrator(OrchestratorConfig cfg) {
         orch_ = std::move(cfg);
+        gcss_index_loaded_ = false;
+        gcss_index_load_failed_ = false;
+        gcss_index_path_.clear();
+        gcss_index_.clear();
+        gcss_idx2_index_loaded_ = false;
+        gcss_idx2_index_load_failed_ = false;
+        gcss_idx2_index_path_.clear();
+        gcss_idx2_index_.clear();
+        gcss_premphf_index_loaded_ = false;
+        gcss_premphf_index_load_failed_ = false;
+        gcss_premphf_index_path_.clear();
+        gcss_premphf_index_.clear();
+        experimental_idx2_ingress_pending_addrs_.clear();
+        experimental_idx2_ingress_pending_set_.clear();
+        experimental_idx2_ingress_inflight_.clear();
+        experimental_idx2_ingress_value_cache_.clear();
+        experimental_idx2_ingress_value_cache_lru_.clear();
+        edge_pre_rank_curr_.clear();
+        edge_pre_rank_prev_.clear();
+        gcss_vlf_issue_queue_.clear();
+        gcss_vlf_issue_queue_prepared_ = false;
+        pre_touch_order_window_.clear();
+        gcss_vlf_issue_prepare_total_ = 0;
+        gcss_vlf_issue_edges_total_ = 0;
+        gcss_vlf_issue_reorder_trigger_total_ = 0;
+        gcss_vlf_issue_line_groups_total_ = 0;
+        experimental_idx2_ingress_stats_ = ExperimentalIdx2IngressStats{};
+        gcss_lookup_hit_ = 0;
+        gcss_lookup_miss_ = 0;
+        read_src_dense_reqs_ = 0;
+        read_src_dense_bytes_ = 0;
+        read_src_rowptr_reqs_ = 0;
+        read_src_rowptr_bytes_ = 0;
+        read_src_colidx_reqs_ = 0;
+        read_src_colidx_bytes_ = 0;
+        read_src_blockdata_reqs_ = 0;
+        read_src_blockdata_bytes_ = 0;
+        read_src_gcss_reqs_ = 0;
+        read_src_gcss_bytes_ = 0;
+        idx_lookup_total_ = 0;
+        idx_lookup_idx2_total_ = 0;
+        idx_lookup_legacy_total_ = 0;
+        l0_lookup_total_ = 0;
+        l0_hit_total_ = 0;
+        l0_miss_total_ = 0;
+        l0_fill_total_ = 0;
+        l0_evict_total_ = 0;
+        retire_global_hol_cycles_total_ = 0;
+        retire_ready_but_blocked_edges_total_ = 0;
+        retire_per_post_progress_total_ = 0;
+        tass_lf_p0_stats_ = TassLfP0Stats{};
+        tass_lf_p0_window_started_ = false;
+        tass_lf_p0_window_seq_ = 0;
+        tass_lf_p0_window_pre_payload_bytes_.clear();
+        tass_lf_p0_window_payload_bytes_ = 0;
+        tass_lf_p0_window_current_vlf_line_groups_ = 0;
+        ready_uncommitted_edges_ = 0;
+        {
+            std::string policy = orch_.experimental_retire_policy;
+            std::transform(policy.begin(), policy.end(), policy.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (policy == "per_post" || policy == "per_post_deterministic") {
+                retire_policy_ = RetirePolicy::PerPostDeterministic;
+            } else {
+                retire_policy_ = RetirePolicy::GlobalInOrder;
+            }
+        }
+        per_post_retire_seq_.clear();
+        per_post_head_idx_.clear();
+        per_post_touched_.clear();
+        per_post_touched_list_.clear();
+        per_post_ready_posts_.clear();
+        tass_lf_p0_enabled_ = orch_.experimental_tass_lf_p0_enable;
+        pending_tass_naive_responses_ = 0;
+        tass_naive_window_request_submitted_ = false;
+        weight_sram_enable_ = orch_.weight_sram_model_enable;
+        weight_idx_sram_enable_ = orch_.weight_idx_sram_enable;
+        weight_l0_sram_enable_ = orch_.weight_l0_sram_enable;
+        VirtualSramLayoutConfig lcfg{};
+        lcfg.idx_base = orch_.weight_idx_sram_base;
+        lcfg.l0_base = orch_.weight_l0_sram_base;
+        lcfg.l0_slots = orch_.weight_l0_sram_slots;
+        sram_layout_.configure(lcfg);
+        BankedSramConfig idx_cfg{};
+        idx_cfg.enable = weight_sram_enable_ && weight_idx_sram_enable_;
+        idx_cfg.name = "weight_idx_sram";
+        idx_cfg.capacity_bytes = orch_.weight_idx_sram_capacity_bytes;
+        idx_cfg.banks = orch_.weight_idx_sram_banks;
+        idx_cfg.ports_per_bank = orch_.weight_sram_ports_per_bank;
+        idx_cfg.bank_interleave_bytes = orch_.weight_sram_bank_interleave_bytes;
+        idx_cfg.t_read_cycles = orch_.weight_sram_t_read_cycles;
+        idx_cfg.t_write_cycles = orch_.weight_sram_t_write_cycles;
+        idx_cfg.sample_log2 = orch_.weight_sram_sample_log2;
+        idx_sram_model_.configure(idx_cfg);
+        BankedSramConfig l0_cfg{};
+        l0_cfg.enable = weight_sram_enable_ && weight_l0_sram_enable_;
+        l0_cfg.name = "weight_l0_sram";
+        l0_cfg.capacity_bytes = orch_.weight_l0_sram_capacity_bytes;
+        l0_cfg.banks = orch_.weight_l0_sram_banks;
+        l0_cfg.ports_per_bank = orch_.weight_sram_ports_per_bank;
+        l0_cfg.bank_interleave_bytes = orch_.weight_sram_bank_interleave_bytes;
+        l0_cfg.t_read_cycles = orch_.weight_sram_t_read_cycles;
+        l0_cfg.t_write_cycles = orch_.weight_sram_t_write_cycles;
+        l0_cfg.sample_log2 = orch_.weight_sram_sample_log2;
+        l0_sram_model_.configure(l0_cfg);
+        {
+            std::string mode = orch_.bcsr_block_fetch_mode;
+            std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+            if (mode == "row_cacheline") bcsr_block_fetch_mode_ = BcsrBlockFetchMode::RowCacheline;
+            else bcsr_block_fetch_mode_ = BcsrBlockFetchMode::FullBlock;
+        }
         dense_cols_effective_ = orch_.use_post_row_pre_col ? orch_.weights_cols : orch_.num_neurons;
         dense_phys_enable_ = (orch_.dense_layout_mode == DenseLayoutMode::PhysV1);
         if (dense_phys_enable_) {
@@ -258,6 +596,7 @@ public:
         posts_list_prev_window_.reserve(post_cap);
         active_pre_window_.reserve(256);
         active_pre_prev_window_.reserve(256);
+        pre_touch_order_window_.reserve(256);
     }
 
     void ensureWindowTracking(uint32_t num_neurons) {
@@ -280,6 +619,8 @@ public:
         posts_list_window_.clear();
         active_pre_prev_window_ = std::move(active_pre_window_);
         active_pre_window_.clear();
+        pre_touch_order_window_.clear();
+        resetExperimentalNocRowidxWindow_();
     }
 
     void notePostLocal(uint32_t post_local, uint32_t num_neurons) {
@@ -291,13 +632,56 @@ public:
         }
     }
 
+    void setSubmitTassLfP0WindowReportFn(SubmitTassLfP0WindowReportFn fn) {
+        orch_.submit_tass_lf_p0_window_report = std::move(fn);
+    }
+
+    void setSubmitTassNaiveWindowRequestFn(SubmitTassNaiveWindowRequestFn fn) {
+        orch_.submit_tass_naive_window_request = std::move(fn);
+    }
+
+    void completeTassNaiveResponses(const std::vector<TassNaiveResponseEntry>& entries) {
+        if (entries.empty()) return;
+        for (const auto& entry : entries) {
+            if (entry.window_seq != window_seq_) {
+                SST::Output* out = diagOutOrFallback_();
+                out->fatal(CALL_INFO, -1,
+                           "WeightMemorySubsystem fatal: naive_tass response window mismatch (node=%u core=%u resp_window=%u active_window=%u)\n",
+                           orch_.node_id,
+                           orch_.core_id,
+                           entry.window_seq,
+                           window_seq_);
+            }
+            const size_t seq = static_cast<size_t>(entry.retire_seq);
+            if (seq >= edge_retire_.size()) {
+                SST::Output* out = diagOutOrFallback_();
+                out->fatal(CALL_INFO, -1,
+                           "WeightMemorySubsystem fatal: naive_tass retire_seq out of range (node=%u core=%u seq=%zu edge_retire_size=%zu window=%u)\n",
+                           orch_.node_id,
+                           orch_.core_id,
+                           seq,
+                           edge_retire_.size(),
+                           window_seq_);
+            }
+            const bool was_ready = edge_retire_[seq].ready;
+            const float resolved = applyReadRespZeroFallback_(entry.weight);
+            setEdgeRetireReady_(seq, resolved, EdgeSrc::Dense);
+            if (!was_ready && pending_tass_naive_responses_ > 0) pending_tass_naive_responses_ -= 1;
+        }
+        tryRetireEdges_();
+        issueFromEdges();
+    }
+
     void notePreGlobal(uint32_t pre_global) {
-        active_pre_window_.insert(pre_global);
+        auto inserted = active_pre_window_.insert(pre_global);
+        if (inserted.second) pre_touch_order_window_.push_back(pre_global);
     }
 
     void noteWindowTouch(uint32_t post_local, uint32_t pre_global, uint32_t num_neurons) {
         notePostLocal(post_local, num_neurons);
         notePreGlobal(pre_global);
+        noteExperimentalNocRowidxTouch_(post_local);
+        noteExperimentalIdx2IngressTouch_(post_local, pre_global);
     }
 
     size_t postsCurrSize() const { return posts_list_window_.size(); }
@@ -311,8 +695,26 @@ public:
 
     // ===== Edge collection =====
     void recordEdge(uint32_t post_local, uint32_t pre_global) {
-        uint64_t key = (static_cast<uint64_t>(post_local) << 32) | static_cast<uint64_t>(pre_global);
+        const uint64_t key = (static_cast<uint64_t>(post_local) << 32) | static_cast<uint64_t>(pre_global);
         edge_collector_.curr[key] += 1;
+    }
+    void recordEdgeWithWeight(uint32_t post_local, uint32_t pre_global, float weight) {
+        (void)weight;
+        const uint64_t key = (static_cast<uint64_t>(post_local) << 32) | static_cast<uint64_t>(pre_global);
+        edge_collector_.curr[key] += 1;
+    }
+    void recordEdgeWithPreRank(uint32_t post_local, uint32_t pre_global, float weight, uint32_t pre_rank) {
+        (void)weight;
+        const uint64_t key = (static_cast<uint64_t>(post_local) << 32) | static_cast<uint64_t>(pre_global);
+        edge_collector_.curr[key] += 1;
+        auto it = edge_pre_rank_curr_.find(key);
+        if (it == edge_pre_rank_curr_.end()) {
+            edge_pre_rank_curr_.emplace(key, pre_rank);
+            return;
+        }
+        if (it->second == pre_rank) return;
+        // Keep deterministic behavior even if duplicated records carry inconsistent rank.
+        it->second = std::min<uint32_t>(it->second, pre_rank);
     }
     size_t edgesCurrSize() const { return edge_collector_.currSize(); }
     size_t edgesPrevSize() const { return edge_collector_.prevSize(); }
@@ -320,12 +722,26 @@ public:
     bool edgesPrevEmpty() const { return edge_collector_.prevEmpty(); }
     void flipEdgesForApply(bool debug, SST::Output* out, int core_id, uint32_t seq) {
         edge_collector_.flipForApply(debug, out, core_id, seq);
+        edge_pre_rank_prev_.swap(edge_pre_rank_curr_);
+        edge_pre_rank_curr_.clear();
     }
     bool nextPrevEdge(uint64_t& key, uint32_t& count) { return edge_collector_.nextPrev(key, count); }
 
     // ===== Orchestration entrypoints =====
     void beginApplyWindow(uint32_t seq, bool debug, SST::Output* out, int core_id) {
         window_seq_ = seq;
+        maybeExportPreWindowProfile_(seq);
+        if (tass_lf_p0_enabled_ && tass_lf_p0_window_started_ && tass_lf_p0_window_seq_ != seq) {
+            flushTassLfP0WindowIfNeeded_(true);
+        }
+        // Gather-only experimental prefetch: stop enqueueing once Apply begins.
+        if (orch_.experimental_noc_rowidx_prefetch_gather_only) {
+            experimental_noc_rowidx_pending_rows_.clear();
+        }
+        if (orch_.experimental_idx2_ingress_prefetch_gather_only) {
+            experimental_idx2_ingress_pending_addrs_.clear();
+            experimental_idx2_ingress_pending_set_.clear();
+        }
         // 若上一窗口未显式收尾（例如仿真提前结束/卡在 BeginApply），在新窗口开启前先输出上一窗口诊断摘要。
         if (diag_debug_ && diag_window_active_ && diag_seq_ != 0 && diag_seq_ != seq) {
             dumpWindowDiagSummary_("[diag-window-weights] rollover");
@@ -352,6 +768,16 @@ public:
         block_hit_window_ = 0;
         block_miss_window_ = 0;
         resetEdgeRetire_();
+        resetGcssVlfIssueQueue_();
+        pending_tass_naive_responses_ = 0;
+        tass_naive_window_request_submitted_ = false;
+        if (tass_lf_p0_enabled_) {
+            tass_lf_p0_window_started_ = true;
+            tass_lf_p0_window_seq_ = seq;
+            tass_lf_p0_window_pre_payload_bytes_.clear();
+            tass_lf_p0_window_payload_bytes_ = 0;
+            tass_lf_p0_window_current_vlf_line_groups_ = 0;
+        }
         if (byteExactVerifyEnabled_()) {
             byte_exact_mismatch_count_ = 0;
             byte_exact_mismatch_logged_ = 0;
@@ -373,6 +799,7 @@ public:
         (void)seq;
         // Always perform non-diagnostic housekeeping (applies to all cores, not only debug targets).
         maybeAutoTuneBlockCache_();
+        flushTassLfP0WindowIfNeeded_(false);
         window_seq_ = 0;
 
         emitByteExactPassMarker_("EndScatter", seq);
@@ -396,6 +823,7 @@ public:
     void finishWindowDiag() {
         emitByteExactPassMarker_("finish", /*seq*/0);
         finishSemanticVerify();
+        flushTassLfP0WindowIfNeeded_(true);
 
         if (!diag_debug_ || !diag_out_) return;
         if (!diag_window_active_) return;
@@ -429,6 +857,7 @@ public:
 private:
     void issueFromEdgesOnce_() {
         if (!orch_.accessor) return;
+        const bool gcss_mode = isGcssValueOnlyMode_();
         if (orch_.ensure_loader_ready && !orch_.ensure_loader_ready()) {
             if (diag_debug_ && diag_out_) {
                 diag_out_->verbose(CALL_INFO, 0, 0,
@@ -437,11 +866,90 @@ private:
             }
             return;
         }
-        if (orch_.use_bcsr && orch_.bcsr_rowptr_ready && !orch_.bcsr_rowptr_ready()) {
+        if (!gcss_mode && orch_.use_bcsr && orch_.bcsr_rowptr_ready && !orch_.bcsr_rowptr_ready()) {
             if (diag_debug_ && diag_out_) {
                 diag_out_->verbose(CALL_INFO, 0, 0,
                     "[diag-window-read] BeginApply: core=%u window=%u defer edge issue (BCSR rowptr not ready)\n",
                     static_cast<uint32_t>(diag_core_id_), diag_seq_);
+            }
+            return;
+        }
+
+        if (gcss_mode && isGcssValueOnlyPreMphfMode_()) {
+            if (!gcss_vlf_issue_queue_prepared_) {
+                prepareGcssVlfIssueQueue_();
+            }
+            while (canIssueMoreReads_() && !gcss_vlf_issue_queue_.empty()) {
+                GcssVlfEdgeIssueEntry e = std::move(gcss_vlf_issue_queue_.front());
+                gcss_vlf_issue_queue_.pop_front();
+                auto cb = [this, seq = e.retire_seq](float w) {
+                    float resolved = applyReadRespZeroFallback_(w);
+                    setEdgeRetireReady_(seq, resolved, EdgeSrc::Dense);
+                    tryRetireEdges_();
+                    issueFromEdges();
+                };
+                issueGcssByAddr_(e.addr, std::move(cb), /*count_weight_read*/true);
+            }
+            return;
+        }
+
+        if (gcss_mode && isGcssValueOnlyBlockNaiveTassMode_()) {
+            if (tass_naive_window_request_submitted_) return;
+            tass_naive_window_request_submitted_ = true;
+            TassNaiveWindowRequest request{};
+            request.mesh_rows = std::max<uint32_t>(1u, orch_.tass_lf_p0_mesh_rows);
+            request.mesh_cols = std::max<uint32_t>(1u, orch_.tass_lf_p0_mesh_cols);
+            request.block_h = std::max<uint32_t>(1u, orch_.tass_lf_p0_block_h);
+            request.block_w = std::max<uint32_t>(1u, orch_.tass_lf_p0_block_w);
+            request.source_node = orch_.node_id;
+            request.source_core = orch_.core_id;
+            request.cores_per_pe = std::max<uint32_t>(1u, orch_.tass_lf_p0_cores_per_pe);
+            request.window_seq = window_seq_;
+            request.line_size_bytes = std::max<uint32_t>(1u, orch_.line_size_bytes);
+            while (true) {
+                uint64_t key = 0;
+                uint32_t count = 0;
+                if (!nextPrevEdge(key, count)) break;
+                const uint32_t post_local = static_cast<uint32_t>(key >> 32);
+                const uint32_t pre_global = static_cast<uint32_t>(key & 0xffffffffu);
+                if (orch_.num_neurons > 0 && post_local >= orch_.num_neurons) continue;
+                const size_t seq = registerEdgeRetire_(post_local, pre_global, count,
+                                                      orch_.use_bcsr ? EdgeSrc::BCSR : EdgeSrc::Dense);
+                const uint32_t block_post_local = computeNaiveTassBlockPostLocal_(post_local);
+                uint32_t widx = 0;
+                if (!lookupGcssWidx_(pre_global, block_post_local, widx)) {
+                    SST::Output* out = diagOutOrFallback_();
+                    out->fatal(CALL_INFO, -1,
+                               "WeightMemorySubsystem fatal: naive_tass strict lookup miss (node=%u core=%u pre=%u post=%u block_post=%u mode=%s)\n",
+                               orch_.node_id,
+                               orch_.core_id,
+                               pre_global,
+                               post_local,
+                               block_post_local,
+                               orch_.synapse_weight_mode.c_str());
+                    return;
+                }
+                TassNaiveRequestEntry entry{};
+                entry.retire_seq = static_cast<uint32_t>(seq);
+                entry.widx = widx;
+                request.entries.push_back(entry);
+                read_src_gcss_reqs_ += 1;
+                read_src_gcss_bytes_ += sizeof(float);
+                if (orch_.report_mem_issue) {
+                    orch_.report_mem_issue(sizeof(float), /*count_weight_read*/true);
+                }
+            }
+            pending_tass_naive_responses_ = static_cast<uint32_t>(request.entries.size());
+            if (!request.entries.empty()) {
+                if (!orch_.submit_tass_naive_window_request) {
+                    SST::Output* out = diagOutOrFallback_();
+                    out->fatal(CALL_INFO, -1,
+                               "WeightMemorySubsystem fatal: naive_tass mode requires submit_tass_naive_window_request callback (node=%u core=%u)\n",
+                               orch_.node_id,
+                               orch_.core_id);
+                    return;
+                }
+                orch_.submit_tass_naive_window_request(request);
             }
             return;
         }
@@ -462,6 +970,23 @@ private:
             if (orch_.num_neurons > 0 && post_local >= orch_.num_neurons) continue;
             const size_t seq = registerEdgeRetire_(post_local, pre_global, count,
                                                   orch_.use_bcsr ? EdgeSrc::BCSR : EdgeSrc::Dense);
+
+            if (gcss_mode) {
+                uint32_t widx = 0;
+                if (!lookupGcssWidx_(pre_global, post_local, widx)) {
+                    setEdgeRetireReady_(seq, 0.0f, EdgeSrc::Dense);
+                    tryRetireEdges_();
+                    continue;
+                }
+                auto cb = [this, seq](float w) {
+                    float resolved = applyReadRespZeroFallback_(w);
+                    setEdgeRetireReady_(seq, resolved, EdgeSrc::Dense);
+                    tryRetireEdges_();
+                    issueFromEdges();
+                };
+                requestGCSS_(widx, std::move(cb));
+                continue;
+            }
 
             if (orch_.use_bcsr) {
                 if (orch_.bcsr_force_file_read && orch_.read_bcsr_from_file) {
@@ -608,6 +1133,11 @@ public:
     }
 
     void issueFallbackReadsIfNeeded(bool strict_gas_active) {
+        if (isGcssValueOnlyMode_()) {
+            // GCSS value-only path is edge-driven by design.
+            // Do not fallback to Cartesian set reads, which would change semantics/cost model.
+            return;
+        }
         bool need_sets = false;
         if (strict_gas_active) {
             need_sets = edgesPrevEmpty();
@@ -654,6 +1184,23 @@ public:
     }
 
 private:
+    bool isGcssValueOnlyMode_() const;
+    bool isGcssValueOnlyIdx2Mode_() const;
+    bool isGcssValueOnlyPreMphfMode_() const;
+    bool isGcssValueOnlyBlockNaiveTassMode_() const;
+    uint32_t computeNaiveTassBlockPostLocal_(uint32_t post_local) const;
+    bool ensureGcssIndexLoaded_();
+    bool lookupGcssWidx_(uint32_t pre_global, uint32_t post_local, uint32_t& out_widx);
+    bool lookupGcssPreBaseLen_(uint32_t pre_global, uint32_t& out_base, uint32_t& out_len);
+    void requestGCSS_(uint32_t widx, std::function<void(float)> cb);
+    void prepareGcssVlfIssueQueue_();
+    void noteTassLfP0PreparedWindow_(const std::unordered_map<uint32_t, uint64_t>& pre_payload_bytes,
+                                     uint64_t payload_bytes,
+                                     uint64_t current_vlf_line_groups);
+    void flushTassLfP0WindowIfNeeded_(bool force);
+    void harvestTassLfP0Completions_();
+    void resetGcssVlfIssueQueue_();
+
     float applyReadRespZeroFallback_(float w) const {
         if (orch_.readresp_zero_fallback && w == 0.0f) return orch_.init_default_weight;
         return w;
@@ -663,10 +1210,11 @@ private:
     SST::Output* diagOutOrFallback_() const;
 
     bool canIssueMoreReads_() const {
-        if (canIssue(/*n*/1, /*count_budget*/true)) return true;
+        // Semantic seal: budget is soft; hard gating uses outstanding only.
+        if (canIssue(/*n*/1, /*count_budget*/false)) return true;
         if (diag_debug_ && diag_out_) {
             diag_out_->verbose(CALL_INFO, 0, 0,
-                "[diag-edge-loop] core=%d budget/ostd stop issued=%u outstanding=%u budget=%u limit=%u\n",
+                "[diag-edge-loop] core=%d outstanding stop issued=%u outstanding=%u budget=%u limit=%u\n",
                 diag_core_id_, issued(), outstanding(), budget(), maxOutstanding());
         }
         return false;
@@ -684,6 +1232,9 @@ private:
     std::vector<uint32_t> posts_list_prev_window_;
     std::unordered_set<uint32_t> active_pre_window_;
     std::unordered_set<uint32_t> active_pre_prev_window_;
+    std::vector<uint32_t> pre_touch_order_window_;
+    std::unordered_map<uint64_t, uint32_t> edge_pre_rank_curr_{};
+    std::unordered_map<uint64_t, uint32_t> edge_pre_rank_prev_{};
     GasEdgeCollector edge_collector_;
 
     // Orchestrator config
@@ -694,11 +1245,14 @@ private:
     uint32_t dense_cols_effective_ = 0;
     DensePhysV1Derived dense_phys_{};
 
+    void maybeExportPreWindowProfile_(uint32_t seq);
+
     // ===== Deterministic retire for edge-driven acc_update =====
     // 由于 StandardMem 回调到达顺序可能在 MPI 多 rank 下抖动，直接在回调里 acc_update
     // 会导致 float 累加顺序变化，从而在“极稀疏发放/阈值临界”场景出现 0/非0 跳变。
     // 这里将每条 edge 的 (post,pre,count) 按发起顺序编号，并在结果 ready 后按序退役。
     enum class EdgeSrc : uint8_t { Dense, Cache, Miss, BCSR, BCSRFile };
+    enum class RetirePolicy : uint8_t { GlobalInOrder, PerPostDeterministic };
     struct EdgeRetireEntry {
         uint32_t post_local = 0;
         uint32_t pre_global = 0;
@@ -710,14 +1264,61 @@ private:
 
     std::vector<EdgeRetireEntry> edge_retire_;
     size_t next_retire_seq_ = 0;
+    size_t retired_edges_count_ = 0;
+    // Number of ready edges that are not committed yet (used for HOL diagnostics).
+    uint64_t ready_uncommitted_edges_ = 0;
+
+    RetirePolicy retire_policy_ = RetirePolicy::GlobalInOrder;
+    // Per-post deterministic retire structures (experimental path).
+    std::vector<std::vector<size_t>> per_post_retire_seq_{};
+    std::vector<size_t> per_post_head_idx_{};
+    std::vector<uint8_t> per_post_touched_{};
+    std::vector<uint32_t> per_post_touched_list_{};
+    std::set<uint32_t> per_post_ready_posts_{};
+
+    // Retire observability counters (run totals).
+    uint64_t retire_global_hol_cycles_total_ = 0;
+    uint64_t retire_ready_but_blocked_edges_total_ = 0;
+    uint64_t retire_per_post_progress_total_ = 0;
 
     bool issue_edges_in_progress_ = false;
     bool issue_edges_again_ = false;
+    uint32_t pending_tass_naive_responses_ = 0;
+    bool tass_naive_window_request_submitted_ = false;
+
+    bool usePerPostRetire_() const { return retire_policy_ == RetirePolicy::PerPostDeterministic; }
+
+    void ensurePerPostRetireStorage_() {
+        const size_t n = static_cast<size_t>(orch_.num_neurons);
+        if (per_post_retire_seq_.size() == n &&
+            per_post_head_idx_.size() == n &&
+            per_post_touched_.size() == n) {
+            return;
+        }
+        per_post_retire_seq_.assign(n, std::vector<size_t>{});
+        per_post_head_idx_.assign(n, 0);
+        per_post_touched_.assign(n, 0);
+        per_post_touched_list_.clear();
+        per_post_ready_posts_.clear();
+    }
 
     void resetEdgeRetire_() {
         edge_retire_.clear();
         next_retire_seq_ = 0;
+        retired_edges_count_ = 0;
+        ready_uncommitted_edges_ = 0;
         edge_retire_.reserve(edgesPrevSize());
+        per_post_ready_posts_.clear();
+        if (usePerPostRetire_()) {
+            ensurePerPostRetireStorage_();
+            for (uint32_t post : per_post_touched_list_) {
+                if (post >= per_post_retire_seq_.size()) continue;
+                per_post_retire_seq_[post].clear();
+                per_post_head_idx_[post] = 0;
+                per_post_touched_[post] = 0;
+            }
+            per_post_touched_list_.clear();
+        }
     }
 
     size_t registerEdgeRetire_(uint32_t post_local, uint32_t pre_global, uint32_t count, EdgeSrc src) {
@@ -728,6 +1329,18 @@ private:
         e.count = count;
         e.src = src;
         edge_retire_.push_back(e);
+        if (usePerPostRetire_() && post_local < static_cast<uint32_t>(orch_.num_neurons)) {
+            ensurePerPostRetireStorage_();
+            if (post_local < per_post_touched_.size() && per_post_touched_[post_local] == 0) {
+                per_post_touched_[post_local] = 1;
+                per_post_touched_list_.push_back(post_local);
+                per_post_head_idx_[post_local] = 0;
+                per_post_retire_seq_[post_local].clear();
+            }
+            if (post_local < per_post_retire_seq_.size()) {
+                per_post_retire_seq_[post_local].push_back(seq);
+            }
+        }
         return seq;
     }
 
@@ -744,20 +1357,99 @@ private:
 
     void setEdgeRetireReady_(size_t seq, float weight, EdgeSrc src) {
         if (seq >= edge_retire_.size()) return;
-        edge_retire_[seq].weight = weight;
-        edge_retire_[seq].ready = true;
-        edge_retire_[seq].src = src;
+        auto& e = edge_retire_[seq];
+        const bool was_ready = e.ready;
+        e.weight = weight;
+        e.ready = true;
+        e.src = src;
+        if (!was_ready) {
+            ready_uncommitted_edges_ += 1;
+        }
+        if (usePerPostRetire_()) {
+            const uint32_t post = e.post_local;
+            if (post < per_post_retire_seq_.size() && post < per_post_head_idx_.size()) {
+                const auto& seqs = per_post_retire_seq_[post];
+                const size_t head_idx = per_post_head_idx_[post];
+                if (head_idx < seqs.size() && seqs[head_idx] == seq) {
+                    per_post_ready_posts_.insert(post);
+                }
+            }
+        }
+    }
+
+    void commitRetireEntry_(const EdgeRetireEntry& e) {
+        if (byteExactVerifyEnabled_() && e.src == EdgeSrc::Dense) {
+            verifyDenseEdgeWeight_(e.pre_global, e.post_local, e.count, e.weight);
+        }
+        if (orch_.acc_update) orch_.acc_update(e.post_local, e.weight * static_cast<float>(e.count));
+        if (orch_.diag_edge_weight) orch_.diag_edge_weight(edgeSrcTag_(e.src), e.post_local, e.pre_global, e.weight, e.count);
+    }
+
+    void tryRetireEdgesPerPost_() {
+        while (!per_post_ready_posts_.empty()) {
+            auto it = per_post_ready_posts_.begin();
+            const uint32_t post = *it;
+            if (post >= per_post_retire_seq_.size() || post >= per_post_head_idx_.size()) {
+                per_post_ready_posts_.erase(it);
+                continue;
+            }
+            auto& seqs = per_post_retire_seq_[post];
+            size_t head_idx = per_post_head_idx_[post];
+            if (head_idx >= seqs.size()) {
+                per_post_ready_posts_.erase(it);
+                continue;
+            }
+            const size_t seq = seqs[head_idx];
+            if (seq >= edge_retire_.size()) {
+                per_post_ready_posts_.erase(it);
+                continue;
+            }
+            const auto& e = edge_retire_[seq];
+            if (!e.ready) {
+                per_post_ready_posts_.erase(it);
+                continue;
+            }
+            commitRetireEntry_(e);
+            if (ready_uncommitted_edges_ > 0) ready_uncommitted_edges_--;
+            retired_edges_count_++;
+            retire_per_post_progress_total_++;
+            per_post_head_idx_[post] = head_idx + 1;
+            head_idx = per_post_head_idx_[post];
+            if (head_idx < seqs.size()) {
+                const size_t next_seq = seqs[head_idx];
+                if (next_seq < edge_retire_.size() && edge_retire_[next_seq].ready) {
+                    // keep in ready set
+                } else {
+                    per_post_ready_posts_.erase(it);
+                }
+            } else {
+                per_post_ready_posts_.erase(it);
+            }
+        }
+    }
+
+    void updateRetireHolStatsOnTick_() {
+        if (usePerPostRetire_()) return;
+        if (edge_retire_.empty()) return;
+        if (next_retire_seq_ >= edge_retire_.size()) return;
+        const auto& head = edge_retire_[next_retire_seq_];
+        if (!head.ready && ready_uncommitted_edges_ > 0) {
+            retire_global_hol_cycles_total_ += 1;
+            retire_ready_but_blocked_edges_total_ += ready_uncommitted_edges_;
+        }
     }
 
     void tryRetireEdges_() {
+        if (usePerPostRetire_()) {
+            tryRetireEdgesPerPost_();
+            return;
+        }
         while (next_retire_seq_ < edge_retire_.size()) {
             const auto& e = edge_retire_[next_retire_seq_];
             if (!e.ready) break;
-            if (byteExactVerifyEnabled_() && e.src == EdgeSrc::Dense) {
-                verifyDenseEdgeWeight_(e.pre_global, e.post_local, e.count, e.weight);
-            }
-            if (orch_.acc_update) orch_.acc_update(e.post_local, e.weight * static_cast<float>(e.count));
-            if (orch_.diag_edge_weight) orch_.diag_edge_weight(edgeSrcTag_(e.src), e.post_local, e.pre_global, e.weight, e.count);
+            commitRetireEntry_(e);
+            if (ready_uncommitted_edges_ > 0) ready_uncommitted_edges_--;
+            retired_edges_count_++;
             next_retire_seq_++;
         }
     }
@@ -890,7 +1582,7 @@ private:
         bool count_weight_read = true;
         bool counted_inflight = false;
         uint64_t issue_cycle = 0;
-        // 0=dense, 1=rowptr, 2=colidx, 3=blockdata
+        // 0=dense, 1=rowptr, 2=colidx, 3=blockdata, 4=gcss_valueonly
         int bcsr_kind = 0;
         uint32_t bcsr_block_row = 0;
         uint32_t bcsr_target_block_col = 0;
@@ -899,6 +1591,7 @@ private:
         uint32_t bcsr_row_start = 0;
         uint32_t bcsr_idx_in_row = 0;
         uint32_t bcsr_global_block_index = 0;
+        bool bcsr_row_slice_fetch = false;
         bool bcsr_prefetch_all = false;
         bool bcsr_colidx_bulk_all_rows = false;
         bool scheme1_prefetch = false;
@@ -914,9 +1607,74 @@ private:
     bool row_index_prefetch_bulk_pending_ = false;
     bool row_index_prefetch_bulk_inflight_ = false;
     std::deque<uint32_t> row_index_prefetch_rows_{};
+    struct ExperimentalNocRowidxCacheEntry {
+        uint32_t row_start = 0;
+        std::vector<uint32_t> cols;
+    };
+    std::unordered_map<uint32_t, ExperimentalNocRowidxCacheEntry> experimental_noc_rowidx_cache_{};
+    std::deque<uint32_t> experimental_noc_rowidx_pending_rows_{};
+    std::vector<uint8_t> experimental_noc_rowidx_touched_rows_{};
+    std::vector<uint16_t> experimental_noc_rowidx_touch_counts_{};
+    ExperimentalNocRowidxStats experimental_noc_rowidx_stats_{};
+    struct ExperimentalIdx2IngressInflightEntry {
+        bool issued = false;
+        std::vector<std::function<void(float)>> waiters;
+    };
+    std::deque<uint64_t> experimental_idx2_ingress_pending_addrs_{};
+    std::unordered_set<uint64_t> experimental_idx2_ingress_pending_set_{};
+    std::unordered_map<uint64_t, ExperimentalIdx2IngressInflightEntry> experimental_idx2_ingress_inflight_{};
+    std::unordered_map<uint64_t, float> experimental_idx2_ingress_value_cache_{};
+    std::deque<uint64_t> experimental_idx2_ingress_value_cache_lru_{};
+    ExperimentalIdx2IngressStats experimental_idx2_ingress_stats_{};
     uint32_t window_seq_ = 0;
     bool bcsr_rowptr_file_preload_attempted_ = false;
     bool bcsr_rowidx_file_preloaded_ = false;
+    bool gcss_index_loaded_ = false;
+    bool gcss_index_load_failed_ = false;
+    std::string gcss_index_path_;
+    GcssIndexTable gcss_index_;
+    bool gcss_idx2_index_loaded_ = false;
+    bool gcss_idx2_index_load_failed_ = false;
+    std::string gcss_idx2_index_path_;
+    GcssIndexRowMphf gcss_idx2_index_;
+    bool gcss_premphf_index_loaded_ = false;
+    bool gcss_premphf_index_load_failed_ = false;
+    std::string gcss_premphf_index_path_;
+    GcssIndexPreMphf gcss_premphf_index_;
+    struct GcssVlfEdgeIssueEntry {
+        size_t retire_seq = 0;
+        uint32_t post_local = 0;
+        uint32_t pre_global = 0;
+        uint32_t pre_rank = 0;
+        uint32_t count = 0;
+        uint64_t addr = 0;
+    };
+    std::deque<GcssVlfEdgeIssueEntry> gcss_vlf_issue_queue_{};
+    bool gcss_vlf_issue_queue_prepared_ = false;
+    uint64_t gcss_vlf_issue_prepare_total_ = 0;
+    uint64_t gcss_vlf_issue_edges_total_ = 0;
+    uint64_t gcss_vlf_issue_reorder_trigger_total_ = 0;
+    uint64_t gcss_vlf_issue_line_groups_total_ = 0;
+    bool tass_lf_p0_enabled_ = false;
+    bool tass_lf_p0_window_started_ = false;
+    uint32_t tass_lf_p0_window_seq_ = 0;
+    std::unordered_map<uint32_t, uint64_t> tass_lf_p0_window_pre_payload_bytes_{};
+    uint64_t tass_lf_p0_window_payload_bytes_ = 0;
+    uint64_t tass_lf_p0_window_current_vlf_line_groups_ = 0;
+    bool tass_lf_p0_flush_branch_logged_ = false;
+    TassLfP0Stats tass_lf_p0_stats_{};
+    uint64_t gcss_lookup_hit_ = 0;
+    uint64_t gcss_lookup_miss_ = 0;
+    uint64_t read_src_dense_reqs_ = 0;
+    uint64_t read_src_dense_bytes_ = 0;
+    uint64_t read_src_rowptr_reqs_ = 0;
+    uint64_t read_src_rowptr_bytes_ = 0;
+    uint64_t read_src_colidx_reqs_ = 0;
+    uint64_t read_src_colidx_bytes_ = 0;
+    uint64_t read_src_blockdata_reqs_ = 0;
+    uint64_t read_src_blockdata_bytes_ = 0;
+    uint64_t read_src_gcss_reqs_ = 0;
+    uint64_t read_src_gcss_bytes_ = 0;
 
     // Lightweight always-on window counters (for auto-tune; independent of debug-only diag_win_).
     uint32_t block_hit_window_ = 0;
@@ -958,6 +1716,8 @@ private:
         uint32_t block_row = 0;
         uint32_t block_col = 0;
         uint32_t global_block_index = 0;
+        uint32_t idx_in_row = 0;
+        uint32_t intra_row = 0;
         bool issued = false;
         bool queued = false;
         bool count_budget = true;
@@ -979,15 +1739,28 @@ private:
     bool drain_pending_in_progress_ = false;
 
     enum class IssueStatus : uint8_t { Issued, DeferredInflight, DeferredBudget, Failed };
+    enum class BcsrBlockFetchMode : uint8_t { FullBlock = 0, RowCacheline = 1 };
     IssueStatus tryIssueRead_(PendingMeta meta, bool count_budget, bool budget_reserved);
     void drainPendingReads_();
     void drainPendingDirectReads_();
+    void drainExperimentalNocRowidxPrefetch_();
+    void drainExperimentalIdx2IngressPrefetch_();
+    uint32_t computeExperimentalNocRowidxBudget_();
+    uint32_t computeExperimentalIdx2IngressBudget_() const;
 
     static uint64_t makeInflightKey_(uint32_t window_seq, uint32_t id) {
         return (static_cast<uint64_t>(window_seq) << 32) | static_cast<uint64_t>(id);
     }
+    static uint64_t makeBlockInflightKey_(uint32_t window_seq,
+                                          uint32_t global_block_index,
+                                          uint32_t intra_row) {
+        return (static_cast<uint64_t>(window_seq) << 48) |
+               ((static_cast<uint64_t>(intra_row) & 0xffffull) << 32) |
+               static_cast<uint64_t>(global_block_index);
+    }
 
     void handleReadResp_(uint64_t req_id, uint64_t addr, PendingMeta meta, std::vector<uint8_t>&& data);
+    void noteReadSourceIssue_(int bcsr_kind, size_t req_bytes);
     uint64_t issueRead_(PendingMeta meta);
 
     bool prepareDenseRead_(uint32_t row, uint32_t col, uint32_t width,
@@ -1000,6 +1773,7 @@ private:
                                         uint32_t block_row,
                                         uint32_t block_col,
                                         uint32_t global_block_index,
+                                        uint32_t idx_in_row,
                                         uint32_t intra_row,
                                         uint32_t intra_col,
                                         uint32_t pre_global,
@@ -1011,10 +1785,47 @@ private:
     void maybeEnqueueRowIndexPrefetchAllRows_();
     void maybeEnqueueRowIndexPrefetchPostsPrev_();
     void drainRowIndexPrefetch_();
+    bool experimentalNocRowidxPrefetchEnabled_() const;
+    void resetExperimentalNocRowidxWindow_();
+    void noteExperimentalNocRowidxTouch_(uint32_t post_local);
+    bool lookupExperimentalNocRowidxCache_(uint32_t block_row,
+                                           uint32_t& row_start_out,
+                                           const std::vector<uint32_t>*& cols_out);
+    void storeExperimentalNocRowidxCache_(uint32_t block_row,
+                                          uint32_t row_start,
+                                          const std::vector<uint32_t>& cols);
     void maybeAutoTuneBlockCache_();
     void bcsrPrefetchAll_();
     void bcsrPrefetchRowBlocks_(uint32_t block_row, const std::vector<uint32_t>& cols, uint32_t row_start);
     void bcsrPopulateWeightCache_(uint32_t block_row, uint32_t block_col, const std::vector<float>& blk);
+    bool experimentalIdx2IngressPrefetchEnabled_() const;
+    void noteExperimentalIdx2IngressTouch_(uint32_t post_local, uint32_t pre_global);
+    bool tryServeExperimentalIdx2Ingress_(uint64_t addr, std::function<void(float)> cb);
+    bool lookupExperimentalIdx2IngressCache_(uint64_t addr, float& value_out);
+    void storeExperimentalIdx2IngressCache_(uint64_t addr, float value);
+    bool shouldTailGuardIdx2RespDrop_() const;
+    void completeExperimentalIdx2IngressPrefetch_(uint64_t addr, bool ok, float value);
+    void issueGcssByAddr_(uint64_t addr, std::function<void(float)> cb, bool count_weight_read);
+    void noteIdxSramLookup_(uint32_t pre_global, uint32_t post_local, bool idx2_mode);
+    void noteL0SramLookup_(uint64_t addr, bool hit);
+    void noteL0SramFill_(uint64_t addr);
+    void noteL0SramEvict_(uint64_t addr);
+
+    BcsrBlockFetchMode bcsr_block_fetch_mode_ = BcsrBlockFetchMode::FullBlock;
+    VirtualSramLayout sram_layout_{};
+    bool weight_sram_enable_ = false;
+    bool weight_idx_sram_enable_ = false;
+    bool weight_l0_sram_enable_ = false;
+    BankedSramModel idx_sram_model_{};
+    BankedSramModel l0_sram_model_{};
+    uint64_t idx_lookup_total_ = 0;
+    uint64_t idx_lookup_idx2_total_ = 0;
+    uint64_t idx_lookup_legacy_total_ = 0;
+    uint64_t l0_lookup_total_ = 0;
+    uint64_t l0_hit_total_ = 0;
+    uint64_t l0_miss_total_ = 0;
+    uint64_t l0_fill_total_ = 0;
+    uint64_t l0_evict_total_ = 0;
 };
 
 }} // namespace SST::SnnDL

@@ -85,6 +85,10 @@ class NocSpikeTransport;
     bool isWindowWorkload_() const { return apply_acc_enable_ && gas_window_mode_; }
     bool processReadySpikes_(uint64_t now_ns);
     void processLocalSpike_(SpikeEvent* spike);
+    bool expandPreGlobalToLocalSpikes_(uint32_t pre_global, uint64_t ts);
+    const std::vector<uint32_t>* lookupPostsLocalForPre_(uint32_t pre_global);
+    bool resolvePreRankForPost_(uint32_t pre_global, uint32_t post_local, uint32_t& out_rank);
+    bool expandPreGlobalToWindowEdgesFast_(uint32_t pre_global);
 
     bool isPreLocal_(uint32_t pre_global) const;
     uint32_t remapPreGlobalModulo_(uint32_t pre_global) const;
@@ -95,6 +99,9 @@ class NocSpikeTransport;
     void ensureComputeCoreConfigured_();
     void ensureSpikeCommConfigured_();
     bool windowScatterModeActive_() const;
+    bool shouldDeferScatterCommit_() const;
+    void finalizeScatterCommit_(uint32_t superstep);
+    bool tryFinalizeDeferredScatter_();
 
     Runtime rt_{};
 
@@ -130,7 +137,35 @@ class NocSpikeTransport;
     bool scheme1_enable_ = false;
     bool use_post_row_pre_col_ = false;
     bool use_bcsr_ = false;
+    std::string synapse_weight_mode_ = "bcsr_gas";
     bool workload_spike_input_enable_ = false;
+    bool experimental_spiketile_enable_ = false;
+    bool experimental_spikekey_fastpath_enable_ = false;
+    uint32_t experimental_spiketile_max_pre_bits_ = 64;
+    uint32_t experimental_spiketile_block_cols_ = 0;
+    bool experimental_compact_mask_enable_ = false;
+    bool experimental_inter_bundle_enable_ = false;
+    uint32_t experimental_inter_bundle_max_entries_ = 64;
+    bool experimental_inter_bundle_v2_enable_ = false;
+    uint64_t snn_rx_spike_packets_total_ = 0;
+    uint64_t snn_rx_spikekey_total_ = 0;
+    uint64_t snn_rx_spiketilekey_total_ = 0;
+    uint64_t snn_rx_fastpath_packets_total_ = 0;
+    uint64_t snn_rx_fallback_packets_total_ = 0;
+    uint64_t snn_rx_decode_fail_total_ = 0;
+    uint64_t snn_rx_fastpath_posts_total_ = 0;
+    uint64_t snn_rx_fastpath_accept_total_ = 0;
+    uint64_t snn_rx_fastpath_reject_total_ = 0;
+    uint64_t snn_rx_fastpath_edges_recorded_total_ = 0;
+    uint64_t snn_edge_record_attempt_total_ = 0;
+    uint64_t snn_edge_record_commit_total_ = 0;
+    uint64_t snn_edge_record_skip_gate_total_ = 0;
+    uint64_t snn_edge_record_skip_stage_total_ = 0;
+    uint64_t snn_edge_record_skip_capacity_total_ = 0;
+    uint64_t snn_edge_record_skip_reject_total_ = 0;
+    uint64_t snn_begin_apply_prev_edges_total_ = 0;
+    uint64_t snn_begin_apply_prev_empty_total_ = 0;
+    uint64_t snn_issue_from_edges_calls_total_ = 0;
     uint64_t now_cycle_cached_ = 0;
     GasStage gas_stage_ = GasStage::Idle;
 
@@ -155,6 +190,8 @@ class NocSpikeTransport;
     uint32_t gather_min_cycles_ = 1;      // avoid ending gather in the same cycle as BeginGather
     bool gather_end_requested_ = false;
     bool scatter_end_requested_ = false;
+    bool scatter_commit_pending_ = false;
+    uint32_t scatter_commit_seq_ = 0;
 
     // WeightLoader barrier (shared signal)
     std::string loader_done_key_;

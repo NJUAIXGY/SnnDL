@@ -34,6 +34,12 @@ struct GasStatEvent {
     uint64_t unique_line_count = 0;
     uint64_t covered_line_count = 0;
     uint64_t overfetch_bytes = 0;
+    // Apply scheduler diagnostics (optional; per-window summary)
+    uint64_t apply_bank_credit_effective = 0;
+    // Cmd-cost guardrail diagnostics (optional; per-window summary)
+    uint64_t cmd_cost_veto = 0;
+    uint64_t cmd_cost_veto_fine_gap = 0;
+    uint64_t cmd_cost_veto_row_window = 0;
 };
 
 class IGasStageSink {

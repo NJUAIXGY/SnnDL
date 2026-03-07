@@ -230,6 +230,8 @@ void StepActivationSubsystem::injectStepActivations_(uint32_t seq, uint64_t sim_
     const uint64_t diag_cap = (rt_.step_diag_cap_cfg > 0) ? static_cast<uint64_t>(rt_.step_diag_cap_cfg) : 0ULL;
     std::mt19937_64 rng(cfg_.seed ^ (static_cast<uint64_t>(seq) + (static_cast<uint64_t>(rt_.node_id) << 32)));
     std::uniform_int_distribution<uint64_t> post_dist(0, local_total - 1);
+    const uint64_t pre_global_hi = (max_global > 0) ? (max_global - 1) : 0;
+    std::uniform_int_distribution<uint64_t> pre_global_dist(0, pre_global_hi);
     std::bernoulli_distribution pick(fraction);
     const bool activate_all = (fraction >= 0.999999);
     const bool clustered_pre = (cfg_.pre_pattern == Config::PrePattern::Clustered);
@@ -382,9 +384,15 @@ void StepActivationSubsystem::injectStepActivations_(uint32_t seq, uint64_t sim_
 
             auto handle_one_pre = [&](uint32_t n) {
                 ++sources_selected;
-                uint64_t pre_global_64 = base + static_cast<uint64_t>(n);
-                if (max_global > 0 && pre_global_64 >= max_global) return;
-                uint32_t pre_global = static_cast<uint32_t>(pre_global_64);
+                uint32_t pre_global = 0;
+                if (cfg_.pre_sample_global) {
+                    if (max_global == 0) return;
+                    pre_global = static_cast<uint32_t>(pre_global_dist(rng));
+                } else {
+                    uint64_t pre_global_64 = base + static_cast<uint64_t>(n);
+                    if (max_global > 0 && pre_global_64 >= max_global) return;
+                    pre_global = static_cast<uint32_t>(pre_global_64);
+                }
                 const auto it = step_routes_map_.find(pre_global);
                 const auto* routes = (use_routes && it != step_routes_map_.end()) ? &it->second : nullptr;
 

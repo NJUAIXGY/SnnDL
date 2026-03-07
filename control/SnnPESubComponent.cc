@@ -14,6 +14,7 @@
 #include "synapse/gas/GasPhaseController.h"
 #include "synapse/gas/AccumulatorOps.h"
 #include "IPeAggregation.h"
+#include "IGasCreditGate.h"
 #include "IGasStepGate.h"
 #include "ISnnComputeCore.h"
 #include "synapse/stdmem/StdMemEndpoint.h"
@@ -143,8 +144,9 @@ void SnnPESubComponent::Impl::markEndScatter(uint32_t seq, uint64_t spikes_emitt
     if (gas_ctrl_) gas_ctrl_->onEndScatter(seq, spikes_emitted);
     uint64_t now = core->getCurrentSimTimeNano();
     core->appendStageEventRow_("EndScatter", now, spikes_emitted);
-    // 额外诊断：输出本窗口权重/BCSR 读流量摘要（仅 window_read_debug=1 时启用）
-    if (core->window_read_debug_ && core->weight_mem_subsystem_) {
+    // Always perform end-of-window housekeeping (including TASS window flush).
+    // endScatterWindow() keeps diagnostic printing internally gated by debug flags.
+    if (core->weight_mem_subsystem_) {
         core->weight_mem_subsystem_->endScatterWindow(seq);
     }
     reportWindowSpikes(static_cast<uint32_t>(seq), spikes_emitted);
@@ -277,6 +279,12 @@ bool SnnPESubComponent::ensureLoaderReady_() {
         return true;
     }
     return false;
+}
+
+void SnnPESubComponent::onTassNaiveResponses(const std::vector<TassNaiveResponseEntry>& entries) {
+    if (weight_mem_subsystem_ && !entries.empty()) {
+        weight_mem_subsystem_->completeTassNaiveResponses(entries);
+    }
 }
 
 void SnnPESubComponent::onLoaderReady() {
@@ -546,6 +554,15 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     }
     // 全网读取扩展参数
     weights_cols_ = cfg.weights_cols;
+    synapse_weight_mode_ = cfg.synapse_weight_mode;
+    const bool gcss_valueonly_mode =
+        (synapse_weight_mode_ == "gcss_valueonly_dstcore") ||
+        (synapse_weight_mode_ == "gcss_valueonly_dstcore_idx2") ||
+        (synapse_weight_mode_ == "gcss_idx2_rowmphf") ||
+        (synapse_weight_mode_ == "gcss_valueonly_dstcore_vlf_premphf") ||
+        (synapse_weight_mode_ == "gcss_valueonly_dstcore_vlf_premphf_plp") ||
+        (synapse_weight_mode_ == "gcss_valueonly_dstblock_naive_tass");
+    gcss_index_template_ = cfg.gcss_index_template;
     std::string index_mode_str = cfg.index_mode;
     // 神经元状态布局参数已下沉到 compute core（控制层不再持有）
     verify_routing_weights_ = cfg.verify_routing_weights;
@@ -557,6 +574,9 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
         // CSR 模式已弃用：统一禁用
         use_post_row_pre_col_ = true;
         SNNDL_DEBUG_LOG(1, "[CSR] 索引模式已禁用，改用密集/BCSR读取\n");
+    }
+    if (gcss_valueonly_mode) {
+        use_bcsr_ = false;
     }
     if (weights_cols_ == 0) weights_cols_ = num_neurons_; // 默认沿用旧行宽
     // 配置权重索引解析器（独立于控制层实现）
@@ -624,6 +644,10 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     bcsr_layout_.colidx_offset = cfg.bcsr_colidx_offset;
     bcsr_layout_.blockdata_offset = cfg.bcsr_blockdata_offset;
     bcsr_layout_.blockids_offset = cfg.bcsr_blockids_offset;
+    bcsr_layout_.layout_mode = cfg.bcsr_layout_mode;
+    bcsr_layout_.colidx_row_stride_bytes = cfg.bcsr_colidx_row_stride_bytes;
+    bcsr_layout_.blockdata_row_stride_bytes = cfg.bcsr_blockdata_row_stride_bytes;
+    bcsr_layout_.blockids_row_stride_bytes = cfg.bcsr_blockids_row_stride_bytes;
     bcsr_layout_.per_core_stride = cfg.per_core_stride;
     bcsr_layout_.validate(base_addr_, output_, (window_read_debug_ || enable_extended_diagnostics_), core_id_, node_id_);
     bcsr_br_ = bcsr_layout_.block_rows;
@@ -639,7 +663,11 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
         bcsr_colidx_addr_,
         bcsr_blockdata_addr_,
         bcsr_blockids_addr_,
-        bcsr_br_, bcsr_bc_, bcsr_idx_bytes_, bcsr_val_bytes_);
+        bcsr_br_, bcsr_bc_, bcsr_idx_bytes_, bcsr_val_bytes_,
+        bcsr_layout_.layout_mode,
+        bcsr_layout_.colidx_row_stride_bytes,
+        bcsr_layout_.blockdata_row_stride_bytes,
+        bcsr_layout_.blockids_row_stride_bytes);
     // Revert: 默认值恢复为 64/256，避免影响发放路径；如需禁用由脚本显式传入 0
     bcsr_row_index_cache_cap_ = cfg.bcsr_row_index_cache_cap;
     bcsr_block_cache_cap_ = cfg.bcsr_block_cache_cap;
@@ -705,6 +733,13 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
 
     // Weights template is used by both synapse/weights (BCSR) and synapse/route; keep cached here.
     weights_template_ = cfg.weights_template;
+    if (gcss_valueonly_mode &&
+        gcss_index_template_.empty() &&
+        output_ && output_->getVerboseLevel() >= 1) {
+        output_->verbose(CALL_INFO, 1, 0,
+            "[gcss] warning: synapse_weight_mode=%s but gcss_index_template is empty (core=%d node=%u)\n",
+            synapse_weight_mode_.c_str(), core_id_, node_id_);
+    }
 
     // neurons_per_pe：默认按 total_cores*num_neurons 推导；但允许脚本显式覆盖（保持兼容）
     uint32_t np_from_params = cfg.neurons_per_pe;
@@ -991,6 +1026,25 @@ void SnnPESubComponent::bindWorkloadRuntime_() {
 
 void SnnPESubComponent::setParentInterface(IPeAggregation* parent) {
     parent_pe_cached_ = parent;
+    if (weight_mem_subsystem_ && parent_pe_cached_) {
+        weight_mem_subsystem_->setSubmitTassLfP0WindowReportFn(
+            [this](const TassLfP0WindowReport& report) {
+                if (parent_pe_cached_) {
+                    parent_pe_cached_->submitTassLfP0WindowReport(report);
+                }
+            });
+        weight_mem_subsystem_->setSubmitTassNaiveWindowRequestFn(
+            [this](const TassNaiveWindowRequest& request) {
+                if (parent_pe_cached_) {
+                    parent_pe_cached_->submitTassNaiveWindowRequest(request);
+                }
+            });
+    }
+    if (output_) {
+        output_->verbose(CALL_INFO, 1, 0,
+                         "[tass-debug] setParent node=%u core=%d weight_mem=%d parent=%d\n",
+                         node_id_, core_id_, weight_mem_subsystem_ ? 1 : 0, parent_pe_cached_ ? 1 : 0);
+    }
     // output_->verbose(CALL_INFO, 2, 0, "🔗 核心%d设置父级接口\n", core_id_);
     bindWorkloadRuntime_();
 }
@@ -1031,6 +1085,14 @@ void SnnPESubComponent::onGlobalStepStart(uint32_t seq) {
         if (stdmem_ep_ && stdmem_ep_->available()) {
             auto* gate = stdmem_ep_->stepGate();
             if (gate) {
+                auto* credit_gate = stdmem_ep_->creditGate();
+                if (credit_gate &&
+                    global_step_apply_bank_credit_seq_ == seq &&
+                    global_step_apply_bank_credit_target_ > 0) {
+                    credit_gate->setApplyBankCreditTarget(seq, global_step_apply_bank_credit_target_);
+                    global_step_apply_bank_credit_seq_ = 0;
+                    global_step_apply_bank_credit_target_ = 0;
+                }
                 gate->openStep(seq);
             }
         }
@@ -1045,6 +1107,14 @@ void SnnPESubComponent::onGlobalStepStart(uint32_t seq) {
     }
     auto* gate = stdmem_ep_->stepGate();
     if (gate) {
+        auto* credit_gate = stdmem_ep_->creditGate();
+        if (credit_gate &&
+            global_step_apply_bank_credit_seq_ == seq &&
+            global_step_apply_bank_credit_target_ > 0) {
+            credit_gate->setApplyBankCreditTarget(seq, global_step_apply_bank_credit_target_);
+            global_step_apply_bank_credit_seq_ = 0;
+            global_step_apply_bank_credit_target_ = 0;
+        }
         gate->openStep(seq);
         if (workload_) workload_->onGlobalStepStart(seq);
         return;
@@ -1061,6 +1131,11 @@ void SnnPESubComponent::onGlobalStepStart(uint32_t seq) {
     }
     curr_stage_seq_ = seq;
     if (workload_) workload_->onGlobalStepStart(seq);
+}
+
+void SnnPESubComponent::onGlobalStepApplyBankCredit(uint32_t seq, uint32_t apply_bank_credit) {
+    global_step_apply_bank_credit_seq_ = seq;
+    global_step_apply_bank_credit_target_ = apply_bank_credit;
 }
 
 // === GAS stage/stat sink (Phase4-Task6.4) ===
@@ -1148,7 +1223,11 @@ void SnnPESubComponent::onGasStatEvent(const GasStatEvent& st) {
                                   st.rowwin_triggers, st.rowwin_bytes,
                                   st.bursts, st.payload_bytes,
                                   st.window_inflight_peak, st.window_buffer_max_bytes,
-                                  st.unique_line_count, st.covered_line_count, st.overfetch_bytes);
+                                  st.unique_line_count, st.covered_line_count, st.overfetch_bytes,
+                                  st.apply_bank_credit_effective,
+                                  st.cmd_cost_veto,
+                                  st.cmd_cost_veto_fine_gap,
+                                  st.cmd_cost_veto_row_window);
     }
     // Local (per-core) copies for unique_* only (optional)
     if (stat_gas_unique_reads_total_ && st.unique_reads) stat_gas_unique_reads_total_->addData(st.unique_reads);
@@ -1220,12 +1299,40 @@ void SnnPESubComponent::configureWeightReaderSubsystem_(const Params& params) {
                 params.find<int>("bcsr_colidx_inflight_coalesce_enable", 1) != 0;
             ocfg.bcsr_block_inflight_coalesce_enable =
                 params.find<int>("bcsr_block_inflight_coalesce_enable", 1) != 0;
+            ocfg.bcsr_block_fetch_mode =
+                params.find<std::string>("bcsr_block_fetch_mode", "full_block");
             ocfg.bcsr_row_index_prefetch_mode =
                 params.find<std::string>("bcsr_row_index_prefetch_mode", "auto");
             ocfg.bcsr_row_index_prefetch_all_rows_threshold =
                 params.find<uint32_t>("bcsr_row_index_prefetch_all_rows_threshold", 1024);
             ocfg.bcsr_row_index_prefetch_all_rows_max_bytes =
                 params.find<uint64_t>("bcsr_row_index_prefetch_all_rows_max_bytes", 64ull * 1024ull);
+            ocfg.experimental_noc_rowidx_prefetch_enable =
+                params.find<int>("experimental_noc_rowidx_prefetch_enable", 0) != 0;
+            ocfg.experimental_noc_rowidx_prefetch_budget_per_tick =
+                params.find<uint32_t>("experimental_noc_rowidx_prefetch_budget_per_tick", 4);
+            ocfg.experimental_noc_rowidx_cache_rows =
+                params.find<uint32_t>("experimental_noc_rowidx_cache_rows", 1024);
+            ocfg.experimental_noc_rowidx_prefetch_gather_only =
+                params.find<int>("experimental_noc_rowidx_prefetch_gather_only", 1) != 0;
+            ocfg.experimental_noc_rowidx_hot_touch_min =
+                params.find<uint32_t>("experimental_noc_rowidx_hot_touch_min", 1);
+            ocfg.experimental_noc_rowidx_budget_adapt_enable =
+                params.find<int>("experimental_noc_rowidx_budget_adapt_enable", 0) != 0;
+            ocfg.experimental_noc_rowidx_budget_adapt_max_per_tick =
+                params.find<uint32_t>("experimental_noc_rowidx_budget_adapt_max_per_tick", 32);
+            ocfg.experimental_noc_rowidx_budget_adapt_q_depth =
+                params.find<uint32_t>("experimental_noc_rowidx_budget_adapt_q_depth", 16);
+            ocfg.experimental_idx2_ingress_prefetch_enable =
+                params.find<int>("experimental_idx2_ingress_prefetch_enable", 0) != 0;
+            ocfg.experimental_idx2_ingress_prefetch_budget_per_tick =
+                params.find<uint32_t>("experimental_idx2_ingress_prefetch_budget_per_tick", 4);
+            ocfg.experimental_idx2_ingress_prefetch_cache_entries =
+                params.find<uint32_t>("experimental_idx2_ingress_prefetch_cache_entries", 4096);
+            ocfg.experimental_idx2_ingress_prefetch_gather_only =
+                params.find<int>("experimental_idx2_ingress_prefetch_gather_only", 1) != 0;
+            ocfg.experimental_idx2_ingress_tail_guard_enable =
+                params.find<int>("experimental_idx2_ingress_tail_guard_enable", 0) != 0;
             ocfg.bcsr_block_cache_auto_tune =
                 params.find<int>("bcsr_block_cache_auto_tune", 1) != 0;
             ocfg.bcsr_block_cache_max_bytes =
@@ -1262,11 +1369,75 @@ void SnnPESubComponent::configureWeightReaderSubsystem_(const Params& params) {
             ocfg.byte_exact_verify_mode = byte_exact_verify_mode_;
             ocfg.byte_exact_verify_row_scale = byte_exact_verify_row_scale_;
             ocfg.byte_exact_verify_max_mismatch = byte_exact_verify_max_mismatch_;
+            ocfg.synapse_weight_mode = synapse_weight_mode_;
+            ocfg.weight_sram_model_enable =
+                params.find<int>("weight_sram_model_enable", 0) != 0;
+            ocfg.weight_idx_sram_enable =
+                params.find<int>("weight_idx_sram_enable", 0) != 0;
+            ocfg.weight_l0_sram_enable =
+                params.find<int>("weight_l0_sram_enable", 0) != 0;
+            ocfg.weight_idx_sram_capacity_bytes =
+                params.find<uint64_t>("weight_idx_sram_capacity_bytes", 0);
+            ocfg.weight_l0_sram_capacity_bytes =
+                params.find<uint64_t>("weight_l0_sram_capacity_bytes", 0);
+            ocfg.weight_idx_sram_banks =
+                params.find<uint32_t>("weight_idx_sram_banks", 16);
+            ocfg.weight_l0_sram_banks =
+                params.find<uint32_t>("weight_l0_sram_banks", 8);
+            ocfg.weight_sram_ports_per_bank =
+                params.find<uint32_t>("weight_sram_ports_per_bank", 1);
+            ocfg.weight_sram_bank_interleave_bytes =
+                params.find<uint64_t>("weight_sram_bank_interleave_bytes", 4);
+            ocfg.weight_sram_t_read_cycles =
+                params.find<uint32_t>("weight_sram_t_read_cycles", 1);
+            ocfg.weight_sram_t_write_cycles =
+                params.find<uint32_t>("weight_sram_t_write_cycles", 1);
+            ocfg.weight_sram_sample_log2 =
+                params.find<uint32_t>("weight_sram_sample_log2", 0);
+            ocfg.weight_idx_sram_base =
+                params.find<uint64_t>("weight_idx_sram_base", 0x100000000ull);
+            ocfg.weight_l0_sram_base =
+                params.find<uint64_t>("weight_l0_sram_base", 0x200000000ull);
+            ocfg.weight_l0_sram_slots =
+                params.find<uint64_t>("weight_l0_sram_slots", (1ull << 20));
             ocfg.memory_warmup_cycles = memory_warmup_cycles_;
             ocfg.loader_barrier_cycles = loader_barrier_cycles_;
             ocfg.node_id = node_id_;
             ocfg.core_id = static_cast<uint32_t>(core_id_);
             ocfg.weights_template = weights_template_;
+            ocfg.gcss_index_template = gcss_index_template_;
+            ocfg.experimental_retire_policy =
+                params.find<std::string>("experimental_retire_policy", "global_inorder");
+            ocfg.experimental_pre_window_profile_export_enable =
+                params.find<int>("experimental_pre_window_profile_export_enable", 0) != 0;
+            ocfg.experimental_pre_window_profile_export_dir =
+                params.find<std::string>("experimental_pre_window_profile_export_dir", "");
+            ocfg.experimental_tass_lf_p0_enable =
+                params.find<int>("experimental_tass_lf_p0_enable", 0) != 0;
+            ocfg.tass_lf_p0_mesh_rows =
+                params.find<uint32_t>("tass_lf_p0_mesh_rows", 1);
+            ocfg.tass_lf_p0_mesh_cols =
+                params.find<uint32_t>("tass_lf_p0_mesh_cols", 1);
+            ocfg.tass_lf_p0_block_h =
+                params.find<uint32_t>("tass_lf_p0_block_h", 2);
+            ocfg.tass_lf_p0_block_w =
+                params.find<uint32_t>("tass_lf_p0_block_w", 2);
+            ocfg.tass_lf_p0_cores_per_pe =
+                params.find<uint32_t>("tass_lf_p0_cores_per_pe", 1);
+            if (parent_pe_cached_) {
+                ocfg.submit_tass_lf_p0_window_report = [this](const TassLfP0WindowReport& report) {
+                    if (parent_pe_cached_) {
+                        parent_pe_cached_->submitTassLfP0WindowReport(report);
+                    }
+                };
+            }
+            if (parent_pe_cached_) {
+                ocfg.submit_tass_naive_window_request = [this](const TassNaiveWindowRequest& request) {
+                    if (parent_pe_cached_) {
+                        parent_pe_cached_->submitTassNaiveWindowRequest(request);
+                    }
+                };
+            }
             ocfg.bcsr_mgr = bcsr_weights_.get();
             mem->configureOrchestrator(std::move(ocfg));
             if (byte_exact_verify_enable_ && output_) {
@@ -1420,6 +1591,13 @@ void SnnPESubComponent::finish() {
     if (stat_pending_reqs_peak_) stat_pending_reqs_peak_->addData(pending_reqs_peak_);
     double avg_lat = (count_mem_responses_ > 0) ? ((double)accum_mem_latency_cycles_ / (double)count_mem_responses_) : 0.0;
     double utilization = (total_cycles_ > 0) ? (double)active_cycles_ / (double)total_cycles_ : 0.0;
+    uint64_t core_state_sram_reads_total = 0;
+    uint64_t core_state_sram_writes_total = 0;
+    uint64_t core_state_sram_bytes_read_total = 0;
+    uint64_t core_state_sram_bytes_write_total = 0;
+    uint64_t core_state_sram_bank_conflict_ticks_total = 0;
+    uint64_t core_state_sram_predicted_extra_cycles_total = 0;
+    uint64_t core_state_sram_resident_bytes_peak = 0;
     if (!quiet_finish_logs_) {
         // 输出统计信息（使用内部计数器获得正确值）
         output_->verbose(CALL_INFO, 1, 0,
@@ -1442,6 +1620,67 @@ void SnnPESubComponent::finish() {
             "[summary] core=%d perf total_cycles=%" PRIu64 " active_cycles=%" PRIu64 " util=%.4f mem_req=%" PRIu64 " cache_hit=%" PRIu64 " cache_miss=%" PRIu64 " pending_peak=%u avg_mem_lat=%.2f\n",
             core_id_, total_cycles_, active_cycles_, utilization,
             count_memory_requests_, count_cache_hits_, count_cache_misses_, pending_reqs_peak_, avg_lat);
+    }
+    if (compute_core_) {
+        std::map<std::string, uint64_t> core_stats;
+        compute_core_->getStatistics(core_stats);
+        auto get_core_u64 = [&core_stats](const char* key) -> uint64_t {
+            if (!key) return 0;
+            auto it = core_stats.find(key);
+            if (it == core_stats.end()) return 0;
+            return it->second;
+        };
+        auto add_core_stat = [&core_stats](const char* key, Statistic<uint64_t>* st) {
+            if (!st || !key) return;
+            auto it = core_stats.find(key);
+            if (it == core_stats.end()) return;
+            if (it->second == 0) return;
+            st->addData(it->second);
+        };
+        core_state_sram_reads_total = get_core_u64("core_state_sram_reads_total");
+        core_state_sram_writes_total = get_core_u64("core_state_sram_writes_total");
+        core_state_sram_bytes_read_total = get_core_u64("core_state_sram_bytes_read_total");
+        core_state_sram_bytes_write_total = get_core_u64("core_state_sram_bytes_write_total");
+        core_state_sram_bank_conflict_ticks_total = get_core_u64("core_state_sram_bank_conflict_ticks_total");
+        core_state_sram_predicted_extra_cycles_total = get_core_u64("core_state_sram_predicted_extra_cycles_total");
+        core_state_sram_resident_bytes_peak = get_core_u64("core_state_sram_resident_bytes_peak");
+        add_core_stat("core_state_sram_reads_total", stat_core_state_sram_reads_total_);
+        add_core_stat("core_state_sram_writes_total", stat_core_state_sram_writes_total_);
+        add_core_stat("core_state_sram_bytes_read_total", stat_core_state_sram_bytes_read_total_);
+        add_core_stat("core_state_sram_bytes_write_total", stat_core_state_sram_bytes_write_total_);
+        add_core_stat("core_state_sram_bank_conflict_ticks_total", stat_core_state_sram_bank_conflict_ticks_total_);
+        add_core_stat("core_state_sram_predicted_extra_cycles_total", stat_core_state_sram_predicted_extra_cycles_total_);
+        add_core_stat("core_state_sram_resident_bytes_peak", stat_core_state_sram_resident_bytes_peak_);
+    } else if (workload_) {
+        std::map<std::string, uint64_t> core_stats;
+        workload_->getStatistics(core_stats);
+        auto get_core_u64 = [&core_stats](const char* key) -> uint64_t {
+            if (!key) return 0;
+            auto it = core_stats.find(key);
+            if (it == core_stats.end()) return 0;
+            return it->second;
+        };
+        auto add_core_stat = [&core_stats](const char* key, Statistic<uint64_t>* st) {
+            if (!st || !key) return;
+            auto it = core_stats.find(key);
+            if (it == core_stats.end()) return;
+            if (it->second == 0) return;
+            st->addData(it->second);
+        };
+        core_state_sram_reads_total = get_core_u64("core_state_sram_reads_total");
+        core_state_sram_writes_total = get_core_u64("core_state_sram_writes_total");
+        core_state_sram_bytes_read_total = get_core_u64("core_state_sram_bytes_read_total");
+        core_state_sram_bytes_write_total = get_core_u64("core_state_sram_bytes_write_total");
+        core_state_sram_bank_conflict_ticks_total = get_core_u64("core_state_sram_bank_conflict_ticks_total");
+        core_state_sram_predicted_extra_cycles_total = get_core_u64("core_state_sram_predicted_extra_cycles_total");
+        core_state_sram_resident_bytes_peak = get_core_u64("core_state_sram_resident_bytes_peak");
+        add_core_stat("core_state_sram_reads_total", stat_core_state_sram_reads_total_);
+        add_core_stat("core_state_sram_writes_total", stat_core_state_sram_writes_total_);
+        add_core_stat("core_state_sram_bytes_read_total", stat_core_state_sram_bytes_read_total_);
+        add_core_stat("core_state_sram_bytes_write_total", stat_core_state_sram_bytes_write_total_);
+        add_core_stat("core_state_sram_bank_conflict_ticks_total", stat_core_state_sram_bank_conflict_ticks_total_);
+        add_core_stat("core_state_sram_predicted_extra_cycles_total", stat_core_state_sram_predicted_extra_cycles_total_);
+        add_core_stat("core_state_sram_resident_bytes_peak", stat_core_state_sram_resident_bytes_peak_);
     }
 
 #ifdef SNNDL_ENABLE_PROFILING
@@ -1470,6 +1709,413 @@ void SnnPESubComponent::finish() {
         }
     }
     if (workload_) workload_->onFinish();
+
+    if (weight_mem_subsystem_) {
+        const auto exp_noc_rowidx = weight_mem_subsystem_->experimentalNocRowidxStats();
+        if (stat_exp_noc_rowidx_prefetch_rows_total_) {
+            stat_exp_noc_rowidx_prefetch_rows_total_->addData(exp_noc_rowidx.prefetch_rows_issued);
+        }
+        if (stat_exp_noc_rowidx_prefetch_bytes_total_) {
+            stat_exp_noc_rowidx_prefetch_bytes_total_->addData(exp_noc_rowidx.prefetch_bytes_issued);
+        }
+        if (stat_exp_noc_rowidx_prefetch_rows_deferred_total_) {
+            stat_exp_noc_rowidx_prefetch_rows_deferred_total_->addData(exp_noc_rowidx.prefetch_rows_deferred);
+        }
+        if (stat_exp_noc_rowidx_prefetch_rows_failed_total_) {
+            stat_exp_noc_rowidx_prefetch_rows_failed_total_->addData(exp_noc_rowidx.prefetch_rows_failed);
+        }
+        if (stat_exp_noc_rowidx_cache_hits_total_) {
+            stat_exp_noc_rowidx_cache_hits_total_->addData(exp_noc_rowidx.cache_hits);
+        }
+        if (stat_exp_noc_rowidx_cache_misses_total_) {
+            stat_exp_noc_rowidx_cache_misses_total_->addData(exp_noc_rowidx.cache_misses);
+        }
+        if (stat_exp_noc_rowidx_cache_fills_total_) {
+            stat_exp_noc_rowidx_cache_fills_total_->addData(exp_noc_rowidx.cache_fills);
+        }
+        if (stat_exp_noc_rowidx_cache_full_drop_total_) {
+            stat_exp_noc_rowidx_cache_full_drop_total_->addData(exp_noc_rowidx.cache_full_drop);
+        }
+        if (stat_exp_noc_rowidx_cache_entries_final_) {
+            stat_exp_noc_rowidx_cache_entries_final_->addData(exp_noc_rowidx.cache_entries);
+        }
+        if (stat_exp_noc_rowidx_touch_rows_total_) {
+            stat_exp_noc_rowidx_touch_rows_total_->addData(exp_noc_rowidx.rows_touched_enqueued);
+        }
+        if (stat_exp_noc_rowidx_touch_events_total_) {
+            stat_exp_noc_rowidx_touch_events_total_->addData(exp_noc_rowidx.touch_events_total);
+        }
+        if (stat_exp_noc_rowidx_rows_filtered_cold_total_) {
+            stat_exp_noc_rowidx_rows_filtered_cold_total_->addData(exp_noc_rowidx.rows_filtered_cold);
+        }
+        if (stat_exp_noc_rowidx_budget_ticks_total_) {
+            stat_exp_noc_rowidx_budget_ticks_total_->addData(exp_noc_rowidx.budget_ticks_total);
+        }
+        if (stat_exp_noc_rowidx_budget_effective_total_) {
+            stat_exp_noc_rowidx_budget_effective_total_->addData(exp_noc_rowidx.budget_effective_total);
+        }
+        if (stat_exp_noc_rowidx_budget_adapt_ticks_total_) {
+            stat_exp_noc_rowidx_budget_adapt_ticks_total_->addData(exp_noc_rowidx.budget_adapt_ticks);
+        }
+        const auto exp_idx2 = weight_mem_subsystem_->experimentalIdx2IngressStats();
+        if (stat_exp_noc_idx2_ingress_touch_events_total_) {
+            stat_exp_noc_idx2_ingress_touch_events_total_->addData(exp_idx2.touch_events_total);
+        }
+        if (stat_exp_noc_idx2_ingress_lookup_miss_total_) {
+            stat_exp_noc_idx2_ingress_lookup_miss_total_->addData(exp_idx2.lookup_miss_total);
+        }
+        if (stat_exp_noc_idx2_ingress_enqueued_total_) {
+            stat_exp_noc_idx2_ingress_enqueued_total_->addData(exp_idx2.enqueued_total);
+        }
+        if (stat_exp_noc_idx2_ingress_dedup_pending_total_) {
+            stat_exp_noc_idx2_ingress_dedup_pending_total_->addData(exp_idx2.dedup_pending_total);
+        }
+        if (stat_exp_noc_idx2_ingress_dedup_inflight_total_) {
+            stat_exp_noc_idx2_ingress_dedup_inflight_total_->addData(exp_idx2.dedup_inflight_total);
+        }
+        if (stat_exp_noc_idx2_ingress_dedup_cache_total_) {
+            stat_exp_noc_idx2_ingress_dedup_cache_total_->addData(exp_idx2.dedup_cache_total);
+        }
+        if (stat_exp_noc_idx2_ingress_prefetch_issued_total_) {
+            stat_exp_noc_idx2_ingress_prefetch_issued_total_->addData(exp_idx2.prefetch_issued_total);
+        }
+        if (stat_exp_noc_idx2_ingress_prefetch_bytes_total_) {
+            stat_exp_noc_idx2_ingress_prefetch_bytes_total_->addData(exp_idx2.prefetch_bytes_total);
+        }
+        if (stat_exp_noc_idx2_ingress_prefetch_deferred_total_) {
+            stat_exp_noc_idx2_ingress_prefetch_deferred_total_->addData(exp_idx2.prefetch_deferred_total);
+        }
+        if (stat_exp_noc_idx2_ingress_prefetch_failed_total_) {
+            stat_exp_noc_idx2_ingress_prefetch_failed_total_->addData(exp_idx2.prefetch_failed_total);
+        }
+        if (stat_exp_noc_idx2_ingress_demand_hit_total_) {
+            stat_exp_noc_idx2_ingress_demand_hit_total_->addData(exp_idx2.demand_hit_total);
+        }
+        if (stat_exp_noc_idx2_ingress_demand_join_total_) {
+            stat_exp_noc_idx2_ingress_demand_join_total_->addData(exp_idx2.demand_join_total);
+        }
+        if (stat_exp_noc_idx2_ingress_demand_fallback_total_) {
+            stat_exp_noc_idx2_ingress_demand_fallback_total_->addData(exp_idx2.demand_fallback_total);
+        }
+        if (stat_exp_noc_idx2_ingress_waiters_served_total_) {
+            stat_exp_noc_idx2_ingress_waiters_served_total_->addData(exp_idx2.waiters_served_total);
+        }
+        if (stat_exp_noc_idx2_ingress_cache_fill_total_) {
+            stat_exp_noc_idx2_ingress_cache_fill_total_->addData(exp_idx2.cache_fill_total);
+        }
+        if (stat_exp_noc_idx2_ingress_cache_evict_total_) {
+            stat_exp_noc_idx2_ingress_cache_evict_total_->addData(exp_idx2.cache_evict_total);
+        }
+        if (stat_exp_noc_idx2_ingress_cache_entries_final_) {
+            stat_exp_noc_idx2_ingress_cache_entries_final_->addData(exp_idx2.cache_entries);
+        }
+        weight_mem_subsystem_->flushSramObservability(static_cast<uint64_t>(total_cycles_));
+        const auto weight_sram = weight_mem_subsystem_->sramObservabilityStats();
+        if (stat_weight_idx_sram_reads_total_) {
+            stat_weight_idx_sram_reads_total_->addData(weight_sram.idx_sram.reads_total);
+        }
+        if (stat_weight_idx_sram_writes_total_) {
+            stat_weight_idx_sram_writes_total_->addData(weight_sram.idx_sram.writes_total);
+        }
+        if (stat_weight_idx_sram_bytes_read_total_) {
+            stat_weight_idx_sram_bytes_read_total_->addData(weight_sram.idx_sram.bytes_read_total);
+        }
+        if (stat_weight_idx_sram_bytes_write_total_) {
+            stat_weight_idx_sram_bytes_write_total_->addData(weight_sram.idx_sram.bytes_write_total);
+        }
+        if (stat_weight_idx_sram_bank_conflict_ticks_total_) {
+            stat_weight_idx_sram_bank_conflict_ticks_total_->addData(weight_sram.idx_sram.bank_conflict_ticks_total);
+        }
+        if (stat_weight_idx_sram_predicted_extra_cycles_total_) {
+            stat_weight_idx_sram_predicted_extra_cycles_total_->addData(weight_sram.idx_sram.predicted_extra_cycles_total);
+        }
+        if (stat_weight_idx_sram_resident_bytes_peak_) {
+            stat_weight_idx_sram_resident_bytes_peak_->addData(weight_sram.idx_sram.resident_bytes_peak);
+        }
+        if (stat_weight_idx_lookup_total_) {
+            stat_weight_idx_lookup_total_->addData(weight_sram.idx_lookup_total);
+        }
+        if (stat_weight_idx_lookup_idx2_total_) {
+            stat_weight_idx_lookup_idx2_total_->addData(weight_sram.idx_lookup_idx2_total);
+        }
+        if (stat_weight_l0_sram_reads_total_) {
+            stat_weight_l0_sram_reads_total_->addData(weight_sram.l0_sram.reads_total);
+        }
+        if (stat_weight_l0_sram_writes_total_) {
+            stat_weight_l0_sram_writes_total_->addData(weight_sram.l0_sram.writes_total);
+        }
+        if (stat_weight_l0_sram_bytes_read_total_) {
+            stat_weight_l0_sram_bytes_read_total_->addData(weight_sram.l0_sram.bytes_read_total);
+        }
+        if (stat_weight_l0_sram_bytes_write_total_) {
+            stat_weight_l0_sram_bytes_write_total_->addData(weight_sram.l0_sram.bytes_write_total);
+        }
+        if (stat_weight_l0_sram_bank_conflict_ticks_total_) {
+            stat_weight_l0_sram_bank_conflict_ticks_total_->addData(weight_sram.l0_sram.bank_conflict_ticks_total);
+        }
+        if (stat_weight_l0_sram_predicted_extra_cycles_total_) {
+            stat_weight_l0_sram_predicted_extra_cycles_total_->addData(weight_sram.l0_sram.predicted_extra_cycles_total);
+        }
+        if (stat_weight_l0_sram_resident_bytes_peak_) {
+            stat_weight_l0_sram_resident_bytes_peak_->addData(weight_sram.l0_sram.resident_bytes_peak);
+        }
+        if (stat_weight_l0_lookup_total_) {
+            stat_weight_l0_lookup_total_->addData(weight_sram.l0_lookup_total);
+        }
+        if (stat_weight_l0_hit_total_) {
+            stat_weight_l0_hit_total_->addData(weight_sram.l0_hit_total);
+        }
+        if (stat_weight_l0_fill_total_) {
+            stat_weight_l0_fill_total_->addData(weight_sram.l0_fill_total);
+        }
+        if (stat_weight_l0_evict_total_) {
+            stat_weight_l0_evict_total_->addData(weight_sram.l0_evict_total);
+        }
+        const auto gcss_lookup = weight_mem_subsystem_->gcssLookupStats();
+        if (stat_gcss_lookup_hit_total_) {
+            stat_gcss_lookup_hit_total_->addData(gcss_lookup.hit_total);
+        }
+        if (stat_gcss_lookup_miss_total_) {
+            stat_gcss_lookup_miss_total_->addData(gcss_lookup.miss_total);
+        }
+        const auto read_source = weight_mem_subsystem_->readSourceStats();
+        if (stat_weight_read_dense_reqs_total_) {
+            stat_weight_read_dense_reqs_total_->addData(read_source.dense_reqs_total);
+        }
+        if (stat_weight_read_dense_bytes_total_) {
+            stat_weight_read_dense_bytes_total_->addData(read_source.dense_bytes_total);
+        }
+        if (stat_weight_read_rowptr_reqs_total_) {
+            stat_weight_read_rowptr_reqs_total_->addData(read_source.rowptr_reqs_total);
+        }
+        if (stat_weight_read_rowptr_bytes_total_) {
+            stat_weight_read_rowptr_bytes_total_->addData(read_source.rowptr_bytes_total);
+        }
+        if (stat_weight_read_colidx_reqs_total_) {
+            stat_weight_read_colidx_reqs_total_->addData(read_source.colidx_reqs_total);
+        }
+        if (stat_weight_read_colidx_bytes_total_) {
+            stat_weight_read_colidx_bytes_total_->addData(read_source.colidx_bytes_total);
+        }
+        if (stat_weight_read_blockdata_reqs_total_) {
+            stat_weight_read_blockdata_reqs_total_->addData(read_source.blockdata_reqs_total);
+        }
+        if (stat_weight_read_blockdata_bytes_total_) {
+            stat_weight_read_blockdata_bytes_total_->addData(read_source.blockdata_bytes_total);
+        }
+        if (stat_weight_read_gcss_reqs_total_) {
+            stat_weight_read_gcss_reqs_total_->addData(read_source.gcss_reqs_total);
+        }
+        if (stat_weight_read_gcss_bytes_total_) {
+            stat_weight_read_gcss_bytes_total_->addData(read_source.gcss_bytes_total);
+        }
+        const auto retire_obs = weight_mem_subsystem_->retireObservabilityStats();
+        if (stat_gas_retire_global_hol_cycles_total_) {
+            stat_gas_retire_global_hol_cycles_total_->addData(retire_obs.global_hol_cycles_total);
+        }
+        if (stat_gas_retire_ready_but_blocked_edges_total_) {
+            stat_gas_retire_ready_but_blocked_edges_total_->addData(retire_obs.ready_but_blocked_edges_total);
+        }
+        if (stat_gas_retire_per_post_progress_total_) {
+            stat_gas_retire_per_post_progress_total_->addData(retire_obs.per_post_progress_total);
+        }
+        const auto tass_p0 = weight_mem_subsystem_->tassLfP0Stats();
+        if (stat_gas_tass_lf_p0_block_epochs_total_) {
+            stat_gas_tass_lf_p0_block_epochs_total_->addData(tass_p0.block_epochs_total);
+        }
+        if (stat_gas_tass_lf_p0_block_active_pres_total_) {
+            stat_gas_tass_lf_p0_block_active_pres_total_->addData(tass_p0.block_active_pres_total);
+        }
+        if (stat_gas_tass_lf_p0_block_shared_pres_total_) {
+            stat_gas_tass_lf_p0_block_shared_pres_total_->addData(tass_p0.block_shared_pres_total);
+        }
+        if (stat_gas_tass_lf_p0_cross_core_joins_total_) {
+            stat_gas_tass_lf_p0_cross_core_joins_total_->addData(tass_p0.cross_core_joins_total);
+        }
+        if (stat_gas_tass_lf_p0_payload_bytes_total_) {
+            stat_gas_tass_lf_p0_payload_bytes_total_->addData(tass_p0.payload_bytes_total);
+        }
+        if (stat_gas_tass_lf_p0_current_vlf_line_groups_total_) {
+            stat_gas_tass_lf_p0_current_vlf_line_groups_total_->addData(tass_p0.current_vlf_line_groups_total);
+        }
+        if (stat_gas_tass_lf_p0_block_naive_line_count_total_) {
+            stat_gas_tass_lf_p0_block_naive_line_count_total_->addData(tass_p0.block_naive_line_count_total);
+        }
+        if (stat_gas_tass_lf_p0_block_fused_lb_line_count_total_) {
+            stat_gas_tass_lf_p0_block_fused_lb_line_count_total_->addData(tass_p0.block_fused_lb_line_count_total);
+        }
+        if (stat_gas_tass_lf_p0_response_fanout_total_) {
+            stat_gas_tass_lf_p0_response_fanout_total_->addData(tass_p0.response_fanout_total);
+        }
+        if (auto* pe = parent_pe_cached_) {
+            pe->accumulateSynapseReadStats(
+                gcss_lookup.hit_total,
+                gcss_lookup.miss_total,
+                read_source.dense_reqs_total,
+                read_source.dense_bytes_total,
+                read_source.rowptr_reqs_total,
+                read_source.rowptr_bytes_total,
+                read_source.colidx_reqs_total,
+                read_source.colidx_bytes_total,
+                read_source.blockdata_reqs_total,
+                read_source.blockdata_bytes_total,
+                read_source.gcss_reqs_total,
+                read_source.gcss_bytes_total,
+                weight_sram.idx_sram.reads_total,
+                weight_sram.idx_sram.writes_total,
+                weight_sram.idx_sram.bytes_read_total,
+                weight_sram.idx_sram.bytes_write_total,
+                weight_sram.idx_sram.bank_conflict_ticks_total,
+                weight_sram.idx_sram.predicted_extra_cycles_total,
+                weight_sram.idx_sram.resident_bytes_peak,
+                weight_sram.idx_lookup_total,
+                weight_sram.idx_lookup_idx2_total,
+                weight_sram.l0_sram.reads_total,
+                weight_sram.l0_sram.writes_total,
+                weight_sram.l0_sram.bytes_read_total,
+                weight_sram.l0_sram.bytes_write_total,
+                weight_sram.l0_sram.bank_conflict_ticks_total,
+                weight_sram.l0_sram.predicted_extra_cycles_total,
+                weight_sram.l0_sram.resident_bytes_peak,
+                weight_sram.l0_lookup_total,
+                weight_sram.l0_hit_total,
+                weight_sram.l0_fill_total,
+                weight_sram.l0_evict_total,
+                core_state_sram_reads_total,
+                core_state_sram_writes_total,
+                core_state_sram_bytes_read_total,
+                core_state_sram_bytes_write_total,
+                core_state_sram_bank_conflict_ticks_total,
+                core_state_sram_predicted_extra_cycles_total,
+                core_state_sram_resident_bytes_peak,
+                retire_obs.global_hol_cycles_total,
+                retire_obs.ready_but_blocked_edges_total,
+                retire_obs.per_post_progress_total,
+                tass_p0.block_epochs_total,
+                tass_p0.block_active_pres_total,
+                tass_p0.block_shared_pres_total,
+                tass_p0.cross_core_joins_total,
+                tass_p0.payload_bytes_total,
+                tass_p0.current_vlf_line_groups_total,
+                tass_p0.block_naive_line_count_total,
+                tass_p0.block_fused_lb_line_count_total,
+                tass_p0.response_fanout_total,
+                tass_p0.reports_flushed_total,
+                tass_p0.reports_nonzero_payload_total,
+                tass_p0.reports_pre_entries_total,
+                tass_p0.reports_via_callback_total,
+                tass_p0.reports_via_fallback_total);
+        }
+
+        const uint64_t exp_total_observed =
+            exp_noc_rowidx.touch_events_total +
+            exp_noc_rowidx.rows_touched_enqueued +
+            exp_noc_rowidx.rows_filtered_cold +
+            exp_noc_rowidx.prefetch_rows_issued +
+            exp_noc_rowidx.prefetch_rows_deferred +
+            exp_noc_rowidx.prefetch_rows_failed +
+            exp_noc_rowidx.budget_ticks_total +
+            exp_noc_rowidx.budget_effective_total +
+            exp_noc_rowidx.budget_adapt_ticks +
+            exp_noc_rowidx.cache_hits +
+            exp_noc_rowidx.cache_misses +
+            exp_noc_rowidx.cache_fills +
+            exp_noc_rowidx.cache_full_drop;
+        if (exp_total_observed > 0 && output_) {
+            output_->verbose(
+                CALL_INFO, 1, 0,
+                "[exp-rowidx] core=%d touch=%" PRIu64 " touch_events=%" PRIu64
+                " cold_filtered=%" PRIu64 " prefetch_rows=%" PRIu64
+                " prefetch_bytes=%" PRIu64 " deferred=%" PRIu64 " failed=%" PRIu64
+                " budget_ticks=%" PRIu64 " budget_eff=%" PRIu64 " budget_adapt_ticks=%" PRIu64
+                " cache_hit=%" PRIu64 " cache_miss=%" PRIu64 " cache_fill=%" PRIu64
+                " cache_drop=%" PRIu64 " cache_entries=%" PRIu64 "\n",
+                core_id_,
+                exp_noc_rowidx.rows_touched_enqueued,
+                exp_noc_rowidx.touch_events_total,
+                exp_noc_rowidx.rows_filtered_cold,
+                exp_noc_rowidx.prefetch_rows_issued,
+                exp_noc_rowidx.prefetch_bytes_issued,
+                exp_noc_rowidx.prefetch_rows_deferred,
+                exp_noc_rowidx.prefetch_rows_failed,
+                exp_noc_rowidx.budget_ticks_total,
+                exp_noc_rowidx.budget_effective_total,
+                exp_noc_rowidx.budget_adapt_ticks,
+                exp_noc_rowidx.cache_hits,
+                exp_noc_rowidx.cache_misses,
+                exp_noc_rowidx.cache_fills,
+                exp_noc_rowidx.cache_full_drop,
+                exp_noc_rowidx.cache_entries);
+        }
+        const uint64_t exp_idx2_total_observed =
+            exp_idx2.touch_events_total +
+            exp_idx2.lookup_miss_total +
+            exp_idx2.enqueued_total +
+            exp_idx2.dedup_pending_total +
+            exp_idx2.dedup_inflight_total +
+            exp_idx2.dedup_cache_total +
+            exp_idx2.prefetch_issued_total +
+            exp_idx2.prefetch_deferred_total +
+            exp_idx2.prefetch_failed_total +
+            exp_idx2.prefetch_resp_ok_total +
+            exp_idx2.prefetch_resp_short_total +
+            exp_idx2.prefetch_resp_drop_tail_total +
+            exp_idx2.prefetch_complete_inflight_miss_total +
+            exp_idx2.prefetch_complete_zero_waiters_total +
+            exp_idx2.prefetch_complete_waiters_total +
+            exp_idx2.demand_hit_total +
+            exp_idx2.demand_join_total +
+            exp_idx2.demand_join_cb_nonnull_total +
+            exp_idx2.demand_join_cb_null_total +
+            exp_idx2.demand_fallback_total +
+            exp_idx2.waiters_served_total +
+            exp_idx2.cache_fill_total +
+            exp_idx2.cache_evict_total;
+        if (exp_idx2_total_observed > 0 && output_) {
+            output_->verbose(
+                CALL_INFO, 1, 0,
+                "[exp-idx2-prefetch] core=%d touch_events=%" PRIu64
+                " lookup_miss=%" PRIu64 " enqueued=%" PRIu64
+                " dedup_pending=%" PRIu64 " dedup_inflight=%" PRIu64
+                " dedup_cache=%" PRIu64 " prefetch_issued=%" PRIu64
+                " prefetch_bytes=%" PRIu64 " prefetch_deferred=%" PRIu64
+                " prefetch_failed=%" PRIu64 " prefetch_resp_ok=%" PRIu64
+                " prefetch_resp_short=%" PRIu64 " prefetch_resp_drop_tail=%" PRIu64
+                " prefetch_inflight_miss=%" PRIu64
+                " prefetch_zero_waiters=%" PRIu64 " prefetch_waiters_total=%" PRIu64
+                " demand_hit=%" PRIu64 " demand_join=%" PRIu64
+                " demand_join_cb_nonnull=%" PRIu64 " demand_join_cb_null=%" PRIu64
+                " demand_fallback=%" PRIu64 " waiters_served=%" PRIu64
+                " cache_fill=%" PRIu64
+                " cache_evict=%" PRIu64 " cache_entries=%" PRIu64 "\n",
+                core_id_,
+                exp_idx2.touch_events_total,
+                exp_idx2.lookup_miss_total,
+                exp_idx2.enqueued_total,
+                exp_idx2.dedup_pending_total,
+                exp_idx2.dedup_inflight_total,
+                exp_idx2.dedup_cache_total,
+                exp_idx2.prefetch_issued_total,
+                exp_idx2.prefetch_bytes_total,
+                exp_idx2.prefetch_deferred_total,
+                exp_idx2.prefetch_failed_total,
+                exp_idx2.prefetch_resp_ok_total,
+                exp_idx2.prefetch_resp_short_total,
+                exp_idx2.prefetch_resp_drop_tail_total,
+                exp_idx2.prefetch_complete_inflight_miss_total,
+                exp_idx2.prefetch_complete_zero_waiters_total,
+                exp_idx2.prefetch_complete_waiters_total,
+                exp_idx2.demand_hit_total,
+                exp_idx2.demand_join_total,
+                exp_idx2.demand_join_cb_nonnull_total,
+                exp_idx2.demand_join_cb_null_total,
+                exp_idx2.demand_fallback_total,
+                exp_idx2.waiters_served_total,
+                exp_idx2.cache_fill_total,
+                exp_idx2.cache_evict_total,
+                exp_idx2.cache_entries);
+        }
+    }
 }
 
 bool SnnPESubComponent::clockTick(Cycle_t current_cycle) {
@@ -1884,6 +2530,77 @@ void SnnPESubComponent::initializeStatistics() {
     stat_gas_bursts_total_ = registerStatistic<uint64_t>("gas_bursts_total");
     stat_gas_payload_bytes_total_ = registerStatistic<uint64_t>("gas_payload_bytes_total");
     stat_gas_gap_absorbed_bytes_total_ = registerStatistic<uint64_t>("gas_gap_absorbed_bytes_total");
+    stat_exp_noc_rowidx_prefetch_rows_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_prefetch_rows_total");
+    stat_exp_noc_rowidx_prefetch_bytes_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_prefetch_bytes_total");
+    stat_exp_noc_rowidx_prefetch_rows_deferred_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_prefetch_rows_deferred_total");
+    stat_exp_noc_rowidx_prefetch_rows_failed_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_prefetch_rows_failed_total");
+    stat_exp_noc_rowidx_cache_hits_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_cache_hits_total");
+    stat_exp_noc_rowidx_cache_misses_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_cache_misses_total");
+    stat_exp_noc_rowidx_cache_fills_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_cache_fills_total");
+    stat_exp_noc_rowidx_cache_full_drop_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_cache_full_drop_total");
+    stat_exp_noc_rowidx_cache_entries_final_ = registerStatistic<uint64_t>("exp_noc_rowidx_cache_entries_final");
+    stat_exp_noc_rowidx_touch_rows_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_touch_rows_total");
+    stat_exp_noc_rowidx_touch_events_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_touch_events_total");
+    stat_exp_noc_rowidx_rows_filtered_cold_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_rows_filtered_cold_total");
+    stat_exp_noc_rowidx_budget_ticks_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_budget_ticks_total");
+    stat_exp_noc_rowidx_budget_effective_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_budget_effective_total");
+    stat_exp_noc_rowidx_budget_adapt_ticks_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_budget_adapt_ticks_total");
+    stat_exp_noc_idx2_ingress_touch_events_total_ = registerStatistic<uint64_t>("exp_noc_idx2_ingress_touch_events_total");
+    stat_exp_noc_idx2_ingress_lookup_miss_total_ = registerStatistic<uint64_t>("exp_noc_idx2_ingress_lookup_miss_total");
+    stat_exp_noc_idx2_ingress_enqueued_total_ = registerStatistic<uint64_t>("exp_noc_idx2_ingress_enqueued_total");
+    stat_exp_noc_idx2_ingress_dedup_pending_total_ = registerStatistic<uint64_t>("exp_noc_idx2_ingress_dedup_pending_total");
+    stat_exp_noc_idx2_ingress_dedup_inflight_total_ = registerStatistic<uint64_t>("exp_noc_idx2_ingress_dedup_inflight_total");
+    stat_exp_noc_idx2_ingress_dedup_cache_total_ = registerStatistic<uint64_t>("exp_noc_idx2_ingress_dedup_cache_total");
+    stat_exp_noc_idx2_ingress_prefetch_issued_total_ = registerStatistic<uint64_t>("exp_noc_idx2_ingress_prefetch_issued_total");
+    stat_exp_noc_idx2_ingress_prefetch_bytes_total_ = registerStatistic<uint64_t>("exp_noc_idx2_ingress_prefetch_bytes_total");
+    stat_exp_noc_idx2_ingress_prefetch_deferred_total_ = registerStatistic<uint64_t>("exp_noc_idx2_ingress_prefetch_deferred_total");
+    stat_exp_noc_idx2_ingress_prefetch_failed_total_ = registerStatistic<uint64_t>("exp_noc_idx2_ingress_prefetch_failed_total");
+    stat_exp_noc_idx2_ingress_demand_hit_total_ = registerStatistic<uint64_t>("exp_noc_idx2_ingress_demand_hit_total");
+    stat_exp_noc_idx2_ingress_demand_join_total_ = registerStatistic<uint64_t>("exp_noc_idx2_ingress_demand_join_total");
+    stat_exp_noc_idx2_ingress_demand_fallback_total_ = registerStatistic<uint64_t>("exp_noc_idx2_ingress_demand_fallback_total");
+    stat_exp_noc_idx2_ingress_waiters_served_total_ = registerStatistic<uint64_t>("exp_noc_idx2_ingress_waiters_served_total");
+    stat_exp_noc_idx2_ingress_cache_fill_total_ = registerStatistic<uint64_t>("exp_noc_idx2_ingress_cache_fill_total");
+    stat_exp_noc_idx2_ingress_cache_evict_total_ = registerStatistic<uint64_t>("exp_noc_idx2_ingress_cache_evict_total");
+    stat_exp_noc_idx2_ingress_cache_entries_final_ = registerStatistic<uint64_t>("exp_noc_idx2_ingress_cache_entries_final");
+    stat_gcss_lookup_hit_total_ = registerStatistic<uint64_t>("gcss_lookup_hit_total");
+    stat_gcss_lookup_miss_total_ = registerStatistic<uint64_t>("gcss_lookup_miss_total");
+    stat_weight_read_dense_reqs_total_ = registerStatistic<uint64_t>("weight_read_dense_reqs_total");
+    stat_weight_read_dense_bytes_total_ = registerStatistic<uint64_t>("weight_read_dense_bytes_total");
+    stat_weight_read_rowptr_reqs_total_ = registerStatistic<uint64_t>("weight_read_rowptr_reqs_total");
+    stat_weight_read_rowptr_bytes_total_ = registerStatistic<uint64_t>("weight_read_rowptr_bytes_total");
+    stat_weight_read_colidx_reqs_total_ = registerStatistic<uint64_t>("weight_read_colidx_reqs_total");
+    stat_weight_read_colidx_bytes_total_ = registerStatistic<uint64_t>("weight_read_colidx_bytes_total");
+    stat_weight_read_blockdata_reqs_total_ = registerStatistic<uint64_t>("weight_read_blockdata_reqs_total");
+    stat_weight_read_blockdata_bytes_total_ = registerStatistic<uint64_t>("weight_read_blockdata_bytes_total");
+    stat_weight_read_gcss_reqs_total_ = registerStatistic<uint64_t>("weight_read_gcss_reqs_total");
+    stat_weight_read_gcss_bytes_total_ = registerStatistic<uint64_t>("weight_read_gcss_bytes_total");
+    stat_weight_idx_sram_reads_total_ = registerStatistic<uint64_t>("weight_idx_sram_reads_total");
+    stat_weight_idx_sram_writes_total_ = registerStatistic<uint64_t>("weight_idx_sram_writes_total");
+    stat_weight_idx_sram_bytes_read_total_ = registerStatistic<uint64_t>("weight_idx_sram_bytes_read_total");
+    stat_weight_idx_sram_bytes_write_total_ = registerStatistic<uint64_t>("weight_idx_sram_bytes_write_total");
+    stat_weight_idx_sram_bank_conflict_ticks_total_ = registerStatistic<uint64_t>("weight_idx_sram_bank_conflict_ticks_total");
+    stat_weight_idx_sram_predicted_extra_cycles_total_ = registerStatistic<uint64_t>("weight_idx_sram_predicted_extra_cycles_total");
+    stat_weight_idx_sram_resident_bytes_peak_ = registerStatistic<uint64_t>("weight_idx_sram_resident_bytes_peak");
+    stat_weight_idx_lookup_total_ = registerStatistic<uint64_t>("weight_idx_lookup_total");
+    stat_weight_idx_lookup_idx2_total_ = registerStatistic<uint64_t>("weight_idx_lookup_idx2_total");
+    stat_weight_l0_sram_reads_total_ = registerStatistic<uint64_t>("weight_l0_sram_reads_total");
+    stat_weight_l0_sram_writes_total_ = registerStatistic<uint64_t>("weight_l0_sram_writes_total");
+    stat_weight_l0_sram_bytes_read_total_ = registerStatistic<uint64_t>("weight_l0_sram_bytes_read_total");
+    stat_weight_l0_sram_bytes_write_total_ = registerStatistic<uint64_t>("weight_l0_sram_bytes_write_total");
+    stat_weight_l0_sram_bank_conflict_ticks_total_ = registerStatistic<uint64_t>("weight_l0_sram_bank_conflict_ticks_total");
+    stat_weight_l0_sram_predicted_extra_cycles_total_ = registerStatistic<uint64_t>("weight_l0_sram_predicted_extra_cycles_total");
+    stat_weight_l0_sram_resident_bytes_peak_ = registerStatistic<uint64_t>("weight_l0_sram_resident_bytes_peak");
+    stat_weight_l0_lookup_total_ = registerStatistic<uint64_t>("weight_l0_lookup_total");
+    stat_weight_l0_hit_total_ = registerStatistic<uint64_t>("weight_l0_hit_total");
+    stat_weight_l0_fill_total_ = registerStatistic<uint64_t>("weight_l0_fill_total");
+    stat_weight_l0_evict_total_ = registerStatistic<uint64_t>("weight_l0_evict_total");
+    stat_core_state_sram_reads_total_ = registerStatistic<uint64_t>("core_state_sram_reads_total");
+    stat_core_state_sram_writes_total_ = registerStatistic<uint64_t>("core_state_sram_writes_total");
+    stat_core_state_sram_bytes_read_total_ = registerStatistic<uint64_t>("core_state_sram_bytes_read_total");
+    stat_core_state_sram_bytes_write_total_ = registerStatistic<uint64_t>("core_state_sram_bytes_write_total");
+    stat_core_state_sram_bank_conflict_ticks_total_ = registerStatistic<uint64_t>("core_state_sram_bank_conflict_ticks_total");
+    stat_core_state_sram_predicted_extra_cycles_total_ = registerStatistic<uint64_t>("core_state_sram_predicted_extra_cycles_total");
+    stat_core_state_sram_resident_bytes_peak_ = registerStatistic<uint64_t>("core_state_sram_resident_bytes_peak");
     // 边集合溢出计数（仅在容量保护触发时递增）
     stat_gas_edge_overflow_ = registerStatistic<uint64_t>("gas_edge_overflow");
     // Apply/Scatter端到端统计（Phase‑1）
@@ -1893,6 +2610,18 @@ void SnnPESubComponent::initializeStatistics() {
     stat_gas_acc_hwm_bytes_total_ = registerStatistic<uint64_t>("gas_acc_high_watermark_bytes_total");
     stat_gas_acc_spill_records_total_ = registerStatistic<uint64_t>("gas_acc_spill_records_total");
     stat_gas_acc_spilled_bytes_total_ = registerStatistic<uint64_t>("gas_acc_spilled_bytes_total");
+    stat_gas_retire_global_hol_cycles_total_ = registerStatistic<uint64_t>("gas_retire_global_hol_cycles_total");
+    stat_gas_retire_ready_but_blocked_edges_total_ = registerStatistic<uint64_t>("gas_retire_ready_but_blocked_edges_total");
+    stat_gas_retire_per_post_progress_total_ = registerStatistic<uint64_t>("gas_retire_per_post_progress_total");
+    stat_gas_tass_lf_p0_block_epochs_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_block_epochs_total");
+    stat_gas_tass_lf_p0_block_active_pres_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_block_active_pres_total");
+    stat_gas_tass_lf_p0_block_shared_pres_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_block_shared_pres_total");
+    stat_gas_tass_lf_p0_cross_core_joins_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_cross_core_joins_total");
+    stat_gas_tass_lf_p0_payload_bytes_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_payload_bytes_total");
+    stat_gas_tass_lf_p0_current_vlf_line_groups_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_current_vlf_line_groups_total");
+    stat_gas_tass_lf_p0_block_naive_line_count_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_block_naive_line_count_total");
+    stat_gas_tass_lf_p0_block_fused_lb_line_count_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_block_fused_lb_line_count_total");
+    stat_gas_tass_lf_p0_response_fanout_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_response_fanout_total");
     // GAS superstep durations（cycles@1GHz == ns）
     // 留空注册，默认不向 SST 统计输出；统一使用 stage_events_csv + 离线脚本聚合
     // Batch-A additions（若需要SST统计输出，可在后续版本开放）

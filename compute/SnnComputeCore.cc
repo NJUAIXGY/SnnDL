@@ -67,6 +67,26 @@ void DefaultSnnComputeCore::configure(const ComputeCoreContext& ctx, const SST::
     // 兼容旧默认：未显式传入时（或传0）先暂存为0，待解析 BCSR 后再回填
     aosoa_block_rows_ = params.find<uint32_t>("aosoa_block_rows", 0);
     if (use_aosoa_state_) use_soa_state_ = true;
+    state_sram_enable_ = params.find<int>("state_sram_enable", 0) != 0;
+    {
+        VirtualSramLayoutConfig lcfg{};
+        lcfg.state_vmem_base = params.find<uint64_t>("state_sram_vmem_base", 0x300000000ull);
+        lcfg.state_refrac_base = params.find<uint64_t>("state_sram_refrac_base", 0x400000000ull);
+        lcfg.state_last_spike_base = params.find<uint64_t>("state_sram_last_spike_base", 0x500000000ull);
+        state_sram_layout_.configure(lcfg);
+
+        BankedSramConfig scfg{};
+        scfg.enable = state_sram_enable_;
+        scfg.name = "core_state_sram";
+        scfg.capacity_bytes = params.find<uint64_t>("state_sram_capacity_bytes", 0);
+        scfg.banks = params.find<uint32_t>("state_sram_banks", 16);
+        scfg.ports_per_bank = params.find<uint32_t>("state_sram_ports_per_bank", 1);
+        scfg.bank_interleave_bytes = params.find<uint64_t>("state_sram_bank_interleave_bytes", 4);
+        scfg.t_read_cycles = params.find<uint32_t>("state_sram_t_read_cycles", 1);
+        scfg.t_write_cycles = params.find<uint32_t>("state_sram_t_write_cycles", 1);
+        scfg.sample_log2 = params.find<uint32_t>("state_sram_sample_log2", 0);
+        state_sram_model_.configure(scfg);
+    }
 
     apply_acc_enable_ = params.find<int>("apply_acc_enable", 0) != 0;
     gas_window_mode_ = params.find<int>("gas_window_mode", 0) != 0;
@@ -148,6 +168,16 @@ void DefaultSnnComputeCore::initCoreEngineState_() {
     pending_dv_touched_.assign(num_neurons_, 0);
     pending_dv_list_.clear();
     pending_dv_list_.reserve(std::max<uint32_t>(8u, num_neurons_ / 10u));
+    if (state_sram_enable_) {
+        uint64_t resident_bytes = 0;
+        if (use_soa_state_) {
+            resident_bytes = static_cast<uint64_t>(num_neurons_) *
+                             static_cast<uint64_t>(sizeof(float) + sizeof(uint32_t) + sizeof(uint64_t));
+        } else {
+            resident_bytes = static_cast<uint64_t>(num_neurons_) * static_cast<uint64_t>(sizeof(SnnCoreNeuronState));
+        }
+        state_sram_model_.noteResidentBytes(resident_bytes);
+    }
 }
 
 void DefaultSnnComputeCore::initVerifyFile_() {
@@ -172,9 +202,17 @@ void DefaultSnnComputeCore::initVerifyFile_() {
 
 void DefaultSnnComputeCore::onInit(unsigned int) {}
 void DefaultSnnComputeCore::onSetup() {}
-void DefaultSnnComputeCore::onFinish() {}
+void DefaultSnnComputeCore::onFinish() {
+    if (state_sram_enable_) {
+        state_sram_model_.onClockTick(state_sram_current_cycle_ + 1);
+    }
+}
 
 void DefaultSnnComputeCore::onClockTick(uint64_t now_cycle) {
+    state_sram_current_cycle_ = now_cycle;
+    if (state_sram_enable_) {
+        state_sram_model_.onClockTick(now_cycle);
+    }
     total_cycles_++;
     if (hasWork()) active_cycles_++;
     performWeightVerificationTick_(now_cycle);
@@ -277,6 +315,11 @@ void DefaultSnnComputeCore::applySynapticDelta(uint32_t post_local, float dv) {
 
 void DefaultSnnComputeCore::applyPendingDeltas_() {
     if (pending_dv_list_.empty()) return;
+    if (state_sram_enable_) {
+        const uint64_t touched = static_cast<uint64_t>(pending_dv_list_.size());
+        const uint64_t bytes = touched * static_cast<uint64_t>(sizeof(float));
+        state_sram_model_.noteBulkUniform(state_sram_current_cycle_, touched, touched, bytes, bytes);
+    }
     for (uint32_t post_local : pending_dv_list_) {
         if (post_local >= num_neurons_) continue;
         const float dv = (post_local < pending_dv_.size()) ? pending_dv_[post_local] : 0.0f;
@@ -324,6 +367,12 @@ void DefaultSnnComputeCore::onSynapticEvent(const SynapticEvent& ev) {
 
 void DefaultSnnComputeCore::updateNeuronStates() {
     cycles_update_neuron_count_ += num_neurons_;
+    if (state_sram_enable_ && num_neurons_ > 0) {
+        const uint64_t n = static_cast<uint64_t>(num_neurons_);
+        const uint64_t bytes = n * static_cast<uint64_t>(sizeof(float) + sizeof(uint32_t));
+        // Per-neuron state sweep: read + write vmem/refrac.
+        state_sram_model_.noteBulkUniform(state_sram_current_cycle_, n * 2ull, n * 2ull, bytes, bytes);
+    }
     if (neuron_model_) {
         if (use_soa_state_) {
             for (uint32_t i = 0; i < num_neurons_; ++i) {
@@ -514,6 +563,14 @@ void DefaultSnnComputeCore::getStatistics(std::map<std::string, uint64_t>& out) 
     out["core_verify_enabled"] = verify_weights_ ? 1ULL : 0ULL;
     out["core_verify_completed"] = static_cast<uint64_t>(verify_completed_);
     out["core_verify_mismatch_count"] = verify_mismatch_count_;
+    const auto& sram_stats = state_sram_model_.stats();
+    out["core_state_sram_reads_total"] = sram_stats.reads_total;
+    out["core_state_sram_writes_total"] = sram_stats.writes_total;
+    out["core_state_sram_bytes_read_total"] = sram_stats.bytes_read_total;
+    out["core_state_sram_bytes_write_total"] = sram_stats.bytes_write_total;
+    out["core_state_sram_bank_conflict_ticks_total"] = sram_stats.bank_conflict_ticks_total;
+    out["core_state_sram_predicted_extra_cycles_total"] = sram_stats.predicted_extra_cycles_total;
+    out["core_state_sram_resident_bytes_peak"] = sram_stats.resident_bytes_peak;
     if (learning_core_) {
         learning_core_->getStatistics(out);
     }

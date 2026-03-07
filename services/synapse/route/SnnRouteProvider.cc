@@ -15,10 +15,12 @@ inline uint32_t resolveNeuronsPerPe_(uint32_t neurons_per_pe_cfg) {
 
 void SnnRouteProvider::configure(const Config& cfg,
                                  const std::shared_ptr<const RouteMap>& routes_shared,
-                                 const RouteMap* routes_local) {
+                                 const RouteMap* routes_local,
+                                 const RouteWeightMap* route_weights) {
     cfg_ = cfg;
     routes_shared_ = routes_shared;
     routes_local_ = routes_local;
+    route_weights_ = route_weights;
 }
 
 const SnnRouteProvider::RouteMap* SnnRouteProvider::chooseRouteTable_() const {
@@ -53,6 +55,7 @@ void SnnRouteProvider::computeFanout(uint32_t source_global, uint32_t neuron_idx
                         FanoutEntry fe;
                         fe.dest_node = dpe;
                         fe.dest_global = dpe * denom + neuron_idx;
+                        fe.weight = resolveWeight_(source_global, fe.dest_global);
                         out_entries.push_back(fe);
                     }
                     applied_gating = true;
@@ -101,6 +104,7 @@ void SnnRouteProvider::fanoutWeightDriven_(uint32_t source_global, uint32_t neur
         FanoutEntry fe;
         fe.dest_global = dest_global;
         fe.dest_node = (dest_global / denom);
+        fe.weight = resolveWeight_(source_global, dest_global);
         out_entries.push_back(fe);
     }
     if (cfg_.log_weight_details && cfg_.out) {
@@ -146,7 +150,17 @@ void SnnRouteProvider::fanoutFixed_(uint32_t neuron_idx,
     FanoutEntry fe;
     fe.dest_global = target_neuron;
     fe.dest_node = target_node;
+    fe.weight = 1.0f;
     out_entries.push_back(fe);
+}
+
+float SnnRouteProvider::resolveWeight_(uint32_t source_global, uint32_t dest_global) const {
+    if (!route_weights_) return 1.0f;
+    const uint64_t key =
+        (static_cast<uint64_t>(source_global) << 32) | static_cast<uint64_t>(dest_global);
+    auto it = route_weights_->find(key);
+    if (it == route_weights_->end()) return 1.0f;
+    return it->second;
 }
 
 } } // namespace SST::SnnDL

@@ -22,6 +22,7 @@
 #include "events/NocPacketEvent.h"
 #include "workload/layout/NormalizedNeuronLayout.h"
 #include "synapse/route/SpikeNocCodec.h"
+#include "synapse/route/SpikeTileNocCodec.h"
 #include "services/synapse/route/SpikeCommSubsystem.h"
 #include "services/synapse/route/SynapseRouteSubsystem.h"
 
@@ -335,6 +336,17 @@ void TrafficWorkload::configureFromParams(const SST::Params& params) {
     traffic_pre_end_ = params_->find<uint32_t>("traffic_pre_end", 0);
     traffic_stop_cycle_ = params_->find<uint64_t>("traffic_stop_cycle", 0);
 
+    experimental_spiketile_enable_ = params_->find<int>("experimental_spiketile_enable", 0) != 0;
+    experimental_spiketile_max_pre_bits_ = params_->find<uint32_t>("experimental_spiketile_max_pre_bits", 64);
+    experimental_spiketile_block_cols_ = params_->find<uint32_t>("experimental_spiketile_block_cols", 0);
+    experimental_compact_mask_enable_ = params_->find<int>("experimental_compact_mask_enable", 0) != 0;
+    experimental_inter_bundle_enable_ = params_->find<int>("experimental_inter_bundle_enable", 0) != 0;
+    experimental_inter_bundle_max_entries_ = params_->find<uint32_t>("experimental_inter_bundle_max_entries", 64);
+    if (experimental_inter_bundle_max_entries_ == 0) {
+        experimental_inter_bundle_max_entries_ = 64;
+    }
+    experimental_inter_bundle_v2_enable_ = params_->find<int>("experimental_inter_bundle_v2_enable", 0) != 0;
+
     spikekey_check_enable_ = params_->find<int>("traffic_spikekey_check_enable", 1) != 0;
     spikekey_check_fatal_ = params_->find<int>("traffic_spikekey_check_fatal", 0) != 0;
     spikekey_check_log_cap_ = params_->find<uint32_t>("traffic_spikekey_check_log_cap", 8);
@@ -371,6 +383,9 @@ void TrafficWorkload::onFinish() {
                                               /*fatal_on_bad=*/spikekey_check_fatal_);
 
     if (tx_batches_ == 0 && tx_pres_total_ == 0 && rx_spike_total_ == 0 && rx_spikekey_total_ == 0) return;
+    const uint64_t tx_spike_pkts = spike_comm_ ? spike_comm_->txSpikePacketsTotal() : 0;
+    const uint64_t tx_spikekey_pkts = spike_comm_ ? spike_comm_->txSpikeKeyPacketsTotal() : 0;
+    const uint64_t tx_spiketilekey_pkts = spike_comm_ ? spike_comm_->txSpikeTileKeyPacketsTotal() : 0;
     rt_.log->verbose(CALL_INFO, 0, 0,
                      "[traffic] node=%u core=%u tx_batches=%" PRIu64 " tx_pre_total=%" PRIu64
                      " rx_spike=%" PRIu64 " rx_spikekey=%" PRIu64
@@ -378,7 +393,9 @@ void TrafficWorkload::onFinish() {
                      " rx_spikekey_hops_sum=%" PRIu64 " rx_spikekey_hops_max=%" PRIu64
                      " sk_ok=%" PRIu64 " sk_bad=%" PRIu64
                      " sk_bad_decode=%" PRIu64 " sk_bad_stage=%" PRIu64 " sk_bad_dst=%" PRIu64
-                     " sk_bad_blockpos=%" PRIu64 " sk_bad_mask=%" PRIu64 "\n",
+                     " sk_bad_blockpos=%" PRIu64 " sk_bad_mask=%" PRIu64
+                     " rx_spiketilekey=%" PRIu64 " tile_bad_decode=%" PRIu64
+                     " tx_spike_pkts=%" PRIu64 " tx_spikekey_pkts=%" PRIu64 " tx_spiketilekey_pkts=%" PRIu64 "\n",
                      rt_.node_id,
                      rt_.core_id,
                      tx_batches_,
@@ -395,7 +412,12 @@ void TrafficWorkload::onFinish() {
                      rx_spikekey_bad_stage_,
                      rx_spikekey_bad_dst_,
                      rx_spikekey_bad_blockpos_,
-                     rx_spikekey_bad_mask_);
+                     rx_spikekey_bad_mask_,
+                     rx_spiketilekey_total_,
+                     rx_spiketilekey_bad_decode_,
+                     tx_spike_pkts,
+                     tx_spikekey_pkts,
+                     tx_spiketilekey_pkts);
 }
 
 bool TrafficWorkload::hasWork() const {
@@ -413,6 +435,11 @@ void TrafficWorkload::getStatistics(std::map<std::string, uint64_t>& stats) cons
     stats["traffic_tx_pre_total"] = tx_pres_total_;
     stats["traffic_rx_spike_total"] = rx_spike_total_;
     stats["traffic_rx_spikekey_total"] = rx_spikekey_total_;
+    stats["traffic_rx_spiketilekey_total"] = rx_spiketilekey_total_;
+    stats["traffic_rx_spiketilekey_bad_decode"] = rx_spiketilekey_bad_decode_;
+    stats["traffic_tx_spike_pkts"] = spike_comm_ ? spike_comm_->txSpikePacketsTotal() : 0;
+    stats["traffic_tx_spikekey_pkts"] = spike_comm_ ? spike_comm_->txSpikeKeyPacketsTotal() : 0;
+    stats["traffic_tx_spiketilekey_pkts"] = spike_comm_ ? spike_comm_->txSpikeTileKeyPacketsTotal() : 0;
     stats["traffic_rx_spike_hops_sum"] = rx_spike_hops_sum_;
     stats["traffic_rx_spike_hops_max"] = rx_spike_hops_max_;
     stats["traffic_rx_spikekey_hops_sum"] = rx_spikekey_hops_sum_;
@@ -553,6 +580,13 @@ void TrafficWorkload::ensureCommReady_() {
     crt.synapse_route = synapse_route_.get();
     // SpikeCommSubsystem 的 global_neuron_base 必须是“本 core 的 base”（而不是 node base），否则 core_id>0 时 source_global 会错位。
     crt.global_neuron_base = n.core_neuron_base;
+    crt.experimental_spiketile_enable = experimental_spiketile_enable_;
+    crt.experimental_spiketile_max_pre_bits = experimental_spiketile_max_pre_bits_;
+    crt.experimental_spiketile_block_cols = experimental_spiketile_block_cols_;
+    crt.experimental_compact_mask_enable = experimental_compact_mask_enable_;
+    crt.experimental_inter_bundle_enable = experimental_inter_bundle_enable_;
+    crt.experimental_inter_bundle_max_entries = experimental_inter_bundle_max_entries_;
+    crt.experimental_inter_bundle_v2_enable = experimental_inter_bundle_v2_enable_;
     spike_comm_->bindRuntime(crt);
     spike_comm_->initRouting();
 
@@ -596,8 +630,10 @@ bool TrafficWorkload::deliverPacket(NocPacketEvent* packet) {
         rx_spike_hops_sum_ += static_cast<uint64_t>(packet->hop_count);
         rx_spike_hops_max_ = std::max<uint64_t>(rx_spike_hops_max_, packet->hop_count);
     }
-        if (kind == NocPacketKind::SpikeKey) {
+        if (kind == NocPacketKind::SpikeKey || kind == NocPacketKind::SpikeTileKey) {
+            // Key-like packets (SpikeKey + SpikeTileKey) share the same blocked-multicast routing semantics.
             rx_spikekey_total_ += 1;
+            if (kind == NocPacketKind::SpikeTileKey) rx_spiketilekey_total_ += 1;
             rx_spikekey_hops_sum_ += static_cast<uint64_t>(packet->hop_count);
             rx_spikekey_hops_max_ = std::max<uint64_t>(rx_spikekey_hops_max_, packet->hop_count);
 
@@ -606,9 +642,19 @@ bool TrafficWorkload::deliverPacket(NocPacketEvent* packet) {
 
                 bool ok = true;
                 SpikeNocCodec::WireSpikeKeyV2 ws{};
-                if (!SpikeNocCodec::decodeSpikeKeyAny(packet->payload, ws) || (ws.version != 1 && ws.version != 2)) {
+                if (!SpikeNocCodec::decodeSpikeKeyAny(packet->payload, ws) ||
+                    (ws.version != 1 && ws.version != 2 && ws.version != 3)) {
                     ok = false;
                     rx_spikekey_bad_decode_ += 1;
+                }
+
+                // For SpikeTileKey: enforce that the payload tail is preserved through the router (decode must succeed).
+                if (ok && kind == NocPacketKind::SpikeTileKey) {
+                    SpikeTileNocCodec::WireSpikeTileKeyV1 tile_ws{};
+                    if (!SpikeTileNocCodec::decode(packet->payload, tile_ws)) {
+                        ok = false;
+                        rx_spiketilekey_bad_decode_ += 1;
+                    }
                 }
 
                 if (ok && ws.stage != 1) {
@@ -690,11 +736,12 @@ bool TrafficWorkload::deliverPacket(NocPacketEvent* packet) {
                         const uint32_t mask_val = (idx < kMaxMulticastBlockCells) ? ws.core_mask[idx] : 0u;
                         rt_.log->verbose(
                             CALL_INFO, 0, 0,
-                            "[traffic][sk-check] BAD node=%u core=%u pkt_dst=%u:%u ingress=%u stage=%u block_w_h=0x%04x idx=%u mask=0x%08x\n",
+                            "[traffic][sk-check] BAD node=%u core=%u pkt_dst=%u:%u kind=%u ingress=%u stage=%u block_w_h=0x%04x idx=%u mask=0x%08x\n",
                             rt_.node_id,
                             rt_.core_id,
                             packet->dst_node,
                             packet->dst_endpoint,
+                            static_cast<unsigned>(packet->kind),
                             ws.ingress_node,
                             static_cast<unsigned>(ws.stage),
                             static_cast<unsigned>(ws.block_w_h),

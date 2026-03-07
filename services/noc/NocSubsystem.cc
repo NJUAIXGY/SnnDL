@@ -133,7 +133,7 @@ void NocSubsystem::onCoreSend(NocPacketEvent* packet) {
 
     if (packet->step_seq == 0 && rt_.active_step_seq && *rt_.active_step_seq != 0) {
         const auto k = packet->packetKind();
-        if (k == NocPacketKind::Spike || k == NocPacketKind::SpikeKey) {
+        if (k == NocPacketKind::Spike || k == NocPacketKind::SpikeKey || k == NocPacketKind::SpikeTileKey) {
             packet->step_seq = (*rt_.active_step_seq) + rt_.step_seq_offset;
         }
     }
@@ -164,15 +164,15 @@ void NocSubsystem::sendFromCore(int src_core, NocPacketEvent* packet) {
 
     if (packet->step_seq == 0 && rt_.active_step_seq && *rt_.active_step_seq != 0) {
         const auto k = packet->packetKind();
-        if (k == NocPacketKind::Spike || k == NocPacketKind::SpikeKey) {
+        if (k == NocPacketKind::Spike || k == NocPacketKind::SpikeKey || k == NocPacketKind::SpikeTileKey) {
             packet->step_seq = (*rt_.active_step_seq) + rt_.step_seq_offset;
         }
     }
 
-    // SpikeKey（原生多播）必须经过外部 router mesh，即便 ingress_node 恰好等于本节点：
+    // SpikeKey/SpikeTileKey（原生多播）必须经过外部 router mesh，即便 ingress_node 恰好等于本节点：
     // 否则会走本地 ring 直投，导致跳过 MulticastRouter 的 INTER→INTRA 阶段切换与 block 内复制，
     // 从而出现“看似收到了包但不是真多播”的语义漂移。
-    if (packet->packetKind() == NocPacketKind::SpikeKey) {
+    if (packet->packetKind() == NocPacketKind::SpikeKey || packet->packetKind() == NocPacketKind::SpikeTileKey) {
         if (rt_.nic) {
             rt_.nic->sendToNode(packet->dst_node, packet);
             if (static_cast<int>(packet->dst_node) != rt_.node_id) {
@@ -208,7 +208,7 @@ void NocSubsystem::injectLocal(int dst_core, NocPacketEvent* packet) {
     if (!packet) return;
     if (packet->step_seq == 0 && rt_.active_step_seq && *rt_.active_step_seq != 0) {
         const auto k = packet->packetKind();
-        if (k == NocPacketKind::Spike || k == NocPacketKind::SpikeKey) {
+        if (k == NocPacketKind::Spike || k == NocPacketKind::SpikeKey || k == NocPacketKind::SpikeTileKey) {
             packet->step_seq = (*rt_.active_step_seq) + rt_.step_seq_offset;
         }
     }
@@ -223,7 +223,7 @@ void NocSubsystem::injectLocal(int dst_core, NocPacketEvent* packet) {
 void NocSubsystem::sendExternal(NocPacketEvent* packet) {
     if (packet && packet->step_seq == 0 && rt_.active_step_seq && *rt_.active_step_seq != 0) {
         const auto k = packet->packetKind();
-        if (k == NocPacketKind::Spike || k == NocPacketKind::SpikeKey) {
+        if (k == NocPacketKind::Spike || k == NocPacketKind::SpikeKey || k == NocPacketKind::SpikeTileKey) {
             packet->step_seq = (*rt_.active_step_seq) + rt_.step_seq_offset;
         }
     }

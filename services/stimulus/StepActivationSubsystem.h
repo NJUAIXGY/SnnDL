@@ -53,6 +53,9 @@ public:
         PrePattern pre_pattern = PrePattern::BernoulliUniform;
         // Clustered 模式：每段连续 pre 的长度（单位：neuron）。0 表示自动（默认 64）。
         uint32_t pre_cluster_len = 0;
+        // Microbench-only：保持“每 core 选源数量”不变，但将 pre_global 映射为全局范围内均匀采样，
+        // 用于制造跨列/跨 bank 访问（验证 Apply 调度策略）。默认关闭以保持历史语义不漂移。
+        bool pre_sample_global = false;
 
         // BCSR reachability 路由采样（仅影响“post 选择”）
         bool use_bcsr_routes = false;

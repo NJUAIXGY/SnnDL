@@ -29,6 +29,7 @@
 #include "services/synapse/weights/WeightMemorySubsystem.h"
 #include "services/synapse/route/SpikeCommSubsystem.h"
 #include "services/synapse/route/SynapseRouteSubsystem.h"
+#include "services/synapse/route/SpikeTileNocCodec.h"
 #include "services/noc/NocSubsystem.h"
 #include "services/stimulus/StepActivationSubsystem.h"
 // Phase: native multicast lab (traffic-only workload)
@@ -44,6 +45,9 @@ int main(int argc, char** argv) {
 
     // compile-only reference for new kinds/helpers
     (void)SST::SnnDL::NocPacketKind::SpikeKey;
+    (void)SST::SnnDL::NocPacketKind::SpikeTileKey;
+    SST::SnnDL::SpikeTileNocCodec::WireSpikeTileKeyV1 tile_ws;
+    (void)tile_ws;
 
     SST::SnnDL::TensorWorkload::Config tensor_cfg;
     tensor_cfg.collective_type = "allreduce";

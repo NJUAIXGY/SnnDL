@@ -19,6 +19,16 @@ struct GlobalGasStepControllerConfig {
     uint32_t max_steps = 0;
     bool require_all_ready = true;
     bool strict_seq_check = false;
+    // Experimental: progress watchdog (disabled by default).
+    bool experimental_progress_enable = false;
+    uint64_t experimental_progress_period_cycles = 0;
+    uint32_t experimental_progress_max_reports = 0;
+    uint32_t experimental_progress_dump_first_n = 8;
+    // Experimental: step-level global apply bank credit control.
+    bool credit_ctrl_enable = false;
+    uint32_t credit_ctrl_credit_min = 1;
+    uint32_t credit_ctrl_credit_max = 2;
+    uint32_t credit_ctrl_top_k = 0; // 0=disable (even if enable=1)
 };
 
 inline GlobalGasStepControllerConfig parseGlobalGasStepControllerConfig(const SST::Params& params) {
@@ -28,6 +38,14 @@ inline GlobalGasStepControllerConfig parseGlobalGasStepControllerConfig(const SS
     c.max_steps = params.find<uint32_t>("max_steps", 0);
     c.require_all_ready = params.find<int>("require_all_ready", 1) != 0;
     c.strict_seq_check = params.find<int>("strict_seq_check", 0) != 0;
+    c.experimental_progress_enable = params.find<int>("experimental_progress_enable", 0) != 0;
+    c.experimental_progress_period_cycles = params.find<uint64_t>("experimental_progress_period_cycles", 0);
+    c.experimental_progress_max_reports = params.find<uint32_t>("experimental_progress_max_reports", 0);
+    c.experimental_progress_dump_first_n = params.find<uint32_t>("experimental_progress_dump_first_n", 8);
+    c.credit_ctrl_enable = params.find<int>("credit_ctrl_enable", 0) != 0;
+    c.credit_ctrl_credit_min = params.find<uint32_t>("credit_ctrl_credit_min", 1);
+    c.credit_ctrl_credit_max = params.find<uint32_t>("credit_ctrl_credit_max", 2);
+    c.credit_ctrl_top_k = params.find<uint32_t>("credit_ctrl_top_k", 0);
     return c;
 }
 

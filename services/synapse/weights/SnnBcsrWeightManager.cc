@@ -1,5 +1,7 @@
 #include "SnnBcsrWeightManager.h"
 
+#include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <utility>
 
@@ -18,7 +20,11 @@ void BcsrWeightManager::configure(uint64_t rowptr_addr,
                                   uint32_t block_rows,
                                   uint32_t block_cols,
                                   uint32_t idx_bytes,
-                                  uint32_t val_bytes) {
+                                  uint32_t val_bytes,
+                                  const std::string& layout_mode,
+                                  uint32_t colidx_row_stride_bytes,
+                                  uint32_t blockdata_row_stride_bytes,
+                                  uint32_t blockids_row_stride_bytes) {
     rowptr_addr_ = rowptr_addr;
     colidx_addr_ = colidx_addr;
     blockdata_addr_ = blockdata_addr;
@@ -27,6 +33,24 @@ void BcsrWeightManager::configure(uint64_t rowptr_addr,
     block_cols_ = block_cols;
     idx_bytes_ = idx_bytes;
     val_bytes_ = val_bytes;
+    layout_mode_ = LayoutMode::Flat;
+    colidx_row_stride_bytes_ = colidx_row_stride_bytes;
+    blockdata_row_stride_bytes_ = blockdata_row_stride_bytes;
+    blockids_row_stride_bytes_ = blockids_row_stride_bytes;
+
+    std::string mode = layout_mode;
+    std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (mode == "rowpack_v1") {
+        const uint32_t idxB = effectiveIdxBytes();
+        const uint32_t blkRowB = static_cast<uint32_t>(blockRowBytes());
+        const bool valid_rowpack =
+            (colidx_row_stride_bytes_ >= idxB) &&
+            (blockdata_row_stride_bytes_ >= blkRowB);
+        if (valid_rowpack) layout_mode_ = LayoutMode::RowpackV1;
+    }
+
     rowptr_ready_ = false;
     rowptr_read_pending_ = false;
     bcsr_rowptr_host_.clear();
@@ -92,12 +116,60 @@ size_t BcsrWeightManager::blockBytes() const {
            static_cast<size_t>(effectiveValBytes());
 }
 
+size_t BcsrWeightManager::blockRowBytes() const {
+    return static_cast<size_t>(effectiveBlockCols()) *
+           static_cast<size_t>(effectiveValBytes());
+}
+
+uint64_t BcsrWeightManager::blockDataAddrByRow(uint32_t block_row, uint32_t idx_in_row) const {
+    if (usesRowpackLayout()) {
+        return blockdata_addr_ +
+               static_cast<uint64_t>(block_row) * static_cast<uint64_t>(blockdata_row_stride_bytes_) +
+               static_cast<uint64_t>(idx_in_row) * static_cast<uint64_t>(blockBytes());
+    }
+    uint32_t start = 0;
+    uint32_t end = 0;
+    if (!rowBounds(block_row, start, end)) return blockdata_addr_;
+    return blockdata_addr_ +
+           static_cast<uint64_t>(start + idx_in_row) * static_cast<uint64_t>(blockBytes());
+}
+
 uint64_t BcsrWeightManager::blockDataAddr(uint32_t global_block_index) const {
-    return blockdata_addr_ + static_cast<uint64_t>(global_block_index) * blockBytes();
+    if (!usesRowpackLayout()) {
+        return blockdata_addr_ + static_cast<uint64_t>(global_block_index) * blockBytes();
+    }
+    uint32_t block_row = 0;
+    uint32_t idx_in_row = 0;
+    if (!decodeGlobalBlockIndex(global_block_index, block_row, idx_in_row)) {
+        return blockdata_addr_ + static_cast<uint64_t>(global_block_index) * blockBytes();
+    }
+    return blockDataAddrByRow(block_row, idx_in_row);
+}
+
+uint64_t BcsrWeightManager::colIndexAddrByRow(uint32_t block_row, uint32_t idx_in_row) const {
+    if (usesRowpackLayout()) {
+        return colidx_addr_ +
+               static_cast<uint64_t>(block_row) * static_cast<uint64_t>(colidx_row_stride_bytes_) +
+               static_cast<uint64_t>(idx_in_row) * static_cast<uint64_t>(effectiveIdxBytes());
+    }
+    uint32_t start = 0;
+    uint32_t end = 0;
+    if (!rowBounds(block_row, start, end)) return colidx_addr_;
+    return colidx_addr_ +
+           static_cast<uint64_t>(start + idx_in_row) * static_cast<uint64_t>(effectiveIdxBytes());
 }
 
 uint64_t BcsrWeightManager::colIndexAddr(uint32_t start_index) const {
-    return colidx_addr_ + static_cast<uint64_t>(start_index) * effectiveIdxBytes();
+    if (!usesRowpackLayout()) {
+        return colidx_addr_ + static_cast<uint64_t>(start_index) * effectiveIdxBytes();
+    }
+    uint32_t block_row = 0;
+    uint32_t idx_in_row = 0;
+    if (!decodeGlobalBlockIndex(start_index, block_row, idx_in_row)) {
+        // row start_index normally lands exactly on rowptr[block_row]. Fallback to flat if unavailable.
+        return colidx_addr_ + static_cast<uint64_t>(start_index) * effectiveIdxBytes();
+    }
+    return colIndexAddrByRow(block_row, idx_in_row);
 }
 
 size_t BcsrWeightManager::colIndexBytes(uint32_t block_count) const {
@@ -108,6 +180,25 @@ bool BcsrWeightManager::rowBounds(uint32_t block_row, uint32_t& start, uint32_t&
     if (block_row + 1 >= bcsr_rowptr_host_.size()) return false;
     start = bcsr_rowptr_host_[block_row];
     end = bcsr_rowptr_host_[block_row + 1];
+    return true;
+}
+
+bool BcsrWeightManager::decodeGlobalBlockIndex(uint32_t global_block_index,
+                                               uint32_t& block_row,
+                                               uint32_t& idx_in_row) const {
+    if (bcsr_rowptr_host_.size() < 2) return false;
+    auto it = std::upper_bound(
+        bcsr_rowptr_host_.begin(),
+        bcsr_rowptr_host_.end(),
+        global_block_index);
+    if (it == bcsr_rowptr_host_.begin()) return false;
+    const size_t row = static_cast<size_t>((it - bcsr_rowptr_host_.begin()) - 1);
+    if (row + 1 >= bcsr_rowptr_host_.size()) return false;
+    const uint32_t start = bcsr_rowptr_host_[row];
+    const uint32_t end = bcsr_rowptr_host_[row + 1];
+    if (global_block_index < start || global_block_index >= end) return false;
+    block_row = static_cast<uint32_t>(row);
+    idx_in_row = global_block_index - start;
     return true;
 }
 

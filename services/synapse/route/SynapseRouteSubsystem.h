@@ -31,6 +31,7 @@ namespace SST { namespace SnnDL {
 class SynapseRouteSubsystem final : public ISynapseRoute {
 public:
     using RouteMap = ISynapseRoute::RouteMap;
+    using RouteWeightMap = std::unordered_map<uint64_t, float>;
 
     struct BlockTarget final {
         uint32_t block_id = 0;
@@ -68,6 +69,7 @@ public:
     bool multicastEnabled() const;
     uint32_t multicastBlockW() const { return cfg_.multicast_block_w; }
     uint32_t multicastBlockH() const { return cfg_.multicast_block_h; }
+    uint32_t bcsrBlockCols() const { return cfg_.bcsr_bc; }
 
     // 计算 blocked multicast targets（不改变 ISynapseRoute 接口，仅供 SpikeCommSubsystem 使用）。
     // applied_gating=true 表示命中 gating 且已对目标集合做过滤。
@@ -95,6 +97,8 @@ private:
     bool route_summary_logged_ = false;
     std::shared_ptr<const RouteMap> routes_shared_;
     RouteMap routes_local_fallback_;
+    std::shared_ptr<const RouteWeightMap> route_weights_shared_;
+    RouteWeightMap route_weights_local_fallback_;
 
     // Fanout provider (Phase3: 从 SpikeCommSubsystem 下沉到 Synapse/Route)。
     bool fanout_provider_ready_ = false;
@@ -116,6 +120,8 @@ private:
 
     static std::mutex s_route_cache_mtx_;
     static std::unordered_map<std::string, std::weak_ptr<const RouteMap>> s_route_cache_;
+    static std::mutex s_route_weight_cache_mtx_;
+    static std::unordered_map<std::string, std::weak_ptr<const RouteWeightMap>> s_route_weight_cache_;
 
     static std::mutex s_multicast_cache_mtx_;
     static std::unordered_map<std::string, std::weak_ptr<const MulticastTargetMap>> s_multicast_cache_;

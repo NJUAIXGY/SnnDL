@@ -29,6 +29,13 @@ struct SpikeCommRuntimeConfig {
     uint32_t node_id = 0;
     ISynapseRoute* synapse_route = nullptr;
     uint64_t global_neuron_base = 0;
+    bool experimental_spiketile_enable = false;
+    uint32_t experimental_spiketile_max_pre_bits = 64;
+    uint32_t experimental_spiketile_block_cols = 0;
+    bool experimental_compact_mask_enable = false;
+    bool experimental_inter_bundle_enable = false;
+    uint32_t experimental_inter_bundle_max_entries = 64;
+    bool experimental_inter_bundle_v2_enable = false;
 };
 
 class SpikeCommSubsystem {
@@ -54,9 +61,13 @@ public:
                              uint64_t ttl_cycles);
 
     bool ready() const { return transport_ && route_provider_ready_; }
+    uint64_t txSpikePacketsTotal() const { return tx_spike_packets_total_; }
+    uint64_t txSpikeKeyPacketsTotal() const { return tx_spikekey_packets_total_; }
+    uint64_t txSpikeTileKeyPacketsTotal() const { return tx_spiketilekey_packets_total_; }
 
 private:
     void emitCommon_(uint32_t source_global, uint32_t source_local, uint64_t now_cycle);
+    bool emitSpikeTileBatchExperimental_(const std::vector<uint32_t>& neuron_indices, uint64_t now_cycle);
 
     Output* log_ = nullptr;
     ISpikeTransport* transport_ = nullptr;     // 非拥有；由外部管理生命周期
@@ -68,6 +79,16 @@ private:
 
     bool route_provider_ready_ = false;
     ISynapseRoute* synapse_route_ = nullptr;  // 非拥有；由控制层装配并保证生命周期
+    bool experimental_spiketile_enable_ = false;
+    uint32_t experimental_spiketile_max_pre_bits_ = 64;
+    uint32_t experimental_spiketile_block_cols_ = 0;
+    bool experimental_compact_mask_enable_ = false;
+    bool experimental_inter_bundle_enable_ = false;
+    uint32_t experimental_inter_bundle_max_entries_ = 64;
+    bool experimental_inter_bundle_v2_enable_ = false;
+    uint64_t tx_spike_packets_total_ = 0;
+    uint64_t tx_spikekey_packets_total_ = 0;
+    uint64_t tx_spiketilekey_packets_total_ = 0;
 
 };
 

@@ -24,9 +24,11 @@
 #include "ICoreControlHooks.h"
 #include "ICoreMemoryLink.h"
 #include "IGlobalStepHooks.h"
+#include "IGlobalStepCreditHooks.h"
 #include "ILoaderReadyHooks.h"
 #include "IGasOrchestrator.h"
 #include "IGasStageSink.h"
+#include "ITassNaiveResponseSink.h"
 
 namespace SST { namespace SnnDL {
 
@@ -53,9 +55,11 @@ class SnnPESubComponent : public SnnCoreAPI,
                           public ICoreControlHooks,
                           public ICoreMemoryLink,
                           public IGlobalStepHooks,
+                          public IGlobalStepCreditHooks,
                           public ILoaderReadyHooks,
                           public IGasOrchestrator,
-                          public IGasStageSink {
+                          public IGasStageSink,
+                          public ITassNaiveResponseSink {
 public:
     SST_ELI_REGISTER_SUBCOMPONENT(
         SnnPESubComponent,
@@ -183,11 +187,36 @@ public:
         // Dense weights physical layout (experiment; default row_major)
         {"dense_layout_mode", "Dense weights layout: row_major (default) | phys_v1", "row_major"},
         {"dense_phys_dram_row_bytes", "Dense weights phys_v1: DRAM row bytes (must match weights_phys generator; 0 disables)", "0"},
+        // BCSR physical layout + runtime fetch granularity (default keeps legacy behavior).
+        {"bcsr_layout_mode", "BCSR layout mode: flat (default) | rowpack_v1", "flat"},
+        {"bcsr_colidx_row_stride_bytes", "BCSR rowpack_v1: row stride bytes for colidx region (0=unused in flat)", "0"},
+        {"bcsr_blockdata_row_stride_bytes", "BCSR rowpack_v1: row stride bytes for blockdata region (0=unused in flat)", "0"},
+        {"bcsr_blockids_row_stride_bytes", "BCSR rowpack_v1: row stride bytes for blockids region (optional)", "0"},
+        {"bcsr_block_fetch_mode", "BCSR blockdata fetch mode: full_block (default) | row_cacheline", "full_block"},
+        {"experimental_noc_rowidx_prefetch_enable", "Experimental STORM-PIF: prefetch BCSR row-index metadata from Gather touches (0/1)", "0"},
+        {"experimental_noc_rowidx_prefetch_budget_per_tick", "Experimental STORM-PIF: max prefetched block_rows per tick", "4"},
+        {"experimental_noc_rowidx_cache_rows", "Experimental STORM-PIF: max cached BCSR row-index rows (0=unlimited)", "1024"},
+        {"experimental_noc_rowidx_prefetch_gather_only", "Experimental STORM-PIF: only prefetch when not in Apply window (0/1)", "1"},
+        {"experimental_noc_rowidx_hot_touch_min", "Experimental STORM-PIF v8: min touches per block_row before enqueueing prefetch", "1"},
+        {"experimental_noc_rowidx_budget_adapt_enable", "Experimental STORM-PIF v8: enable queue/headroom adaptive prefetch budget (0/1)", "0"},
+        {"experimental_noc_rowidx_budget_adapt_max_per_tick", "Experimental STORM-PIF v8: adaptive budget upper bound per tick", "32"},
+        {"experimental_noc_rowidx_budget_adapt_q_depth", "Experimental STORM-PIF v8: queue depth target used for adaptive budget scaling", "16"},
         {"weights_cols", "Number of columns in weight matrix when using global read (post_row_pre_col)", "0"},
         {"index_mode", "Indexing mode: pre_row_post_col (default) or post_row_pre_col", "pre_row_post_col"},
         {"use_soa_neuron_state", "Use Structure-of-Arrays layout for neuron state (0=AoS,1=SoA)", "0"},
         {"use_aosoa_neuron_state", "Use block-wise AoSoA iteration on top of SoA (0/1)", "0"},
         {"aosoa_block_rows", "AoSoA block row width; defaults to bcsr_block_rows when unset", "0"},
+        {"state_sram_enable", "Observe-only neuron-state SRAM model enable (0/1)", "0"},
+        {"state_sram_capacity_bytes", "Observe-only neuron-state SRAM capacity bytes", "0"},
+        {"state_sram_banks", "Observe-only neuron-state SRAM bank count", "16"},
+        {"state_sram_ports_per_bank", "Observe-only neuron-state SRAM ports per bank", "1"},
+        {"state_sram_bank_interleave_bytes", "Observe-only neuron-state SRAM bank interleave bytes", "4"},
+        {"state_sram_t_read_cycles", "Observe-only neuron-state SRAM read cycles", "1"},
+        {"state_sram_t_write_cycles", "Observe-only neuron-state SRAM write cycles", "1"},
+        {"state_sram_sample_log2", "Observe-only neuron-state SRAM sampling log2", "0"},
+        {"state_sram_vmem_base", "Observe-only neuron-state SRAM virtual base for vmem", "12884901888"},
+        {"state_sram_refrac_base", "Observe-only neuron-state SRAM virtual base for refrac", "17179869184"},
+        {"state_sram_last_spike_base", "Observe-only neuron-state SRAM virtual base for last_spike", "21474836480"},
         {"verify_routing_weights", "Log and verify routing fanout against weight threshold (0/1)", "0"},
         {"enable_detailed_map_log", "Enable detailed logging of neuron mapping", "0"},
         {"route_summary_enable", "Enable one-shot route summary logging per core (0/1)", "0"},
@@ -215,6 +244,23 @@ public:
         {"route_layers_mask", "Allowed layer transitions, e.g. I>H1,H1>H2,H2>O", ""},
         {"route_filter_warn", "Print prominent warning when route filters are enabled (0/1)", "1"},
         {"readresp_zero_fallback", "When DRAM returns 0 for weight, fallback to init_default_weight (0/1)", "0"},
+        {"synapse_weight_mode", "Synapse weight sourcing mode: bcsr_gas | gcss_valueonly_dstcore | gcss_valueonly_dstcore_idx2 | gcss_valueonly_dstcore_vlf_premphf | gcss_valueonly_dstcore_vlf_premphf_plp", "bcsr_gas"},
+        {"gcss_index_template", "Template for per-core GCSS index files, e.g. .../pe{pe:02d}/core{core:02d}.gcss.idx.bin", ""},
+        {"weight_sram_model_enable", "Observe-only weight SRAM model master enable (0/1)", "0"},
+        {"weight_idx_sram_enable", "Observe-only weight index SRAM enable (0/1)", "0"},
+        {"weight_l0_sram_enable", "Observe-only weight L0 SRAM enable (0/1)", "0"},
+        {"weight_idx_sram_capacity_bytes", "Observe-only weight index SRAM capacity bytes", "0"},
+        {"weight_l0_sram_capacity_bytes", "Observe-only weight L0 SRAM capacity bytes", "0"},
+        {"weight_idx_sram_banks", "Observe-only weight index SRAM bank count", "16"},
+        {"weight_l0_sram_banks", "Observe-only weight L0 SRAM bank count", "8"},
+        {"weight_sram_ports_per_bank", "Observe-only weight SRAM ports per bank", "1"},
+        {"weight_sram_bank_interleave_bytes", "Observe-only weight SRAM bank interleave bytes", "4"},
+        {"weight_sram_t_read_cycles", "Observe-only weight SRAM read cycles", "1"},
+        {"weight_sram_t_write_cycles", "Observe-only weight SRAM write cycles", "1"},
+        {"weight_sram_sample_log2", "Observe-only weight SRAM sampling log2", "0"},
+        {"weight_idx_sram_base", "Observe-only weight index SRAM virtual base", "4294967296"},
+        {"weight_l0_sram_base", "Observe-only weight L0 SRAM virtual base", "8589934592"},
+        {"weight_l0_sram_slots", "Observe-only weight L0 SRAM virtual slot count", "1048576"},
         // === GAS Apply/Scatter (Phase-1, default off) ===
         {"apply_acc_enable", "Enable Apply-side accumulation and Scatter-side fire (0/1)", "0"},
         {"acc_high_watermark_bytes", "Accumulator high-watermark in bytes before spilling", "16777216"},
@@ -258,7 +304,11 @@ public:
         {"window_read_budget", "Max number of (pre,post) single-col reads per window", "1024"},
         {"scatter_diag_limit", "Limit scatter diagnostic logs when window_read_debug=1 (0=disable)", "0"},
         // 安全保护：限制单窗边集合容量，防止极端随机发放导致内存增长
-        {"edge_collector_max_capacity", "Max edges per window before overflow protection", "1000000"}
+        {"edge_collector_max_capacity", "Max edges per window before overflow protection", "1000000"},
+        // Experimental retire policy in WeightMemorySubsystem (default keeps historical behavior).
+        {"experimental_retire_policy", "Retire policy: global_inorder | per_post", "global_inorder"},
+        {"experimental_pre_window_profile_export_enable", "Experimental GCSS-PLP: export per-window pre first-touch profile (0/1)", "0"},
+        {"experimental_pre_window_profile_export_dir", "Experimental GCSS-PLP: output directory for per-core pre-window profile CSVs", ""}
     )
 
     SST_ELI_DOCUMENT_STATISTICS(
@@ -294,14 +344,96 @@ public:
         {"gas_bursts_total", "Total number of bursts (segments) built by GAS", "count", 1},
         {"gas_payload_bytes_total", "Total useful payload bytes requested upstream (sum of sub-reads)", "bytes", 1},
         {"gas_gap_absorbed_bytes_total", "Total gap bytes absorbed by fine-grained gap-merge", "bytes", 1},
+        {"exp_noc_rowidx_prefetch_rows_total", "Experimental STORM-PIF: number of BCSR row-index rows prefetched", "rows", 1},
+        {"exp_noc_rowidx_prefetch_bytes_total", "Experimental STORM-PIF: bytes issued for BCSR row-index prefetch", "bytes", 1},
+        {"exp_noc_rowidx_prefetch_rows_deferred_total", "Experimental STORM-PIF: row-index prefetch rows deferred by inflight pressure", "rows", 1},
+        {"exp_noc_rowidx_prefetch_rows_failed_total", "Experimental STORM-PIF: row-index prefetch rows that failed to issue", "rows", 1},
+        {"exp_noc_rowidx_cache_hits_total", "Experimental STORM-PIF: row-index cache hits on BCSR requests", "hits", 1},
+        {"exp_noc_rowidx_cache_misses_total", "Experimental STORM-PIF: row-index cache misses on BCSR requests", "misses", 1},
+        {"exp_noc_rowidx_cache_fills_total", "Experimental STORM-PIF: row-index cache fill operations", "fills", 1},
+        {"exp_noc_rowidx_cache_full_drop_total", "Experimental STORM-PIF: row-index cache insert drops due to capacity limit", "drops", 1},
+        {"exp_noc_rowidx_cache_entries_final", "Experimental STORM-PIF: final row-index cache entries at finish", "entries", 1},
+        {"exp_noc_rowidx_touch_rows_total", "Experimental STORM-PIF: unique touched block_rows enqueued from Gather", "rows", 1},
+        {"exp_noc_rowidx_touch_events_total", "Experimental STORM-PIF v8: total Gather touch events observed", "events", 1},
+        {"exp_noc_rowidx_rows_filtered_cold_total", "Experimental STORM-PIF v8: touches filtered by hot_touch_min threshold", "events", 1},
+        {"exp_noc_rowidx_budget_ticks_total", "Experimental STORM-PIF v8: ticks where prefetch budget was computed", "ticks", 1},
+        {"exp_noc_rowidx_budget_effective_total", "Experimental STORM-PIF v8: effective prefetch budget consumed by scheduler", "rows", 1},
+        {"exp_noc_rowidx_budget_adapt_ticks_total", "Experimental STORM-PIF v8: ticks where adaptive budget deviated from base budget", "ticks", 1},
+        {"exp_noc_idx2_ingress_touch_events_total", "Experimental STORM-NIP: ingress touch events observed for idx2 prefetch", "events", 1},
+        {"exp_noc_idx2_ingress_lookup_miss_total", "Experimental STORM-NIP: idx2 lookup misses during ingress prefetch enqueue", "misses", 1},
+        {"exp_noc_idx2_ingress_enqueued_total", "Experimental STORM-NIP: unique gcss value addresses enqueued for prefetch", "requests", 1},
+        {"exp_noc_idx2_ingress_dedup_pending_total", "Experimental STORM-NIP: enqueue dedup hits on pending queue", "hits", 1},
+        {"exp_noc_idx2_ingress_dedup_inflight_total", "Experimental STORM-NIP: enqueue dedup hits on inflight prefetches", "hits", 1},
+        {"exp_noc_idx2_ingress_dedup_cache_total", "Experimental STORM-NIP: enqueue dedup hits on prefetch value cache", "hits", 1},
+        {"exp_noc_idx2_ingress_prefetch_issued_total", "Experimental STORM-NIP: prefetch reads issued", "requests", 1},
+        {"exp_noc_idx2_ingress_prefetch_bytes_total", "Experimental STORM-NIP: bytes issued by ingress prefetch", "bytes", 1},
+        {"exp_noc_idx2_ingress_prefetch_deferred_total", "Experimental STORM-NIP: prefetch requests deferred by inflight pressure", "requests", 1},
+        {"exp_noc_idx2_ingress_prefetch_failed_total", "Experimental STORM-NIP: prefetch requests failed to issue", "requests", 1},
+        {"exp_noc_idx2_ingress_demand_hit_total", "Experimental STORM-NIP: demand reads served from prefetch value cache", "hits", 1},
+        {"exp_noc_idx2_ingress_demand_join_total", "Experimental STORM-NIP: demand reads joined inflight prefetches", "joins", 1},
+        {"exp_noc_idx2_ingress_demand_fallback_total", "Experimental STORM-NIP: joined demand reads that fell back to direct demand", "requests", 1},
+        {"exp_noc_idx2_ingress_waiters_served_total", "Experimental STORM-NIP: demand callbacks served by prefetch completion", "callbacks", 1},
+        {"exp_noc_idx2_ingress_cache_fill_total", "Experimental STORM-NIP: value cache fills", "fills", 1},
+        {"exp_noc_idx2_ingress_cache_evict_total", "Experimental STORM-NIP: value cache evictions", "evictions", 1},
+        {"exp_noc_idx2_ingress_cache_entries_final", "Experimental STORM-NIP: final value cache entries at finish", "entries", 1},
+        {"gcss_lookup_hit_total", "GCSS lookup hits in gcss_valueonly mode", "hits", 1},
+        {"gcss_lookup_miss_total", "GCSS lookup misses in gcss_valueonly mode", "misses", 1},
+        {"weight_read_dense_reqs_total", "Issued weight-read requests classified as dense", "requests", 1},
+        {"weight_read_dense_bytes_total", "Issued weight-read bytes classified as dense", "bytes", 1},
+        {"weight_read_rowptr_reqs_total", "Issued weight-read requests classified as BCSR rowptr", "requests", 1},
+        {"weight_read_rowptr_bytes_total", "Issued weight-read bytes classified as BCSR rowptr", "bytes", 1},
+        {"weight_read_colidx_reqs_total", "Issued weight-read requests classified as BCSR colidx", "requests", 1},
+        {"weight_read_colidx_bytes_total", "Issued weight-read bytes classified as BCSR colidx", "bytes", 1},
+        {"weight_read_blockdata_reqs_total", "Issued weight-read requests classified as BCSR blockdata", "requests", 1},
+        {"weight_read_blockdata_bytes_total", "Issued weight-read bytes classified as BCSR blockdata", "bytes", 1},
+        {"weight_read_gcss_reqs_total", "Issued weight-read requests classified as GCSS value-only", "requests", 1},
+        {"weight_read_gcss_bytes_total", "Issued weight-read bytes classified as GCSS value-only", "bytes", 1},
+        {"weight_idx_sram_reads_total", "Observe-only weight idx SRAM reads", "reads", 1},
+        {"weight_idx_sram_writes_total", "Observe-only weight idx SRAM writes", "writes", 1},
+        {"weight_idx_sram_bytes_read_total", "Observe-only weight idx SRAM read bytes", "bytes", 1},
+        {"weight_idx_sram_bytes_write_total", "Observe-only weight idx SRAM write bytes", "bytes", 1},
+        {"weight_idx_sram_bank_conflict_ticks_total", "Observe-only weight idx SRAM ticks with bank conflicts", "ticks", 1},
+        {"weight_idx_sram_predicted_extra_cycles_total", "Observe-only weight idx SRAM predicted extra cycles", "cycles", 1},
+        {"weight_idx_sram_resident_bytes_peak", "Observe-only weight idx SRAM resident bytes peak", "bytes", 1},
+        {"weight_idx_lookup_total", "Total GCSS index lookups", "lookups", 1},
+        {"weight_idx_lookup_idx2_total", "Total GCSSIDX2 lookups", "lookups", 1},
+        {"weight_l0_sram_reads_total", "Observe-only weight L0 SRAM reads", "reads", 1},
+        {"weight_l0_sram_writes_total", "Observe-only weight L0 SRAM writes", "writes", 1},
+        {"weight_l0_sram_bytes_read_total", "Observe-only weight L0 SRAM read bytes", "bytes", 1},
+        {"weight_l0_sram_bytes_write_total", "Observe-only weight L0 SRAM write bytes", "bytes", 1},
+        {"weight_l0_sram_bank_conflict_ticks_total", "Observe-only weight L0 SRAM ticks with bank conflicts", "ticks", 1},
+        {"weight_l0_sram_predicted_extra_cycles_total", "Observe-only weight L0 SRAM predicted extra cycles", "cycles", 1},
+        {"weight_l0_sram_resident_bytes_peak", "Observe-only weight L0 SRAM resident bytes peak", "bytes", 1},
+        {"weight_l0_lookup_total", "Total weight L0 lookups", "lookups", 1},
+        {"weight_l0_hit_total", "Total weight L0 hits", "hits", 1},
+        {"weight_l0_fill_total", "Total weight L0 fills", "fills", 1},
+        {"weight_l0_evict_total", "Total weight L0 evictions", "evictions", 1},
+        {"core_state_sram_reads_total", "Observe-only neuron-state SRAM reads", "reads", 1},
+        {"core_state_sram_writes_total", "Observe-only neuron-state SRAM writes", "writes", 1},
+        {"core_state_sram_bytes_read_total", "Observe-only neuron-state SRAM read bytes", "bytes", 1},
+        {"core_state_sram_bytes_write_total", "Observe-only neuron-state SRAM write bytes", "bytes", 1},
+        {"core_state_sram_bank_conflict_ticks_total", "Observe-only neuron-state SRAM ticks with bank conflicts", "ticks", 1},
+        {"core_state_sram_predicted_extra_cycles_total", "Observe-only neuron-state SRAM predicted extra cycles", "cycles", 1},
+        {"core_state_sram_resident_bytes_peak", "Observe-only neuron-state SRAM resident bytes peak", "bytes", 1},
         // Apply/Scatter端到端统计（Phase-1）
         {"gas_apply_acc_updates_total", "Apply阶段的delta累加次数（有效子读）", "count", 1},
         {"gas_acc_posts_touched_total", "Apply阶段触达的post计数（去重）", "posts", 1},
         {"gas_scatter_spikes_emitted_total", "Scatter阶段发放的spike个数", "spikes", 1},
         {"gas_acc_high_watermark_bytes_total", "累加器峰值占用（bytes）", "bytes", 1},
         {"gas_acc_spill_records_total", "溢写到增量日志的记录条数", "records", 1},
-        {"gas_acc_spilled_bytes_total", "溢写到增量日志的有效字节数（payload）", "bytes", 1}
-        ,
+        {"gas_acc_spilled_bytes_total", "溢写到增量日志的有效字节数（payload）", "bytes", 1},
+        {"gas_retire_global_hol_cycles_total", "Global retire路径head未ready且存在ready-edge时的阻塞周期", "cycles", 1},
+        {"gas_retire_ready_but_blocked_edges_total", "Global retire路径中ready但被head阻塞的edge累计量", "edge_cycles", 1},
+        {"gas_retire_per_post_progress_total", "Per-post retire模式下实际退役次数", "count", 1},
+        {"gas_tass_lf_p0_block_epochs_total", "TASS-LF P0: completed 2x2-block epochs observed by reporter cores", "epochs", 1},
+        {"gas_tass_lf_p0_block_active_pres_total", "TASS-LF P0: total active pre count aggregated at block scope", "pres", 1},
+        {"gas_tass_lf_p0_block_shared_pres_total", "TASS-LF P0: active pres shared by at least two cores in the block", "pres", 1},
+        {"gas_tass_lf_p0_cross_core_joins_total", "TASS-LF P0: cross-core joins implied by shared pre activity", "joins", 1},
+        {"gas_tass_lf_p0_payload_bytes_total", "TASS-LF P0: useful payload bytes aggregated at block scope", "bytes", 1},
+        {"gas_tass_lf_p0_current_vlf_line_groups_total", "TASS-LF P0: current per-core VLF line groups summed over completed block epochs", "lines", 1},
+        {"gas_tass_lf_p0_block_naive_line_count_total", "TASS-LF P0: same-pre block service line count without cross-pre fusion", "lines", 1},
+        {"gas_tass_lf_p0_block_fused_lb_line_count_total", "TASS-LF P0: ideal lower-bound line count with block-level line fusion", "lines", 1},
+        {"gas_tass_lf_p0_response_fanout_total", "TASS-LF P0: total block-level response fanout count", "fanout", 1},
         {"weight_read_requests", "Number of weight read requests issued by core", "requests", 1},
         {"gas_edge_overflow", "Number of times per-window edge collector hit capacity and stopped recording", "events", 1},
         // Phase6：stream workload 统计（默认不影响 SNN；仅在 workload_impl=stream 时有意义）
@@ -323,7 +455,9 @@ public:
     virtual void setParentInterface(IPeAggregation* parent) override;
     void setNocTransport(INocTransport* noc) override;
     void onGlobalStepStart(uint32_t seq) override;
+    void onGlobalStepApplyBankCredit(uint32_t seq, uint32_t apply_bank_credit) override;
     void onLoaderReady() override;
+    void onTassNaiveResponses(const std::vector<TassNaiveResponseEntry>& entries) override;
     virtual void init(unsigned int phase) override;
     virtual void complete(unsigned int phase) override;
     virtual void setup() override;
@@ -440,6 +574,9 @@ private:
 	    enum class GasStage { Idle=0, Gather=1, Apply=2, Scatter=3 };
 	    GasStage gas_stage_ = GasStage::Idle;
 	    uint32_t curr_stage_seq_ = 0;             // gather/apply/scatter sequence id
+        // Global step control-plane: Apply-stage per-bank credit target for this seq (0 means "no override").
+        uint32_t global_step_apply_bank_credit_seq_ = 0;
+        uint32_t global_step_apply_bank_credit_target_ = 0;
 	    // Extracted accumulator/cache helpers (constructed in ctor)
 	    std::unique_ptr<AccumulatorOps> acc_ops_;
 	    std::unique_ptr<WeightCacheOps> weight_cache_ops_;
@@ -458,6 +595,18 @@ private:
     Statistic<uint64_t>* stat_gas_acc_hwm_bytes_total_ = nullptr;
     Statistic<uint64_t>* stat_gas_acc_spill_records_total_ = nullptr;
 	    Statistic<uint64_t>* stat_gas_acc_spilled_bytes_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_retire_global_hol_cycles_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_retire_ready_but_blocked_edges_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_retire_per_post_progress_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_tass_lf_p0_block_epochs_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_tass_lf_p0_block_active_pres_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_tass_lf_p0_block_shared_pres_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_tass_lf_p0_cross_core_joins_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_tass_lf_p0_payload_bytes_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_tass_lf_p0_current_vlf_line_groups_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_tass_lf_p0_block_naive_line_count_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_tass_lf_p0_block_fused_lb_line_count_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_tass_lf_p0_response_fanout_total_ = nullptr;
     // GAS superstep duration statistics (cycles)
     Statistic<uint64_t>* stat_gas_superstep_gather_cycles_  = nullptr;
     Statistic<uint64_t>* stat_gas_superstep_apply_cycles_   = nullptr;
@@ -766,6 +915,77 @@ private:
     Statistic<uint64_t>* stat_gas_bursts_total_ = nullptr;
     Statistic<uint64_t>* stat_gas_payload_bytes_total_ = nullptr;
     Statistic<uint64_t>* stat_gas_gap_absorbed_bytes_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_prefetch_rows_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_prefetch_bytes_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_prefetch_rows_deferred_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_prefetch_rows_failed_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_cache_hits_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_cache_misses_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_cache_fills_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_cache_full_drop_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_cache_entries_final_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_touch_rows_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_touch_events_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_rows_filtered_cold_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_budget_ticks_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_budget_effective_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_budget_adapt_ticks_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_idx2_ingress_touch_events_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_idx2_ingress_lookup_miss_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_idx2_ingress_enqueued_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_idx2_ingress_dedup_pending_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_idx2_ingress_dedup_inflight_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_idx2_ingress_dedup_cache_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_idx2_ingress_prefetch_issued_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_idx2_ingress_prefetch_bytes_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_idx2_ingress_prefetch_deferred_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_idx2_ingress_prefetch_failed_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_idx2_ingress_demand_hit_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_idx2_ingress_demand_join_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_idx2_ingress_demand_fallback_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_idx2_ingress_waiters_served_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_idx2_ingress_cache_fill_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_idx2_ingress_cache_evict_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_idx2_ingress_cache_entries_final_ = nullptr;
+    Statistic<uint64_t>* stat_gcss_lookup_hit_total_ = nullptr;
+    Statistic<uint64_t>* stat_gcss_lookup_miss_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_read_dense_reqs_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_read_dense_bytes_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_read_rowptr_reqs_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_read_rowptr_bytes_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_read_colidx_reqs_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_read_colidx_bytes_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_read_blockdata_reqs_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_read_blockdata_bytes_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_read_gcss_reqs_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_read_gcss_bytes_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_idx_sram_reads_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_idx_sram_writes_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_idx_sram_bytes_read_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_idx_sram_bytes_write_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_idx_sram_bank_conflict_ticks_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_idx_sram_predicted_extra_cycles_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_idx_sram_resident_bytes_peak_ = nullptr;
+    Statistic<uint64_t>* stat_weight_idx_lookup_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_idx_lookup_idx2_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_l0_sram_reads_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_l0_sram_writes_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_l0_sram_bytes_read_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_l0_sram_bytes_write_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_l0_sram_bank_conflict_ticks_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_l0_sram_predicted_extra_cycles_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_l0_sram_resident_bytes_peak_ = nullptr;
+    Statistic<uint64_t>* stat_weight_l0_lookup_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_l0_hit_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_l0_fill_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_l0_evict_total_ = nullptr;
+    Statistic<uint64_t>* stat_core_state_sram_reads_total_ = nullptr;
+    Statistic<uint64_t>* stat_core_state_sram_writes_total_ = nullptr;
+    Statistic<uint64_t>* stat_core_state_sram_bytes_read_total_ = nullptr;
+    Statistic<uint64_t>* stat_core_state_sram_bytes_write_total_ = nullptr;
+    Statistic<uint64_t>* stat_core_state_sram_bank_conflict_ticks_total_ = nullptr;
+    Statistic<uint64_t>* stat_core_state_sram_predicted_extra_cycles_total_ = nullptr;
+    Statistic<uint64_t>* stat_core_state_sram_resident_bytes_peak_ = nullptr;
     
     // 内部计数器用于getStatistics()方法
     uint64_t count_spikes_received_;
@@ -837,6 +1057,10 @@ private:
         uint64_t colidx_offset = 0;
         uint64_t blockdata_offset = 0;
         uint64_t blockids_offset = 0;
+        std::string layout_mode = "flat"; // flat|rowpack_v1
+        uint32_t colidx_row_stride_bytes = 0;
+        uint32_t blockdata_row_stride_bytes = 0;
+        uint32_t blockids_row_stride_bytes = 0;
         uint64_t per_core_stride = 0;
         bool validate(uint64_t base, Output* out, bool debug, uint32_t core_id, uint32_t node_id) const;
         uint64_t maxOffset() const {
@@ -903,6 +1127,8 @@ private:
 
     // weights_template_ 保留：用于 BCSR 文件兜底与诊断读取
     std::string weights_template_;
+    std::string gcss_index_template_;
+    std::string synapse_weight_mode_ = "bcsr_gas";
     bool record_edge_apply_enable_ = false;
     bool record_edge_idle_enable_ = true;
     bool record_edge_scatter_enable_ = false;

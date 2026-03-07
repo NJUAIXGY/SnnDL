@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <list>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -13,6 +14,7 @@ namespace SnnDL {
 class BcsrWeightManager {
 public:
     enum class BlockCachePolicy : uint8_t { LegacyUnordered = 0, FIFO = 1, LRU = 2 };
+    enum class LayoutMode : uint8_t { Flat = 0, RowpackV1 = 1 };
 
     BcsrWeightManager() = default;
 
@@ -23,7 +25,11 @@ public:
                    uint32_t block_rows,
                    uint32_t block_cols,
                    uint32_t idx_bytes,
-                   uint32_t val_bytes);
+                   uint32_t val_bytes,
+                   const std::string& layout_mode,
+                   uint32_t colidx_row_stride_bytes,
+                   uint32_t blockdata_row_stride_bytes,
+                   uint32_t blockids_row_stride_bytes);
 
     void setRowIndexCacheCapacity(uint32_t cap);
     void setBlockCacheCapacity(uint32_t cap);
@@ -47,9 +53,14 @@ public:
     uint32_t effectiveBlockCols() const;
     uint32_t effectiveIdxBytes() const;
     uint32_t effectiveValBytes() const;
+    LayoutMode layoutMode() const { return layout_mode_; }
+    bool usesRowpackLayout() const { return layout_mode_ == LayoutMode::RowpackV1; }
     size_t blockBytes() const;
+    size_t blockRowBytes() const;
     uint64_t blockDataAddr(uint32_t global_block_index) const;
+    uint64_t blockDataAddrByRow(uint32_t block_row, uint32_t idx_in_row) const;
     uint64_t colIndexAddr(uint32_t start_index) const;
+    uint64_t colIndexAddrByRow(uint32_t block_row, uint32_t idx_in_row) const;
     size_t colIndexBytes(uint32_t block_count) const;
     bool rowBounds(uint32_t block_row, uint32_t& start, uint32_t& end) const;
 
@@ -73,6 +84,7 @@ public:
 
 private:
     static uint64_t makeBlockKey(uint32_t block_row, uint32_t block_col);
+    bool decodeGlobalBlockIndex(uint32_t global_block_index, uint32_t& block_row, uint32_t& idx_in_row) const;
     void evictRowIndexIfNeeded(uint32_t incoming_key);
 
     uint64_t rowptr_addr_ = 0;
@@ -83,6 +95,10 @@ private:
     uint32_t block_cols_ = 16;
     uint32_t idx_bytes_ = 2;
     uint32_t val_bytes_ = 4;
+    LayoutMode layout_mode_ = LayoutMode::Flat;
+    uint32_t colidx_row_stride_bytes_ = 0;
+    uint32_t blockdata_row_stride_bytes_ = 0;
+    uint32_t blockids_row_stride_bytes_ = 0;
 
     std::vector<uint32_t> bcsr_rowptr_host_;
     bool rowptr_ready_ = false;

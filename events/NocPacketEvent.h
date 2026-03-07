@@ -22,6 +22,7 @@ enum class NocPacketKind : uint16_t {
     Control = 2,
     RawBytes = 3,
     SpikeKey = 4,
+    SpikeTileKey = 5,
 };
 
 class NocPacketEvent : public SST::Event {

@@ -22,6 +22,7 @@ namespace SST { namespace SnnDL {
 
 class IGasStageSink;
 class IGasStepGate;
+class IGasCreditGate;
 class IMemoryAccess;
 
 // 约束：本头文件不包含 stdMem.h，也不暴露 StandardMem 类型。
@@ -59,6 +60,7 @@ public:
     bool available() const { return mem_access_ != nullptr; }
     IMemoryAccess* memoryAccess() const { return mem_access_; }
     IGasStepGate* stepGate() const { return step_gate_; }
+    IGasCreditGate* creditGate() const { return credit_gate_; }
 
     void init(unsigned int phase);
     void complete(unsigned int phase);
@@ -83,6 +85,7 @@ private:
     // Non-owning handles for callers (filled after bindRuntime()).
     IMemoryAccess* mem_access_ = nullptr;
     IGasStepGate* step_gate_ = nullptr;
+    IGasCreditGate* credit_gate_ = nullptr;
 };
 
 }} // namespace SST::SnnDL

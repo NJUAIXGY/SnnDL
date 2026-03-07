@@ -22,6 +22,7 @@ struct GatingEntry { std::vector<uint32_t> dest_pes; uint64_t expire_cycle; };
 class SnnRouteProvider {
 public:
     using RouteMap = std::unordered_map<uint32_t, std::vector<uint32_t>>;
+    using RouteWeightMap = std::unordered_map<uint64_t, float>;
     using FanoutEntry = ISynapseRoute::FanoutEntry;
     struct Config {
         bool routing_weight_driven = false;
@@ -38,7 +39,8 @@ public:
 
     void configure(const Config& cfg,
                    const std::shared_ptr<const RouteMap>& routes_shared,
-                   const RouteMap* routes_local);
+                   const RouteMap* routes_local,
+                   const RouteWeightMap* route_weights);
 
     // 计算扇出列表；applied_gating=true 表示命中 gating 并已替代常规路由。
     void computeFanout(uint32_t source_global, uint32_t neuron_idx,
@@ -52,10 +54,12 @@ private:
                              std::vector<FanoutEntry>& out_entries) const;
     void fanoutFixed_(uint32_t neuron_idx,
                       std::vector<FanoutEntry>& out_entries) const;
+    float resolveWeight_(uint32_t source_global, uint32_t dest_global) const;
 
     Config cfg_{};
     std::shared_ptr<const RouteMap> routes_shared_;
     const RouteMap* routes_local_ = nullptr;
+    const RouteWeightMap* route_weights_ = nullptr;
 };
 
 } } // namespace SST::SnnDL

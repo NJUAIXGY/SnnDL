@@ -17,6 +17,19 @@ GatherBufferIFConfig parseGatherBufferIFConfig(const SST::Params& params) {
     c.diag_enable = (params.find<int>("diag_enable", 0) != 0);
     c.debug_enable = (params.find<int>("snndl_debug", 0) != 0);
     c.sentinel_enable = (params.find<int>("sentinel_enable", 0) != 0);
+    c.experimental_stepgate_progress_enable = (params.find<int>("experimental_stepgate_progress_enable", 0) != 0);
+    c.experimental_stepgate_progress_period_cycles =
+        params.find<uint64_t>("experimental_stepgate_progress_period_cycles", 0);
+    c.experimental_stepgate_progress_max_reports =
+        params.find<uint32_t>("experimental_stepgate_progress_max_reports", 0);
+    c.experimental_stepgate_progress_dump_level =
+        params.find<uint32_t>("experimental_stepgate_progress_dump_level", 0);
+    c.experimental_stepgate_progress_owner_node =
+        params.find<int>("experimental_stepgate_progress_owner_node", -1);
+    c.experimental_stepgate_progress_owner_core =
+        params.find<int>("experimental_stepgate_progress_owner_core", -1);
+    c.experimental_stepgate_apply_finish_poll_period_cycles =
+        params.find<uint64_t>("experimental_stepgate_apply_finish_poll_period_cycles", 1);
 
     c.merge_policy = params.find<std::string>("merge_policy", "cacheline");
     c.sort_policy = params.find<std::string>("sort_policy", "row");
@@ -26,6 +39,9 @@ GatherBufferIFConfig parseGatherBufferIFConfig(const SST::Params& params) {
     c.gap_merge_enable = params.find<int>("gap_merge_enable", 1) != 0;
     c.gap_merge_k_bytes = params.find<uint64_t>("gap_merge_k_bytes", 0);
     c.burst_bytes_max = params.find<uint64_t>("burst_bytes_max", 64 * 1024);
+
+    c.vlf_enable = params.find<int>("vlf_enable", 0) != 0;
+    c.vlf_run_enable = params.find<int>("vlf_run_enable", 0) != 0;
 
     c.bank_bits = params.find<uint32_t>("bank_bits", 0);
     c.bank_shift = params.find<uint32_t>("bank_shift", 0);
@@ -107,14 +123,9 @@ GatherBufferIFConfig parseGatherBufferIFConfig(const SST::Params& params) {
     c.ctrl_rowwin_list = params.find<std::string>("ctrl_rowwin_list", "0,16384,32768,65536");
     c.ctrl_timeout_list = params.find<std::string>("ctrl_timeout_list", "0,300,600");
 
-    // DRAM-aware Apply (exploration; default OFF)
-    c.dram_row_bytes = params.find<uint32_t>("dram_row_bytes", 0);
-    c.dram_bank_count = params.find<uint32_t>("dram_bank_count", 0);
-    c.dram_read_burst_bytes = params.find<uint32_t>("dram_read_burst_bytes", 64);
-    c.dram_row_miss_penalty_cycles = params.find<uint32_t>("dram_row_miss_penalty_cycles", 0);
-    c.dram_overfetch_budget_bytes = params.find<uint64_t>("dram_overfetch_budget_bytes", 0);
-    c.dram_aware_enable_row_window = params.find<int>("dram_aware_enable_row_window", 0) != 0;
-    c.dram_aware_k_policy = params.find<std::string>("dram_aware_k_policy", "cost_budgeted");
+    c.dram_cmd_cost_merge_enable = params.find<int>("dram_cmd_cost_merge_enable", 0) != 0;
+    c.dram_cmd_t_row_hit_ns = params.find<uint32_t>("dram_cmd_t_row_hit_ns", 30);
+    c.dram_cmd_t_row_miss_ns = params.find<uint32_t>("dram_cmd_t_row_miss_ns", 120);
 
     c.export_granules_csv = params.find<std::string>("export_granules_csv", "");
     c.node_id = params.find<uint32_t>("node_id", 0);

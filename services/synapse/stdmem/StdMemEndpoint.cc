@@ -11,6 +11,7 @@
 #include <sst/core/output.h>
 
 #include "IGasStageSink.h"
+#include "IGasCreditGate.h"
 #include "IGasStepGate.h"
 #include "memory/StandardMemAccess.h"
 #include "synapse/gas/GasCustomCmd.h"
@@ -37,6 +38,7 @@ void StdMemEndpoint::bindStdMem(SST::SubComponent* stdmem_subcomp) {
     // Reset previous bindings
     mem_access_ = nullptr;
     step_gate_ = nullptr;
+    credit_gate_ = nullptr;
     if (impl_) {
         impl_->stdmem = nullptr;
         impl_->stdmem_access.reset();
@@ -55,6 +57,7 @@ void StdMemEndpoint::bindStdMem(SST::SubComponent* stdmem_subcomp) {
 
     // Optional: query GAS step gate and manual window driver from downstream StandardMem front-end.
     step_gate_ = dynamic_cast<IGasStepGate*>(impl_->stdmem);
+    credit_gate_ = dynamic_cast<IGasCreditGate*>(impl_->stdmem);
 }
 
 void StdMemEndpoint::init(unsigned int phase) {
@@ -114,6 +117,10 @@ void StdMemEndpoint::handleResponseOpaque(void* req) {
                 sev.unique_line_count = st->unique_line_count;
                 sev.covered_line_count = st->covered_line_count;
                 sev.overfetch_bytes = st->overfetch_bytes;
+                sev.apply_bank_credit_effective = st->apply_bank_credit_effective;
+                sev.cmd_cost_veto = st->cmd_cost_veto;
+                sev.cmd_cost_veto_fine_gap = st->cmd_cost_veto_fine_gap;
+                sev.cmd_cost_veto_row_window = st->cmd_cost_veto_row_window;
                 rt_.gas_stage_sink->onGasStatEvent(sev);
             }
             delete stdmem_req;

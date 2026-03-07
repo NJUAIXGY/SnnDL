@@ -14,11 +14,15 @@
 #include "ICoreControlHooks.h"
 #include "ICoreMemoryLink.h"
 #include "IGlobalStepHooks.h"
+#include "IGlobalStepCreditHooks.h"
 #include "ILoaderReadyHooks.h"
 #include "NocPacketEvent.h"
 #include "NocPacketBatchEvent.h"
 #include "GasStepBarrierEvent.h"
 #include "LoaderDoneEvent.h"
+#include "TassLfP0ReportEvent.h"
+#include "TassNaiveWindowRequestEvent.h"
+#include "TassNaiveResponseEvent.h"
 #include "WorkloadConfig.h"
 #include "SnnDLLogging.h"
 #include "SnnCoreAPI.h"
@@ -88,6 +92,75 @@ inline uint8_t stepStageCodeFromName_(const std::string& ev) {
 	    if (::mkdir(dir.c_str(), 0775) == 0) return true;
 	    return (errno == EEXIST);
 	}
+
+inline uint64_t ceilDivU64_(uint64_t num, uint64_t den) {
+    if (den == 0) return 0;
+    return (num + den - 1ull) / den;
+}
+
+inline uint64_t packTassContributorKey_(uint32_t node_id, uint32_t core_id) {
+    return (static_cast<uint64_t>(node_id) << 32) | static_cast<uint64_t>(core_id);
+}
+
+inline uint64_t packTassBlockEpochKey_(uint32_t block_origin_node, uint32_t window_seq) {
+    return (static_cast<uint64_t>(window_seq) << 32) | static_cast<uint64_t>(block_origin_node);
+}
+
+inline void computeTassBlockInfo_(uint32_t mesh_rows,
+                                  uint32_t mesh_cols,
+                                  uint32_t block_h,
+                                  uint32_t block_w,
+                                  uint32_t node_id,
+                                  uint32_t cores_per_pe,
+                                  uint32_t& block_origin_node,
+                                  uint32_t& expected_contributors) {
+    mesh_rows = std::max<uint32_t>(1u, mesh_rows);
+    mesh_cols = std::max<uint32_t>(1u, mesh_cols);
+    block_h = std::max<uint32_t>(1u, block_h);
+    block_w = std::max<uint32_t>(1u, block_w);
+    cores_per_pe = std::max<uint32_t>(1u, cores_per_pe);
+    const uint32_t pe_row = node_id / mesh_cols;
+    const uint32_t pe_col = node_id % mesh_cols;
+    const uint32_t block_row0 = (pe_row / block_h) * block_h;
+    const uint32_t block_col0 = (pe_col / block_w) * block_w;
+    const uint32_t block_rows = std::min<uint32_t>(block_h, mesh_rows > block_row0 ? (mesh_rows - block_row0) : 1u);
+    const uint32_t block_cols = std::min<uint32_t>(block_w, mesh_cols > block_col0 ? (mesh_cols - block_col0) : 1u);
+    block_origin_node = block_row0 * mesh_cols + block_col0;
+    expected_contributors = std::max<uint32_t>(1u, block_rows * block_cols * cores_per_pe);
+}
+
+inline void computeTassBlockInfo_(const TassLfP0WindowReport& report,
+                                  uint32_t& block_origin_node,
+                                  uint32_t& expected_contributors) {
+    computeTassBlockInfo_(report.mesh_rows,
+                          report.mesh_cols,
+                          report.block_h,
+                          report.block_w,
+                          report.node_id,
+                          report.cores_per_pe,
+                          block_origin_node,
+                          expected_contributors);
+}
+
+inline void computeTassBlockInfo_(const TassNaiveWindowRequest& request,
+                                  uint32_t& block_origin_node,
+                                  uint32_t& expected_contributors) {
+    computeTassBlockInfo_(request.mesh_rows,
+                          request.mesh_cols,
+                          request.block_h,
+                          request.block_w,
+                          request.source_node,
+                          request.cores_per_pe,
+                          block_origin_node,
+                          expected_contributors);
+}
+
+inline float loadTassNaiveWeight_(const std::vector<uint8_t>& data, uint32_t byte_offset) {
+    if (byte_offset + sizeof(float) > data.size()) return 0.0f;
+    float value = 0.0f;
+    std::memcpy(&value, data.data() + byte_offset, sizeof(float));
+    return value;
+}
 } // namespace
 
 MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
@@ -104,6 +177,7 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
     node_id_ = cfg.node_id;
     total_nodes_ = cfg.total_nodes;
     global_neuron_base_ = cfg.global_neuron_base;
+    base_addr_ = cfg.base_addr;
     sim_stop_ns_ = cfg.sim_stop_ns;
     // NoC e2e latency histogram range (cycles) for native multicast lab.
     noc_lat_hist_max_ = cfg.noc_lat_hist_max;
@@ -246,6 +320,21 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
         loader_done_shared_ = std::make_unique<SST::Shared::SharedArray<int>>();
         loader_done_shared_->initialize(loader_done_key_, 1, 0);
     }
+    tass_lf_p0_enable_ = params.find<int>("experimental_tass_lf_p0_enable", 0) != 0;
+    naive_tass_enable_ = params.find<int>("experimental_naive_tass_enable", 0) != 0;
+    tass_lf_p0_mesh_rows_ = std::max<uint32_t>(1u, params.find<uint32_t>("tass_lf_p0_mesh_rows", 1));
+    tass_lf_p0_mesh_cols_ = std::max<uint32_t>(1u, params.find<uint32_t>("tass_lf_p0_mesh_cols", 1));
+    tass_lf_p0_block_h_ = std::max<uint32_t>(1u, params.find<uint32_t>("tass_lf_p0_block_h", 2));
+    tass_lf_p0_block_w_ = std::max<uint32_t>(1u, params.find<uint32_t>("tass_lf_p0_block_w", 2));
+    output_->verbose(CALL_INFO, 1, 0,
+                     "[tass-debug] node=%d naive_tass_enable=%d tass_lf_p0_enable=%d mesh=%ux%u block=%ux%u\n",
+                     node_id_,
+                     naive_tass_enable_ ? 1 : 0,
+                     tass_lf_p0_enable_ ? 1 : 0,
+                     tass_lf_p0_mesh_rows_,
+                     tass_lf_p0_mesh_cols_,
+                     tass_lf_p0_block_h_,
+                     tass_lf_p0_block_w_);
 
     // Step-level random activation injection (Phase3-B): 下沉为独立子系统（MultiCorePE 仅转发 tick/阶段事件）
     {
@@ -433,6 +522,17 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
         };
         noc_subsys_.bindRuntime(noc_rt);
     }
+    if (naive_tass_enable_) {
+        memory_interface_ = loadUserSubComponent<SST::Interfaces::StandardMem>(
+            "memory_interface", ComponentInfo::SHARE_NONE,
+            registerTimeBase("1ns"),
+            new SST::Interfaces::StandardMem::Handler2<MultiCorePE, &MultiCorePE::handleTassNaiveMemoryResponse_>(this));
+        if (!memory_interface_) {
+            output_->fatal(CALL_INFO, -1,
+                           "MultiCorePE fatal: experimental_naive_tass_enable=1 but memory_interface subcomponent is missing on node=%d\n",
+                           node_id_);
+        }
+    }
     // 记录路径（若提供），用于派生输出目录
     stage_events_csv_path_ = cfg.stage_events_csv_path;
     stats_csv_path_ = cfg.stats_csv_path;
@@ -490,6 +590,24 @@ void MultiCorePE::init(unsigned int phase) {
         loader_done_link_ = configureLink(
             "loader_done",
             new Event::Handler2<MultiCorePE, &MultiCorePE::handleLoaderDoneEvent>(this));
+        tass_p0_out_link_ = configureLink("tass_p0_out");
+        tass_p0_in_links_.clear();
+        tass_p0_in_links_.reserve(static_cast<size_t>(std::max(0, total_nodes_)));
+        tass_p0_rsp_out_links_.clear();
+        tass_p0_rsp_out_links_.reserve(static_cast<size_t>(std::max(0, total_nodes_)));
+        for (int src = 0; src < total_nodes_; ++src) {
+            std::ostringstream port;
+            port << "tass_p0_in" << src;
+            SST::Link* link = configureLink(
+                port.str(),
+                new Event::Handler2<MultiCorePE, &MultiCorePE::handleTassLfP0ReportEvent>(this));
+            tass_p0_in_links_.push_back(link);
+        }
+        for (int dst = 0; dst < total_nodes_; ++dst) {
+            std::ostringstream port;
+            port << "tass_p0_rsp_out" << dst;
+            tass_p0_rsp_out_links_.push_back(configureLink(port.str()));
+        }
         if (loader_done_link_) {
             SST::Event* ev = loader_done_link_->recvUntimedData();
             while (ev) {
@@ -554,6 +672,9 @@ void MultiCorePE::init(unsigned int phase) {
         if (external_nic_) {
             external_nic_->init(phase);
         }
+        if (memory_interface_) {
+            memory_interface_->init(phase);
+        }
         if (sentinel_enabled_ && output_) { output_->verbose(CALL_INFO, 2, 0, "[[sentinel-pe-init]] node=%d phase=0 nic-init-done\n", node_id_); }
         // 标记 Step 注入就绪（保证 NIC 已完成 init）
         step_activation_subsys_.setInjectionReady(true);
@@ -574,6 +695,9 @@ void MultiCorePE::init(unsigned int phase) {
         if (external_nic_) {
             external_nic_->init(phase);
         }
+        if (memory_interface_) {
+            memory_interface_->init(phase);
+        }
         if (sentinel_enabled_ && output_) { output_->verbose(CALL_INFO, 2, 0, "[[sentinel-pe-init]] node=%d phase=1 nic-init-done\n", node_id_); }
     }
     else {
@@ -586,6 +710,9 @@ void MultiCorePE::init(unsigned int phase) {
         // 转发init到网络接口
         if (external_nic_) {
             external_nic_->init(phase);
+        }
+        if (memory_interface_) {
+            memory_interface_->init(phase);
         }
         if (sentinel_enabled_ && output_) { output_->verbose(CALL_INFO, 2, 0, "[[sentinel-pe-init]] node=%d phase=%u done\n", node_id_, phase); }
     }
@@ -600,6 +727,9 @@ void MultiCorePE::complete(unsigned int phase) {
     }
     if (external_nic_) {
         external_nic_->complete(phase);
+    }
+    if (memory_interface_) {
+        memory_interface_->complete(phase);
     }
 }
 
@@ -635,6 +765,9 @@ void MultiCorePE::setup() {
     // 调用网络接口的setup
     if (external_nic_) {
         external_nic_->setup();
+    }
+    if (memory_interface_) {
+        memory_interface_->setup();
     }
     if (sentinel_enabled_ && output_) { output_->verbose(CALL_INFO, 2, 0, "[[sentinel-pe-setup]] node=%d nic-setup\n", node_id_); }
     
@@ -1094,6 +1227,18 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
                 auto* ev = new GasStepBarrierEvent(GasStepBarrierOp::PeDone,
                                                    global_step_active_seq_,
                                                    static_cast<uint32_t>(node_id_));
+                // Step-level telemetry (best-effort): enables GlobalGasStepController criticality-aware control.
+                // total: from BeginGather to PE_DONE send time (includes drain/quiescent wait for non-EndScatter policies)
+                // apply: from BeginApply to BeginScatter (pure Apply duration, excludes drain)
+                {
+                    auto it = stage_marks_.find(global_step_active_seq_);
+                    if (it != stage_marks_.end()) {
+                        const auto& m = it->second;
+                        const uint64_t now_ns = getCurrentSimTimeNano();
+                        if (m.bg != 0 && now_ns >= m.bg) ev->step_total_ns = now_ns - m.bg;
+                        if (m.ga != 0 && m.bs != 0 && m.bs >= m.ga) ev->step_apply_ns = m.bs - m.ga;
+                    }
+                }
                 gas_step_ctrl_link_->send(ev);
                 global_step_done_sent_ = true;
                 if (stat_global_steps_done_total_) stat_global_steps_done_total_->addData(1);
@@ -1112,48 +1257,62 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
             const bool noc_idle = noc_subsys_.isIdle();
             if (!noc_idle) active = true;
 
-            // 3) step 语义等价：优先用“阶段事件已到 EndScatter(seq)”作为完成判定（避免把 BCSR/预取等后台事务算进 step）。
-            // 注意：仅当 *所有 core* 都在该 seq 上报过阶段事件时，才使用 EndScatter 判定；
-            // 否则属于混合/非窗口 workload（或误配置），回退为 hasWork()，避免“任一 core 上报→强制所有 core 等 EndScatter”导致卡死。
+            // 3) step 语义等价：
+            // - 对已经进入 BeginApply/EndApply/BeginScatter/EndScatter 的 core，必须等待该 core 到达 EndScatter(seq)。
+            // - 对仅停在 BeginGather（或尚未产生阶段事件）的 core，回退为 hasWork()；否则“空 core 也必须 EndScatter”会把 step 永久卡住。
             bool uses_stage_events = false;
             bool all_end_scatter = false;
+            int stage_progress_cores = 0;
+            int stage_done_cores = 0;
+            int stage_bg_only_cores = 0;
+            int fallback_busy_cores = 0;
             if (global_step_last_stage_code_.size() == static_cast<size_t>(num_cores_) &&
                 global_step_last_stage_seq_.size() == static_cast<size_t>(num_cores_)) {
-                bool all_have_stage = true;
                 for (int i = 0; i < num_cores_; ++i) {
                     const size_t idx = static_cast<size_t>(i);
                     const bool have_stage =
                         (global_step_last_stage_seq_[idx] == global_step_active_seq_) &&
                         (global_step_last_stage_code_[idx] != 0);
-                    if (!have_stage) {
-                        all_have_stage = false;
-                        break;
+                    const int stage_code = have_stage ? global_step_last_stage_code_[idx] : 0;
+
+                    if (stage_code >= 2 /*BeginApply and later*/) {
+                        uses_stage_events = true;
+                        stage_progress_cores += 1;
+                        if (stage_code == 5 /*EndScatter*/) {
+                            stage_done_cores += 1;
+                        } else {
+                            active = true;
+                        }
+                        continue;
+                    }
+
+                    if (stage_code == 1 /*BeginGather*/) {
+                        stage_bg_only_cores += 1;
+                    }
+                    if (cores_[i] && cores_[i]->hasWork()) {
+                        fallback_busy_cores += 1;
+                        active = true;
                     }
                 }
-                uses_stage_events = all_have_stage;
-                if (uses_stage_events) {
-                    all_end_scatter = true;
-                    for (int i = 0; i < num_cores_; ++i) {
-                        const size_t idx = static_cast<size_t>(i);
-                        const bool es_ok = (global_step_last_stage_code_[idx] == 5 /*EndScatter*/);
-                        if (!es_ok) {
-                            all_end_scatter = false;
-                            break;
-                        }
+                all_end_scatter = uses_stage_events && (stage_done_cores == stage_progress_cores);
+            } else {
+                // 非 window/GAS workload（或阶段镜像未初始化）：回退为 core 的 hasWork() 语义
+                for (int i = 0; i < num_cores_; ++i) {
+                    if (cores_[i] && cores_[i]->hasWork()) {
+                        fallback_busy_cores += 1;
+                        active = true;
                     }
                 }
             }
 
-            if (uses_stage_events) {
-                if (!all_end_scatter) active = true;
-            } else {
-                // 非 window/GAS workload（或混合模式）：回退为 core 的 hasWork() 语义
-                for (int i = 0; i < num_cores_; ++i) {
-                    if (cores_[i] && cores_[i]->hasWork()) {
-                        active = true;
-                        break;
-                    }
-                }
+            const bool hold_for_gather_completion =
+                (!uses_stage_events && stage_bg_only_cores > 0 &&
+                 global_step_last_stage_code_.size() == static_cast<size_t>(num_cores_) &&
+                 global_step_last_stage_seq_.size() == static_cast<size_t>(num_cores_));
+            if (hold_for_gather_completion) {
+                // 仍停留在 Gather：必须等 workload 的 Gather->EndGather quiesce 规则自己推进，
+                // 不能让 PE 级 Drain 先于空窗口/慢窗口的 BeginApply 收尾。
+                active = true;
             }
 
             // Drain 卡点探针（仅 node0 / seq1 / sentinel 模式限量打印）：用于定位“为什么 step 不推进”。
@@ -1167,12 +1326,17 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
                         ? (now - global_step_last_activity_cycle_)
                         : 0;
                     output_->verbose(CALL_INFO, 2, 0,
-                        "[[sentinel-step-drain]] node=%d seq=%u injected=%d stage=%d all_es=%d noc_idle=%d inq=%zu ring=%d nic_pending=%zu quiet=%" PRIu64 " min=%" PRIu64 "\n",
+                        "[[sentinel-step-drain]] node=%d seq=%u injected=%d stage=%d all_es=%d progressed=%d done=%d bg_only=%d bg_hold=%d fallback_busy=%d noc_idle=%d inq=%zu ring=%d nic_pending=%zu quiet=%" PRIu64 " min=%" PRIu64 "\n",
                         node_id_,
                         global_step_active_seq_,
                         injected ? 1 : 0,
                         uses_stage_events ? 1 : 0,
                         all_end_scatter ? 1 : 0,
+                        stage_progress_cores,
+                        stage_done_cores,
+                        stage_bg_only_cores,
+                        hold_for_gather_completion ? 1 : 0,
+                        fallback_busy_cores,
                         noc_idle ? 1 : 0,
                         inq,
                         ring_p,
@@ -1193,6 +1357,16 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
                     auto* ev = new GasStepBarrierEvent(GasStepBarrierOp::PeDone,
                                                        global_step_active_seq_,
                                                        static_cast<uint32_t>(node_id_));
+                    // Step-level telemetry (best-effort): enables GlobalGasStepController criticality-aware control.
+                    {
+                        auto it = stage_marks_.find(global_step_active_seq_);
+                        if (it != stage_marks_.end()) {
+                            const auto& m = it->second;
+                            const uint64_t now_ns = getCurrentSimTimeNano();
+                            if (m.bg != 0 && now_ns >= m.bg) ev->step_total_ns = now_ns - m.bg;
+                            if (m.ga != 0 && m.bs != 0 && m.bs >= m.ga) ev->step_apply_ns = m.bs - m.ga;
+                        }
+                    }
                     gas_step_ctrl_link_->send(ev);
                     global_step_done_sent_ = true;
                     if (stat_global_steps_done_total_) stat_global_steps_done_total_->addData(1);
@@ -1224,6 +1398,16 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
                     auto* ev = new GasStepBarrierEvent(GasStepBarrierOp::PeDone,
                                                        global_step_active_seq_,
                                                        static_cast<uint32_t>(node_id_));
+                    // Step-level telemetry (best-effort): enables GlobalGasStepController criticality-aware control.
+                    {
+                        auto it = stage_marks_.find(global_step_active_seq_);
+                        if (it != stage_marks_.end()) {
+                            const auto& m = it->second;
+                            const uint64_t now_ns = getCurrentSimTimeNano();
+                            if (m.bg != 0 && now_ns >= m.bg) ev->step_total_ns = now_ns - m.bg;
+                            if (m.ga != 0 && m.bs != 0 && m.bs >= m.ga) ev->step_apply_ns = m.bs - m.ga;
+                        }
+                    }
                     gas_step_ctrl_link_->send(ev);
                     global_step_done_sent_ = true;
                     if (stat_global_steps_done_total_) stat_global_steps_done_total_->addData(1);
@@ -1280,6 +1464,274 @@ void MultiCorePE::handleLoaderDoneEvent(SST::Event* ev) {
     delete ev;
 }
 
+void MultiCorePE::submitTassLfP0WindowReport(const TassLfP0WindowReport& report) {
+    if (!tass_lf_p0_enable_) return;
+    if (stat_gas_tass_lf_p0_reports_submit_total_) stat_gas_tass_lf_p0_reports_submit_total_->addData(1);
+    uint32_t block_origin_node = 0;
+    uint32_t expected_contributors = 1;
+    computeTassBlockInfo_(report, block_origin_node, expected_contributors);
+    if (block_origin_node == static_cast<uint32_t>(node_id_)) {
+        reduceTassLfP0WindowReport_(report);
+        return;
+    }
+    if (tass_p0_out_link_) {
+        if (stat_gas_tass_lf_p0_reports_send_total_) stat_gas_tass_lf_p0_reports_send_total_->addData(1);
+        tass_p0_out_link_->send(new TassLfP0ReportEvent(report));
+    } else {
+        if (stat_gas_tass_lf_p0_reports_drop_no_link_total_) stat_gas_tass_lf_p0_reports_drop_no_link_total_->addData(1);
+    }
+}
+
+void MultiCorePE::submitTassNaiveWindowRequest(const TassNaiveWindowRequest& request) {
+    if (!naive_tass_enable_) {
+        if (!request.entries.empty()) {
+            output_->fatal(CALL_INFO, -1,
+                           "MultiCorePE fatal: received naive_tass window request while experimental_naive_tass_enable=0 "
+                           "(node=%d source_node=%u source_core=%u entries=%zu window=%u)\n",
+                           node_id_, request.source_node, request.source_core, request.entries.size(), request.window_seq);
+        }
+        return;
+    }
+    uint32_t block_origin_node = 0;
+    uint32_t expected_contributors = 1;
+    computeTassBlockInfo_(request, block_origin_node, expected_contributors);
+    if (block_origin_node == static_cast<uint32_t>(node_id_)) {
+        handleTassNaiveWindowRequest_(request);
+        return;
+    }
+    if (!tass_p0_out_link_) {
+        output_->fatal(CALL_INFO, -1,
+                       "MultiCorePE fatal: naive_tass request missing tass_p0_out link on node=%d source_core=%u\n",
+                       node_id_, request.source_core);
+    }
+    tass_p0_out_link_->send(new TassNaiveWindowRequestEvent(request));
+}
+
+void MultiCorePE::handleTassLfP0ReportEvent(SST::Event* ev) {
+    if (!ev) return;
+    if (auto* msg = dynamic_cast<TassLfP0ReportEvent*>(ev)) {
+        if (stat_gas_tass_lf_p0_reports_recv_total_) stat_gas_tass_lf_p0_reports_recv_total_->addData(1);
+        reduceTassLfP0WindowReport_(msg->report);
+        delete ev;
+        return;
+    }
+    if (auto* req = dynamic_cast<TassNaiveWindowRequestEvent*>(ev)) {
+        handleTassNaiveWindowRequest_(req->request);
+        delete ev;
+        return;
+    }
+    if (auto* rsp = dynamic_cast<TassNaiveResponseEvent*>(ev)) {
+        deliverTassNaiveResponsesLocal_(rsp->entries);
+        delete ev;
+        return;
+    }
+    delete ev;
+}
+
+void MultiCorePE::handleTassNaiveWindowRequest_(const TassNaiveWindowRequest& request) {
+    if (!naive_tass_enable_) {
+        if (!request.entries.empty()) {
+            output_->fatal(CALL_INFO, -1,
+                           "MultiCorePE fatal: TassNaiveWindowRequestEvent arrived on node with naive_tass disabled "
+                           "(node=%d source_node=%u source_core=%u entries=%zu window=%u)\n",
+                           node_id_, request.source_node, request.source_core, request.entries.size(), request.window_seq);
+        }
+        return;
+    }
+    if (request.entries.empty()) return;
+    if (!memory_interface_) {
+        output_->fatal(CALL_INFO, -1,
+                       "MultiCorePE fatal: naive_tass request arrived without memory_interface on node=%d\n",
+                       node_id_);
+    }
+    uint32_t block_origin_node = 0;
+    uint32_t expected_contributors = 1;
+    computeTassBlockInfo_(request, block_origin_node, expected_contributors);
+    if (block_origin_node != static_cast<uint32_t>(node_id_)) {
+        output_->fatal(CALL_INFO, -1,
+                       "MultiCorePE fatal: naive_tass request routed to non-origin node=%d expected_origin=%u src_node=%u\n",
+                       node_id_, block_origin_node, request.source_node);
+    }
+    const uint32_t line_size = std::max<uint32_t>(1u, request.line_size_bytes);
+    for (const auto& entry : request.entries) {
+        const uint64_t addr = base_addr_ + static_cast<uint64_t>(entry.widx) * sizeof(float);
+        const uint64_t line_addr = (addr / static_cast<uint64_t>(line_size)) * static_cast<uint64_t>(line_size);
+        const uint32_t byte_offset = static_cast<uint32_t>(addr - line_addr);
+        auto& state = tass_naive_lines_[line_addr];
+        if (state.window_seq != request.window_seq) {
+            state = TassNaiveLineState{};
+            state.window_seq = request.window_seq;
+            state.line_size_bytes = line_size;
+        }
+        if (!state.inflight && !state.data.empty()) {
+            TassNaiveResponseEntry rsp{};
+            rsp.dst_core = request.source_core;
+            rsp.window_seq = request.window_seq;
+            rsp.retire_seq = entry.retire_seq;
+            rsp.weight = loadTassNaiveWeight_(state.data, byte_offset);
+            std::vector<TassNaiveResponseEntry> local_entries{};
+            local_entries.push_back(rsp);
+            dispatchTassNaiveResponses_(request.source_node, local_entries);
+            continue;
+        }
+        TassNaiveLineWaiter waiter{};
+        waiter.dst_node = request.source_node;
+        waiter.dst_core = request.source_core;
+        waiter.window_seq = request.window_seq;
+        waiter.retire_seq = entry.retire_seq;
+        waiter.byte_offset = byte_offset;
+        state.waiters.push_back(waiter);
+        if (state.inflight) continue;
+        state.window_seq = request.window_seq;
+        state.line_size_bytes = line_size;
+        state.inflight = true;
+        auto* rd = new SST::Interfaces::StandardMem::Read(line_addr, line_size);
+        const auto req_id = rd->getID();
+        tass_naive_req_to_line_[req_id] = line_addr;
+        memory_interface_->send(rd);
+    }
+}
+
+void MultiCorePE::handleTassNaiveMemoryResponse_(SST::Interfaces::StandardMem::Request* req) {
+    if (!req) return;
+    auto* rr = dynamic_cast<SST::Interfaces::StandardMem::ReadResp*>(req);
+    if (!rr) {
+        delete req;
+        return;
+    }
+    const auto it = tass_naive_req_to_line_.find(req->getID());
+    if (it == tass_naive_req_to_line_.end()) {
+        output_->fatal(CALL_INFO, -1,
+                       "MultiCorePE fatal: naive_tass memory response with unknown request id "
+                       "(node=%d req_id=%" PRIu64 " inflight_req_count=%zu)\n",
+                       node_id_, static_cast<uint64_t>(req->getID()), tass_naive_req_to_line_.size());
+    }
+    const uint64_t line_addr = it->second;
+    tass_naive_req_to_line_.erase(it);
+    auto line_it = tass_naive_lines_.find(line_addr);
+    if (line_it == tass_naive_lines_.end()) {
+        output_->fatal(CALL_INFO, -1,
+                       "MultiCorePE fatal: naive_tass memory response line state missing "
+                       "(node=%d line_addr=0x%" PRIx64 " req_id=%" PRIu64 ")\n",
+                       node_id_, line_addr, static_cast<uint64_t>(req->getID()));
+    }
+    auto& state = line_it->second;
+    state.inflight = false;
+    state.data = rr->data;
+    std::unordered_map<uint32_t, std::vector<TassNaiveResponseEntry>> by_node{};
+    for (const auto& waiter : state.waiters) {
+        TassNaiveResponseEntry entry{};
+        entry.dst_core = waiter.dst_core;
+        entry.window_seq = waiter.window_seq;
+        entry.retire_seq = waiter.retire_seq;
+        entry.weight = loadTassNaiveWeight_(state.data, waiter.byte_offset);
+        by_node[waiter.dst_node].push_back(entry);
+    }
+    state.waiters.clear();
+    for (auto& kv : by_node) {
+        dispatchTassNaiveResponses_(kv.first, kv.second);
+    }
+    delete req;
+}
+
+void MultiCorePE::deliverTassNaiveResponsesLocal_(const std::vector<TassNaiveResponseEntry>& entries) {
+    if (entries.empty()) return;
+    std::unordered_map<uint32_t, std::vector<TassNaiveResponseEntry>> by_core{};
+    for (const auto& entry : entries) {
+        by_core[entry.dst_core].push_back(entry);
+    }
+    for (auto& kv : by_core) {
+        const uint32_t core_id = kv.first;
+        if (core_id >= static_cast<uint32_t>(cores_.size()) || !cores_[core_id]) {
+            output_->fatal(CALL_INFO, -1,
+                           "MultiCorePE fatal: naive_tass response target core out of range node=%d core=%u size=%zu\n",
+                           node_id_, core_id, cores_.size());
+        }
+        auto* sink = dynamic_cast<ITassNaiveResponseSink*>(cores_[core_id]);
+        if (!sink) {
+            output_->fatal(CALL_INFO, -1,
+                           "MultiCorePE fatal: core=%u on node=%d does not implement ITassNaiveResponseSink\n",
+                           core_id, node_id_);
+        }
+        sink->onTassNaiveResponses(kv.second);
+    }
+}
+
+void MultiCorePE::dispatchTassNaiveResponses_(uint32_t dst_node, std::vector<TassNaiveResponseEntry>& entries) {
+    if (entries.empty()) return;
+    if (dst_node == static_cast<uint32_t>(node_id_)) {
+        deliverTassNaiveResponsesLocal_(entries);
+        entries.clear();
+        return;
+    }
+    if (dst_node >= tass_p0_rsp_out_links_.size() || !tass_p0_rsp_out_links_[dst_node]) {
+        output_->fatal(CALL_INFO, -1,
+                       "MultiCorePE fatal: naive_tass response link missing node=%d dst_node=%u entries=%zu\n",
+                       node_id_, dst_node, entries.size());
+    }
+    tass_p0_rsp_out_links_[dst_node]->send(new TassNaiveResponseEvent(static_cast<uint32_t>(node_id_), std::move(entries)));
+    entries.clear();
+}
+
+void MultiCorePE::reduceTassLfP0WindowReport_(const TassLfP0WindowReport& report) {
+    if (!tass_lf_p0_enable_) return;
+    if (stat_gas_tass_lf_p0_reports_reduce_total_) stat_gas_tass_lf_p0_reports_reduce_total_->addData(1);
+    uint32_t block_origin_node = 0;
+    uint32_t expected_contributors = 1;
+    computeTassBlockInfo_(report, block_origin_node, expected_contributors);
+    if (block_origin_node != static_cast<uint32_t>(node_id_)) {
+        if (stat_gas_tass_lf_p0_reports_drop_non_origin_total_) stat_gas_tass_lf_p0_reports_drop_non_origin_total_->addData(1);
+        return;
+    }
+    const uint64_t epoch_key = packTassBlockEpochKey_(block_origin_node, report.window_seq);
+    const uint64_t contributor_key = packTassContributorKey_(report.node_id, report.core_id);
+    auto& epoch = tass_lf_p0_pending_epochs_[epoch_key];
+    if (epoch.expected_contributors == 0) {
+        epoch.expected_contributors = expected_contributors;
+        epoch.line_size_bytes = std::max<uint32_t>(1u, report.line_size_bytes);
+    }
+    const auto inserted = epoch.contributors.insert(contributor_key);
+    if (!inserted.second) {
+        return;
+    }
+    epoch.payload_bytes_total += report.payload_bytes_total;
+    epoch.current_vlf_line_groups_total += report.current_vlf_line_groups_total;
+    for (const auto& kv : report.pre_payload_entries) {
+        epoch.pre_payload_bytes[kv.pre_global] += kv.payload_bytes;
+        epoch.pre_contributors[kv.pre_global] += 1u;
+    }
+    if (epoch.contributors.size() < static_cast<size_t>(epoch.expected_contributors)) {
+        return;
+    }
+    const uint64_t line_size = std::max<uint64_t>(1ull, static_cast<uint64_t>(epoch.line_size_bytes));
+    uint64_t block_active_pres_total = static_cast<uint64_t>(epoch.pre_payload_bytes.size());
+    uint64_t block_shared_pres_total = 0;
+    uint64_t cross_core_joins_total = 0;
+    uint64_t block_naive_line_count_total = 0;
+    uint64_t response_fanout_total = 0;
+    for (const auto& kv : epoch.pre_payload_bytes) {
+        block_naive_line_count_total += ceilDivU64_(kv.second, line_size);
+    }
+    for (const auto& kv : epoch.pre_contributors) {
+        const uint64_t fanout = static_cast<uint64_t>(kv.second);
+        response_fanout_total += fanout;
+        if (fanout > 1) {
+            block_shared_pres_total += 1;
+            cross_core_joins_total += (fanout - 1);
+        }
+    }
+    if (stat_gas_tass_lf_p0_block_epochs_total_) stat_gas_tass_lf_p0_block_epochs_total_->addData(1);
+    if (stat_gas_tass_lf_p0_block_active_pres_total_) stat_gas_tass_lf_p0_block_active_pres_total_->addData(block_active_pres_total);
+    if (stat_gas_tass_lf_p0_block_shared_pres_total_) stat_gas_tass_lf_p0_block_shared_pres_total_->addData(block_shared_pres_total);
+    if (stat_gas_tass_lf_p0_cross_core_joins_total_) stat_gas_tass_lf_p0_cross_core_joins_total_->addData(cross_core_joins_total);
+    if (stat_gas_tass_lf_p0_payload_bytes_total_) stat_gas_tass_lf_p0_payload_bytes_total_->addData(epoch.payload_bytes_total);
+    if (stat_gas_tass_lf_p0_current_vlf_line_groups_total_) stat_gas_tass_lf_p0_current_vlf_line_groups_total_->addData(epoch.current_vlf_line_groups_total);
+    if (stat_gas_tass_lf_p0_block_naive_line_count_total_) stat_gas_tass_lf_p0_block_naive_line_count_total_->addData(block_naive_line_count_total);
+    if (stat_gas_tass_lf_p0_block_fused_lb_line_count_total_) stat_gas_tass_lf_p0_block_fused_lb_line_count_total_->addData(ceilDivU64_(epoch.payload_bytes_total, line_size));
+    if (stat_gas_tass_lf_p0_response_fanout_total_) stat_gas_tass_lf_p0_response_fanout_total_->addData(response_fanout_total);
+    tass_lf_p0_pending_epochs_.erase(epoch_key);
+}
+
 void MultiCorePE::handleGasStepCtrlEvent(SST::Event* ev) {
     if (!ev) return;
     auto* msg = dynamic_cast<GasStepBarrierEvent*>(ev);
@@ -1328,6 +1780,7 @@ void MultiCorePE::handleGasStepCtrlEvent(SST::Event* ev) {
                 }
             }
             global_step_pending_seq_ = seq;
+            global_step_pending_apply_bank_credit_target_ = msg->apply_bank_credit_target;
             global_step_start_pending_ = true;
             global_step_last_seen_seq_ = seq;
             if (sentinel_enabled_ && output_ && node_id_ == 0) {
@@ -1339,7 +1792,11 @@ void MultiCorePE::handleGasStepCtrlEvent(SST::Event* ev) {
 }
 
 void MultiCorePE::beginGlobalStep_(uint32_t seq) {
+    tass_naive_lines_.clear();
+    tass_naive_req_to_line_.clear();
     global_step_active_seq_ = seq;
+    global_step_active_apply_bank_credit_target_ = global_step_pending_apply_bank_credit_target_;
+    global_step_pending_apply_bank_credit_target_ = 0;
     global_step_done_sent_ = false;
     global_step_begin_cycle_ = static_cast<uint64_t>(current_cycle_);
     global_step_last_activity_cycle_ = static_cast<uint64_t>(current_cycle_);
@@ -1368,6 +1825,11 @@ void MultiCorePE::beginGlobalStep_(uint32_t seq) {
         if (!core) {
             output_->fatal(CALL_INFO, -1, "GlobalStep fatal: core%d is null\n", i);
             return;
+        }
+        if (global_step_active_apply_bank_credit_target_ > 0) {
+            if (auto* credit = dynamic_cast<IGlobalStepCreditHooks*>(core)) {
+                credit->onGlobalStepApplyBankCredit(seq, global_step_active_apply_bank_credit_target_);
+            }
         }
         auto* hook = dynamic_cast<IGlobalStepHooks*>(core);
         if (!hook) {
@@ -1505,12 +1967,78 @@ void MultiCorePE::initializeStatistics() {
     stat_gas_unique_line_count_total_ = registerStatistic<uint64_t>("gas_unique_line_count_total");
     stat_gas_covered_line_count_total_ = registerStatistic<uint64_t>("gas_covered_line_count_total");
     stat_gas_overfetch_bytes_total_ = registerStatistic<uint64_t>("gas_overfetch_bytes_total");
+    stat_gas_apply_bank_credit_effective_total_ = registerStatistic<uint64_t>("gas_apply_bank_credit_effective_total");
+    stat_gas_cmd_cost_veto_total_ = registerStatistic<uint64_t>("gas_cmd_cost_veto_total");
+    stat_gas_cmd_cost_veto_fine_gap_total_ = registerStatistic<uint64_t>("gas_cmd_cost_veto_fine_gap_total");
+    stat_gas_cmd_cost_veto_row_window_total_ = registerStatistic<uint64_t>("gas_cmd_cost_veto_row_window_total");
     stat_gas_apply_acc_updates_total_ = registerStatistic<uint64_t>("gas_apply_acc_updates_total");
     stat_gas_acc_posts_touched_total_ = registerStatistic<uint64_t>("gas_acc_posts_touched_total");
     stat_gas_scatter_spikes_emitted_total_ = registerStatistic<uint64_t>("gas_scatter_spikes_emitted_total");
     stat_gas_acc_hwm_bytes_total_ = registerStatistic<uint64_t>("gas_acc_high_watermark_bytes_total");
     stat_gas_acc_spill_records_total_ = registerStatistic<uint64_t>("gas_acc_spill_records_total");
     stat_gas_acc_spilled_bytes_total_ = registerStatistic<uint64_t>("gas_acc_spilled_bytes_total");
+    stat_gas_retire_global_hol_cycles_total_ = registerStatistic<uint64_t>("gas_retire_global_hol_cycles_total");
+    stat_gas_retire_ready_but_blocked_edges_total_ = registerStatistic<uint64_t>("gas_retire_ready_but_blocked_edges_total");
+    stat_gas_retire_per_post_progress_total_ = registerStatistic<uint64_t>("gas_retire_per_post_progress_total");
+    stat_gas_tass_lf_p0_block_epochs_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_block_epochs_total");
+    stat_gas_tass_lf_p0_block_active_pres_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_block_active_pres_total");
+    stat_gas_tass_lf_p0_block_shared_pres_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_block_shared_pres_total");
+    stat_gas_tass_lf_p0_cross_core_joins_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_cross_core_joins_total");
+    stat_gas_tass_lf_p0_payload_bytes_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_payload_bytes_total");
+    stat_gas_tass_lf_p0_current_vlf_line_groups_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_current_vlf_line_groups_total");
+    stat_gas_tass_lf_p0_block_naive_line_count_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_block_naive_line_count_total");
+    stat_gas_tass_lf_p0_block_fused_lb_line_count_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_block_fused_lb_line_count_total");
+    stat_gas_tass_lf_p0_response_fanout_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_response_fanout_total");
+    stat_gas_tass_lf_p0_reports_submit_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_reports_submit_total");
+    stat_gas_tass_lf_p0_reports_send_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_reports_send_total");
+    stat_gas_tass_lf_p0_reports_recv_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_reports_recv_total");
+    stat_gas_tass_lf_p0_reports_reduce_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_reports_reduce_total");
+    stat_gas_tass_lf_p0_reports_drop_no_link_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_reports_drop_no_link_total");
+    stat_gas_tass_lf_p0_reports_drop_non_origin_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_reports_drop_non_origin_total");
+    stat_gas_tass_lf_p0_reports_flushed_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_reports_flushed_total");
+    stat_gas_tass_lf_p0_reports_nonzero_payload_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_reports_nonzero_payload_total");
+    stat_gas_tass_lf_p0_reports_pre_entries_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_reports_pre_entries_total");
+    stat_gas_tass_lf_p0_reports_via_callback_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_reports_via_callback_total");
+    stat_gas_tass_lf_p0_reports_via_fallback_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_reports_via_fallback_total");
+    stat_gcss_lookup_hit_total_ = registerStatistic<uint64_t>("gcss_lookup_hit_total");
+    stat_gcss_lookup_miss_total_ = registerStatistic<uint64_t>("gcss_lookup_miss_total");
+    stat_weight_read_dense_reqs_total_ = registerStatistic<uint64_t>("weight_read_dense_reqs_total");
+    stat_weight_read_dense_bytes_total_ = registerStatistic<uint64_t>("weight_read_dense_bytes_total");
+    stat_weight_read_rowptr_reqs_total_ = registerStatistic<uint64_t>("weight_read_rowptr_reqs_total");
+    stat_weight_read_rowptr_bytes_total_ = registerStatistic<uint64_t>("weight_read_rowptr_bytes_total");
+    stat_weight_read_colidx_reqs_total_ = registerStatistic<uint64_t>("weight_read_colidx_reqs_total");
+    stat_weight_read_colidx_bytes_total_ = registerStatistic<uint64_t>("weight_read_colidx_bytes_total");
+    stat_weight_read_blockdata_reqs_total_ = registerStatistic<uint64_t>("weight_read_blockdata_reqs_total");
+    stat_weight_read_blockdata_bytes_total_ = registerStatistic<uint64_t>("weight_read_blockdata_bytes_total");
+    stat_weight_read_gcss_reqs_total_ = registerStatistic<uint64_t>("weight_read_gcss_reqs_total");
+    stat_weight_read_gcss_bytes_total_ = registerStatistic<uint64_t>("weight_read_gcss_bytes_total");
+    stat_weight_idx_sram_reads_total_ = registerStatistic<uint64_t>("weight_idx_sram_reads_total");
+    stat_weight_idx_sram_writes_total_ = registerStatistic<uint64_t>("weight_idx_sram_writes_total");
+    stat_weight_idx_sram_bytes_read_total_ = registerStatistic<uint64_t>("weight_idx_sram_bytes_read_total");
+    stat_weight_idx_sram_bytes_write_total_ = registerStatistic<uint64_t>("weight_idx_sram_bytes_write_total");
+    stat_weight_idx_sram_bank_conflict_ticks_total_ = registerStatistic<uint64_t>("weight_idx_sram_bank_conflict_ticks_total");
+    stat_weight_idx_sram_predicted_extra_cycles_total_ = registerStatistic<uint64_t>("weight_idx_sram_predicted_extra_cycles_total");
+    stat_weight_idx_sram_resident_bytes_peak_ = registerStatistic<uint64_t>("weight_idx_sram_resident_bytes_peak");
+    stat_weight_idx_lookup_total_ = registerStatistic<uint64_t>("weight_idx_lookup_total");
+    stat_weight_idx_lookup_idx2_total_ = registerStatistic<uint64_t>("weight_idx_lookup_idx2_total");
+    stat_weight_l0_sram_reads_total_ = registerStatistic<uint64_t>("weight_l0_sram_reads_total");
+    stat_weight_l0_sram_writes_total_ = registerStatistic<uint64_t>("weight_l0_sram_writes_total");
+    stat_weight_l0_sram_bytes_read_total_ = registerStatistic<uint64_t>("weight_l0_sram_bytes_read_total");
+    stat_weight_l0_sram_bytes_write_total_ = registerStatistic<uint64_t>("weight_l0_sram_bytes_write_total");
+    stat_weight_l0_sram_bank_conflict_ticks_total_ = registerStatistic<uint64_t>("weight_l0_sram_bank_conflict_ticks_total");
+    stat_weight_l0_sram_predicted_extra_cycles_total_ = registerStatistic<uint64_t>("weight_l0_sram_predicted_extra_cycles_total");
+    stat_weight_l0_sram_resident_bytes_peak_ = registerStatistic<uint64_t>("weight_l0_sram_resident_bytes_peak");
+    stat_weight_l0_lookup_total_ = registerStatistic<uint64_t>("weight_l0_lookup_total");
+    stat_weight_l0_hit_total_ = registerStatistic<uint64_t>("weight_l0_hit_total");
+    stat_weight_l0_fill_total_ = registerStatistic<uint64_t>("weight_l0_fill_total");
+    stat_weight_l0_evict_total_ = registerStatistic<uint64_t>("weight_l0_evict_total");
+    stat_core_state_sram_reads_total_ = registerStatistic<uint64_t>("core_state_sram_reads_total");
+    stat_core_state_sram_writes_total_ = registerStatistic<uint64_t>("core_state_sram_writes_total");
+    stat_core_state_sram_bytes_read_total_ = registerStatistic<uint64_t>("core_state_sram_bytes_read_total");
+    stat_core_state_sram_bytes_write_total_ = registerStatistic<uint64_t>("core_state_sram_bytes_write_total");
+    stat_core_state_sram_bank_conflict_ticks_total_ = registerStatistic<uint64_t>("core_state_sram_bank_conflict_ticks_total");
+    stat_core_state_sram_predicted_extra_cycles_total_ = registerStatistic<uint64_t>("core_state_sram_predicted_extra_cycles_total");
+    stat_core_state_sram_resident_bytes_peak_ = registerStatistic<uint64_t>("core_state_sram_resident_bytes_peak");
     stat_gas_activity_f_ = registerStatistic<double>("gas_activity_f");
     stat_sim_cycles_total_ = registerStatistic<uint64_t>("sim_cycles_total");
     stat_global_steps_done_total_ = registerStatistic<uint64_t>("global_steps_done_total");
@@ -1566,7 +2094,11 @@ void MultiCorePE::accumulateGasStatsExt(uint64_t unique_bytes, uint64_t unique_r
                                         uint64_t window_buffer_max_bytes,
                                         uint64_t unique_line_count,
                                         uint64_t covered_line_count,
-                                        uint64_t overfetch_bytes) {
+                                        uint64_t overfetch_bytes,
+                                        uint64_t apply_bank_credit_effective,
+                                        uint64_t cmd_cost_veto,
+                                        uint64_t cmd_cost_veto_fine_gap,
+                                        uint64_t cmd_cost_veto_row_window) {
     accumulateGasStats(unique_bytes, unique_reads);
     if (rowwin_triggers && stat_gas_rowwin_triggers_total_) stat_gas_rowwin_triggers_total_->addData(rowwin_triggers);
     if (rowwin_bytes && stat_gas_rowwin_bytes_total_) stat_gas_rowwin_bytes_total_->addData(rowwin_bytes);
@@ -1575,6 +2107,10 @@ void MultiCorePE::accumulateGasStatsExt(uint64_t unique_bytes, uint64_t unique_r
     if (unique_line_count && stat_gas_unique_line_count_total_) stat_gas_unique_line_count_total_->addData(unique_line_count);
     if (covered_line_count && stat_gas_covered_line_count_total_) stat_gas_covered_line_count_total_->addData(covered_line_count);
     if (overfetch_bytes && stat_gas_overfetch_bytes_total_) stat_gas_overfetch_bytes_total_->addData(overfetch_bytes);
+    if (apply_bank_credit_effective && stat_gas_apply_bank_credit_effective_total_) stat_gas_apply_bank_credit_effective_total_->addData(apply_bank_credit_effective);
+    if (cmd_cost_veto && stat_gas_cmd_cost_veto_total_) stat_gas_cmd_cost_veto_total_->addData(cmd_cost_veto);
+    if (cmd_cost_veto_fine_gap && stat_gas_cmd_cost_veto_fine_gap_total_) stat_gas_cmd_cost_veto_fine_gap_total_->addData(cmd_cost_veto_fine_gap);
+    if (cmd_cost_veto_row_window && stat_gas_cmd_cost_veto_row_window_total_) stat_gas_cmd_cost_veto_row_window_total_->addData(cmd_cost_veto_row_window);
 }
 
 void MultiCorePE::accumulateActivityF(double f) {
@@ -1596,6 +2132,120 @@ void MultiCorePE::accumulateApplyScatterStats(uint64_t acc_updates, uint64_t pos
     if (hwm_bytes && stat_gas_acc_hwm_bytes_total_) stat_gas_acc_hwm_bytes_total_->addData(hwm_bytes);
     if (spill_records && stat_gas_acc_spill_records_total_) stat_gas_acc_spill_records_total_->addData(spill_records);
     if (spilled_bytes && stat_gas_acc_spilled_bytes_total_) stat_gas_acc_spilled_bytes_total_->addData(spilled_bytes);
+}
+
+void MultiCorePE::accumulateSynapseReadStats(uint64_t gcss_lookup_hit_total,
+                                             uint64_t gcss_lookup_miss_total,
+                                             uint64_t dense_reqs_total,
+                                             uint64_t dense_bytes_total,
+                                             uint64_t rowptr_reqs_total,
+                                             uint64_t rowptr_bytes_total,
+                                             uint64_t colidx_reqs_total,
+                                             uint64_t colidx_bytes_total,
+                                             uint64_t blockdata_reqs_total,
+                                             uint64_t blockdata_bytes_total,
+                                             uint64_t gcss_reqs_total,
+                                             uint64_t gcss_bytes_total,
+                                             uint64_t weight_idx_sram_reads_total,
+                                             uint64_t weight_idx_sram_writes_total,
+                                             uint64_t weight_idx_sram_bytes_read_total,
+                                             uint64_t weight_idx_sram_bytes_write_total,
+                                             uint64_t weight_idx_sram_bank_conflict_ticks_total,
+                                             uint64_t weight_idx_sram_predicted_extra_cycles_total,
+                                             uint64_t weight_idx_sram_resident_bytes_peak,
+                                             uint64_t weight_idx_lookup_total,
+                                             uint64_t weight_idx_lookup_idx2_total,
+                                             uint64_t weight_l0_sram_reads_total,
+                                             uint64_t weight_l0_sram_writes_total,
+                                             uint64_t weight_l0_sram_bytes_read_total,
+                                             uint64_t weight_l0_sram_bytes_write_total,
+                                             uint64_t weight_l0_sram_bank_conflict_ticks_total,
+                                             uint64_t weight_l0_sram_predicted_extra_cycles_total,
+                                             uint64_t weight_l0_sram_resident_bytes_peak,
+                                             uint64_t weight_l0_lookup_total,
+                                             uint64_t weight_l0_hit_total,
+                                             uint64_t weight_l0_fill_total,
+                                             uint64_t weight_l0_evict_total,
+                                             uint64_t core_state_sram_reads_total,
+                                             uint64_t core_state_sram_writes_total,
+                                             uint64_t core_state_sram_bytes_read_total,
+                                             uint64_t core_state_sram_bytes_write_total,
+                                             uint64_t core_state_sram_bank_conflict_ticks_total,
+                                             uint64_t core_state_sram_predicted_extra_cycles_total,
+                                             uint64_t core_state_sram_resident_bytes_peak,
+                                             uint64_t gas_retire_global_hol_cycles_total,
+                                             uint64_t gas_retire_ready_but_blocked_edges_total,
+                                             uint64_t gas_retire_per_post_progress_total,
+                                             uint64_t gas_tass_lf_p0_block_epochs_total,
+                                             uint64_t gas_tass_lf_p0_block_active_pres_total,
+                                             uint64_t gas_tass_lf_p0_block_shared_pres_total,
+                                             uint64_t gas_tass_lf_p0_cross_core_joins_total,
+                                             uint64_t gas_tass_lf_p0_payload_bytes_total,
+                                             uint64_t gas_tass_lf_p0_current_vlf_line_groups_total,
+                                             uint64_t gas_tass_lf_p0_block_naive_line_count_total,
+                                             uint64_t gas_tass_lf_p0_block_fused_lb_line_count_total,
+                                             uint64_t gas_tass_lf_p0_response_fanout_total,
+                                             uint64_t gas_tass_lf_p0_reports_flushed_total,
+                                             uint64_t gas_tass_lf_p0_reports_nonzero_payload_total,
+                                             uint64_t gas_tass_lf_p0_reports_pre_entries_total,
+                                             uint64_t gas_tass_lf_p0_reports_via_callback_total,
+                                             uint64_t gas_tass_lf_p0_reports_via_fallback_total) {
+    if (stat_gcss_lookup_hit_total_) stat_gcss_lookup_hit_total_->addData(gcss_lookup_hit_total);
+    if (stat_gcss_lookup_miss_total_) stat_gcss_lookup_miss_total_->addData(gcss_lookup_miss_total);
+    if (stat_weight_read_dense_reqs_total_) stat_weight_read_dense_reqs_total_->addData(dense_reqs_total);
+    if (stat_weight_read_dense_bytes_total_) stat_weight_read_dense_bytes_total_->addData(dense_bytes_total);
+    if (stat_weight_read_rowptr_reqs_total_) stat_weight_read_rowptr_reqs_total_->addData(rowptr_reqs_total);
+    if (stat_weight_read_rowptr_bytes_total_) stat_weight_read_rowptr_bytes_total_->addData(rowptr_bytes_total);
+    if (stat_weight_read_colidx_reqs_total_) stat_weight_read_colidx_reqs_total_->addData(colidx_reqs_total);
+    if (stat_weight_read_colidx_bytes_total_) stat_weight_read_colidx_bytes_total_->addData(colidx_bytes_total);
+    if (stat_weight_read_blockdata_reqs_total_) stat_weight_read_blockdata_reqs_total_->addData(blockdata_reqs_total);
+    if (stat_weight_read_blockdata_bytes_total_) stat_weight_read_blockdata_bytes_total_->addData(blockdata_bytes_total);
+    if (stat_weight_read_gcss_reqs_total_) stat_weight_read_gcss_reqs_total_->addData(gcss_reqs_total);
+    if (stat_weight_read_gcss_bytes_total_) stat_weight_read_gcss_bytes_total_->addData(gcss_bytes_total);
+    if (stat_weight_idx_sram_reads_total_) stat_weight_idx_sram_reads_total_->addData(weight_idx_sram_reads_total);
+    if (stat_weight_idx_sram_writes_total_) stat_weight_idx_sram_writes_total_->addData(weight_idx_sram_writes_total);
+    if (stat_weight_idx_sram_bytes_read_total_) stat_weight_idx_sram_bytes_read_total_->addData(weight_idx_sram_bytes_read_total);
+    if (stat_weight_idx_sram_bytes_write_total_) stat_weight_idx_sram_bytes_write_total_->addData(weight_idx_sram_bytes_write_total);
+    if (stat_weight_idx_sram_bank_conflict_ticks_total_) stat_weight_idx_sram_bank_conflict_ticks_total_->addData(weight_idx_sram_bank_conflict_ticks_total);
+    if (stat_weight_idx_sram_predicted_extra_cycles_total_) stat_weight_idx_sram_predicted_extra_cycles_total_->addData(weight_idx_sram_predicted_extra_cycles_total);
+    if (stat_weight_idx_sram_resident_bytes_peak_) stat_weight_idx_sram_resident_bytes_peak_->addData(weight_idx_sram_resident_bytes_peak);
+    if (stat_weight_idx_lookup_total_) stat_weight_idx_lookup_total_->addData(weight_idx_lookup_total);
+    if (stat_weight_idx_lookup_idx2_total_) stat_weight_idx_lookup_idx2_total_->addData(weight_idx_lookup_idx2_total);
+    if (stat_weight_l0_sram_reads_total_) stat_weight_l0_sram_reads_total_->addData(weight_l0_sram_reads_total);
+    if (stat_weight_l0_sram_writes_total_) stat_weight_l0_sram_writes_total_->addData(weight_l0_sram_writes_total);
+    if (stat_weight_l0_sram_bytes_read_total_) stat_weight_l0_sram_bytes_read_total_->addData(weight_l0_sram_bytes_read_total);
+    if (stat_weight_l0_sram_bytes_write_total_) stat_weight_l0_sram_bytes_write_total_->addData(weight_l0_sram_bytes_write_total);
+    if (stat_weight_l0_sram_bank_conflict_ticks_total_) stat_weight_l0_sram_bank_conflict_ticks_total_->addData(weight_l0_sram_bank_conflict_ticks_total);
+    if (stat_weight_l0_sram_predicted_extra_cycles_total_) stat_weight_l0_sram_predicted_extra_cycles_total_->addData(weight_l0_sram_predicted_extra_cycles_total);
+    if (stat_weight_l0_sram_resident_bytes_peak_) stat_weight_l0_sram_resident_bytes_peak_->addData(weight_l0_sram_resident_bytes_peak);
+    if (stat_weight_l0_lookup_total_) stat_weight_l0_lookup_total_->addData(weight_l0_lookup_total);
+    if (stat_weight_l0_hit_total_) stat_weight_l0_hit_total_->addData(weight_l0_hit_total);
+    if (stat_weight_l0_fill_total_) stat_weight_l0_fill_total_->addData(weight_l0_fill_total);
+    if (stat_weight_l0_evict_total_) stat_weight_l0_evict_total_->addData(weight_l0_evict_total);
+    if (stat_core_state_sram_reads_total_) stat_core_state_sram_reads_total_->addData(core_state_sram_reads_total);
+    if (stat_core_state_sram_writes_total_) stat_core_state_sram_writes_total_->addData(core_state_sram_writes_total);
+    if (stat_core_state_sram_bytes_read_total_) stat_core_state_sram_bytes_read_total_->addData(core_state_sram_bytes_read_total);
+    if (stat_core_state_sram_bytes_write_total_) stat_core_state_sram_bytes_write_total_->addData(core_state_sram_bytes_write_total);
+    if (stat_core_state_sram_bank_conflict_ticks_total_) stat_core_state_sram_bank_conflict_ticks_total_->addData(core_state_sram_bank_conflict_ticks_total);
+    if (stat_core_state_sram_predicted_extra_cycles_total_) stat_core_state_sram_predicted_extra_cycles_total_->addData(core_state_sram_predicted_extra_cycles_total);
+    if (stat_core_state_sram_resident_bytes_peak_) stat_core_state_sram_resident_bytes_peak_->addData(core_state_sram_resident_bytes_peak);
+    if (stat_gas_retire_global_hol_cycles_total_) stat_gas_retire_global_hol_cycles_total_->addData(gas_retire_global_hol_cycles_total);
+    if (stat_gas_retire_ready_but_blocked_edges_total_) stat_gas_retire_ready_but_blocked_edges_total_->addData(gas_retire_ready_but_blocked_edges_total);
+    if (stat_gas_retire_per_post_progress_total_) stat_gas_retire_per_post_progress_total_->addData(gas_retire_per_post_progress_total);
+    if (stat_gas_tass_lf_p0_block_epochs_total_) stat_gas_tass_lf_p0_block_epochs_total_->addData(gas_tass_lf_p0_block_epochs_total);
+    if (stat_gas_tass_lf_p0_block_active_pres_total_) stat_gas_tass_lf_p0_block_active_pres_total_->addData(gas_tass_lf_p0_block_active_pres_total);
+    if (stat_gas_tass_lf_p0_block_shared_pres_total_) stat_gas_tass_lf_p0_block_shared_pres_total_->addData(gas_tass_lf_p0_block_shared_pres_total);
+    if (stat_gas_tass_lf_p0_cross_core_joins_total_) stat_gas_tass_lf_p0_cross_core_joins_total_->addData(gas_tass_lf_p0_cross_core_joins_total);
+    if (stat_gas_tass_lf_p0_payload_bytes_total_) stat_gas_tass_lf_p0_payload_bytes_total_->addData(gas_tass_lf_p0_payload_bytes_total);
+    if (stat_gas_tass_lf_p0_current_vlf_line_groups_total_) stat_gas_tass_lf_p0_current_vlf_line_groups_total_->addData(gas_tass_lf_p0_current_vlf_line_groups_total);
+    if (stat_gas_tass_lf_p0_block_naive_line_count_total_) stat_gas_tass_lf_p0_block_naive_line_count_total_->addData(gas_tass_lf_p0_block_naive_line_count_total);
+    if (stat_gas_tass_lf_p0_block_fused_lb_line_count_total_) stat_gas_tass_lf_p0_block_fused_lb_line_count_total_->addData(gas_tass_lf_p0_block_fused_lb_line_count_total);
+    if (stat_gas_tass_lf_p0_response_fanout_total_) stat_gas_tass_lf_p0_response_fanout_total_->addData(gas_tass_lf_p0_response_fanout_total);
+    if (stat_gas_tass_lf_p0_reports_flushed_total_) stat_gas_tass_lf_p0_reports_flushed_total_->addData(gas_tass_lf_p0_reports_flushed_total);
+    if (stat_gas_tass_lf_p0_reports_nonzero_payload_total_) stat_gas_tass_lf_p0_reports_nonzero_payload_total_->addData(gas_tass_lf_p0_reports_nonzero_payload_total);
+    if (stat_gas_tass_lf_p0_reports_pre_entries_total_) stat_gas_tass_lf_p0_reports_pre_entries_total_->addData(gas_tass_lf_p0_reports_pre_entries_total);
+    if (stat_gas_tass_lf_p0_reports_via_callback_total_) stat_gas_tass_lf_p0_reports_via_callback_total_->addData(gas_tass_lf_p0_reports_via_callback_total);
+    if (stat_gas_tass_lf_p0_reports_via_fallback_total_) stat_gas_tass_lf_p0_reports_via_fallback_total_->addData(gas_tass_lf_p0_reports_via_fallback_total);
 }
 
 void MultiCorePE::notifyStageEvent(uint32_t seq, const std::string& event, uint64_t ts_ns,
@@ -1674,6 +2324,14 @@ void MultiCorePE::notifyStageEvent(uint32_t seq, const std::string& event, uint6
             }
             if (all_done) {
                 auto* ev = new GasStepBarrierEvent(GasStepBarrierOp::PeDone, seq, static_cast<uint32_t>(node_id_));
+                // Step-level telemetry: reuse PE-level stage marks aggregated in notifyStageEvent().
+                // This is used by GlobalGasStepController for criticality-aware global credit control.
+                if (m.bg != 0 && m.es != 0 && m.es >= m.bg) {
+                    ev->step_total_ns = m.es - m.bg;
+                }
+                if (m.ga != 0 && m.bs != 0 && m.bs >= m.ga) {
+                    ev->step_apply_ns = m.bs - m.ga;
+                }
                 gas_step_ctrl_link_->send(ev);
                 global_step_done_sent_ = true;
                 if (stat_global_steps_done_total_) stat_global_steps_done_total_->addData(1);
@@ -2156,7 +2814,9 @@ void MultiCorePE::deliverPacketToEndpoint_(int endpoint_id, NocPacketEvent* pkt)
     if (exec_mode_ == "naive_raw" &&
         global_step_sync_enable_ &&
         global_step_active_seq_ != 0 &&
-        (pkt->packetKind() == NocPacketKind::Spike || pkt->packetKind() == NocPacketKind::SpikeKey)) {
+        (pkt->packetKind() == NocPacketKind::Spike ||
+         pkt->packetKind() == NocPacketKind::SpikeKey ||
+         pkt->packetKind() == NocPacketKind::SpikeTileKey)) {
         const uint32_t target_seq = pkt->step_seq;
         if (target_seq != 0 && target_seq > global_step_active_seq_) {
             deferred_packets_by_seq_[target_seq].push_back(DeferredNocPacket{endpoint_id, pkt});
@@ -2175,7 +2835,8 @@ void MultiCorePE::deliverPacketToEndpoint_(int endpoint_id, NocPacketEvent* pkt)
             noc_lat_spike_sum_ += lat;
             noc_lat_spike_max_ = std::max<uint64_t>(noc_lat_spike_max_, lat);
             if (bin < noc_lat_spike_hist_.size()) noc_lat_spike_hist_[static_cast<size_t>(bin)] += 1;
-        } else if (pkt->packetKind() == NocPacketKind::SpikeKey) {
+        } else if (pkt->packetKind() == NocPacketKind::SpikeKey ||
+                   pkt->packetKind() == NocPacketKind::SpikeTileKey) {
             noc_lat_spikekey_cnt_ += 1;
             noc_lat_spikekey_sum_ += lat;
             noc_lat_spikekey_max_ = std::max<uint64_t>(noc_lat_spikekey_max_, lat);

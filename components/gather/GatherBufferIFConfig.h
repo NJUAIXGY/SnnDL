@@ -23,6 +23,15 @@ struct GatherBufferIFConfig {
     bool diag_enable = false;
     bool debug_enable = false;
     bool sentinel_enable = false;
+    // Experimental: step-gate progress watchdog (debugging only; disabled by default).
+    bool experimental_stepgate_progress_enable = false;
+    uint64_t experimental_stepgate_progress_period_cycles = 0;
+    uint32_t experimental_stepgate_progress_max_reports = 0;
+    uint32_t experimental_stepgate_progress_dump_level = 0;
+    int experimental_stepgate_progress_owner_node = -1;
+    int experimental_stepgate_progress_owner_core = -1;
+    // Experimental: avoid per-cycle EndApply spin in step-gate fallback mode (default preserves legacy behavior).
+    uint64_t experimental_stepgate_apply_finish_poll_period_cycles = 1;
 
     // Policies
     // 默认使用 cacheline 语义（更贴近 memHierarchy/通用 cacheline 事务建模）。
@@ -37,6 +46,14 @@ struct GatherBufferIFConfig {
     uint64_t gap_merge_k_bytes = 0;
     uint64_t burst_bytes_max = 64 * 1024;
 
+    // Experimental: GCSS value-line fusion (VLF).
+    // When enabled, staged reads are fused at cacheline granularity without absorbing "holes"
+    // (i.e., no byte-gap fill / no row-window coarse merge). This targets pathological
+    // read amplification observed in GCSS value-only paths.
+    bool vlf_enable = false;
+    // Optional: merge adjacent cachelines into contiguous runs (still no holes).
+    bool vlf_run_enable = false;
+
     // Bank/row ordering
     uint32_t bank_bits = 0;
     uint32_t bank_shift = 0;
@@ -44,8 +61,8 @@ struct GatherBufferIFConfig {
     uint32_t bank_auto_min_banks = 4;
     uint32_t bank_auto_max_banks = 32;
 
-    // Apply-stage issue scheduling (optional; default preserves legacy "order" behavior).
-    std::string apply_issue_policy = "order"; // order|bank_rr_row_sticky_age
+    // Apply-stage issue scheduling.
+    std::string apply_issue_policy = "order"; // order
     uint32_t apply_frags_per_issue = 1;       // max frags per scheduling step (0=unlimited)
     uint32_t apply_bank_credit = 1;           // max active granules per bank (0=unlimited)
     uint64_t apply_age_fair_ns = 2000;        // age-based fairness threshold (ns), 0=disable
@@ -122,14 +139,11 @@ struct GatherBufferIFConfig {
     std::string ctrl_rowwin_list = "0,16384,32768,65536";
     std::string ctrl_timeout_list = "0,300,600";
 
-    // DRAM-aware Apply (exploration; default OFF, activated by apply_issue_policy=dram_aware_v1)
-    uint32_t dram_row_bytes = 0;
-    uint32_t dram_bank_count = 0;
-    uint32_t dram_read_burst_bytes = 64;
-    uint32_t dram_row_miss_penalty_cycles = 0;
-    uint64_t dram_overfetch_budget_bytes = 0;
-    bool dram_aware_enable_row_window = false;
-    std::string dram_aware_k_policy = "cost_budgeted"; // fixed|cost_budgeted|density_budgeted
+    // Experimental: DRAM command-cost guided gap-merge/row-pack decisions during segment build.
+    // This is intentionally isolated from baseline GAS semantics and must be explicitly enabled.
+    bool dram_cmd_cost_merge_enable = false;
+    uint32_t dram_cmd_t_row_hit_ns = 30;
+    uint32_t dram_cmd_t_row_miss_ns = 120;
 
     // Granule/window metrics export
     std::string export_granules_csv;

@@ -46,6 +46,10 @@
 
 mesh 模板会在每次运行目录写出 `effective_config.json`（并汇总进 `essential_summary_mesh.json` 的 `model.effective`），用于记录最终生效的合并/粒度参数，避免配置文件与实际行为不一致导致误读。
 
+此外，`GatherBufferIF` 在 Apply 阶段支持可选的 DRAM-aware 发射策略（`apply_issue_policy=bank_rr_row_sticky_age|dram_aware_v1|cmd_aware_v1`）。其中
+`cmd_aware_v1` 为实验性策略，默认关闭，需与主线口径隔离。该策略依赖
+`bank_bits/bank_shift/row_bytes_guess` 的 bank×row 映射口径；使用 Ramulator2 时建议显式校准并固定（见 `components/gather/README.md`）。
+
 ## 子目录
 
 - `components/stimulus/`：Stimulus 域的注入型组件（例如 `SpikeSource`）。

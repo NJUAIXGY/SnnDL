@@ -45,6 +45,10 @@ public:
 	        // When enabled, extra cycles are added per tile-seg beyond macs/peak throughput.
 	        bool mxu_wavefront_enable = false;
 	        float mxu_wavefront_alpha = 1.0f;
+	        // M30: optional MXU feed/drain bandwidth model (bytes/cycle). 0 = disabled/unlimited.
+	        uint64_t mxu_a_bytes_per_cycle = 0;
+	        uint64_t mxu_b_bytes_per_cycle = 0;
+	        uint64_t mxu_c_bytes_per_cycle = 0;
 
         // Runtime scheduling
         bool overlap_enable = true; // overlap DMA-read with compute
@@ -56,6 +60,21 @@ public:
         uint64_t mem_region_bytes = 1ull << 20; // wrap-around region per core
         uint32_t mem_req_bytes = 64;
         uint32_t mem_max_outstanding = 32;
+        // M55/M61: optional memory timing proxy model (row/bank/queue/refresh/command-bus visibility).
+        std::string mem_timing_model = "off"; // off/proxy_v2/proxy_v3
+        uint32_t mem_bank_groups_per_channel = 1;
+        uint32_t mem_banks_per_group = 1;
+        uint64_t mem_row_bytes = 8192;
+        uint32_t mem_bank_queue_depth = 16;
+        std::string mem_sched_policy = "fifo"; // fifo/frfcfs
+        uint32_t mem_t_rcd_cycles = 0;
+        uint32_t mem_t_cl_cycles = 0;
+        uint32_t mem_t_rp_cycles = 0;
+        uint32_t mem_t_burst_cycles = 0;
+        uint32_t mem_t_ccd_s_cycles = 0;
+        uint32_t mem_t_ccd_l_cycles = 0;
+        uint32_t mem_refresh_interval_cycles = 0;
+        uint32_t mem_refresh_block_cycles = 0;
 
         // Dataflow + tiling
         std::string dataflow = "os"; // os/ws/is
@@ -116,6 +135,13 @@ public:
         // Optional shared DMA bandwidth budget across all cores in a PE (bytes/cycle). 0 = disabled.
         // When enabled, each core receives a per-cycle quota derived from this PE-level budget.
         uint64_t dma_shared_bandwidth_bytes_per_cycle = 0;
+        // DMA microarchitecture knobs (M29, program-mode focused).
+        // Defaults keep legacy behavior (0 = disabled / unlimited).
+        uint64_t dma_burst_bytes = 0; // 0 = no burst segmentation
+        uint32_t dma_setup_cycles = 0; // setup cost per burst (cycles)
+        uint32_t dma_read_engines = 0; // 0 = unlimited issue lanes (legacy)
+        uint32_t dma_write_engines = 0; // 0 = unlimited issue lanes (legacy)
+        uint32_t dma_max_inflight_per_engine = 0; // 0 = no per-engine inflight cap
         // Optional HBM channel budget model (shared across cores in a PE):
         // - channels: number of independent channels
         // - channel_bandwidth: per-channel budget (bytes/cycle); 0 = disabled
@@ -190,6 +216,22 @@ private:
         MemTag tag = MemTag::Generic;
         uint64_t epoch = 0;
         uint32_t bytes = 0;
+        uint64_t issue_ns = 0; // best-effort (uses runtime time source; falls back to now_cycle)
+        uint64_t proxy_delay_cycles = 0; // M55 proxy delay injected at issue time.
+    };
+
+    struct MemTimingBankState {
+        bool row_open = false;
+        uint64_t open_row = 0;
+        uint64_t busy_until_cycle = 0;
+        uint64_t last_refresh_cycle = 0;
+    };
+
+    struct MemTimingChannelState {
+        uint64_t cmd_bus_ready_cycle = 0;
+        uint64_t last_cmd_cycle = 0;
+        uint32_t last_cmd_bank_group = 0;
+        bool last_cmd_valid = false;
     };
 
 	    struct TileSegState {
@@ -347,6 +389,7 @@ private:
 
     uint32_t issueMemReadTagged_(uint32_t max_bytes, MemTag tag, uint64_t epoch);
     uint32_t issueMemWriteTagged_(uint32_t max_bytes, MemTag tag, uint64_t epoch);
+    void onMemResponse_(uint64_t req_id, ReqKind kind, MemTag tag, uint64_t epoch, uint32_t bytes);
     void onMemComplete_(ReqKind kind, MemTag tag, uint64_t epoch, uint32_t bytes);
     uint32_t issueMemRead_();
     uint32_t issueMemWrite_();
@@ -432,11 +475,23 @@ private:
     uint64_t dmaBudgetBytesPerCycle_(uint64_t now_cycle) const;
     bool hbmChannelBudgetEnabled_() const;
     uint32_t hbmChannelCount_() const;
-    uint64_t peekNextMemAddr_(ReqKind kind, uint32_t bytes) const;
-    uint32_t memAddrToHbmChannel_(uint64_t addr) const;
+    bool memTimingProxyEnabled_() const;
+    uint32_t memTimingBanksPerChannel_() const;
+    uint32_t memTimingBankGroupIndex_(uint64_t off) const;
+    uint64_t memTimingServiceQuantumCycles_() const;
+    uint32_t memTimingBankIndex_(uint64_t off) const;
+    uint64_t memTimingRowIndex_(uint64_t off) const;
+    uint64_t memTimingQueueDepthForReq_() const;
+    uint64_t memTimingRefreshDelayCycles_(MemTimingBankState& st, uint64_t now_cycle);
+    uint64_t memTimingProxyDelayCycles_(ReqKind kind, uint64_t off, uint32_t bytes, uint64_t now_cycle);
+    void resetMemTimingState_();
+    uint64_t peekNextMemOffset_(ReqKind kind, uint32_t bytes) const;
+    uint32_t memOffsetToHbmChannel_(uint64_t off) const;
+    uint64_t memOffsetToPhysicalAddr_(uint64_t off) const;
     uint64_t hbmChannelBudgetLeftBytes_(uint64_t now_cycle, uint32_t channel) const;
     void consumeHbmChannelBudget_(uint64_t now_cycle, uint32_t channel, uint32_t bytes);
     uint32_t clampBytesByHbmChannelBudget_(uint64_t now_cycle, ReqKind kind, uint32_t want, uint32_t& out_channel) const;
+    uint64_t nowNs_() const;
 
     inline bool commReady_() const { return cfg_.comm_enable && rt_.noc && cfg_.comm_period_cycles > 0 && cfg_.comm_payload_bytes > 0; }
     inline bool collectiveReady_() const {
@@ -520,20 +575,50 @@ private:
     uint64_t write_off_ = 0;
 
     std::unordered_map<uint64_t, InflightReq> inflight_;
+    std::vector<MemTimingBankState> mem_timing_banks_{};
+    std::vector<MemTimingChannelState> mem_timing_channels_{};
 
     // Activity & counters (per-core; MultiCorePE pulls via getStatistics())
     uint64_t total_cycles_ = 0;
     uint64_t active_cycles_ = 0;
     uint64_t memory_requests_ = 0;
+    uint64_t now_cycle_cached_ = 0; // for best-effort timing when runtime time source is absent
 
     uint64_t tensor_mem_reads_issued_total_ = 0;
     uint64_t tensor_mem_writes_issued_total_ = 0;
     uint64_t tensor_mem_bytes_read_total_ = 0;
     uint64_t tensor_mem_bytes_write_total_ = 0;
+    uint64_t tensor_mem_read_latency_cycles_total_ = 0;
+    uint64_t tensor_mem_read_latency_cycles_max_ = 0;
+    uint64_t tensor_mem_read_latency_samples_total_ = 0;
+    uint64_t tensor_mem_write_latency_cycles_total_ = 0;
+    uint64_t tensor_mem_write_latency_cycles_max_ = 0;
+    uint64_t tensor_mem_write_latency_samples_total_ = 0;
+    uint64_t tensor_mem_row_hit_total_ = 0;
+    uint64_t tensor_mem_row_miss_total_ = 0;
+    uint64_t tensor_mem_row_conflict_total_ = 0;
+    uint64_t tensor_mem_bank_queue_full_total_ = 0;
+    uint64_t tensor_mem_bank_queue_wait_cycles_total_ = 0;
+    uint64_t tensor_mem_sched_fifo_pick_total_ = 0;
+    uint64_t tensor_mem_sched_frfcfs_pick_total_ = 0;
+    uint64_t tensor_mem_cmd_act_total_ = 0;
+    uint64_t tensor_mem_cmd_pre_total_ = 0;
+    uint64_t tensor_mem_cmd_rdwr_total_ = 0;
+    uint64_t tensor_mem_row_service_cycles_total_ = 0;
+    uint64_t tensor_mem_refresh_block_cycles_total_ = 0;
+    uint64_t tensor_mem_proxy_delay_cycles_total_ = 0;
+    uint64_t tensor_mem_proxy_delay_cycles_max_ = 0;
+    uint64_t tensor_mem_bank_active_cycles_total_ = 0;
+    uint64_t tensor_mem_cmd_queue_slots_total_ = 0;
+    uint64_t tensor_mem_cmd_queue_depth_max_ = 0;
+    uint64_t tensor_mem_cmd_bus_wait_cycles_total_ = 0;
+    uint64_t tensor_mem_cmd_bus_bg_switch_total_ = 0;
+    uint64_t tensor_mem_cmd_issue_total_ = 0;
     uint64_t tensor_compute_cycles_total_ = 0;
     uint64_t tensor_compute_math_cycles_total_ = 0;
     uint64_t tensor_compute_pipeline_cycles_total_ = 0;
     uint64_t tensor_mxu_wavefront_cycles_total_ = 0;
+    uint64_t tensor_mxu_io_busy_cycles_total_ = 0;
     uint64_t tensor_compute_precision_profile_id_ = 0;
     uint64_t tensor_mac_ops_total_ = 0;
     uint64_t tensor_dma_stall_cycles_total_ = 0;
@@ -708,6 +793,10 @@ private:
         uint64_t total_bytes = 0;
         uint64_t issued_bytes = 0;
         uint64_t done_bytes = 0;
+        // M29: burst/setup and per-slot inflight tracking.
+        uint32_t setup_cycles_rem = 0;
+        uint64_t burst_bytes_rem = 0;
+        uint32_t inflight_reqs = 0;
     };
 
     struct ProgramMxuSlot {
@@ -719,6 +808,10 @@ private:
         uint64_t ub_read_bytes = 0;
         uint64_t ub_write_bytes = 0;
         uint64_t ub_write_reserved_bytes = 0;
+        // M33: per-cycle IO budget tracking (split A/B) for program-mode gemm_ub.
+        uint64_t ub_read_a_bytes_rem = 0;
+        uint64_t ub_read_b_bytes_rem = 0;
+        uint64_t ub_write_bytes_rem = 0;
     };
 
     struct ProgramVecSlot {

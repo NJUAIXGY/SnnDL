@@ -26,6 +26,7 @@ public:
     struct FanoutEntry {
         uint32_t dest_global = 0;
         uint32_t dest_node = 0;
+        float weight = 1.0f;
     };
 
     virtual ~ISynapseRoute() = default;

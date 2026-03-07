@@ -28,6 +28,14 @@ struct BcsrMeta {
     uint64_t blockdata_offset = 0;
     uint64_t blockids_offset = 0;
     uint32_t total_blocks = 0;
+
+    // Optional layout hints (newer datasets):
+    // - layout_mode: "flat" (default) | "rowpack_v1"
+    // - *_row_stride_bytes: only meaningful for rowpack_v1 (0 means "absent"/unused)
+    std::string layout_mode;
+    uint32_t colidx_row_stride_bytes = 0;
+    uint32_t blockdata_row_stride_bytes = 0;
+    uint32_t blockids_row_stride_bytes = 0;
 };
 
 inline uint32_t bcsrDefaultU32(uint32_t v, uint32_t fallback) { return v ? v : fallback; }
@@ -49,6 +57,22 @@ inline bool bcsrExtractUnsignedJson(const std::string& text, const char* key, ui
     return true;
 }
 
+inline bool bcsrExtractStringJson(const std::string& text, const char* key, std::string& value) {
+    auto pos = text.find(key);
+    if (pos == std::string::npos) return false;
+    pos = text.find(':', pos);
+    if (pos == std::string::npos) return false;
+    ++pos;
+    while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos]))) ++pos;
+    if (pos >= text.size() || text[pos] != '"') return false;
+    ++pos;
+    size_t end = pos;
+    while (end < text.size() && text[end] != '"') ++end;
+    if (end <= pos) return false;
+    value = text.substr(pos, end - pos);
+    return true;
+}
+
 inline bool parseBcsrMetaJsonFile(const std::string& meta_path, BcsrMeta& out) {
     std::ifstream meta(meta_path);
     if (!meta.good()) return false;
@@ -66,6 +90,10 @@ inline bool parseBcsrMetaJsonFile(const std::string& meta_path, BcsrMeta& out) {
     if (bcsrExtractUnsignedJson(text, "\"blockdata_offset\"", value)) { out.blockdata_offset = value; ok = true; }
     if (bcsrExtractUnsignedJson(text, "\"blockids_offset\"", value)) { out.blockids_offset = value; ok = true; }
     if (bcsrExtractUnsignedJson(text, "\"total_blocks\"", value)) { out.total_blocks = static_cast<uint32_t>(value); ok = true; }
+    if (bcsrExtractStringJson(text, "\"layout_mode\"", out.layout_mode)) { ok = true; }
+    if (bcsrExtractUnsignedJson(text, "\"colidx_row_stride_bytes\"", value)) { out.colidx_row_stride_bytes = static_cast<uint32_t>(value); ok = true; }
+    if (bcsrExtractUnsignedJson(text, "\"blockdata_row_stride_bytes\"", value)) { out.blockdata_row_stride_bytes = static_cast<uint32_t>(value); ok = true; }
+    if (bcsrExtractUnsignedJson(text, "\"blockids_row_stride_bytes\"", value)) { out.blockids_row_stride_bytes = static_cast<uint32_t>(value); ok = true; }
     return ok;
 }
 
@@ -108,15 +136,30 @@ inline bool validateBcsrMetaAgainstFile(const BcsrMeta& meta,
 
     if (meta.total_blocks == 0) return true;
 
-    const uint64_t need_colidx = static_cast<uint64_t>(meta.total_blocks) * static_cast<uint64_t>(idxB);
-    const uint64_t need_block = static_cast<uint64_t>(meta.total_blocks) * bcsrBytesPerBlock(br, bc, valB);
+    const std::string mode = meta.layout_mode;
+    if (mode == "rowpack_v1") {
+        const uint64_t need_colidx_rows =
+            static_cast<uint64_t>(n_block_rows) * static_cast<uint64_t>(meta.colidx_row_stride_bytes);
+        const uint64_t need_blockdata_rows =
+            static_cast<uint64_t>(n_block_rows) * static_cast<uint64_t>(meta.blockdata_row_stride_bytes);
+        if (meta.colidx_row_stride_bytes < idxB) return fail("rowpack_v1 invalid colidx_row_stride_bytes");
+        if (meta.blockdata_row_stride_bytes < bcsrBytesPerBlock(br, bc, valB)) return fail("rowpack_v1 invalid blockdata_row_stride_bytes");
+        if (meta.colidx_offset + need_colidx_rows > file_size) return fail("rowpack_v1 colidx rows range exceeds file");
+        if (meta.blockdata_offset + need_blockdata_rows > file_size) return fail("rowpack_v1 blockdata rows range exceeds file");
+        // blockids: generator contract keeps it in legacy flat layout for compatibility.
+        const uint64_t need_blockids =
+            static_cast<uint64_t>(meta.total_blocks) * bcsrBytesPerBlock(br, bc, valB);
+        if (meta.blockids_offset && meta.blockids_offset + need_blockids > file_size) return fail("blockids range exceeds file");
+    } else {
+        const uint64_t need_colidx = static_cast<uint64_t>(meta.total_blocks) * static_cast<uint64_t>(idxB);
+        const uint64_t need_block = static_cast<uint64_t>(meta.total_blocks) * bcsrBytesPerBlock(br, bc, valB);
 
-    if (meta.colidx_offset + need_colidx > file_size) return fail("colidx range exceeds file");
-    if (meta.blockdata_offset + need_block > file_size) return fail("blockdata range exceeds file");
-    if (meta.blockids_offset && meta.blockids_offset + need_block > file_size) return fail("blockids range exceeds file");
+        if (meta.colidx_offset + need_colidx > file_size) return fail("colidx range exceeds file");
+        if (meta.blockdata_offset + need_block > file_size) return fail("blockdata range exceeds file");
+        if (meta.blockids_offset && meta.blockids_offset + need_block > file_size) return fail("blockids range exceeds file");
+    }
 
     return true;
 }
 
 }} // namespace SST::SnnDL
-

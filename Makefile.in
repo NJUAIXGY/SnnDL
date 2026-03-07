@@ -183,6 +183,7 @@ am_libSnnDL_la_OBJECTS = events/SimpleTestEvent.lo \
 	components/CachelineFragmentMemIF.lo \
 	components/GatherBufferIF.lo \
 	components/gather/GatherBufferIFConfig.lo \
+	components/gather/apply/DramAwareModel.lo \
 	components/GatingPE.lo components/MemKCalBench.lo \
 	components/multicore/MultiCorePEConfig.lo \
 	components/MultiCorePE.lo components/SnnNIC.lo \
@@ -226,6 +227,7 @@ am_libSnnDL_la_OBJECTS = events/SimpleTestEvent.lo \
 	services/workload/stream/StreamWorkload.lo \
 	services/workload/traffic/TrafficWorkload.lo \
 	services/workload/tensor/TensorWorkload.lo \
+	services/memory/sram_sim/model/BankedSramModel.lo \
 	services/memory/StandardMemAccess.lo
 libSnnDL_la_OBJECTS = $(am_libSnnDL_la_OBJECTS)
 AM_V_lt = $(am__v_lt_@AM_V@)
@@ -259,6 +261,7 @@ am__depfiles_remade = components/$(DEPDIR)/CachelineFragmentMemIF.Plo \
 	components/$(DEPDIR)/WeightLoader.Plo \
 	components/gas/$(DEPDIR)/GlobalGasStepController.Plo \
 	components/gather/$(DEPDIR)/GatherBufferIFConfig.Plo \
+	components/gather/apply/$(DEPDIR)/DramAwareModel.Plo \
 	components/multicore/$(DEPDIR)/MultiCorePEConfig.Plo \
 	components/noc/$(DEPDIR)/MulticastNIC.Plo \
 	components/noc/$(DEPDIR)/MulticastRouter.Plo \
@@ -279,6 +282,7 @@ am__depfiles_remade = components/$(DEPDIR)/CachelineFragmentMemIF.Plo \
 	events/$(DEPDIR)/SimpleTestEvent.Plo \
 	events/$(DEPDIR)/SpikeEventWrapper.Plo \
 	services/memory/$(DEPDIR)/StandardMemAccess.Plo \
+	services/memory/sram_sim/model/$(DEPDIR)/BankedSramModel.Plo \
 	services/noc/$(DEPDIR)/NocSubsystem.Plo \
 	services/noc/$(DEPDIR)/OptimizedInternalRing.Plo \
 	services/stimulus/$(DEPDIR)/ExternalSpikeInputSubsystem.Plo \
@@ -641,6 +645,7 @@ libSnnDL_la_SOURCES = \
 	api/IGasStageSink.h \
 	api/IGasStepGate.h \
 	api/IGlobalStepHooks.h \
+	api/ITassLfP0Hooks.h \
 	api/ICoreMemoryLink.h \
 	api/IMemoryAccess.h \
 	api/ICoreWorkload.h \
@@ -670,8 +675,6 @@ libSnnDL_la_SOURCES = \
 	components/gather/GatherBufferIFConfig.h \
 	components/gather/apply/DramAwareModel.cc \
 	components/gather/apply/DramAwareModel.h \
-	components/gather/apply/DramAwareTuner.cc \
-	components/gather/apply/DramAwareTuner.h \
 	components/GatingPE.cc \
 	components/GatingPE.h \
 	components/MemKCalBench.cc \
@@ -773,6 +776,9 @@ libSnnDL_la_SOURCES = \
 	services/workload/traffic/TrafficWorkload.h \
 	services/workload/tensor/TensorWorkload.cc \
 	services/workload/tensor/TensorWorkload.h \
+	services/memory/sram_sim/layout/VirtualSramLayout.h \
+	services/memory/sram_sim/model/BankedSramModel.cc \
+	services/memory/sram_sim/model/BankedSramModel.h \
 	services/memory/StandardMemAccess.cc \
 	services/memory/StandardMemAccess.h
 
@@ -887,6 +893,15 @@ components/gather/$(DEPDIR)/$(am__dirstamp):
 components/gather/GatherBufferIFConfig.lo:  \
 	components/gather/$(am__dirstamp) \
 	components/gather/$(DEPDIR)/$(am__dirstamp)
+components/gather/apply/$(am__dirstamp):
+	@$(MKDIR_P) components/gather/apply
+	@: > components/gather/apply/$(am__dirstamp)
+components/gather/apply/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) components/gather/apply/$(DEPDIR)
+	@: > components/gather/apply/$(DEPDIR)/$(am__dirstamp)
+components/gather/apply/DramAwareModel.lo:  \
+	components/gather/apply/$(am__dirstamp) \
+	components/gather/apply/$(DEPDIR)/$(am__dirstamp)
 components/GatingPE.lo: components/$(am__dirstamp) \
 	components/$(DEPDIR)/$(am__dirstamp)
 components/MemKCalBench.lo: components/$(am__dirstamp) \
@@ -1121,6 +1136,15 @@ services/workload/tensor/$(DEPDIR)/$(am__dirstamp):
 services/workload/tensor/TensorWorkload.lo:  \
 	services/workload/tensor/$(am__dirstamp) \
 	services/workload/tensor/$(DEPDIR)/$(am__dirstamp)
+services/memory/sram_sim/model/$(am__dirstamp):
+	@$(MKDIR_P) services/memory/sram_sim/model
+	@: > services/memory/sram_sim/model/$(am__dirstamp)
+services/memory/sram_sim/model/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) services/memory/sram_sim/model/$(DEPDIR)
+	@: > services/memory/sram_sim/model/$(DEPDIR)/$(am__dirstamp)
+services/memory/sram_sim/model/BankedSramModel.lo:  \
+	services/memory/sram_sim/model/$(am__dirstamp) \
+	services/memory/sram_sim/model/$(DEPDIR)/$(am__dirstamp)
 services/memory/$(am__dirstamp):
 	@$(MKDIR_P) services/memory
 	@: > services/memory/$(am__dirstamp)
@@ -1141,6 +1165,8 @@ mostlyclean-compile:
 	-rm -f components/gas/*.lo
 	-rm -f components/gather/*.$(OBJEXT)
 	-rm -f components/gather/*.lo
+	-rm -f components/gather/apply/*.$(OBJEXT)
+	-rm -f components/gather/apply/*.lo
 	-rm -f components/multicore/*.$(OBJEXT)
 	-rm -f components/multicore/*.lo
 	-rm -f components/noc/*.$(OBJEXT)
@@ -1157,6 +1183,8 @@ mostlyclean-compile:
 	-rm -f events/*.lo
 	-rm -f services/memory/*.$(OBJEXT)
 	-rm -f services/memory/*.lo
+	-rm -f services/memory/sram_sim/model/*.$(OBJEXT)
+	-rm -f services/memory/sram_sim/model/*.lo
 	-rm -f services/noc/*.$(OBJEXT)
 	-rm -f services/noc/*.lo
 	-rm -f services/stimulus/*.$(OBJEXT)
@@ -1195,6 +1223,7 @@ distclean-compile:
 @AMDEP_TRUE@@am__include@ @am__quote@components/$(DEPDIR)/WeightLoader.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@components/gas/$(DEPDIR)/GlobalGasStepController.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@components/gather/$(DEPDIR)/GatherBufferIFConfig.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@components/gather/apply/$(DEPDIR)/DramAwareModel.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@components/multicore/$(DEPDIR)/MultiCorePEConfig.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@components/noc/$(DEPDIR)/MulticastNIC.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@components/noc/$(DEPDIR)/MulticastRouter.Plo@am__quote@ # am--include-marker
@@ -1215,6 +1244,7 @@ distclean-compile:
 @AMDEP_TRUE@@am__include@ @am__quote@events/$(DEPDIR)/SimpleTestEvent.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@events/$(DEPDIR)/SpikeEventWrapper.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@services/memory/$(DEPDIR)/StandardMemAccess.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@services/memory/sram_sim/model/$(DEPDIR)/BankedSramModel.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@services/noc/$(DEPDIR)/NocSubsystem.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@services/noc/$(DEPDIR)/OptimizedInternalRing.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@services/stimulus/$(DEPDIR)/ExternalSpikeInputSubsystem.Plo@am__quote@ # am--include-marker
@@ -1280,6 +1310,7 @@ clean-libtool:
 	-rm -rf components/.libs components/_libs
 	-rm -rf components/gas/.libs components/gas/_libs
 	-rm -rf components/gather/.libs components/gather/_libs
+	-rm -rf components/gather/apply/.libs components/gather/apply/_libs
 	-rm -rf components/multicore/.libs components/multicore/_libs
 	-rm -rf components/noc/.libs components/noc/_libs
 	-rm -rf components/stimulus/.libs components/stimulus/_libs
@@ -1288,6 +1319,7 @@ clean-libtool:
 	-rm -rf control/.libs control/_libs
 	-rm -rf events/.libs events/_libs
 	-rm -rf services/memory/.libs services/memory/_libs
+	-rm -rf services/memory/sram_sim/model/.libs services/memory/sram_sim/model/_libs
 	-rm -rf services/noc/.libs services/noc/_libs
 	-rm -rf services/stimulus/.libs services/stimulus/_libs
 	-rm -rf services/synapse/gas/.libs services/synapse/gas/_libs
@@ -1425,6 +1457,8 @@ distclean-generic:
 	-rm -f components/gas/$(am__dirstamp)
 	-rm -f components/gather/$(DEPDIR)/$(am__dirstamp)
 	-rm -f components/gather/$(am__dirstamp)
+	-rm -f components/gather/apply/$(DEPDIR)/$(am__dirstamp)
+	-rm -f components/gather/apply/$(am__dirstamp)
 	-rm -f components/multicore/$(DEPDIR)/$(am__dirstamp)
 	-rm -f components/multicore/$(am__dirstamp)
 	-rm -f components/noc/$(DEPDIR)/$(am__dirstamp)
@@ -1441,6 +1475,8 @@ distclean-generic:
 	-rm -f events/$(am__dirstamp)
 	-rm -f services/memory/$(DEPDIR)/$(am__dirstamp)
 	-rm -f services/memory/$(am__dirstamp)
+	-rm -f services/memory/sram_sim/model/$(DEPDIR)/$(am__dirstamp)
+	-rm -f services/memory/sram_sim/model/$(am__dirstamp)
 	-rm -f services/noc/$(DEPDIR)/$(am__dirstamp)
 	-rm -f services/noc/$(am__dirstamp)
 	-rm -f services/stimulus/$(DEPDIR)/$(am__dirstamp)
@@ -1485,6 +1521,7 @@ distclean: distclean-am
 	-rm -f components/$(DEPDIR)/WeightLoader.Plo
 	-rm -f components/gas/$(DEPDIR)/GlobalGasStepController.Plo
 	-rm -f components/gather/$(DEPDIR)/GatherBufferIFConfig.Plo
+	-rm -f components/gather/apply/$(DEPDIR)/DramAwareModel.Plo
 	-rm -f components/multicore/$(DEPDIR)/MultiCorePEConfig.Plo
 	-rm -f components/noc/$(DEPDIR)/MulticastNIC.Plo
 	-rm -f components/noc/$(DEPDIR)/MulticastRouter.Plo
@@ -1505,6 +1542,7 @@ distclean: distclean-am
 	-rm -f events/$(DEPDIR)/SimpleTestEvent.Plo
 	-rm -f events/$(DEPDIR)/SpikeEventWrapper.Plo
 	-rm -f services/memory/$(DEPDIR)/StandardMemAccess.Plo
+	-rm -f services/memory/sram_sim/model/$(DEPDIR)/BankedSramModel.Plo
 	-rm -f services/noc/$(DEPDIR)/NocSubsystem.Plo
 	-rm -f services/noc/$(DEPDIR)/OptimizedInternalRing.Plo
 	-rm -f services/stimulus/$(DEPDIR)/ExternalSpikeInputSubsystem.Plo
@@ -1586,6 +1624,7 @@ maintainer-clean: maintainer-clean-am
 	-rm -f components/$(DEPDIR)/WeightLoader.Plo
 	-rm -f components/gas/$(DEPDIR)/GlobalGasStepController.Plo
 	-rm -f components/gather/$(DEPDIR)/GatherBufferIFConfig.Plo
+	-rm -f components/gather/apply/$(DEPDIR)/DramAwareModel.Plo
 	-rm -f components/multicore/$(DEPDIR)/MultiCorePEConfig.Plo
 	-rm -f components/noc/$(DEPDIR)/MulticastNIC.Plo
 	-rm -f components/noc/$(DEPDIR)/MulticastRouter.Plo
@@ -1606,6 +1645,7 @@ maintainer-clean: maintainer-clean-am
 	-rm -f events/$(DEPDIR)/SimpleTestEvent.Plo
 	-rm -f events/$(DEPDIR)/SpikeEventWrapper.Plo
 	-rm -f services/memory/$(DEPDIR)/StandardMemAccess.Plo
+	-rm -f services/memory/sram_sim/model/$(DEPDIR)/BankedSramModel.Plo
 	-rm -f services/noc/$(DEPDIR)/NocSubsystem.Plo
 	-rm -f services/noc/$(DEPDIR)/OptimizedInternalRing.Plo
 	-rm -f services/stimulus/$(DEPDIR)/ExternalSpikeInputSubsystem.Plo

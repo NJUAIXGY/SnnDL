@@ -65,6 +65,12 @@ struct GasStatData : public SST::Interfaces::StandardMem::CustomData {
     uint64_t unique_line_count = 0;        // approx unique cachelines touched by staged reads (per window)
     uint64_t covered_line_count = 0;       // approx covered cachelines by issued segments (per window)
     uint64_t overfetch_bytes = 0;          // issued_bytes - payload_bytes (per window)
+    // Apply scheduler diagnostics (optional; per-window summary)
+    uint64_t apply_bank_credit_effective = 0;
+    // Cmd-cost guardrail diagnostics (optional; per-window summary)
+    uint64_t cmd_cost_veto = 0;
+    uint64_t cmd_cost_veto_fine_gap = 0;
+    uint64_t cmd_cost_veto_row_window = 0;
 
     GasStatData() = default;
     GasStatData(uint64_t r, uint64_t b,
@@ -74,7 +80,11 @@ struct GasStatData : public SST::Interfaces::StandardMem::CustomData {
                 uint64_t gap_abs_=0,
                 uint64_t unique_lines_=0,
                 uint64_t covered_lines_=0,
-                uint64_t overfetch_bytes_=0)
+                uint64_t overfetch_bytes_=0,
+                uint64_t apply_bank_credit_effective_=0,
+                uint64_t cmd_cost_veto_=0,
+                uint64_t cmd_cost_veto_fine_gap_=0,
+                uint64_t cmd_cost_veto_row_window_=0)
         : unique_reads(r), unique_bytes(b),
           rowwin_triggers(rwt), rowwin_bytes(rwb),
           bursts(bursts_), payload_bytes(payload_),
@@ -83,7 +93,11 @@ struct GasStatData : public SST::Interfaces::StandardMem::CustomData {
           gap_absorbed_bytes(gap_abs_),
           unique_line_count(unique_lines_),
           covered_line_count(covered_lines_),
-          overfetch_bytes(overfetch_bytes_) {}
+          overfetch_bytes(overfetch_bytes_),
+          apply_bank_credit_effective(apply_bank_credit_effective_),
+          cmd_cost_veto(cmd_cost_veto_),
+          cmd_cost_veto_fine_gap(cmd_cost_veto_fine_gap_),
+          cmd_cost_veto_row_window(cmd_cost_veto_row_window_) {}
 
     // CustomData API
     SST::Interfaces::StandardMem::CustomData* makeResponse() override { return new GasStatData(0, 0); }
@@ -102,7 +116,11 @@ struct GasStatData : public SST::Interfaces::StandardMem::CustomData {
                ",gap_abs=" + std::to_string(gap_absorbed_bytes) +
                ",uniq_lines=" + std::to_string(unique_line_count) +
                ",cov_lines=" + std::to_string(covered_line_count) +
-               ",overfetch=" + std::to_string(overfetch_bytes);
+               ",overfetch=" + std::to_string(overfetch_bytes) +
+               ",credit=" + std::to_string(apply_bank_credit_effective) +
+               ",cmd_veto=" + std::to_string(cmd_cost_veto) +
+               ",cmd_veto_fine=" + std::to_string(cmd_cost_veto_fine_gap) +
+               ",cmd_veto_rowwin=" + std::to_string(cmd_cost_veto_row_window);
     }
     void serialize_order(SST::Core::Serialization::serializer& ser) override {
         SST_SER(unique_reads);
@@ -117,6 +135,10 @@ struct GasStatData : public SST::Interfaces::StandardMem::CustomData {
         SST_SER(unique_line_count);
         SST_SER(covered_line_count);
         SST_SER(overfetch_bytes);
+        SST_SER(apply_bank_credit_effective);
+        SST_SER(cmd_cost_veto);
+        SST_SER(cmd_cost_veto_fine_gap);
+        SST_SER(cmd_cost_veto_row_window);
     }
     ImplementSerializable(SST::SnnDL::GasStatData);
 };

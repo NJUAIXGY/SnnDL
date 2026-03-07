@@ -27,6 +27,7 @@
 #include <memory>
 #include <queue>
 #include <unordered_map>
+#include <unordered_set>
 #include <random>
 #include <limits>
 
@@ -34,6 +35,7 @@
 #include "SnnInterface.h"
 #include "SnnPEParentInterface.h"
 #include "IPeAggregation.h"
+#include "ITassNaiveResponseSink.h"
 #include "CoreShellAPI.h"
 #include "../api/GlobalNeuronLayout.h"
 #include "noc/OptimizedInternalRing.h"
@@ -187,6 +189,39 @@ public:
         {"external_spike_output", "外部脉冲输出端口", {"SnnDL.SpikeEvent"}},
         {"gas_step_ctrl", "全局 Step/GAS 同步控制器端口（可选）", {"SnnDL.GasStepBarrierEvent"}},
         {"loader_done", "WeightLoader完成事件（可选，桥接跨rank loader_done_key）", {"SnnDL.LoaderDoneEvent"}},
+        {"tass_p0_out", "TASS-LF P0 / naive_tass 请求输出端口（可选，桥接跨rank block reporter / request）", {"SnnDL.TassLfP0ReportEvent", "SnnDL.TassNaiveWindowRequestEvent"}},
+        {"tass_p0_in0", "TASS-LF P0 / naive_tass 输入端口0", {"SnnDL.TassLfP0ReportEvent", "SnnDL.TassNaiveWindowRequestEvent", "SnnDL.TassNaiveResponseEvent"}},
+        {"tass_p0_in1", "TASS-LF P0 / naive_tass 输入端口1", {"SnnDL.TassLfP0ReportEvent", "SnnDL.TassNaiveWindowRequestEvent", "SnnDL.TassNaiveResponseEvent"}},
+        {"tass_p0_in2", "TASS-LF P0 / naive_tass 输入端口2", {"SnnDL.TassLfP0ReportEvent", "SnnDL.TassNaiveWindowRequestEvent", "SnnDL.TassNaiveResponseEvent"}},
+        {"tass_p0_in3", "TASS-LF P0 / naive_tass 输入端口3", {"SnnDL.TassLfP0ReportEvent", "SnnDL.TassNaiveWindowRequestEvent", "SnnDL.TassNaiveResponseEvent"}},
+        {"tass_p0_in4", "TASS-LF P0 / naive_tass 输入端口4", {"SnnDL.TassLfP0ReportEvent", "SnnDL.TassNaiveWindowRequestEvent", "SnnDL.TassNaiveResponseEvent"}},
+        {"tass_p0_in5", "TASS-LF P0 / naive_tass 输入端口5", {"SnnDL.TassLfP0ReportEvent", "SnnDL.TassNaiveWindowRequestEvent", "SnnDL.TassNaiveResponseEvent"}},
+        {"tass_p0_in6", "TASS-LF P0 / naive_tass 输入端口6", {"SnnDL.TassLfP0ReportEvent", "SnnDL.TassNaiveWindowRequestEvent", "SnnDL.TassNaiveResponseEvent"}},
+        {"tass_p0_in7", "TASS-LF P0 / naive_tass 输入端口7", {"SnnDL.TassLfP0ReportEvent", "SnnDL.TassNaiveWindowRequestEvent", "SnnDL.TassNaiveResponseEvent"}},
+        {"tass_p0_in8", "TASS-LF P0 / naive_tass 输入端口8", {"SnnDL.TassLfP0ReportEvent", "SnnDL.TassNaiveWindowRequestEvent", "SnnDL.TassNaiveResponseEvent"}},
+        {"tass_p0_in9", "TASS-LF P0 / naive_tass 输入端口9", {"SnnDL.TassLfP0ReportEvent", "SnnDL.TassNaiveWindowRequestEvent", "SnnDL.TassNaiveResponseEvent"}},
+        {"tass_p0_in10", "TASS-LF P0 / naive_tass 输入端口10", {"SnnDL.TassLfP0ReportEvent", "SnnDL.TassNaiveWindowRequestEvent", "SnnDL.TassNaiveResponseEvent"}},
+        {"tass_p0_in11", "TASS-LF P0 / naive_tass 输入端口11", {"SnnDL.TassLfP0ReportEvent", "SnnDL.TassNaiveWindowRequestEvent", "SnnDL.TassNaiveResponseEvent"}},
+        {"tass_p0_in12", "TASS-LF P0 / naive_tass 输入端口12", {"SnnDL.TassLfP0ReportEvent", "SnnDL.TassNaiveWindowRequestEvent", "SnnDL.TassNaiveResponseEvent"}},
+        {"tass_p0_in13", "TASS-LF P0 / naive_tass 输入端口13", {"SnnDL.TassLfP0ReportEvent", "SnnDL.TassNaiveWindowRequestEvent", "SnnDL.TassNaiveResponseEvent"}},
+        {"tass_p0_in14", "TASS-LF P0 / naive_tass 输入端口14", {"SnnDL.TassLfP0ReportEvent", "SnnDL.TassNaiveWindowRequestEvent", "SnnDL.TassNaiveResponseEvent"}},
+        {"tass_p0_in15", "TASS-LF P0 / naive_tass 输入端口15", {"SnnDL.TassLfP0ReportEvent", "SnnDL.TassNaiveWindowRequestEvent", "SnnDL.TassNaiveResponseEvent"}},
+        {"tass_p0_rsp_out0", "naive_tass 响应输出端口0", {"SnnDL.TassNaiveResponseEvent"}},
+        {"tass_p0_rsp_out1", "naive_tass 响应输出端口1", {"SnnDL.TassNaiveResponseEvent"}},
+        {"tass_p0_rsp_out2", "naive_tass 响应输出端口2", {"SnnDL.TassNaiveResponseEvent"}},
+        {"tass_p0_rsp_out3", "naive_tass 响应输出端口3", {"SnnDL.TassNaiveResponseEvent"}},
+        {"tass_p0_rsp_out4", "naive_tass 响应输出端口4", {"SnnDL.TassNaiveResponseEvent"}},
+        {"tass_p0_rsp_out5", "naive_tass 响应输出端口5", {"SnnDL.TassNaiveResponseEvent"}},
+        {"tass_p0_rsp_out6", "naive_tass 响应输出端口6", {"SnnDL.TassNaiveResponseEvent"}},
+        {"tass_p0_rsp_out7", "naive_tass 响应输出端口7", {"SnnDL.TassNaiveResponseEvent"}},
+        {"tass_p0_rsp_out8", "naive_tass 响应输出端口8", {"SnnDL.TassNaiveResponseEvent"}},
+        {"tass_p0_rsp_out9", "naive_tass 响应输出端口9", {"SnnDL.TassNaiveResponseEvent"}},
+        {"tass_p0_rsp_out10", "naive_tass 响应输出端口10", {"SnnDL.TassNaiveResponseEvent"}},
+        {"tass_p0_rsp_out11", "naive_tass 响应输出端口11", {"SnnDL.TassNaiveResponseEvent"}},
+        {"tass_p0_rsp_out12", "naive_tass 响应输出端口12", {"SnnDL.TassNaiveResponseEvent"}},
+        {"tass_p0_rsp_out13", "naive_tass 响应输出端口13", {"SnnDL.TassNaiveResponseEvent"}},
+        {"tass_p0_rsp_out14", "naive_tass 响应输出端口14", {"SnnDL.TassNaiveResponseEvent"}},
+        {"tass_p0_rsp_out15", "naive_tass 响应输出端口15", {"SnnDL.TassNaiveResponseEvent"}},
         {"network", "网络连接端口（用于direct_link模式）", {"SnnDL.SpikeEvent", "SimpleNetwork"}},
         {"north", "北向网络连接端口（网格拓扑）", {"SnnDL.SpikeEvent"}},
         {"south", "南向网络连接端口（网格拓扑）", {"SnnDL.SpikeEvent"}},
@@ -211,10 +246,23 @@ public:
         {"l2_cache_misses", "L2缓存缺失数", "misses", 1},
         {"memory_requests", "内存请求数", "requests", 1},
         {"avg_core_utilization", "平均核心利用率", "percentage", 1},
-        {"total_neurons_fired", "总神经元发放数", "neurons", 1},
+	        {"total_neurons_fired", "总神经元发放数", "neurons", 1},
 	        {"unique_neurons_fired_total", "至少发放一次的不同神经元数（总）", "neurons", 1},
 	        {"external_spikes_sent", "发送的外部脉冲数", "spikes", 1},
 	        {"external_spikes_received", "接收的外部脉冲数", "spikes", 1},
+            {"snn_tx_spike_packets_total", "SNN workload: 发送的Spike包数（PE聚合）", "packets", 1},
+            {"snn_tx_spikekey_packets_total", "SNN workload: 发送的SpikeKey包数（PE聚合）", "packets", 1},
+            {"snn_tx_spiketilekey_packets_total", "SNN workload: 发送的SpikeTileKey包数（PE聚合）", "packets", 1},
+            {"snn_rx_spike_packets_total", "SNN workload: 接收的Spike包数（PE聚合）", "packets", 1},
+            {"snn_rx_spikekey_total", "SNN workload: 接收的SpikeKey包数（PE聚合）", "packets", 1},
+            {"snn_rx_spiketilekey_total", "SNN workload: 接收的SpikeTileKey包数（PE聚合）", "packets", 1},
+            {"snn_rx_fastpath_packets_total", "SNN workload: 接收侧fastpath处理包数（PE聚合）", "packets", 1},
+            {"snn_rx_fallback_packets_total", "SNN workload: 接收侧fallback处理包数（PE聚合）", "packets", 1},
+            {"snn_rx_decode_fail_total", "SNN workload: SpikeKey/SpikeTileKey解码失败数（PE聚合）", "packets", 1},
+            {"snn_rx_fastpath_posts_total", "SNN workload: fastpath展开post节点总数（PE聚合）", "posts", 1},
+            {"snn_rx_fastpath_accept_total", "SNN workload: fastpath通过门控并接收的post数（PE聚合）", "posts", 1},
+            {"snn_rx_fastpath_reject_total", "SNN workload: fastpath门控拒绝的post数（PE聚合）", "posts", 1},
+            {"snn_rx_fastpath_edges_recorded_total", "SNN workload: fastpath写入window edge记录数（PE聚合）", "edges", 1},
 	        // Stream workload（PE聚合，供 essential_summary_mesh 汇总）
 	        {"stream_mem_writes_issued_total", "Stream workload: total writes issued（PE聚合）", "requests", 1},
 	        {"stream_mem_reads_issued_total", "Stream workload: total reads issued（PE聚合）", "requests", 1},
@@ -231,10 +279,37 @@ public:
         {"tensor_mem_writes_issued_total", "Tensor workload: total writes issued（PE聚合）", "requests", 1},
         {"tensor_mem_bytes_read_total", "Tensor workload: bytes read（issued, PE聚合）", "bytes", 1},
         {"tensor_mem_bytes_write_total", "Tensor workload: bytes written（issued, PE聚合）", "bytes", 1},
+        {"tensor_mem_read_latency_cycles_total", "Tensor workload: cumulative mem read latency（PE聚合）", "cycles", 1},
+        {"tensor_mem_read_latency_cycles_max", "Tensor workload: max mem read latency（PE聚合）", "cycles", 1},
+        {"tensor_mem_read_latency_samples_total", "Tensor workload: mem read latency samples（PE聚合）", "count", 1},
+        {"tensor_mem_write_latency_cycles_total", "Tensor workload: cumulative mem write latency（PE聚合）", "cycles", 1},
+        {"tensor_mem_write_latency_cycles_max", "Tensor workload: max mem write latency（PE聚合）", "cycles", 1},
+        {"tensor_mem_write_latency_samples_total", "Tensor workload: mem write latency samples（PE聚合）", "count", 1},
+        {"tensor_mem_row_hit_total", "Tensor workload: DRAM row-buffer hits（PE聚合）", "count", 1},
+        {"tensor_mem_row_miss_total", "Tensor workload: DRAM row-buffer misses（PE聚合）", "count", 1},
+        {"tensor_mem_row_conflict_total", "Tensor workload: DRAM row-buffer conflicts（PE聚合）", "count", 1},
+        {"tensor_mem_bank_queue_full_total", "Tensor workload: DRAM bank queue full events（PE聚合）", "count", 1},
+        {"tensor_mem_bank_queue_wait_cycles_total", "Tensor workload: DRAM bank queue wait cycles（PE聚合）", "cycles", 1},
+        {"tensor_mem_sched_fifo_pick_total", "Tensor workload: DRAM scheduler FIFO picks（PE聚合）", "count", 1},
+        {"tensor_mem_sched_frfcfs_pick_total", "Tensor workload: DRAM scheduler FRFCFS picks（PE聚合）", "count", 1},
+        {"tensor_mem_cmd_act_total", "Tensor workload: DRAM ACT command proxy count（PE聚合）", "count", 1},
+        {"tensor_mem_cmd_pre_total", "Tensor workload: DRAM PRE command proxy count（PE聚合）", "count", 1},
+        {"tensor_mem_cmd_rdwr_total", "Tensor workload: DRAM RD/WR command proxy count（PE聚合）", "count", 1},
+        {"tensor_mem_row_service_cycles_total", "Tensor workload: DRAM row service cycles（PE聚合）", "cycles", 1},
+        {"tensor_mem_refresh_block_cycles_total", "Tensor workload: DRAM refresh blocked cycles（PE聚合）", "cycles", 1},
+        {"tensor_mem_proxy_delay_cycles_total", "Tensor workload: proxy timing delay cycles（PE聚合）", "cycles", 1},
+        {"tensor_mem_proxy_delay_cycles_max", "Tensor workload: proxy timing max delay cycles（PE聚合）", "cycles", 1},
+        {"tensor_mem_bank_active_cycles_total", "Tensor workload: DRAM bank active cycles（PE聚合）", "cycles", 1},
+        {"tensor_mem_cmd_queue_slots_total", "Tensor workload: memory command queue slots（PE聚合）", "slots", 1},
+        {"tensor_mem_cmd_queue_depth_max", "Tensor workload: memory command queue depth max（PE聚合）", "slots", 1},
+        {"tensor_mem_cmd_bus_wait_cycles_total", "Tensor workload: memory command bus wait cycles（PE聚合）", "cycles", 1},
+        {"tensor_mem_cmd_bus_bg_switch_total", "Tensor workload: memory command bus bank-group switch count（PE聚合）", "count", 1},
+        {"tensor_mem_cmd_issue_total", "Tensor workload: memory command issue count（PE聚合）", "count", 1},
 	        {"tensor_compute_cycles_total", "Tensor workload: compute cycles（PE聚合）", "cycles", 1},
 	        {"tensor_compute_math_cycles_total", "Tensor workload: compute math cycles（PE聚合）", "cycles", 1},
 	        {"tensor_compute_pipeline_cycles_total", "Tensor workload: compute pipeline cycles（PE聚合）", "cycles", 1},
 	        {"tensor_mxu_wavefront_cycles_total", "Tensor workload: MXU wavefront cycles（PE聚合）", "cycles", 1},
+	        {"tensor_mxu_io_busy_cycles_total", "Tensor workload: MXU IO busy cycles（PE聚合）", "cycles", 1},
 	        {"tensor_compute_precision_profile_id", "Tensor workload: compute precision profile id（PE聚合）", "id", 1},
 	        {"tensor_mac_ops_total", "Tensor workload: MAC ops（PE聚合）", "ops", 1},
         {"tensor_dma_stall_cycles_total", "Tensor workload: DMA stall cycles（PE聚合）", "cycles", 1},
@@ -327,12 +402,78 @@ public:
         {"gas_unique_line_count_total", "GAS 诊断：近似 unique cacheline 数（总；DRAM-aware）", "lines", 1},
         {"gas_covered_line_count_total", "GAS 诊断：近似 covered cacheline 数（总；DRAM-aware）", "lines", 1},
         {"gas_overfetch_bytes_total", "GAS 诊断：overfetch bytes（总；DRAM-aware）", "bytes", 1},
+        {"gas_apply_bank_credit_effective_total", "GAS Apply 并发额度：窗口有效 bank credit（总）", "count", 1},
+        {"gas_cmd_cost_veto_total", "GAS cmd-cost 护栏：veto 次数（总）", "count", 1},
+        {"gas_cmd_cost_veto_fine_gap_total", "GAS cmd-cost 护栏：fine-gap veto 次数（总）", "count", 1},
+        {"gas_cmd_cost_veto_row_window_total", "GAS cmd-cost 护栏：row-window veto 次数（总）", "count", 1},
         {"gas_apply_acc_updates_total", "Apply阶段的delta累加次数（总）", "count", 1},
         {"gas_acc_posts_touched_total", "Apply阶段触达post个数（总）", "posts", 1},
         {"gas_scatter_spikes_emitted_total", "Scatter阶段发放spike个数（总）", "spikes", 1},
         {"gas_acc_high_watermark_bytes_total", "累加器峰值占用（总）", "bytes", 1},
         {"gas_acc_spill_records_total", "溢写记录条数（总）", "records", 1},
         {"gas_acc_spilled_bytes_total", "溢写有效字节（总）", "bytes", 1},
+        {"gas_retire_global_hol_cycles_total", "Global retire路径head未ready且存在ready-edge时的阻塞周期（PE聚合）", "cycles", 1},
+        {"gas_retire_ready_but_blocked_edges_total", "Global retire路径中ready但被head阻塞的edge累计量（PE聚合）", "edge_cycles", 1},
+        {"gas_retire_per_post_progress_total", "Per-post retire模式下实际退役次数（PE聚合）", "count", 1},
+        {"gas_tass_lf_p0_block_epochs_total", "TASS-LF P0: completed 2x2-block epochs（PE聚合）", "epochs", 1},
+        {"gas_tass_lf_p0_block_active_pres_total", "TASS-LF P0: block active pre count（PE聚合）", "pres", 1},
+        {"gas_tass_lf_p0_block_shared_pres_total", "TASS-LF P0: shared pres across block contributors（PE聚合）", "pres", 1},
+        {"gas_tass_lf_p0_cross_core_joins_total", "TASS-LF P0: cross-core joins（PE聚合）", "joins", 1},
+        {"gas_tass_lf_p0_payload_bytes_total", "TASS-LF P0: block payload bytes（PE聚合）", "bytes", 1},
+        {"gas_tass_lf_p0_current_vlf_line_groups_total", "TASS-LF P0: current VLF line groups（PE聚合）", "lines", 1},
+        {"gas_tass_lf_p0_block_naive_line_count_total", "TASS-LF P0: naive block line count（PE聚合）", "lines", 1},
+        {"gas_tass_lf_p0_block_fused_lb_line_count_total", "TASS-LF P0: fused lower-bound block line count（PE聚合）", "lines", 1},
+        {"gas_tass_lf_p0_response_fanout_total", "TASS-LF P0: response fanout（PE聚合）", "fanout", 1},
+        {"gas_tass_lf_p0_reports_submit_total", "TASS-LF P0 debug: reports submitted by local cores", "reports", 1},
+        {"gas_tass_lf_p0_reports_send_total", "TASS-LF P0 debug: reports sent to remote block-origin PE", "reports", 1},
+        {"gas_tass_lf_p0_reports_recv_total", "TASS-LF P0 debug: reports received on tass_p0_in*", "reports", 1},
+        {"gas_tass_lf_p0_reports_reduce_total", "TASS-LF P0 debug: reports entering reporter reduction", "reports", 1},
+        {"gas_tass_lf_p0_reports_drop_no_link_total", "TASS-LF P0 debug: reports dropped because tass_p0_out link missing", "reports", 1},
+        {"gas_tass_lf_p0_reports_drop_non_origin_total", "TASS-LF P0 debug: reports dropped at non-origin reporter", "reports", 1},
+        {"gas_tass_lf_p0_reports_flushed_total", "TASS-LF P0 debug: local window reports flushed by WeightMemorySubsystem", "reports", 1},
+        {"gas_tass_lf_p0_reports_nonzero_payload_total", "TASS-LF P0 debug: local flushed reports with non-zero payload", "reports", 1},
+        {"gas_tass_lf_p0_reports_pre_entries_total", "TASS-LF P0 debug: total pre-entry count across flushed reports", "entries", 1},
+        {"gas_tass_lf_p0_reports_via_callback_total", "TASS-LF P0 debug: flushed reports taking callback path", "reports", 1},
+        {"gas_tass_lf_p0_reports_via_fallback_total", "TASS-LF P0 debug: flushed reports taking fallback registry path", "reports", 1},
+        {"gcss_lookup_hit_total", "GCSS lookup hits（PE聚合）", "hits", 1},
+        {"gcss_lookup_miss_total", "GCSS lookup misses（PE聚合）", "misses", 1},
+        {"weight_read_dense_reqs_total", "Issued weight-read requests classified as dense（PE聚合）", "requests", 1},
+        {"weight_read_dense_bytes_total", "Issued weight-read bytes classified as dense（PE聚合）", "bytes", 1},
+        {"weight_read_rowptr_reqs_total", "Issued weight-read requests classified as BCSR rowptr（PE聚合）", "requests", 1},
+        {"weight_read_rowptr_bytes_total", "Issued weight-read bytes classified as BCSR rowptr（PE聚合）", "bytes", 1},
+        {"weight_read_colidx_reqs_total", "Issued weight-read requests classified as BCSR colidx（PE聚合）", "requests", 1},
+        {"weight_read_colidx_bytes_total", "Issued weight-read bytes classified as BCSR colidx（PE聚合）", "bytes", 1},
+        {"weight_read_blockdata_reqs_total", "Issued weight-read requests classified as BCSR blockdata（PE聚合）", "requests", 1},
+        {"weight_read_blockdata_bytes_total", "Issued weight-read bytes classified as BCSR blockdata（PE聚合）", "bytes", 1},
+        {"weight_read_gcss_reqs_total", "Issued weight-read requests classified as GCSS value-only（PE聚合）", "requests", 1},
+        {"weight_read_gcss_bytes_total", "Issued weight-read bytes classified as GCSS value-only（PE聚合）", "bytes", 1},
+        {"weight_idx_sram_reads_total", "Observe-only weight idx SRAM reads（PE聚合）", "reads", 1},
+        {"weight_idx_sram_writes_total", "Observe-only weight idx SRAM writes（PE聚合）", "writes", 1},
+        {"weight_idx_sram_bytes_read_total", "Observe-only weight idx SRAM read bytes（PE聚合）", "bytes", 1},
+        {"weight_idx_sram_bytes_write_total", "Observe-only weight idx SRAM write bytes（PE聚合）", "bytes", 1},
+        {"weight_idx_sram_bank_conflict_ticks_total", "Observe-only weight idx SRAM conflict ticks（PE聚合）", "ticks", 1},
+        {"weight_idx_sram_predicted_extra_cycles_total", "Observe-only weight idx SRAM predicted extra cycles（PE聚合）", "cycles", 1},
+        {"weight_idx_sram_resident_bytes_peak", "Observe-only weight idx SRAM resident bytes peak（PE聚合）", "bytes", 1},
+        {"weight_idx_lookup_total", "GCSS index lookups（PE聚合）", "lookups", 1},
+        {"weight_idx_lookup_idx2_total", "GCSSIDX2 lookups（PE聚合）", "lookups", 1},
+        {"weight_l0_sram_reads_total", "Observe-only weight L0 SRAM reads（PE聚合）", "reads", 1},
+        {"weight_l0_sram_writes_total", "Observe-only weight L0 SRAM writes（PE聚合）", "writes", 1},
+        {"weight_l0_sram_bytes_read_total", "Observe-only weight L0 SRAM read bytes（PE聚合）", "bytes", 1},
+        {"weight_l0_sram_bytes_write_total", "Observe-only weight L0 SRAM write bytes（PE聚合）", "bytes", 1},
+        {"weight_l0_sram_bank_conflict_ticks_total", "Observe-only weight L0 SRAM conflict ticks（PE聚合）", "ticks", 1},
+        {"weight_l0_sram_predicted_extra_cycles_total", "Observe-only weight L0 SRAM predicted extra cycles（PE聚合）", "cycles", 1},
+        {"weight_l0_sram_resident_bytes_peak", "Observe-only weight L0 SRAM resident bytes peak（PE聚合）", "bytes", 1},
+        {"weight_l0_lookup_total", "Weight L0 lookups（PE聚合）", "lookups", 1},
+        {"weight_l0_hit_total", "Weight L0 hits（PE聚合）", "hits", 1},
+        {"weight_l0_fill_total", "Weight L0 fills（PE聚合）", "fills", 1},
+        {"weight_l0_evict_total", "Weight L0 evictions（PE聚合）", "evictions", 1},
+        {"core_state_sram_reads_total", "Observe-only state SRAM reads（PE聚合）", "reads", 1},
+        {"core_state_sram_writes_total", "Observe-only state SRAM writes（PE聚合）", "writes", 1},
+        {"core_state_sram_bytes_read_total", "Observe-only state SRAM read bytes（PE聚合）", "bytes", 1},
+        {"core_state_sram_bytes_write_total", "Observe-only state SRAM write bytes（PE聚合）", "bytes", 1},
+        {"core_state_sram_bank_conflict_ticks_total", "Observe-only state SRAM conflict ticks（PE聚合）", "ticks", 1},
+        {"core_state_sram_predicted_extra_cycles_total", "Observe-only state SRAM predicted extra cycles（PE聚合）", "cycles", 1},
+        {"core_state_sram_resident_bytes_peak", "Observe-only state SRAM resident bytes peak（PE聚合）", "bytes", 1},
         {"mem_outstanding_at_issue", "发起时并发请求数", "count", 1},
         {"gas_activity_f", "GAS 窗口内活跃度 f（活跃轴数/列宽）", "ratio", 1},
         {"sim_cycles_total", "总仿真周期（组件clock tick累计）", "cycles", 1},
@@ -400,15 +541,77 @@ public:
                                uint64_t window_buffer_max_bytes = 0,
                                uint64_t unique_line_count = 0,
                                uint64_t covered_line_count = 0,
-                               uint64_t overfetch_bytes = 0);
+                               uint64_t overfetch_bytes = 0,
+                               uint64_t apply_bank_credit_effective = 0,
+                               uint64_t cmd_cost_veto = 0,
+                               uint64_t cmd_cost_veto_fine_gap = 0,
+                               uint64_t cmd_cost_veto_row_window = 0);
     void accumulateActivityF(double f);
     void accumulateApplyScatterStats(uint64_t acc_updates, uint64_t posts_touched,
                                      uint64_t spikes_emitted, uint64_t hwm_bytes,
                                      uint64_t spill_records, uint64_t spilled_bytes);
+    void accumulateSynapseReadStats(uint64_t gcss_lookup_hit_total,
+                                    uint64_t gcss_lookup_miss_total,
+                                    uint64_t dense_reqs_total,
+                                    uint64_t dense_bytes_total,
+                                    uint64_t rowptr_reqs_total,
+                                    uint64_t rowptr_bytes_total,
+                                    uint64_t colidx_reqs_total,
+                                    uint64_t colidx_bytes_total,
+                                    uint64_t blockdata_reqs_total,
+                                    uint64_t blockdata_bytes_total,
+                                    uint64_t gcss_reqs_total,
+                                    uint64_t gcss_bytes_total,
+                                    uint64_t weight_idx_sram_reads_total,
+                                    uint64_t weight_idx_sram_writes_total,
+                                    uint64_t weight_idx_sram_bytes_read_total,
+                                    uint64_t weight_idx_sram_bytes_write_total,
+                                    uint64_t weight_idx_sram_bank_conflict_ticks_total,
+                                    uint64_t weight_idx_sram_predicted_extra_cycles_total,
+                                    uint64_t weight_idx_sram_resident_bytes_peak,
+                                    uint64_t weight_idx_lookup_total,
+                                    uint64_t weight_idx_lookup_idx2_total,
+                                    uint64_t weight_l0_sram_reads_total,
+                                    uint64_t weight_l0_sram_writes_total,
+                                    uint64_t weight_l0_sram_bytes_read_total,
+                                    uint64_t weight_l0_sram_bytes_write_total,
+                                    uint64_t weight_l0_sram_bank_conflict_ticks_total,
+                                    uint64_t weight_l0_sram_predicted_extra_cycles_total,
+                                    uint64_t weight_l0_sram_resident_bytes_peak,
+                                    uint64_t weight_l0_lookup_total,
+                                    uint64_t weight_l0_hit_total,
+                                    uint64_t weight_l0_fill_total,
+                                    uint64_t weight_l0_evict_total,
+                                    uint64_t core_state_sram_reads_total,
+                                    uint64_t core_state_sram_writes_total,
+                                    uint64_t core_state_sram_bytes_read_total,
+                                    uint64_t core_state_sram_bytes_write_total,
+                                    uint64_t core_state_sram_bank_conflict_ticks_total,
+                                    uint64_t core_state_sram_predicted_extra_cycles_total,
+                                    uint64_t core_state_sram_resident_bytes_peak,
+                                    uint64_t gas_retire_global_hol_cycles_total,
+                                    uint64_t gas_retire_ready_but_blocked_edges_total,
+                                    uint64_t gas_retire_per_post_progress_total,
+                                    uint64_t gas_tass_lf_p0_block_epochs_total,
+                                    uint64_t gas_tass_lf_p0_block_active_pres_total,
+                                    uint64_t gas_tass_lf_p0_block_shared_pres_total,
+                                    uint64_t gas_tass_lf_p0_cross_core_joins_total,
+                                    uint64_t gas_tass_lf_p0_payload_bytes_total,
+                                    uint64_t gas_tass_lf_p0_current_vlf_line_groups_total,
+                                    uint64_t gas_tass_lf_p0_block_naive_line_count_total,
+                                    uint64_t gas_tass_lf_p0_block_fused_lb_line_count_total,
+                                    uint64_t gas_tass_lf_p0_response_fanout_total,
+                                    uint64_t gas_tass_lf_p0_reports_flushed_total,
+                                    uint64_t gas_tass_lf_p0_reports_nonzero_payload_total,
+                                    uint64_t gas_tass_lf_p0_reports_pre_entries_total,
+                                    uint64_t gas_tass_lf_p0_reports_via_callback_total,
+                                    uint64_t gas_tass_lf_p0_reports_via_fallback_total);
     // PE级阶段事件收敛：核心通知PE，PE只写一次（每窗一行）
     // 接收核心上报的阶段事件；当 event=EndScatter 且 spikes>0 时，同时记录本窗发放
     void notifyStageEvent(uint32_t seq, const std::string& event, uint64_t ts_ns,
                           uint64_t spikes_emitted = 0, int core_id = -1);
+    void submitTassLfP0WindowReport(const TassLfP0WindowReport& report) override;
+    void submitTassNaiveWindowRequest(const TassNaiveWindowRequest& request) override;
     void accumulateUniqueNeuronFired(uint64_t cnt) {
         if (cnt && stat_unique_neurons_fired_total_) stat_unique_neurons_fired_total_->addData(cnt);
     }
@@ -470,6 +673,7 @@ private:
     uint64_t sim_stop_ns_ = 0;      // 组件主控停止时间（ns）；>0 启用
     bool primary_registered_ = false;
     uint64_t global_neuron_base_;
+    uint64_t base_addr_ = 0;
     int verbose_;
     std::string clock_freq_ = "1GHz";
     std::string weights_file_;
@@ -543,12 +747,78 @@ private:
     Statistic<uint64_t>* stat_gas_unique_line_count_total_ = nullptr;
     Statistic<uint64_t>* stat_gas_covered_line_count_total_ = nullptr;
     Statistic<uint64_t>* stat_gas_overfetch_bytes_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_apply_bank_credit_effective_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_cmd_cost_veto_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_cmd_cost_veto_fine_gap_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_cmd_cost_veto_row_window_total_ = nullptr;
     Statistic<uint64_t>* stat_gas_apply_acc_updates_total_ = nullptr;
     Statistic<uint64_t>* stat_gas_acc_posts_touched_total_ = nullptr;
     Statistic<uint64_t>* stat_gas_scatter_spikes_emitted_total_ = nullptr;
     Statistic<uint64_t>* stat_gas_acc_hwm_bytes_total_ = nullptr;
     Statistic<uint64_t>* stat_gas_acc_spill_records_total_ = nullptr;
     Statistic<uint64_t>* stat_gas_acc_spilled_bytes_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_retire_global_hol_cycles_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_retire_ready_but_blocked_edges_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_retire_per_post_progress_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_tass_lf_p0_block_epochs_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_tass_lf_p0_block_active_pres_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_tass_lf_p0_block_shared_pres_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_tass_lf_p0_cross_core_joins_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_tass_lf_p0_payload_bytes_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_tass_lf_p0_current_vlf_line_groups_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_tass_lf_p0_block_naive_line_count_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_tass_lf_p0_block_fused_lb_line_count_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_tass_lf_p0_response_fanout_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_tass_lf_p0_reports_submit_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_tass_lf_p0_reports_send_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_tass_lf_p0_reports_recv_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_tass_lf_p0_reports_reduce_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_tass_lf_p0_reports_drop_no_link_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_tass_lf_p0_reports_drop_non_origin_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_tass_lf_p0_reports_flushed_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_tass_lf_p0_reports_nonzero_payload_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_tass_lf_p0_reports_pre_entries_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_tass_lf_p0_reports_via_callback_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_tass_lf_p0_reports_via_fallback_total_ = nullptr;
+    Statistic<uint64_t>* stat_gcss_lookup_hit_total_ = nullptr;
+    Statistic<uint64_t>* stat_gcss_lookup_miss_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_read_dense_reqs_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_read_dense_bytes_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_read_rowptr_reqs_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_read_rowptr_bytes_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_read_colidx_reqs_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_read_colidx_bytes_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_read_blockdata_reqs_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_read_blockdata_bytes_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_read_gcss_reqs_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_read_gcss_bytes_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_idx_sram_reads_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_idx_sram_writes_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_idx_sram_bytes_read_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_idx_sram_bytes_write_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_idx_sram_bank_conflict_ticks_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_idx_sram_predicted_extra_cycles_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_idx_sram_resident_bytes_peak_ = nullptr;
+    Statistic<uint64_t>* stat_weight_idx_lookup_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_idx_lookup_idx2_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_l0_sram_reads_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_l0_sram_writes_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_l0_sram_bytes_read_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_l0_sram_bytes_write_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_l0_sram_bank_conflict_ticks_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_l0_sram_predicted_extra_cycles_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_l0_sram_resident_bytes_peak_ = nullptr;
+    Statistic<uint64_t>* stat_weight_l0_lookup_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_l0_hit_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_l0_fill_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_l0_evict_total_ = nullptr;
+    Statistic<uint64_t>* stat_core_state_sram_reads_total_ = nullptr;
+    Statistic<uint64_t>* stat_core_state_sram_writes_total_ = nullptr;
+    Statistic<uint64_t>* stat_core_state_sram_bytes_read_total_ = nullptr;
+    Statistic<uint64_t>* stat_core_state_sram_bytes_write_total_ = nullptr;
+    Statistic<uint64_t>* stat_core_state_sram_bank_conflict_ticks_total_ = nullptr;
+    Statistic<uint64_t>* stat_core_state_sram_predicted_extra_cycles_total_ = nullptr;
+    Statistic<uint64_t>* stat_core_state_sram_resident_bytes_peak_ = nullptr;
     Statistic<double>*  stat_gas_activity_f_ = nullptr;
     Statistic<uint64_t>* stat_mem_outstanding_at_issue_ = nullptr;
     Statistic<uint64_t>* stat_sim_cycles_total_ = nullptr;
@@ -681,9 +951,15 @@ private:
     bool global_step_ready_sent_ = false;
     SST::Link* gas_step_ctrl_link_ = nullptr;
     SST::Link* loader_done_link_ = nullptr;
+    SST::Link* tass_p0_out_link_ = nullptr;
+    std::vector<SST::Link*> tass_p0_in_links_{};
+    std::vector<SST::Link*> tass_p0_rsp_out_links_{};
     bool global_step_start_pending_ = false;
     uint32_t global_step_pending_seq_ = 0;
+    // Optional per-step apply bank credit target carried by START_STEP(seq) (0 means "no override").
+    uint32_t global_step_pending_apply_bank_credit_target_ = 0;
     uint32_t global_step_active_seq_ = 0;
+    uint32_t global_step_active_apply_bank_credit_target_ = 0;
     uint32_t global_step_last_seen_seq_ = 0;
     uint64_t global_step_start_dup_total_ = 0;
     uint64_t global_step_start_stale_total_ = 0;
@@ -755,6 +1031,45 @@ private:
      * @brief 处理 WeightLoader 完成事件（跨rank桥接 loader_done_key）
      */
     void handleLoaderDoneEvent(SST::Event* ev);
+    void handleTassLfP0ReportEvent(SST::Event* ev);
+    void handleTassNaiveWindowRequest_(const TassNaiveWindowRequest& request);
+    void handleTassNaiveMemoryResponse_(SST::Interfaces::StandardMem::Request* req);
+    void reduceTassLfP0WindowReport_(const TassLfP0WindowReport& report);
+    void deliverTassNaiveResponsesLocal_(const std::vector<TassNaiveResponseEntry>& entries);
+    void dispatchTassNaiveResponses_(uint32_t dst_node, std::vector<TassNaiveResponseEntry>& entries);
+
+    struct TassLfP0BlockEpochPending {
+        uint32_t expected_contributors = 0;
+        uint32_t line_size_bytes = 64;
+        std::unordered_set<uint64_t> contributors{};
+        std::unordered_map<uint32_t, uint64_t> pre_payload_bytes{};
+        std::unordered_map<uint32_t, uint32_t> pre_contributors{};
+        uint64_t payload_bytes_total = 0;
+        uint64_t current_vlf_line_groups_total = 0;
+    };
+    std::unordered_map<uint64_t, TassLfP0BlockEpochPending> tass_lf_p0_pending_epochs_{};
+    struct TassNaiveLineWaiter {
+        uint32_t dst_node = 0;
+        uint32_t dst_core = 0;
+        uint32_t window_seq = 0;
+        uint32_t retire_seq = 0;
+        uint32_t byte_offset = 0;
+    };
+    struct TassNaiveLineState {
+        uint32_t window_seq = 0;
+        uint32_t line_size_bytes = 64;
+        bool inflight = false;
+        std::vector<uint8_t> data{};
+        std::vector<TassNaiveLineWaiter> waiters{};
+    };
+    std::unordered_map<uint64_t, TassNaiveLineState> tass_naive_lines_{};
+    std::unordered_map<SST::Interfaces::StandardMem::Request::id_t, uint64_t> tass_naive_req_to_line_{};
+    bool tass_lf_p0_enable_ = false;
+    bool naive_tass_enable_ = false;
+    uint32_t tass_lf_p0_mesh_rows_ = 1;
+    uint32_t tass_lf_p0_mesh_cols_ = 1;
+    uint32_t tass_lf_p0_block_h_ = 2;
+    uint32_t tass_lf_p0_block_w_ = 2;
 
     /**
      * @brief 在时钟边界打开所有 core 的新窗口（由 StartStep 驱动）

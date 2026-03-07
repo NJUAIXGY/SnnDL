@@ -184,6 +184,12 @@ void TensorWorkload::fillBytesDeterministic_(uint64_t seed,
     }
 }
 
+uint64_t TensorWorkload::nowNs_() const {
+    if (rt_.time.now_ns) return rt_.time.now_ns(rt_.time.ctx);
+    // Fallback: best-effort (legacy behavior assumes 1GHz => 1 cycle == 1ns anyway).
+    return now_cycle_cached_;
+}
+
 void TensorWorkload::configureFromParams(const SST::Params& params) {
     cfg_.m = params.find<uint32_t>("tensor_m", cfg_.m);
     cfg_.n = params.find<uint32_t>("tensor_n", cfg_.n);
@@ -203,6 +209,9 @@ void TensorWorkload::configureFromParams(const SST::Params& params) {
         params.find<int>("tensor_mxu_wavefront_enable", cfg_.mxu_wavefront_enable ? 1 : 0) != 0;
     cfg_.mxu_wavefront_alpha = params.find<float>("tensor_mxu_wavefront_alpha", cfg_.mxu_wavefront_alpha);
     if (!(cfg_.mxu_wavefront_alpha >= 0.0f)) cfg_.mxu_wavefront_alpha = 0.0f;
+    cfg_.mxu_a_bytes_per_cycle = params.find<uint64_t>("tensor_mxu_a_bytes_per_cycle", cfg_.mxu_a_bytes_per_cycle);
+    cfg_.mxu_b_bytes_per_cycle = params.find<uint64_t>("tensor_mxu_b_bytes_per_cycle", cfg_.mxu_b_bytes_per_cycle);
+    cfg_.mxu_c_bytes_per_cycle = params.find<uint64_t>("tensor_mxu_c_bytes_per_cycle", cfg_.mxu_c_bytes_per_cycle);
 
     cfg_.overlap_enable = params.find<int>("tensor_overlap_enable", cfg_.overlap_enable ? 1 : 0) != 0;
     cfg_.start_cycle = params.find<uint64_t>("tensor_start_cycle", cfg_.start_cycle);
@@ -212,6 +221,23 @@ void TensorWorkload::configureFromParams(const SST::Params& params) {
     cfg_.mem_region_bytes = params.find<uint64_t>("tensor_mem_region_bytes", cfg_.mem_region_bytes);
     cfg_.mem_req_bytes = params.find<uint32_t>("tensor_mem_req_bytes", cfg_.mem_req_bytes);
     cfg_.mem_max_outstanding = params.find<uint32_t>("tensor_mem_max_outstanding", cfg_.mem_max_outstanding);
+    cfg_.mem_timing_model = to_lower_copy_(params.find<std::string>("tensor_mem_timing_model", cfg_.mem_timing_model));
+    cfg_.mem_bank_groups_per_channel =
+        params.find<uint32_t>("tensor_mem_bank_groups_per_channel", cfg_.mem_bank_groups_per_channel);
+    cfg_.mem_banks_per_group = params.find<uint32_t>("tensor_mem_banks_per_group", cfg_.mem_banks_per_group);
+    cfg_.mem_row_bytes = params.find<uint64_t>("tensor_mem_row_bytes", cfg_.mem_row_bytes);
+    cfg_.mem_bank_queue_depth = params.find<uint32_t>("tensor_mem_bank_queue_depth", cfg_.mem_bank_queue_depth);
+    cfg_.mem_sched_policy = to_lower_copy_(params.find<std::string>("tensor_mem_sched_policy", cfg_.mem_sched_policy));
+    cfg_.mem_t_rcd_cycles = params.find<uint32_t>("tensor_mem_t_rcd_cycles", cfg_.mem_t_rcd_cycles);
+    cfg_.mem_t_cl_cycles = params.find<uint32_t>("tensor_mem_t_cl_cycles", cfg_.mem_t_cl_cycles);
+    cfg_.mem_t_rp_cycles = params.find<uint32_t>("tensor_mem_t_rp_cycles", cfg_.mem_t_rp_cycles);
+    cfg_.mem_t_burst_cycles = params.find<uint32_t>("tensor_mem_t_burst_cycles", cfg_.mem_t_burst_cycles);
+    cfg_.mem_t_ccd_s_cycles = params.find<uint32_t>("tensor_mem_t_ccd_s_cycles", cfg_.mem_t_ccd_s_cycles);
+    cfg_.mem_t_ccd_l_cycles = params.find<uint32_t>("tensor_mem_t_ccd_l_cycles", cfg_.mem_t_ccd_l_cycles);
+    cfg_.mem_refresh_interval_cycles =
+        params.find<uint32_t>("tensor_mem_refresh_interval_cycles", cfg_.mem_refresh_interval_cycles);
+    cfg_.mem_refresh_block_cycles =
+        params.find<uint32_t>("tensor_mem_refresh_block_cycles", cfg_.mem_refresh_block_cycles);
 
     cfg_.dataflow = to_lower_copy_(params.find<std::string>("tensor_dataflow", cfg_.dataflow));
     cfg_.tile_m = params.find<uint32_t>("tensor_tile_m", cfg_.tile_m);
@@ -264,6 +290,12 @@ void TensorWorkload::configureFromParams(const SST::Params& params) {
         params.find<uint64_t>("tensor_dma_bandwidth_bytes_per_cycle", cfg_.dma_bandwidth_bytes_per_cycle);
     cfg_.dma_shared_bandwidth_bytes_per_cycle =
         params.find<uint64_t>("tensor_dma_shared_bandwidth_bytes_per_cycle", cfg_.dma_shared_bandwidth_bytes_per_cycle);
+    cfg_.dma_burst_bytes = params.find<uint64_t>("tensor_dma_burst_bytes", cfg_.dma_burst_bytes);
+    cfg_.dma_setup_cycles = params.find<uint32_t>("tensor_dma_setup_cycles", cfg_.dma_setup_cycles);
+    cfg_.dma_read_engines = params.find<uint32_t>("tensor_dma_read_engines", cfg_.dma_read_engines);
+    cfg_.dma_write_engines = params.find<uint32_t>("tensor_dma_write_engines", cfg_.dma_write_engines);
+    cfg_.dma_max_inflight_per_engine =
+        params.find<uint32_t>("tensor_dma_max_inflight_per_engine", cfg_.dma_max_inflight_per_engine);
     cfg_.dma_hbm_channels = std::max<uint32_t>(
         1u, params.find<uint32_t>("tensor_dma_hbm_channels", cfg_.dma_hbm_channels));
     cfg_.dma_hbm_channel_bandwidth_bytes_per_cycle =
@@ -293,6 +325,14 @@ void TensorWorkload::configureFromParams(const SST::Params& params) {
     }
     if (cfg_.dataflow != "os" && cfg_.dataflow != "ws" && cfg_.dataflow != "is") {
         cfg_.dataflow = "os";
+    }
+    if (cfg_.mem_timing_model != "off" &&
+        cfg_.mem_timing_model != "proxy_v2" &&
+        cfg_.mem_timing_model != "proxy_v3") {
+        cfg_.mem_timing_model = "off";
+    }
+    if (cfg_.mem_sched_policy != "fifo" && cfg_.mem_sched_policy != "frfcfs") {
+        cfg_.mem_sched_policy = "fifo";
     }
     if (cfg_.compute_precision != "fp16" &&
         cfg_.compute_precision != "bf16" &&
@@ -416,6 +456,16 @@ void TensorWorkload::configureFromParams(const SST::Params& params) {
     cfg_.mem_req_bytes = static_cast<uint32_t>(clamp_u64_(cfg_.mem_req_bytes, 1, 1024ull * 1024ull));
     cfg_.mem_max_outstanding = static_cast<uint32_t>(clamp_u64_(cfg_.mem_max_outstanding, 1, 4096));
     cfg_.mem_region_bytes = clampNonZero_(cfg_.mem_region_bytes, 4096);
+    cfg_.mem_bank_groups_per_channel = static_cast<uint32_t>(clamp_u64_(cfg_.mem_bank_groups_per_channel, 1, 1024));
+    cfg_.mem_banks_per_group = static_cast<uint32_t>(clamp_u64_(cfg_.mem_banks_per_group, 1, 1024));
+    cfg_.mem_row_bytes = clampNonZero_(cfg_.mem_row_bytes, 256);
+    cfg_.mem_bank_queue_depth = static_cast<uint32_t>(clamp_u64_(cfg_.mem_bank_queue_depth, 1, 4096));
+    cfg_.mem_t_rcd_cycles = static_cast<uint32_t>(clamp_u64_(cfg_.mem_t_rcd_cycles, 0, 4096));
+    cfg_.mem_t_cl_cycles = static_cast<uint32_t>(clamp_u64_(cfg_.mem_t_cl_cycles, 0, 4096));
+    cfg_.mem_t_rp_cycles = static_cast<uint32_t>(clamp_u64_(cfg_.mem_t_rp_cycles, 0, 4096));
+    cfg_.mem_t_burst_cycles = static_cast<uint32_t>(clamp_u64_(cfg_.mem_t_burst_cycles, 0, 4096));
+    cfg_.mem_refresh_interval_cycles = static_cast<uint32_t>(clamp_u64_(cfg_.mem_refresh_interval_cycles, 0, (1ull << 20)));
+    cfg_.mem_refresh_block_cycles = static_cast<uint32_t>(clamp_u64_(cfg_.mem_refresh_block_cycles, 0, 4096));
     cfg_.start_cycle = clampNonZero_(cfg_.start_cycle, 1);
     cfg_.comm_payload_bytes = static_cast<uint32_t>(clamp_u64_(cfg_.comm_payload_bytes, 0, 1024ull * 1024ull));
     cfg_.collective_packet_bytes = static_cast<uint32_t>(clamp_u64_(cfg_.collective_packet_bytes, 1, 1024ull * 1024ull));
@@ -432,6 +482,14 @@ void TensorWorkload::configureFromParams(const SST::Params& params) {
     cfg_.ub_bank_count = static_cast<uint32_t>(clamp_u64_(cfg_.ub_bank_count, 1, 4096));
     cfg_.acc_bank_count = static_cast<uint32_t>(clamp_u64_(cfg_.acc_bank_count, 1, 4096));
     cfg_.bank_queue_depth = static_cast<uint32_t>(clamp_u64_(cfg_.bank_queue_depth, 1, 4096));
+    cfg_.dma_burst_bytes = clamp_u64_(cfg_.dma_burst_bytes, 0, 1ull << 30);
+    cfg_.dma_setup_cycles = static_cast<uint32_t>(clamp_u64_(cfg_.dma_setup_cycles, 0, 4096));
+    cfg_.dma_read_engines = static_cast<uint32_t>(clamp_u64_(cfg_.dma_read_engines, 0, 4096));
+    cfg_.dma_write_engines = static_cast<uint32_t>(clamp_u64_(cfg_.dma_write_engines, 0, 4096));
+    cfg_.dma_max_inflight_per_engine = static_cast<uint32_t>(clamp_u64_(cfg_.dma_max_inflight_per_engine, 0, 4096));
+    cfg_.mxu_a_bytes_per_cycle = clamp_u64_(cfg_.mxu_a_bytes_per_cycle, 0, 1ull << 30);
+    cfg_.mxu_b_bytes_per_cycle = clamp_u64_(cfg_.mxu_b_bytes_per_cycle, 0, 1ull << 30);
+    cfg_.mxu_c_bytes_per_cycle = clamp_u64_(cfg_.mxu_c_bytes_per_cycle, 0, 1ull << 30);
     if (cfg_.onchip_bank_model_enable) {
         cfg_.onchip_model_enable = true;
     }
@@ -589,6 +647,7 @@ void TensorWorkload::configureFromParams(const SST::Params& params) {
     onchip_ub_bank_rr_ = 0;
     onchip_weight_bank_rr_ = 0;
     onchip_acc_bank_rr_ = 0;
+    resetMemTimingState_();
     collective_credit_inflight_chunks_ = 0;
     collective_credit_outstanding_.clear();
     collective_credit_return_seen_.clear();
@@ -649,19 +708,255 @@ uint32_t TensorWorkload::hbmChannelCount_() const {
     return std::max<uint32_t>(cfg_.dma_hbm_channels, 1u);
 }
 
-uint64_t TensorWorkload::peekNextMemAddr_(ReqKind kind, uint32_t bytes) const {
+bool TensorWorkload::memTimingProxyEnabled_() const {
+    return cfg_.mem_enable &&
+           (cfg_.mem_timing_model == "proxy_v2" || cfg_.mem_timing_model == "proxy_v3");
+}
+
+uint32_t TensorWorkload::memTimingBanksPerChannel_() const {
+    const uint64_t groups = static_cast<uint64_t>(std::max<uint32_t>(cfg_.mem_bank_groups_per_channel, 1u));
+    const uint64_t per_group = static_cast<uint64_t>(std::max<uint32_t>(cfg_.mem_banks_per_group, 1u));
+    const uint64_t banks = groups * per_group;
+    return static_cast<uint32_t>(std::max<uint64_t>(1ull, banks));
+}
+
+uint64_t TensorWorkload::memTimingServiceQuantumCycles_() const {
+    return std::max<uint64_t>(1ull, static_cast<uint64_t>(cfg_.mem_t_burst_cycles));
+}
+
+uint32_t TensorWorkload::memTimingBankIndex_(uint64_t off) const {
+    const uint64_t interleave = std::max<uint64_t>(cfg_.dma_hbm_channel_interleave_bytes, 1ull);
+    const uint32_t channels = hbmChannelCount_();
+    const uint64_t stripe = off / interleave;
+    const uint64_t stripe_in_ch = stripe / static_cast<uint64_t>(std::max<uint32_t>(channels, 1u));
+    const uint32_t banks_per_channel = memTimingBanksPerChannel_();
+    if (banks_per_channel <= 1u) return 0u;
+    return static_cast<uint32_t>(stripe_in_ch % static_cast<uint64_t>(banks_per_channel));
+}
+
+uint32_t TensorWorkload::memTimingBankGroupIndex_(uint64_t off) const {
+    const uint32_t banks_per_group = std::max<uint32_t>(cfg_.mem_banks_per_group, 1u);
+    const uint32_t groups = std::max<uint32_t>(cfg_.mem_bank_groups_per_channel, 1u);
+    const uint32_t bank = memTimingBankIndex_(off);
+    const uint32_t group = bank / banks_per_group;
+    if (groups <= 1u) return 0u;
+    return static_cast<uint32_t>(group % groups);
+}
+
+uint64_t TensorWorkload::memTimingRowIndex_(uint64_t off) const {
+    const uint64_t interleave = std::max<uint64_t>(cfg_.dma_hbm_channel_interleave_bytes, 1ull);
+    const uint32_t channels = hbmChannelCount_();
+    const uint64_t stripe = off / interleave;
+    const uint64_t stripe_off = off % interleave;
+    const uint64_t stripe_in_ch = stripe / static_cast<uint64_t>(std::max<uint32_t>(channels, 1u));
+    const uint64_t channel_local_off = stripe_in_ch * interleave + stripe_off;
+    const uint64_t row_bytes = clampNonZero_(cfg_.mem_row_bytes, 256ull);
+    return channel_local_off / row_bytes;
+}
+
+uint64_t TensorWorkload::memTimingQueueDepthForReq_() const {
+    return std::max<uint64_t>(1ull, static_cast<uint64_t>(cfg_.mem_bank_queue_depth));
+}
+
+uint64_t TensorWorkload::memTimingRefreshDelayCycles_(MemTimingBankState& st, uint64_t now_cycle) {
+    const uint64_t interval = static_cast<uint64_t>(cfg_.mem_refresh_interval_cycles);
+    const uint64_t block = static_cast<uint64_t>(cfg_.mem_refresh_block_cycles);
+    if (interval == 0 || block == 0) return 0;
+    if (st.last_refresh_cycle == 0) {
+        st.last_refresh_cycle = now_cycle;
+        return 0;
+    }
+    if (now_cycle <= st.last_refresh_cycle) return 0;
+    const uint64_t elapsed = now_cycle - st.last_refresh_cycle;
+    const uint64_t periods = elapsed / interval;
+    if (periods == 0) return 0;
+    st.last_refresh_cycle = st.last_refresh_cycle + periods * interval;
+    const uint64_t delay = periods * block;
+    tensor_mem_refresh_block_cycles_total_ = saturatingAddU64_(tensor_mem_refresh_block_cycles_total_, delay);
+    return delay;
+}
+
+uint64_t TensorWorkload::memTimingProxyDelayCycles_(ReqKind kind, uint64_t off, uint32_t bytes, uint64_t now_cycle) {
+    (void)kind;
+    (void)bytes;
+    if (!memTimingProxyEnabled_()) return 0;
+    if (mem_timing_banks_.empty()) resetMemTimingState_();
+    if (mem_timing_banks_.empty()) return 0;
+
+    const uint32_t channels = hbmChannelCount_();
+    const uint32_t banks_per_channel = memTimingBanksPerChannel_();
+    const uint32_t ch = memOffsetToHbmChannel_(off);
+    const uint32_t bank_local = memTimingBankIndex_(off);
+    const uint64_t bank_global_u64 =
+        static_cast<uint64_t>(ch % std::max<uint32_t>(channels, 1u)) * static_cast<uint64_t>(banks_per_channel) +
+        static_cast<uint64_t>(bank_local % std::max<uint32_t>(banks_per_channel, 1u));
+    if (bank_global_u64 >= static_cast<uint64_t>(mem_timing_banks_.size())) return 0;
+    MemTimingBankState& st = mem_timing_banks_[static_cast<size_t>(bank_global_u64)];
+
+    const uint64_t burst = memTimingServiceQuantumCycles_();
+    uint64_t queue_wait = (st.busy_until_cycle > now_cycle) ? (st.busy_until_cycle - now_cycle) : 0ull;
+    if (cfg_.mem_sched_policy == "frfcfs" && st.row_open && st.open_row == memTimingRowIndex_(off) && queue_wait > 0) {
+        const uint64_t cut = std::min<uint64_t>(queue_wait, burst);
+        queue_wait -= cut;
+    }
+
+    const uint64_t depth = memTimingQueueDepthForReq_();
+    uint64_t queue_slots = (burst > 0) ? ceilDivU64_(queue_wait, burst) : 0ull;
+    if (queue_slots >= depth) {
+        tensor_mem_bank_queue_full_total_ = saturatingAddU64_(tensor_mem_bank_queue_full_total_, 1ull);
+        const uint64_t cap = (depth > 0) ? ((depth - 1ull) * burst) : 0ull;
+        queue_wait = std::min<uint64_t>(queue_wait, cap);
+        queue_slots = (burst > 0) ? ceilDivU64_(queue_wait, burst) : 0ull;
+    }
+    tensor_mem_cmd_queue_slots_total_ =
+        saturatingAddU64_(tensor_mem_cmd_queue_slots_total_, queue_slots);
+    if (queue_slots > tensor_mem_cmd_queue_depth_max_) {
+        tensor_mem_cmd_queue_depth_max_ = queue_slots;
+    }
+
+    const uint64_t row = memTimingRowIndex_(off);
+    const uint64_t t_rcd = static_cast<uint64_t>(cfg_.mem_t_rcd_cycles);
+    const uint64_t t_cl = static_cast<uint64_t>(cfg_.mem_t_cl_cycles);
+    const uint64_t t_rp = static_cast<uint64_t>(cfg_.mem_t_rp_cycles);
+    uint64_t row_delay = 0;
+    uint32_t cmd_issue_count = 0;
+    if (!st.row_open) {
+        tensor_mem_row_miss_total_ = saturatingAddU64_(tensor_mem_row_miss_total_, 1ull);
+        tensor_mem_cmd_act_total_ = saturatingAddU64_(tensor_mem_cmd_act_total_, 1ull);
+        tensor_mem_cmd_rdwr_total_ = saturatingAddU64_(tensor_mem_cmd_rdwr_total_, 1ull);
+        row_delay = t_rcd + t_cl + burst;
+        cmd_issue_count = 2u;
+    } else if (st.open_row == row) {
+        tensor_mem_row_hit_total_ = saturatingAddU64_(tensor_mem_row_hit_total_, 1ull);
+        tensor_mem_cmd_rdwr_total_ = saturatingAddU64_(tensor_mem_cmd_rdwr_total_, 1ull);
+        row_delay = t_cl + burst;
+        cmd_issue_count = 1u;
+    } else {
+        tensor_mem_row_conflict_total_ = saturatingAddU64_(tensor_mem_row_conflict_total_, 1ull);
+        tensor_mem_cmd_pre_total_ = saturatingAddU64_(tensor_mem_cmd_pre_total_, 1ull);
+        tensor_mem_cmd_act_total_ = saturatingAddU64_(tensor_mem_cmd_act_total_, 1ull);
+        tensor_mem_cmd_rdwr_total_ = saturatingAddU64_(tensor_mem_cmd_rdwr_total_, 1ull);
+        row_delay = t_rp + t_rcd + t_cl + burst;
+        cmd_issue_count = 3u;
+    }
+    tensor_mem_row_service_cycles_total_ =
+        saturatingAddU64_(tensor_mem_row_service_cycles_total_, row_delay);
+    tensor_mem_cmd_issue_total_ =
+        saturatingAddU64_(tensor_mem_cmd_issue_total_, static_cast<uint64_t>(std::max<uint32_t>(1u, cmd_issue_count)));
+
+    uint64_t cmd_bus_wait = 0;
+    if (cfg_.mem_timing_model == "proxy_v3" && !mem_timing_channels_.empty()) {
+        const uint32_t ch_idx = ch % std::max<uint32_t>(channels, 1u);
+        if (ch_idx < static_cast<uint32_t>(mem_timing_channels_.size())) {
+            MemTimingChannelState& ch_state = mem_timing_channels_[static_cast<size_t>(ch_idx)];
+            const uint32_t bank_group = memTimingBankGroupIndex_(off);
+            const uint64_t tccd_s = std::max<uint64_t>(1ull, static_cast<uint64_t>(cfg_.mem_t_ccd_s_cycles));
+            const uint64_t tccd_l = std::max<uint64_t>(tccd_s, static_cast<uint64_t>(cfg_.mem_t_ccd_l_cycles));
+
+            uint64_t cmd_cycle = std::max<uint64_t>(now_cycle, ch_state.cmd_bus_ready_cycle);
+            uint64_t first_cmd_cycle = cmd_cycle;
+            const uint32_t cmd_total = std::max<uint32_t>(1u, cmd_issue_count);
+            for (uint32_t i = 0; i < cmd_total; ++i) {
+                uint64_t issue_cycle = cmd_cycle;
+                if (ch_state.last_cmd_valid) {
+                    const bool same_bg = (ch_state.last_cmd_bank_group == bank_group);
+                    const uint64_t tccd = same_bg ? tccd_l : tccd_s;
+                    issue_cycle = std::max<uint64_t>(issue_cycle, ch_state.last_cmd_cycle + tccd);
+                    if (!same_bg) {
+                        tensor_mem_cmd_bus_bg_switch_total_ =
+                            saturatingAddU64_(tensor_mem_cmd_bus_bg_switch_total_, 1ull);
+                    }
+                }
+                if (i == 0u) {
+                    first_cmd_cycle = issue_cycle;
+                }
+                ch_state.last_cmd_cycle = issue_cycle;
+                ch_state.last_cmd_bank_group = bank_group;
+                ch_state.last_cmd_valid = true;
+                ch_state.cmd_bus_ready_cycle = issue_cycle + 1ull;
+                cmd_cycle = ch_state.cmd_bus_ready_cycle;
+            }
+            if (first_cmd_cycle > now_cycle) {
+                cmd_bus_wait = first_cmd_cycle - now_cycle;
+            }
+            tensor_mem_cmd_bus_wait_cycles_total_ =
+                saturatingAddU64_(tensor_mem_cmd_bus_wait_cycles_total_, cmd_bus_wait);
+        }
+    }
+
+    const uint64_t service_start = now_cycle + queue_wait + cmd_bus_wait;
+    const uint64_t refresh_delay = memTimingRefreshDelayCycles_(st, service_start);
+    const uint64_t proxy_delay = queue_wait + cmd_bus_wait + refresh_delay + row_delay;
+    const uint64_t active_span = std::max<uint64_t>(burst, row_delay);
+    const uint64_t ready_cycle = service_start + refresh_delay + active_span;
+
+    st.busy_until_cycle = ready_cycle;
+    st.row_open = true;
+    st.open_row = row;
+
+    tensor_mem_bank_queue_wait_cycles_total_ =
+        saturatingAddU64_(tensor_mem_bank_queue_wait_cycles_total_, queue_wait);
+    if (cfg_.mem_sched_policy == "frfcfs") {
+        tensor_mem_sched_frfcfs_pick_total_ = saturatingAddU64_(tensor_mem_sched_frfcfs_pick_total_, 1ull);
+    } else {
+        tensor_mem_sched_fifo_pick_total_ = saturatingAddU64_(tensor_mem_sched_fifo_pick_total_, 1ull);
+    }
+    tensor_mem_proxy_delay_cycles_total_ =
+        saturatingAddU64_(tensor_mem_proxy_delay_cycles_total_, proxy_delay);
+    if (proxy_delay > tensor_mem_proxy_delay_cycles_max_) {
+        tensor_mem_proxy_delay_cycles_max_ = proxy_delay;
+    }
+    tensor_mem_bank_active_cycles_total_ =
+        saturatingAddU64_(tensor_mem_bank_active_cycles_total_, active_span);
+    return proxy_delay;
+}
+
+void TensorWorkload::resetMemTimingState_() {
+    mem_timing_banks_.clear();
+    mem_timing_channels_.clear();
+    if (!memTimingProxyEnabled_()) return;
+    const uint64_t banks =
+        static_cast<uint64_t>(hbmChannelCount_()) * static_cast<uint64_t>(memTimingBanksPerChannel_());
+    const size_t count = static_cast<size_t>(std::max<uint64_t>(banks, 1ull));
+    mem_timing_banks_.assign(count, MemTimingBankState{});
+    const size_t channels = static_cast<size_t>(std::max<uint32_t>(hbmChannelCount_(), 1u));
+    mem_timing_channels_.assign(channels, MemTimingChannelState{});
+}
+
+uint64_t TensorWorkload::peekNextMemOffset_(ReqKind kind, uint32_t bytes) const {
     const uint64_t region = clampNonZero_(cfg_.mem_region_bytes, 4096);
     uint64_t off = (kind == ReqKind::Read) ? read_off_ : write_off_;
     if (off + static_cast<uint64_t>(bytes) > region) off = 0;
-    return rt_.base_addr + off;
+    return off;
 }
 
-uint32_t TensorWorkload::memAddrToHbmChannel_(uint64_t addr) const {
+uint32_t TensorWorkload::memOffsetToHbmChannel_(uint64_t off) const {
     const uint64_t interleave = std::max<uint64_t>(cfg_.dma_hbm_channel_interleave_bytes, 1ull);
     const uint32_t channels = hbmChannelCount_();
     if (channels <= 1u) return 0;
-    const uint64_t idx = addr / interleave;
+    const uint64_t idx = off / interleave;
     return static_cast<uint32_t>(idx % static_cast<uint64_t>(channels));
+}
+
+uint64_t TensorWorkload::memOffsetToPhysicalAddr_(uint64_t off) const {
+    const uint64_t region = clampNonZero_(cfg_.mem_region_bytes, 4096);
+    const uint32_t channels = hbmChannelCount_();
+    if (channels <= 1u) return rt_.base_addr + off;
+
+    const uint64_t interleave = std::max<uint64_t>(cfg_.dma_hbm_channel_interleave_bytes, 1ull);
+    const uint64_t stripe = off / interleave;
+    const uint64_t stripe_off = off % interleave;
+    const uint32_t ch = static_cast<uint32_t>(stripe % static_cast<uint64_t>(channels));
+    const uint64_t stripe_in_ch = stripe / static_cast<uint64_t>(channels);
+
+    // Deinterleave: map a striped (logical) address space into contiguous per-channel
+    // physical partitions (as built by mem_memhierarchy.build_pe_memory_systems()).
+    const uint64_t base = region / static_cast<uint64_t>(channels);
+    const uint64_t rem = region % static_cast<uint64_t>(channels);
+    const uint64_t ch_base =
+        base * static_cast<uint64_t>(ch) + std::min<uint64_t>(static_cast<uint64_t>(ch), rem);
+    const uint64_t phys_off = ch_base + stripe_in_ch * interleave + stripe_off;
+    return rt_.base_addr + (region ? (phys_off % region) : phys_off);
 }
 
 uint64_t TensorWorkload::hbmChannelBudgetLeftBytes_(uint64_t now_cycle, uint32_t channel) const {
@@ -712,8 +1007,8 @@ uint32_t TensorWorkload::clampBytesByHbmChannelBudget_(uint64_t now_cycle,
     // whether wrap-around happens, so iterate to reach a stable (addr,channel,bytes).
     for (int it = 0; it < 3; ++it) {
         if (bytes == 0) return 0;
-        const uint64_t addr = peekNextMemAddr_(kind, bytes);
-        const uint32_t ch = memAddrToHbmChannel_(addr);
+        const uint64_t off = peekNextMemOffset_(kind, bytes);
+        const uint32_t ch = memOffsetToHbmChannel_(off);
         out_channel = ch;
         const uint64_t left = hbmChannelBudgetLeftBytes_(now_cycle, ch);
         const uint32_t clamped = static_cast<uint32_t>(std::min<uint64_t>(static_cast<uint64_t>(bytes), left));
@@ -728,6 +1023,7 @@ void TensorWorkload::bindRuntime(const Runtime& rt) {
     if (inflight_.size() > static_cast<size_t>(cfg_.mem_max_outstanding) * 8u) {
         inflight_.clear();
     }
+    resetMemTimingState_();
 
     // Program mode: parse DSL after runtime is available (for strict fatal logging).
     program_ops_.clear();
@@ -1464,11 +1760,18 @@ uint32_t TensorWorkload::issueMemReadTagged_(uint32_t max_bytes, MemTag tag, uin
     if (max_bytes == 0) return 0;
     if (inflight_.size() >= static_cast<size_t>(cfg_.mem_max_outstanding)) return 0;
 
-    const uint32_t bytes = static_cast<uint32_t>(std::min<uint32_t>(max_bytes, cfg_.mem_req_bytes));
+    uint32_t bytes = static_cast<uint32_t>(std::min<uint32_t>(max_bytes, cfg_.mem_req_bytes));
     const uint64_t region = clampNonZero_(cfg_.mem_region_bytes, 4096);
     uint64_t off = read_off_;
+    const uint32_t channels = hbmChannelCount_();
+    if (channels > 1u) {
+        const uint64_t interleave = std::max<uint64_t>(cfg_.dma_hbm_channel_interleave_bytes, 1ull);
+        const uint64_t rem = interleave - (off % interleave);
+        bytes = static_cast<uint32_t>(std::min<uint64_t>(static_cast<uint64_t>(bytes), rem));
+    }
     if (off + bytes > region) off = 0;
-    const uint64_t addr = rt_.base_addr + off;
+    const uint64_t proxy_delay_cycles = memTimingProxyDelayCycles_(ReqKind::Read, off, bytes, now_cycle_cached_);
+    const uint64_t addr = memOffsetToPhysicalAddr_(off);
     read_off_ = off + bytes;
     if (read_off_ >= region) read_off_ = 0;
 
@@ -1478,13 +1781,11 @@ uint32_t TensorWorkload::issueMemReadTagged_(uint32_t max_bytes, MemTag tag, uin
     memory_requests_++;
     tensor_mem_reads_issued_total_ += 1;
     tensor_mem_bytes_read_total_ += static_cast<uint64_t>(bytes);
+    const uint64_t issue_ns = nowNs_();
 
     const auto req_id = rt_.mem->read(
         addr, bytes,
         [this, addr, bytes, tag, epoch](IMemoryAccess::RequestId cb_id, uint64_t /*addr_cb*/, std::vector<uint8_t>&& got) {
-            if (cb_id != 0) {
-                inflight_.erase(static_cast<uint64_t>(cb_id));
-            }
             if (cb_id == 0 || got.size() != bytes) {
                 if (cfg_.strict && rt_.log) {
                     rt_.log->fatal(
@@ -1494,10 +1795,17 @@ uint32_t TensorWorkload::issueMemReadTagged_(uint32_t max_bytes, MemTag tag, uin
                 }
                 return;
             }
-            onMemComplete_(ReqKind::Read, tag, epoch, bytes);
+            onMemResponse_(static_cast<uint64_t>(cb_id), ReqKind::Read, tag, epoch, bytes);
         });
     if (req_id != 0) {
-        inflight_[static_cast<uint64_t>(req_id)] = InflightReq{ReqKind::Read, tag, epoch, bytes};
+        inflight_[static_cast<uint64_t>(req_id)] = InflightReq{
+            ReqKind::Read,
+            tag,
+            epoch,
+            bytes,
+            issue_ns,
+            proxy_delay_cycles,
+        };
     } else if (cfg_.strict && rt_.log) {
         rt_.log->fatal(
             CALL_INFO, -1,
@@ -1519,11 +1827,18 @@ uint32_t TensorWorkload::issueMemWriteTagged_(uint32_t max_bytes, MemTag tag, ui
     if (max_bytes == 0) return 0;
     if (inflight_.size() >= static_cast<size_t>(cfg_.mem_max_outstanding)) return 0;
 
-    const uint32_t bytes = static_cast<uint32_t>(std::min<uint32_t>(max_bytes, cfg_.mem_req_bytes));
+    uint32_t bytes = static_cast<uint32_t>(std::min<uint32_t>(max_bytes, cfg_.mem_req_bytes));
     const uint64_t region = clampNonZero_(cfg_.mem_region_bytes, 4096);
     uint64_t off = write_off_;
+    const uint32_t channels = hbmChannelCount_();
+    if (channels > 1u) {
+        const uint64_t interleave = std::max<uint64_t>(cfg_.dma_hbm_channel_interleave_bytes, 1ull);
+        const uint64_t rem = interleave - (off % interleave);
+        bytes = static_cast<uint32_t>(std::min<uint64_t>(static_cast<uint64_t>(bytes), rem));
+    }
     if (off + bytes > region) off = 0;
-    const uint64_t addr = rt_.base_addr + off;
+    const uint64_t proxy_delay_cycles = memTimingProxyDelayCycles_(ReqKind::Write, off, bytes, now_cycle_cached_);
+    const uint64_t addr = memOffsetToPhysicalAddr_(off);
     write_off_ = off + bytes;
     if (write_off_ >= region) write_off_ = 0;
 
@@ -1540,13 +1855,11 @@ uint32_t TensorWorkload::issueMemWriteTagged_(uint32_t max_bytes, MemTag tag, ui
     memory_requests_++;
     tensor_mem_writes_issued_total_ += 1;
     tensor_mem_bytes_write_total_ += static_cast<uint64_t>(bytes);
+    const uint64_t issue_ns = nowNs_();
 
     const auto req_id = rt_.mem->write(
         addr, data,
         [this, addr, bytes, tag, epoch](IMemoryAccess::RequestId cb_id, uint64_t /*addr_cb*/) {
-            if (cb_id != 0) {
-                inflight_.erase(static_cast<uint64_t>(cb_id));
-            }
             if (cb_id == 0) {
                 if (cfg_.strict && rt_.log) {
                     rt_.log->fatal(
@@ -1556,10 +1869,17 @@ uint32_t TensorWorkload::issueMemWriteTagged_(uint32_t max_bytes, MemTag tag, ui
                 }
                 return;
             }
-            onMemComplete_(ReqKind::Write, tag, epoch, bytes);
+            onMemResponse_(static_cast<uint64_t>(cb_id), ReqKind::Write, tag, epoch, bytes);
         });
     if (req_id != 0) {
-        inflight_[static_cast<uint64_t>(req_id)] = InflightReq{ReqKind::Write, tag, epoch, bytes};
+        inflight_[static_cast<uint64_t>(req_id)] = InflightReq{
+            ReqKind::Write,
+            tag,
+            epoch,
+            bytes,
+            issue_ns,
+            proxy_delay_cycles,
+        };
     } else if (cfg_.strict && rt_.log) {
         rt_.log->fatal(
             CALL_INFO, -1,
@@ -1570,6 +1890,37 @@ uint32_t TensorWorkload::issueMemWriteTagged_(uint32_t max_bytes, MemTag tag, ui
     return bytes;
 }
 
+void TensorWorkload::onMemResponse_(uint64_t req_id, ReqKind kind, MemTag tag, uint64_t epoch, uint32_t bytes) {
+    uint64_t issue_ns = 0;
+    uint64_t proxy_delay_cycles = 0;
+    auto it = inflight_.find(req_id);
+    if (it != inflight_.end()) {
+        issue_ns = it->second.issue_ns;
+        proxy_delay_cycles = it->second.proxy_delay_cycles;
+    }
+    const uint64_t done_ns = nowNs_();
+    uint64_t lat = 0;
+    if (done_ns >= issue_ns) {
+        lat = done_ns - issue_ns;
+    }
+    lat = saturatingAddU64_(lat, proxy_delay_cycles);
+
+    if (kind == ReqKind::Read) {
+        tensor_mem_read_latency_cycles_total_ = saturatingAddU64_(tensor_mem_read_latency_cycles_total_, lat);
+        if (lat > tensor_mem_read_latency_cycles_max_) tensor_mem_read_latency_cycles_max_ = lat;
+        tensor_mem_read_latency_samples_total_ = saturatingAddU64_(tensor_mem_read_latency_samples_total_, 1);
+    } else {
+        tensor_mem_write_latency_cycles_total_ = saturatingAddU64_(tensor_mem_write_latency_cycles_total_, lat);
+        if (lat > tensor_mem_write_latency_cycles_max_) tensor_mem_write_latency_cycles_max_ = lat;
+        tensor_mem_write_latency_samples_total_ = saturatingAddU64_(tensor_mem_write_latency_samples_total_, 1);
+    }
+
+    if (it != inflight_.end()) {
+        inflight_.erase(it);
+    }
+    onMemComplete_(kind, tag, epoch, bytes);
+}
+
 void TensorWorkload::onMemComplete_(ReqKind kind, MemTag tag, uint64_t epoch, uint32_t bytes) {
     // Program-mode explicit DMA (M7): update slot progress even when tile model is disabled.
     if (cfg_.exec_mode == "program" && program_m7_enable_) {
@@ -1578,6 +1929,9 @@ void TensorWorkload::onMemComplete_(ReqKind kind, MemTag tag, uint64_t epoch, ui
                 program_dma_read_slot_.done_bytes = std::min<uint64_t>(
                     program_dma_read_slot_.total_bytes,
                     program_dma_read_slot_.done_bytes + static_cast<uint64_t>(bytes));
+                if (program_dma_read_slot_.inflight_reqs > 0) {
+                    program_dma_read_slot_.inflight_reqs -= 1;
+                }
             }
         }
         if (program_dma_write_slot_.active && program_dma_write_slot_.epoch == epoch) {
@@ -1585,6 +1939,9 @@ void TensorWorkload::onMemComplete_(ReqKind kind, MemTag tag, uint64_t epoch, ui
                 program_dma_write_slot_.done_bytes = std::min<uint64_t>(
                     program_dma_write_slot_.total_bytes,
                     program_dma_write_slot_.done_bytes + static_cast<uint64_t>(bytes));
+                if (program_dma_write_slot_.inflight_reqs > 0) {
+                    program_dma_write_slot_.inflight_reqs -= 1;
+                }
             }
         }
     }
@@ -4254,10 +4611,43 @@ bool TensorWorkload::onClockTickProgramM7_(uint64_t now_cycle) {
 
         auto service_dma_slot = [&](ProgramDmaSlot& slot, MemTag tag) {
             if (!slot.active) return;
+
+            // M29: optional burst/setup model. When enabled, a slot issues at most one burst at a time,
+            // and pays a fixed setup cost before each burst can start issuing bytes.
+            const bool burst_enable = (cfg_.dma_burst_bytes > 0);
+            if (burst_enable) {
+                if (slot.setup_cycles_rem > 0) {
+                    slot.setup_cycles_rem -= 1;
+                    return;
+                }
+                if (slot.burst_bytes_rem == 0 && slot.issued_bytes < slot.total_bytes) {
+                    slot.burst_bytes_rem =
+                        std::min<uint64_t>(cfg_.dma_burst_bytes, slot.total_bytes - slot.issued_bytes);
+                    if (cfg_.dma_setup_cycles > 0) {
+                        slot.setup_cycles_rem = cfg_.dma_setup_cycles;
+                        // Count this cycle as setup.
+                        slot.setup_cycles_rem -= 1;
+                        return;
+                    }
+                }
+            }
+
+            // M29: optional per-cycle issue-lane and per-slot inflight limits.
+            const uint32_t engines_cfg = slot.is_read ? cfg_.dma_read_engines : cfg_.dma_write_engines;
+            const uint32_t engines = (engines_cfg > 0) ? engines_cfg : std::numeric_limits<uint32_t>::max();
+            const uint64_t slot_inflight_cap =
+                (engines_cfg > 0 && cfg_.dma_max_inflight_per_engine > 0)
+                    ? (static_cast<uint64_t>(engines_cfg) * static_cast<uint64_t>(cfg_.dma_max_inflight_per_engine))
+                    : 0ull;
+
             bool slot_issued_this_cycle = false;
-            while (slot.issued_bytes < slot.total_bytes) {
+            uint32_t reqs_issued_this_cycle = 0;
+            while (slot.issued_bytes < slot.total_bytes && reqs_issued_this_cycle < engines) {
                 const uint64_t rem = slot.total_bytes - slot.issued_bytes;
                 uint32_t want = static_cast<uint32_t>(std::min<uint64_t>(cfg_.mem_req_bytes, rem));
+                if (burst_enable && slot.burst_bytes_rem > 0) {
+                    want = static_cast<uint32_t>(std::min<uint64_t>(want, slot.burst_bytes_rem));
+                }
                 if (want == 0) break;
                 if (capped) {
                     if (budget == 0) {
@@ -4275,6 +4665,10 @@ bool TensorWorkload::onClockTickProgramM7_(uint64_t now_cycle) {
                     }
                 }
                 if (inflight_.size() >= max_out) {
+                    mark_outstanding_stall();
+                    break;
+                }
+                if (slot_inflight_cap > 0 && static_cast<uint64_t>(slot.inflight_reqs) >= slot_inflight_cap) {
                     mark_outstanding_stall();
                     break;
                 }
@@ -4330,6 +4724,11 @@ bool TensorWorkload::onClockTickProgramM7_(uint64_t now_cycle) {
                 }
 
                 slot.issued_bytes += static_cast<uint64_t>(issued);
+                slot.inflight_reqs += 1;
+                reqs_issued_this_cycle += 1;
+                if (burst_enable && slot.burst_bytes_rem > 0) {
+                    slot.burst_bytes_rem = (slot.burst_bytes_rem >= issued) ? (slot.burst_bytes_rem - issued) : 0;
+                }
                 consumeHbmChannelBudget_(now_cycle, hbm_ch, issued);
                 did = true;
                 did_mem = true;
@@ -4337,6 +4736,11 @@ bool TensorWorkload::onClockTickProgramM7_(uint64_t now_cycle) {
                 if (capped) {
                     budget = (budget >= issued) ? (budget - issued) : 0;
                     if (budget == 0) break;
+                }
+
+                // M29: one burst at a time; next burst (with setup) begins next cycle.
+                if (burst_enable && slot.burst_bytes_rem == 0 && slot.issued_bytes < slot.total_bytes) {
+                    break;
                 }
             }
 
@@ -4381,16 +4785,149 @@ bool TensorWorkload::onClockTickProgramM7_(uint64_t now_cycle) {
     if (program_mxu_slot_.active) {
         if (collective_blocks_compute) {
             tensor_stall_collective_cycles_total_ += 1;
-        } else if (program_mxu_slot_.rem_cycles > 0) {
-            tensor_program_mxu_busy_cycles_total_ += 1;
-            tensor_compute_cycles_total_ += 1;
-            tensor_compute_math_cycles_total_ += 1;
-            tensor_mac_ops_total_ += effectivePeakMacsPerCycle_();
-            program_mxu_slot_.rem_cycles -= 1;
-            did = true;
-            did_compute = true;
+        } else if (program_mxu_slot_.rem_cycles > 0 ||
+                   program_mxu_slot_.ub_read_a_bytes_rem > 0 ||
+                   program_mxu_slot_.ub_read_b_bytes_rem > 0 ||
+                   program_mxu_slot_.ub_write_bytes_rem > 0) {
+            bool ok = true;
+            bool onchip_port_stall_marked = false;
+            bool onchip_bank_stall_marked = false;
+            auto mark_onchip_port_stall = [&]() {
+                if (!onchip_port_stall_marked) {
+                    tensor_stall_onchip_port_cycles_total_ += 1;
+                    onchip_port_stall_marked = true;
+                }
+            };
+            auto mark_onchip_bank_stall = [&]() {
+                if (!onchip_bank_stall_marked) {
+                    tensor_stall_onchip_bank_conflict_cycles_total_ += 1;
+                    onchip_bank_stall_marked = true;
+                }
+            };
+
+            auto try_acquire_ub_banks2 = [&](uint64_t seed0, uint64_t seed1) -> bool {
+                if (!cfg_.onchip_model_enable) return true;
+                if (!cfg_.onchip_bank_model_enable) return true;
+                const uint32_t bank0 = selectUbBank_(seed0);
+                const uint32_t bank1 = selectUbBank_(seed1);
+                if (bank0 >= onchip_ub_bank_queue_occupancy_.size()) return true;
+                if (bank1 >= onchip_ub_bank_queue_occupancy_.size()) return true;
+                const uint32_t depth = std::max<uint32_t>(cfg_.bank_queue_depth, 1u);
+
+                if (cfg_.ub_bank_conflict_mode == "queue") {
+                    if (bank0 == bank1) {
+                        const uint32_t occ = onchip_ub_bank_queue_occupancy_[bank0];
+                        if (occ + 2u > depth) return false;
+                        onchip_ub_bank_queue_occupancy_[bank0] = occ + 2u;
+                    } else {
+                        const uint32_t occ0 = onchip_ub_bank_queue_occupancy_[bank0];
+                        const uint32_t occ1 = onchip_ub_bank_queue_occupancy_[bank1];
+                        if (occ0 + 1u > depth) return false;
+                        if (occ1 + 1u > depth) return false;
+                        onchip_ub_bank_queue_occupancy_[bank0] = occ0 + 1u;
+                        onchip_ub_bank_queue_occupancy_[bank1] = occ1 + 1u;
+                    }
+                    updateBankQueueOccupancyMax_();
+                    return true;
+                }
+
+                // hard: only 1 access per bank per cycle
+                if (bank0 == bank1) return false;
+                if (onchip_ub_bank_queue_occupancy_[bank0] > 0) return false;
+                if (onchip_ub_bank_queue_occupancy_[bank1] > 0) return false;
+                onchip_ub_bank_queue_occupancy_[bank0] = 1;
+                onchip_ub_bank_queue_occupancy_[bank1] = 1;
+                updateBankQueueOccupancyMax_();
+                return true;
+            };
+
+            auto try_acquire_acc_bank = [&](uint64_t seed) -> bool {
+                if (!cfg_.onchip_model_enable) return true;
+                if (!cfg_.onchip_bank_model_enable) return true;
+                const uint32_t bank = selectAccBank_(seed);
+                if (bank >= onchip_acc_bank_queue_occupancy_.size()) return true;
+                const uint32_t depth = std::max<uint32_t>(cfg_.bank_queue_depth, 1u);
+
+                if (cfg_.acc_bank_conflict_mode == "queue") {
+                    if (onchip_acc_bank_queue_occupancy_[bank] >= depth) return false;
+                    onchip_acc_bank_queue_occupancy_[bank] += 1;
+                    updateBankQueueOccupancyMax_();
+                    return true;
+                }
+
+                // hard: only 1 access per bank per cycle
+                if (onchip_acc_bank_queue_occupancy_[bank] > 0) return false;
+                onchip_acc_bank_queue_occupancy_[bank] = 1;
+                updateBankQueueOccupancyMax_();
+                return true;
+            };
+
+            if (cfg_.onchip_model_enable) {
+                // Conservative per-cycle demand: 2x UB read + 1x ACC write.
+                if (!acquireOnchipReadPorts_(2, 0)) {
+                    mark_onchip_port_stall();
+                    ok = false;
+                } else if (!acquireOnchipWritePorts_(0, 1)) {
+                    mark_onchip_port_stall();
+                    ok = false;
+                }
+
+                if (ok) {
+                    const uint64_t tag_base =
+                        (static_cast<uint64_t>(program_mxu_slot_.buf) << 48) ^
+                        (static_cast<uint64_t>(program_pc_) << 16) ^
+                        (static_cast<uint64_t>(program_iter_done_) << 1) ^
+                        cfg_.seed_base;
+                    if (!try_acquire_ub_banks2(tag_base ^ 0x1001ull, tag_base ^ 0x1002ull)) {
+                        mark_onchip_bank_stall();
+                        ok = false;
+                    } else if (!try_acquire_acc_bank(tag_base ^ 0x2001ull)) {
+                        mark_onchip_bank_stall();
+                        ok = false;
+                    }
+                }
+            }
+
+            if (ok) {
+                const bool have_math = (program_mxu_slot_.rem_cycles > 0);
+                const bool have_io =
+                    (program_mxu_slot_.ub_read_a_bytes_rem > 0) ||
+                    (program_mxu_slot_.ub_read_b_bytes_rem > 0) ||
+                    (program_mxu_slot_.ub_write_bytes_rem > 0);
+
+                tensor_program_mxu_busy_cycles_total_ += 1;
+                tensor_compute_cycles_total_ += 1;
+
+                if (have_math) {
+                    tensor_compute_math_cycles_total_ += 1;
+                    tensor_mac_ops_total_ += effectivePeakMacsPerCycle_();
+                    program_mxu_slot_.rem_cycles -= 1;
+                }
+
+                if (have_io) {
+                    tensor_mxu_io_busy_cycles_total_ += 1;
+                    const uint64_t a_bpc = cfg_.mxu_a_bytes_per_cycle;
+                    const uint64_t b_bpc = cfg_.mxu_b_bytes_per_cycle;
+                    const uint64_t c_bpc = cfg_.mxu_c_bytes_per_cycle;
+                    auto consume = [&](uint64_t& rem, uint64_t bpc) {
+                        if (rem == 0) return;
+                        const uint64_t cut = (bpc > 0) ? std::min<uint64_t>(rem, bpc) : rem;
+                        rem -= cut;
+                    };
+                    consume(program_mxu_slot_.ub_read_a_bytes_rem, a_bpc);
+                    consume(program_mxu_slot_.ub_read_b_bytes_rem, b_bpc);
+                    consume(program_mxu_slot_.ub_write_bytes_rem, c_bpc);
+                }
+
+                did = true;
+                did_compute = true;
+            }
         }
-        if (program_mxu_slot_.active && program_mxu_slot_.rem_cycles == 0) {
+        if (program_mxu_slot_.active &&
+            program_mxu_slot_.rem_cycles == 0 &&
+            program_mxu_slot_.ub_read_a_bytes_rem == 0 &&
+            program_mxu_slot_.ub_read_b_bytes_rem == 0 &&
+            program_mxu_slot_.ub_write_bytes_rem == 0) {
             const uint64_t w = program_mxu_slot_.ub_write_bytes;
             const uint64_t rsv = program_mxu_slot_.ub_write_reserved_bytes;
             const uint32_t buf = program_mxu_slot_.buf;
@@ -4523,6 +5060,25 @@ bool TensorWorkload::onClockTickProgramM7_(uint64_t now_cycle) {
             return &it->second;
         };
 
+        // M28: attribute a subset of program-mode UB stalls into the shared stall counters
+        // so exec_mode=program becomes comparable with exec_mode=tile in summaries.
+        bool wait_read_stall_marked = false;
+        bool onchip_capacity_stall_marked = false;
+        auto mark_wait_read_stall = [&]() {
+            if (!wait_read_stall_marked) {
+                tensor_stall_wait_read_cycles_total_ += 1;
+                wait_read_stall_marked = true;
+            }
+            tensor_program_ub_stall_cycles_total_ += 1;
+        };
+        auto mark_onchip_capacity_stall = [&]() {
+            if (!onchip_capacity_stall_marked) {
+                tensor_stall_onchip_capacity_cycles_total_ += 1;
+                onchip_capacity_stall_marked = true;
+            }
+            tensor_program_ub_stall_cycles_total_ += 1;
+        };
+
         uint32_t issued = 0;
         while (issued < cfg_.program_issue_width && program_pc_ < program_ops_.size()) {
             const ProgramOp& op = program_ops_[program_pc_];
@@ -4551,7 +5107,7 @@ bool TensorWorkload::onClockTickProgramM7_(uint64_t now_cycle) {
                                        }
                                        return saturatingAddU64_(occ, op.bytes) > cfg_.ub_bytes;
                                    })()) {
-                            tensor_program_ub_stall_cycles_total_ += 1;
+                            mark_onchip_capacity_stall();
                             ok = false;
                         } else {
                             program_dma_read_slot_.active = true;
@@ -4595,7 +5151,7 @@ bool TensorWorkload::onClockTickProgramM7_(uint64_t now_cycle) {
                             if (!reg) {
                                 ok = false;
                             } else if (reg->reserved_bytes > 0 || reg->valid_bytes > 0) {
-                                tensor_program_ub_stall_cycles_total_ += 1;
+                                mark_onchip_capacity_stall();
                                 ok = false;
                             } else {
                                 reg->reserved_bytes = saturatingAddU64_(reg->reserved_bytes, op.bytes);
@@ -4628,7 +5184,7 @@ bool TensorWorkload::onClockTickProgramM7_(uint64_t now_cycle) {
                         if (buf >= program_ub_valid_bytes_by_buf_.size()) {
                             ok = false;
                         } else if (program_ub_valid_bytes_by_buf_[buf] < op.bytes) {
-                            tensor_program_ub_stall_cycles_total_ += 1;
+                            mark_wait_read_stall();
                             ok = false;
                         } else {
                             if (op.consume) {
@@ -4666,7 +5222,7 @@ bool TensorWorkload::onClockTickProgramM7_(uint64_t now_cycle) {
                             if (!reg) {
                                 ok = false;
                             } else if (reg->valid_bytes < op.bytes) {
-                                tensor_program_ub_stall_cycles_total_ += 1;
+                                mark_wait_read_stall();
                                 ok = false;
                             } else {
                                 if (op.consume) {
@@ -4702,11 +5258,11 @@ bool TensorWorkload::onClockTickProgramM7_(uint64_t now_cycle) {
                         if (buf >= program_ub_reserved_bytes_by_buf_.size() || buf >= program_ub_valid_bytes_by_buf_.size()) {
                             ok = false;
                         } else if (program_ub_valid_bytes_by_buf_[buf] < op.ub_read_bytes) {
-                            tensor_program_ub_stall_cycles_total_ += 1;
+                            mark_wait_read_stall();
                             ok = false;
                         } else if (cfg_.ub_bytes > 0 &&
                                    saturatingAddU64_(program_ub_total_occupancy_bytes(), op.ub_write_bytes) > cfg_.ub_bytes) {
-                            tensor_program_ub_stall_cycles_total_ += 1;
+                            mark_onchip_capacity_stall();
                             ok = false;
                         } else {
                             if (op.ub_write_bytes > 0) {
@@ -4722,6 +5278,14 @@ bool TensorWorkload::onClockTickProgramM7_(uint64_t now_cycle) {
                             program_mxu_slot_.ub_read_bytes = op.ub_read_bytes;
                             program_mxu_slot_.ub_write_bytes = op.ub_write_bytes;
                             program_mxu_slot_.ub_write_reserved_bytes = op.ub_write_bytes;
+                            {
+                                const uint64_t total_in = op.ub_read_bytes;
+                                const uint64_t a_bytes = total_in / 2;
+                                const uint64_t b_bytes = total_in - a_bytes;
+                                program_mxu_slot_.ub_read_a_bytes_rem = a_bytes;
+                                program_mxu_slot_.ub_read_b_bytes_rem = b_bytes;
+                                program_mxu_slot_.ub_write_bytes_rem = op.ub_write_bytes;
+                            }
                             ok = true;
                         }
                     } else {
@@ -4747,7 +5311,7 @@ bool TensorWorkload::onClockTickProgramM7_(uint64_t now_cycle) {
                                 if (!in) {
                                     ok = false;
                                 } else if (in->valid_bytes < op.ub_read_bytes) {
-                                    tensor_program_ub_stall_cycles_total_ += 1;
+                                    mark_wait_read_stall();
                                     ok = false;
                                 }
                             }
@@ -4756,7 +5320,7 @@ bool TensorWorkload::onClockTickProgramM7_(uint64_t now_cycle) {
                                 if (!out) {
                                     ok = false;
                                 } else if (out->reserved_bytes > 0 || out->valid_bytes > 0) {
-                                    tensor_program_ub_stall_cycles_total_ += 1;
+                                    mark_onchip_capacity_stall();
                                     ok = false;
                                 } else {
                                     out->reserved_bytes = saturatingAddU64_(out->reserved_bytes, op.ub_write_bytes);
@@ -4771,14 +5335,22 @@ bool TensorWorkload::onClockTickProgramM7_(uint64_t now_cycle) {
                                 program_mxu_slot_.buf = buf;
                                 program_mxu_slot_.ub_write_addr_present = op.ub_write_addr_present;
                                 program_mxu_slot_.ub_write_addr = op.ub_write_addr;
-                                program_mxu_slot_.rem_cycles = cycles;
-                                program_mxu_slot_.ub_read_bytes = op.ub_read_bytes;
-                                program_mxu_slot_.ub_write_bytes = op.ub_write_bytes;
-                                program_mxu_slot_.ub_write_reserved_bytes = op.ub_write_bytes;
-                                ok = true;
+                                    program_mxu_slot_.rem_cycles = cycles;
+                                    program_mxu_slot_.ub_read_bytes = op.ub_read_bytes;
+                                    program_mxu_slot_.ub_write_bytes = op.ub_write_bytes;
+                                    program_mxu_slot_.ub_write_reserved_bytes = op.ub_write_bytes;
+                                    {
+                                        const uint64_t total_in = op.ub_read_bytes;
+                                        const uint64_t a_bytes = total_in / 2;
+                                        const uint64_t b_bytes = total_in - a_bytes;
+                                        program_mxu_slot_.ub_read_a_bytes_rem = a_bytes;
+                                        program_mxu_slot_.ub_read_b_bytes_rem = b_bytes;
+                                        program_mxu_slot_.ub_write_bytes_rem = op.ub_write_bytes;
+                                    }
+                                    ok = true;
+                                }
                             }
                         }
-                    }
                 }
             } else if (op.kind == ProgramOpKind::Softmax) {
                 if (program_vec_slot_.active) {
@@ -5003,6 +5575,7 @@ bool TensorWorkload::onClockTickProgram_(uint64_t now_cycle) {
 }
 
 bool TensorWorkload::onClockTick(uint64_t now_cycle) {
+    now_cycle_cached_ = now_cycle;
     total_cycles_++;
     if (!configured_) return false;
 
@@ -5257,10 +5830,37 @@ void TensorWorkload::getStatistics(std::map<std::string, uint64_t>& stats) const
     stats["tensor_mem_writes_issued_total"] = tensor_mem_writes_issued_total_;
     stats["tensor_mem_bytes_read_total"] = tensor_mem_bytes_read_total_;
     stats["tensor_mem_bytes_write_total"] = tensor_mem_bytes_write_total_;
+    stats["tensor_mem_read_latency_cycles_total"] = tensor_mem_read_latency_cycles_total_;
+    stats["tensor_mem_read_latency_cycles_max"] = tensor_mem_read_latency_cycles_max_;
+    stats["tensor_mem_read_latency_samples_total"] = tensor_mem_read_latency_samples_total_;
+    stats["tensor_mem_write_latency_cycles_total"] = tensor_mem_write_latency_cycles_total_;
+    stats["tensor_mem_write_latency_cycles_max"] = tensor_mem_write_latency_cycles_max_;
+    stats["tensor_mem_write_latency_samples_total"] = tensor_mem_write_latency_samples_total_;
+    stats["tensor_mem_row_hit_total"] = tensor_mem_row_hit_total_;
+    stats["tensor_mem_row_miss_total"] = tensor_mem_row_miss_total_;
+    stats["tensor_mem_row_conflict_total"] = tensor_mem_row_conflict_total_;
+    stats["tensor_mem_bank_queue_full_total"] = tensor_mem_bank_queue_full_total_;
+    stats["tensor_mem_bank_queue_wait_cycles_total"] = tensor_mem_bank_queue_wait_cycles_total_;
+    stats["tensor_mem_sched_fifo_pick_total"] = tensor_mem_sched_fifo_pick_total_;
+    stats["tensor_mem_sched_frfcfs_pick_total"] = tensor_mem_sched_frfcfs_pick_total_;
+    stats["tensor_mem_cmd_act_total"] = tensor_mem_cmd_act_total_;
+    stats["tensor_mem_cmd_pre_total"] = tensor_mem_cmd_pre_total_;
+    stats["tensor_mem_cmd_rdwr_total"] = tensor_mem_cmd_rdwr_total_;
+    stats["tensor_mem_row_service_cycles_total"] = tensor_mem_row_service_cycles_total_;
+    stats["tensor_mem_refresh_block_cycles_total"] = tensor_mem_refresh_block_cycles_total_;
+    stats["tensor_mem_proxy_delay_cycles_total"] = tensor_mem_proxy_delay_cycles_total_;
+    stats["tensor_mem_proxy_delay_cycles_max"] = tensor_mem_proxy_delay_cycles_max_;
+    stats["tensor_mem_bank_active_cycles_total"] = tensor_mem_bank_active_cycles_total_;
+    stats["tensor_mem_cmd_queue_slots_total"] = tensor_mem_cmd_queue_slots_total_;
+    stats["tensor_mem_cmd_queue_depth_max"] = tensor_mem_cmd_queue_depth_max_;
+    stats["tensor_mem_cmd_bus_wait_cycles_total"] = tensor_mem_cmd_bus_wait_cycles_total_;
+    stats["tensor_mem_cmd_bus_bg_switch_total"] = tensor_mem_cmd_bus_bg_switch_total_;
+    stats["tensor_mem_cmd_issue_total"] = tensor_mem_cmd_issue_total_;
     stats["tensor_compute_cycles_total"] = tensor_compute_cycles_total_;
     stats["tensor_compute_math_cycles_total"] = tensor_compute_math_cycles_total_;
     stats["tensor_compute_pipeline_cycles_total"] = tensor_compute_pipeline_cycles_total_;
     stats["tensor_mxu_wavefront_cycles_total"] = tensor_mxu_wavefront_cycles_total_;
+    stats["tensor_mxu_io_busy_cycles_total"] = tensor_mxu_io_busy_cycles_total_;
     stats["tensor_compute_precision_profile_id"] = tensor_compute_precision_profile_id_;
     stats["tensor_mac_ops_total"] = tensor_mac_ops_total_;
     stats["tensor_dma_stall_cycles_total"] = tensor_dma_stall_cycles_total_;

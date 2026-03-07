@@ -12,6 +12,14 @@
   - `gas.avg_granule_bytes`（聚合指标，dense microbench 默认应接近 `line_size_bytes`）
 - 若实验需要 row-streaming/DMA 假设，应显式开启并单列结果；默认不允许隐式回退到 row/granule 语义。
 
+## Apply 发射顺序（GatherBufferIF 可选优化）
+
+GAS 的“合并/去重/发射 granule”实现位于 `components/GatherBufferIF`。当需要研究 DRAM 行局部性/BLP 时，可在 GatherBufferIF 开启
+`apply_issue_policy=bank_rr_row_sticky_age|dram_aware_v1|cmd_aware_v1`（默认 `order`），并显式校准 `bank_bits/bank_shift/row_bytes_guess`，避免调度器在“伪 bank/伪 row”
+上做优化导致退化。
+
+详见：`components/gather/README.md`（参数含义、Ramulator2 推荐值与复现脚本）。
+
 ---
 
 ## 目录结构与组件职责

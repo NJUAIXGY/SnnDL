@@ -183,6 +183,7 @@ am_libSnnDL_la_OBJECTS = events/SimpleTestEvent.lo \
 	components/CachelineFragmentMemIF.lo \
 	components/GatherBufferIF.lo \
 	components/gather/GatherBufferIFConfig.lo \
+	components/gather/apply/DramAwareModel.lo \
 	components/GatingPE.lo components/MemKCalBench.lo \
 	components/multicore/MultiCorePEConfig.lo \
 	components/MultiCorePE.lo components/SnnNIC.lo \
@@ -226,6 +227,7 @@ am_libSnnDL_la_OBJECTS = events/SimpleTestEvent.lo \
 	services/workload/stream/StreamWorkload.lo \
 	services/workload/traffic/TrafficWorkload.lo \
 	services/workload/tensor/TensorWorkload.lo \
+	services/memory/sram_sim/model/BankedSramModel.lo \
 	services/memory/StandardMemAccess.lo
 libSnnDL_la_OBJECTS = $(am_libSnnDL_la_OBJECTS)
 AM_V_lt = $(am__v_lt_$(V))
@@ -259,6 +261,7 @@ am__depfiles_remade = components/$(DEPDIR)/CachelineFragmentMemIF.Plo \
 	components/$(DEPDIR)/WeightLoader.Plo \
 	components/gas/$(DEPDIR)/GlobalGasStepController.Plo \
 	components/gather/$(DEPDIR)/GatherBufferIFConfig.Plo \
+	components/gather/apply/$(DEPDIR)/DramAwareModel.Plo \
 	components/multicore/$(DEPDIR)/MultiCorePEConfig.Plo \
 	components/noc/$(DEPDIR)/MulticastNIC.Plo \
 	components/noc/$(DEPDIR)/MulticastRouter.Plo \
@@ -279,6 +282,7 @@ am__depfiles_remade = components/$(DEPDIR)/CachelineFragmentMemIF.Plo \
 	events/$(DEPDIR)/SimpleTestEvent.Plo \
 	events/$(DEPDIR)/SpikeEventWrapper.Plo \
 	services/memory/$(DEPDIR)/StandardMemAccess.Plo \
+	services/memory/sram_sim/model/$(DEPDIR)/BankedSramModel.Plo \
 	services/noc/$(DEPDIR)/NocSubsystem.Plo \
 	services/noc/$(DEPDIR)/OptimizedInternalRing.Plo \
 	services/stimulus/$(DEPDIR)/ExternalSpikeInputSubsystem.Plo \
@@ -530,7 +534,7 @@ PINTOOL3_RUNTIME =
 PINTOOL_CPPFLAGS = 
 PINTOOL_DIR = 
 PINTOOL_LDFLAGS = 
-PINTOOL_PATH = /home/xgy/.codex/tmp/path/codex-arg0UE7kUS:/home/xgy/.nvm/versions/node/v22.20.0/lib/node_modules/@openai/codex/vendor/x86_64-unknown-linux-musl/path:/home/xgy/.local/bin:/usr/lib/jvm/java-17-openjdk-amd64/bin:/home/xgy/remote/sst_install/bin:/home/xgy/remote/sst_install/bin:/home/xgy/.nvm/versions/node/v22.20.0/bin:/home/xgy/.vscode-server/cli/servers/Stable-0f0d87fa9e96c856c5212fc86db137ac0d783365/server/bin/remote-cli:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/home/xgy/.vscode-server/extensions/ms-python.debugpy-2025.18.0-linux-x64/bundled/scripts/noConfigScripts:/home/xgy/.vscode-server/data/User/globalStorage/github.copilot-chat/debugCommand
+PINTOOL_PATH = /home/xgy/.codex/tmp/arg0/codex-arg0sTnLS9:/home/xgy/.nvm/versions/node/v22.20.0/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/path:/home/xgy/.local/bin:/usr/lib/jvm/java-17-openjdk-amd64/bin:/home/xgy/remote/sst_install/bin:/home/xgy/remote/sst_install/bin:/home/xgy/.nvm/versions/node/v22.20.0/bin:/home/xgy/.vscode-server/cli/servers/Stable-0f0d87fa9e96c856c5212fc86db137ac0d783365/server/bin/remote-cli:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/home/xgy/.vscode-server/data/User/globalStorage/github.copilot-chat/debugCommand
 PINTOOL_RUNTIME = 
 PIN_CPPFLAGS = -g   -Wall   -Werror   -Wno-unknown-pragmas   -D__PIN__=1 -DPIN_CRT=1   -fno-stack-protector   -fno-exceptions   -funwind-tables   -fasynchronous-unwind-tables   -fomit-frame-pointer   -fno-strict-aliasing   -fno-rtti   -faligned-new   -fpic   -DTARGET_IA32E   -DHOST_IA32E   -DTARGET_LINUX   -DPIN_VERSION_MINOR=
 PIN_CPPFLAGS_COMPILER = -fno-exceptions          -fabi-version=2
@@ -548,8 +552,8 @@ SET_MAKE =
 SHELL = /bin/bash
 SHM_LIB =  
 SSTELEMENTS_GIT_BRANCH = snndl_re
-SSTELEMENTS_GIT_COMMITCOUNT = 15403
-SSTELEMENTS_GIT_HEADSHA = 43e4d871d1c57255085150393da94d925ba7ee1d
+SSTELEMENTS_GIT_COMMITCOUNT = 15405
+SSTELEMENTS_GIT_HEADSHA = f30efc3539d21fb2076b762e6524113bf9d3a159
 SST_ACTIVE_ELEMENT_LIBRARIES =  ariel cacheTracer cassini cramSim ember firefly gensa golem hermes iris kingsley mask-mpi memHierarchy mercury merlin messier miranda mmu osseous prospero rdmaNic samba shogun simpleElementExample simpleSimulation SnnDL thornhill vanadis vaultsim zodiac
 SST_CONFIG_TOOL = /home/xgy/remote/sst_install_mpi/bin/sst-config
 SST_DIST_ELEMENT_LIBRARIES =  ariel balar cacheTracer cassini cramSim ember firefly gensa golem hermes iris kingsley mask-mpi memHierarchy mercury merlin messier miranda mmu osseous prospero rdmaNic samba shogun simpleElementExample simpleSimulation SnnDL thornhill vanadis vaultsim zodiac
@@ -641,6 +645,7 @@ libSnnDL_la_SOURCES = \
 	api/IGasStageSink.h \
 	api/IGasStepGate.h \
 	api/IGlobalStepHooks.h \
+	api/ITassLfP0Hooks.h \
 	api/ICoreMemoryLink.h \
 	api/IMemoryAccess.h \
 	api/ICoreWorkload.h \
@@ -670,8 +675,6 @@ libSnnDL_la_SOURCES = \
 	components/gather/GatherBufferIFConfig.h \
 	components/gather/apply/DramAwareModel.cc \
 	components/gather/apply/DramAwareModel.h \
-	components/gather/apply/DramAwareTuner.cc \
-	components/gather/apply/DramAwareTuner.h \
 	components/GatingPE.cc \
 	components/GatingPE.h \
 	components/MemKCalBench.cc \
@@ -773,6 +776,9 @@ libSnnDL_la_SOURCES = \
 	services/workload/traffic/TrafficWorkload.h \
 	services/workload/tensor/TensorWorkload.cc \
 	services/workload/tensor/TensorWorkload.h \
+	services/memory/sram_sim/layout/VirtualSramLayout.h \
+	services/memory/sram_sim/model/BankedSramModel.cc \
+	services/memory/sram_sim/model/BankedSramModel.h \
 	services/memory/StandardMemAccess.cc \
 	services/memory/StandardMemAccess.h
 
@@ -887,6 +893,15 @@ components/gather/$(DEPDIR)/$(am__dirstamp):
 components/gather/GatherBufferIFConfig.lo:  \
 	components/gather/$(am__dirstamp) \
 	components/gather/$(DEPDIR)/$(am__dirstamp)
+components/gather/apply/$(am__dirstamp):
+	@$(MKDIR_P) components/gather/apply
+	@: > components/gather/apply/$(am__dirstamp)
+components/gather/apply/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) components/gather/apply/$(DEPDIR)
+	@: > components/gather/apply/$(DEPDIR)/$(am__dirstamp)
+components/gather/apply/DramAwareModel.lo:  \
+	components/gather/apply/$(am__dirstamp) \
+	components/gather/apply/$(DEPDIR)/$(am__dirstamp)
 components/GatingPE.lo: components/$(am__dirstamp) \
 	components/$(DEPDIR)/$(am__dirstamp)
 components/MemKCalBench.lo: components/$(am__dirstamp) \
@@ -1121,6 +1136,15 @@ services/workload/tensor/$(DEPDIR)/$(am__dirstamp):
 services/workload/tensor/TensorWorkload.lo:  \
 	services/workload/tensor/$(am__dirstamp) \
 	services/workload/tensor/$(DEPDIR)/$(am__dirstamp)
+services/memory/sram_sim/model/$(am__dirstamp):
+	@$(MKDIR_P) services/memory/sram_sim/model
+	@: > services/memory/sram_sim/model/$(am__dirstamp)
+services/memory/sram_sim/model/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) services/memory/sram_sim/model/$(DEPDIR)
+	@: > services/memory/sram_sim/model/$(DEPDIR)/$(am__dirstamp)
+services/memory/sram_sim/model/BankedSramModel.lo:  \
+	services/memory/sram_sim/model/$(am__dirstamp) \
+	services/memory/sram_sim/model/$(DEPDIR)/$(am__dirstamp)
 services/memory/$(am__dirstamp):
 	@$(MKDIR_P) services/memory
 	@: > services/memory/$(am__dirstamp)
@@ -1141,6 +1165,8 @@ mostlyclean-compile:
 	-rm -f components/gas/*.lo
 	-rm -f components/gather/*.$(OBJEXT)
 	-rm -f components/gather/*.lo
+	-rm -f components/gather/apply/*.$(OBJEXT)
+	-rm -f components/gather/apply/*.lo
 	-rm -f components/multicore/*.$(OBJEXT)
 	-rm -f components/multicore/*.lo
 	-rm -f components/noc/*.$(OBJEXT)
@@ -1157,6 +1183,8 @@ mostlyclean-compile:
 	-rm -f events/*.lo
 	-rm -f services/memory/*.$(OBJEXT)
 	-rm -f services/memory/*.lo
+	-rm -f services/memory/sram_sim/model/*.$(OBJEXT)
+	-rm -f services/memory/sram_sim/model/*.lo
 	-rm -f services/noc/*.$(OBJEXT)
 	-rm -f services/noc/*.lo
 	-rm -f services/stimulus/*.$(OBJEXT)
@@ -1195,6 +1223,7 @@ include components/$(DEPDIR)/SnnPE.Plo # am--include-marker
 include components/$(DEPDIR)/WeightLoader.Plo # am--include-marker
 include components/gas/$(DEPDIR)/GlobalGasStepController.Plo # am--include-marker
 include components/gather/$(DEPDIR)/GatherBufferIFConfig.Plo # am--include-marker
+include components/gather/apply/$(DEPDIR)/DramAwareModel.Plo # am--include-marker
 include components/multicore/$(DEPDIR)/MultiCorePEConfig.Plo # am--include-marker
 include components/noc/$(DEPDIR)/MulticastNIC.Plo # am--include-marker
 include components/noc/$(DEPDIR)/MulticastRouter.Plo # am--include-marker
@@ -1215,6 +1244,7 @@ include control/$(DEPDIR)/SnnPESubComponent_spike.Plo # am--include-marker
 include events/$(DEPDIR)/SimpleTestEvent.Plo # am--include-marker
 include events/$(DEPDIR)/SpikeEventWrapper.Plo # am--include-marker
 include services/memory/$(DEPDIR)/StandardMemAccess.Plo # am--include-marker
+include services/memory/sram_sim/model/$(DEPDIR)/BankedSramModel.Plo # am--include-marker
 include services/noc/$(DEPDIR)/NocSubsystem.Plo # am--include-marker
 include services/noc/$(DEPDIR)/OptimizedInternalRing.Plo # am--include-marker
 include services/stimulus/$(DEPDIR)/ExternalSpikeInputSubsystem.Plo # am--include-marker
@@ -1280,6 +1310,7 @@ clean-libtool:
 	-rm -rf components/.libs components/_libs
 	-rm -rf components/gas/.libs components/gas/_libs
 	-rm -rf components/gather/.libs components/gather/_libs
+	-rm -rf components/gather/apply/.libs components/gather/apply/_libs
 	-rm -rf components/multicore/.libs components/multicore/_libs
 	-rm -rf components/noc/.libs components/noc/_libs
 	-rm -rf components/stimulus/.libs components/stimulus/_libs
@@ -1288,6 +1319,7 @@ clean-libtool:
 	-rm -rf control/.libs control/_libs
 	-rm -rf events/.libs events/_libs
 	-rm -rf services/memory/.libs services/memory/_libs
+	-rm -rf services/memory/sram_sim/model/.libs services/memory/sram_sim/model/_libs
 	-rm -rf services/noc/.libs services/noc/_libs
 	-rm -rf services/stimulus/.libs services/stimulus/_libs
 	-rm -rf services/synapse/gas/.libs services/synapse/gas/_libs
@@ -1425,6 +1457,8 @@ distclean-generic:
 	-rm -f components/gas/$(am__dirstamp)
 	-rm -f components/gather/$(DEPDIR)/$(am__dirstamp)
 	-rm -f components/gather/$(am__dirstamp)
+	-rm -f components/gather/apply/$(DEPDIR)/$(am__dirstamp)
+	-rm -f components/gather/apply/$(am__dirstamp)
 	-rm -f components/multicore/$(DEPDIR)/$(am__dirstamp)
 	-rm -f components/multicore/$(am__dirstamp)
 	-rm -f components/noc/$(DEPDIR)/$(am__dirstamp)
@@ -1441,6 +1475,8 @@ distclean-generic:
 	-rm -f events/$(am__dirstamp)
 	-rm -f services/memory/$(DEPDIR)/$(am__dirstamp)
 	-rm -f services/memory/$(am__dirstamp)
+	-rm -f services/memory/sram_sim/model/$(DEPDIR)/$(am__dirstamp)
+	-rm -f services/memory/sram_sim/model/$(am__dirstamp)
 	-rm -f services/noc/$(DEPDIR)/$(am__dirstamp)
 	-rm -f services/noc/$(am__dirstamp)
 	-rm -f services/stimulus/$(DEPDIR)/$(am__dirstamp)
@@ -1485,6 +1521,7 @@ distclean: distclean-am
 	-rm -f components/$(DEPDIR)/WeightLoader.Plo
 	-rm -f components/gas/$(DEPDIR)/GlobalGasStepController.Plo
 	-rm -f components/gather/$(DEPDIR)/GatherBufferIFConfig.Plo
+	-rm -f components/gather/apply/$(DEPDIR)/DramAwareModel.Plo
 	-rm -f components/multicore/$(DEPDIR)/MultiCorePEConfig.Plo
 	-rm -f components/noc/$(DEPDIR)/MulticastNIC.Plo
 	-rm -f components/noc/$(DEPDIR)/MulticastRouter.Plo
@@ -1505,6 +1542,7 @@ distclean: distclean-am
 	-rm -f events/$(DEPDIR)/SimpleTestEvent.Plo
 	-rm -f events/$(DEPDIR)/SpikeEventWrapper.Plo
 	-rm -f services/memory/$(DEPDIR)/StandardMemAccess.Plo
+	-rm -f services/memory/sram_sim/model/$(DEPDIR)/BankedSramModel.Plo
 	-rm -f services/noc/$(DEPDIR)/NocSubsystem.Plo
 	-rm -f services/noc/$(DEPDIR)/OptimizedInternalRing.Plo
 	-rm -f services/stimulus/$(DEPDIR)/ExternalSpikeInputSubsystem.Plo
@@ -1586,6 +1624,7 @@ maintainer-clean: maintainer-clean-am
 	-rm -f components/$(DEPDIR)/WeightLoader.Plo
 	-rm -f components/gas/$(DEPDIR)/GlobalGasStepController.Plo
 	-rm -f components/gather/$(DEPDIR)/GatherBufferIFConfig.Plo
+	-rm -f components/gather/apply/$(DEPDIR)/DramAwareModel.Plo
 	-rm -f components/multicore/$(DEPDIR)/MultiCorePEConfig.Plo
 	-rm -f components/noc/$(DEPDIR)/MulticastNIC.Plo
 	-rm -f components/noc/$(DEPDIR)/MulticastRouter.Plo
@@ -1606,6 +1645,7 @@ maintainer-clean: maintainer-clean-am
 	-rm -f events/$(DEPDIR)/SimpleTestEvent.Plo
 	-rm -f events/$(DEPDIR)/SpikeEventWrapper.Plo
 	-rm -f services/memory/$(DEPDIR)/StandardMemAccess.Plo
+	-rm -f services/memory/sram_sim/model/$(DEPDIR)/BankedSramModel.Plo
 	-rm -f services/noc/$(DEPDIR)/NocSubsystem.Plo
 	-rm -f services/noc/$(DEPDIR)/OptimizedInternalRing.Plo
 	-rm -f services/stimulus/$(DEPDIR)/ExternalSpikeInputSubsystem.Plo

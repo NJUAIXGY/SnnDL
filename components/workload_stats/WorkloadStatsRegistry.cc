@@ -7,6 +7,7 @@
 
 #include <cctype>
 
+#include "components/workload_stats/SnnWorkloadStatsModule.h"
 #include "api/SnnDLStringUtil.h"
 #include "components/workload_stats/StreamWorkloadStatsModule.h"
 #include "components/workload_stats/TensorWorkloadStatsModule.h"
@@ -56,11 +57,16 @@ std::vector<WorkloadStatsRegistry::ModulePtr> WorkloadStatsRegistry::buildModule
             names.emplace_back("stream");
         } else if (wl == "tensor") {
             names.emplace_back("tensor");
+        } else if (wl == "snn") {
+            names.emplace_back("snn");
         }
     }
 
     for (const auto& name : names) {
-        if (name == "stream") {
+        if (name == "snn") {
+            const bool active = (wl == "snn");
+            modules.emplace_back(std::make_unique<SnnWorkloadStatsModule>(active));
+        } else if (name == "stream") {
             const bool active = (wl == "stream" || wl == "traffic");
             modules.emplace_back(std::make_unique<StreamWorkloadStatsModule>(active));
         } else if (name == "tensor") {
@@ -75,4 +81,3 @@ std::vector<WorkloadStatsRegistry::ModulePtr> WorkloadStatsRegistry::buildModule
 }
 
 }} // namespace SST::SnnDL
-

@@ -15,6 +15,7 @@
 #include "synapse/route/SynapseRouteSubsystem.h"
 #include "synapse/route/SpikeCommSubsystem.h"
 #include "synapse/route/SpikeNocCodec.h"
+#include "synapse/route/SpikeTileNocCodec.h"
 #include "SynapseRouteBuildConfig.h"
 #include "ISpikeTransport.h"
 #include "NocSpikeTransport.h"
@@ -29,6 +30,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <inttypes.h>
+#include <iterator>
+#include <limits>
 #include <utility>
 
 namespace SST { namespace SnnDL {
@@ -86,6 +89,43 @@ void SnnWorkload::configureFromParams(const SST::Params& params) {
         (index_mode_str == "bcsr_post_row") ||
         (index_mode_str == "csr_post_row");
     use_bcsr_ = (index_mode_str == "bcsr_post_row");
+    {
+        std::string mode = params.find<std::string>("synapse_weight_mode", "bcsr_gas");
+        for (char& ch : mode) {
+            if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+        }
+        if (mode == "gscc_valueonly_dstcore") mode = "gcss_valueonly_dstcore";
+        if (mode == "gscc_valueonly_dstcore_vlf_premphf") mode = "gcss_valueonly_dstcore_vlf_premphf";
+        if (mode == "gscc_valueonly_dstcore_vlf_premphf_plp") mode = "gcss_valueonly_dstcore_vlf_premphf_plp";
+        if (mode != "bcsr_gas" &&
+            mode != "gcss_valueonly_dstcore" &&
+            mode != "gcss_valueonly_dstcore_idx2" &&
+            mode != "gcss_idx2_rowmphf" &&
+            mode != "gcss_valueonly_dstcore_vlf_premphf" &&
+            mode != "gcss_valueonly_dstcore_vlf_premphf_plp" &&
+            mode != "gcss_valueonly_dstblock_naive_tass") {
+            mode = "bcsr_gas";
+        }
+        synapse_weight_mode_ = mode;
+    }
+    const bool gcss_valueonly_mode =
+        (synapse_weight_mode_ == "gcss_valueonly_dstcore") ||
+        (synapse_weight_mode_ == "gcss_valueonly_dstcore_idx2") ||
+        (synapse_weight_mode_ == "gcss_idx2_rowmphf") ||
+        (synapse_weight_mode_ == "gcss_valueonly_dstcore_vlf_premphf") ||
+        (synapse_weight_mode_ == "gcss_valueonly_dstcore_vlf_premphf_plp");
+    if (gcss_valueonly_mode) {
+        use_bcsr_ = false;
+    }
+    snn_edge_record_attempt_total_ = 0;
+    snn_edge_record_commit_total_ = 0;
+    snn_edge_record_skip_gate_total_ = 0;
+    snn_edge_record_skip_stage_total_ = 0;
+    snn_edge_record_skip_capacity_total_ = 0;
+    snn_edge_record_skip_reject_total_ = 0;
+    snn_begin_apply_prev_edges_total_ = 0;
+    snn_begin_apply_prev_empty_total_ = 0;
+    snn_issue_from_edges_calls_total_ = 0;
 
     // Phase10: GAS/window 模式下默认启用 strict window-read spike input（由 workload 直接记录 edge/touch）。
     // 兼容性：某些环境可能会把未显式设置的参数默认注入为 0，此时不应“误关掉”窗口路径，因此将 0 视为 auto。
@@ -99,6 +139,22 @@ void SnnWorkload::configureFromParams(const SST::Params& params) {
     } else {
         workload_spike_input_enable_ = auto_enable;
     }
+
+    experimental_spiketile_enable_ = params.find<int>("experimental_spiketile_enable", 0) != 0;
+    experimental_spikekey_fastpath_enable_ = params.find<int>("experimental_spikekey_fastpath_enable", 0) != 0;
+    experimental_spiketile_max_pre_bits_ = params.find<uint32_t>("experimental_spiketile_max_pre_bits", 64);
+    if (experimental_spiketile_max_pre_bits_ == 0 || experimental_spiketile_max_pre_bits_ > 64) {
+        experimental_spiketile_max_pre_bits_ = 64;
+    }
+    const uint32_t default_block_cols = params.find<uint32_t>("bcsr_block_cols", 0);
+    experimental_spiketile_block_cols_ = params.find<uint32_t>("experimental_spiketile_block_cols", default_block_cols);
+    experimental_compact_mask_enable_ = params.find<int>("experimental_compact_mask_enable", 0) != 0;
+    experimental_inter_bundle_enable_ = params.find<int>("experimental_inter_bundle_enable", 0) != 0;
+    experimental_inter_bundle_max_entries_ = params.find<uint32_t>("experimental_inter_bundle_max_entries", 64);
+    if (experimental_inter_bundle_max_entries_ == 0) {
+        experimental_inter_bundle_max_entries_ = 64;
+    }
+    experimental_inter_bundle_v2_enable_ = params.find<int>("experimental_inter_bundle_v2_enable", 0) != 0;
 
     enable_weight_fetch_ = params.find<int>("enable_weight_fetch", 0) != 0;
     edge_collector_max_capacity_ = static_cast<size_t>(params.find<uint64_t>("edge_collector_max_capacity", 1'000'000));
@@ -191,6 +247,13 @@ void SnnWorkload::bindRuntime(const Runtime& rt) {
         crt.node_id = static_cast<uint32_t>(rt_.node_id);
         crt.synapse_route = synapse_route_.get();
         crt.global_neuron_base = global_neuron_base_;
+        crt.experimental_spiketile_enable = experimental_spiketile_enable_;
+        crt.experimental_spiketile_max_pre_bits = experimental_spiketile_max_pre_bits_;
+        crt.experimental_spiketile_block_cols = experimental_spiketile_block_cols_;
+        crt.experimental_compact_mask_enable = experimental_compact_mask_enable_;
+        crt.experimental_inter_bundle_enable = experimental_inter_bundle_enable_;
+        crt.experimental_inter_bundle_max_entries = experimental_inter_bundle_max_entries_;
+        crt.experimental_inter_bundle_v2_enable = experimental_inter_bundle_v2_enable_;
         spike_comm_->bindRuntime(crt);
     }
 }
@@ -324,11 +387,20 @@ void SnnWorkload::ensureWeightReaderOwned_() {
             const uint32_t bc = params_->find<uint32_t>("bcsr_block_cols", 16);
             const uint32_t idxb = params_->find<uint32_t>("bcsr_idx_bytes", 2);
             const uint32_t valb = params_->find<uint32_t>("bcsr_val_bytes", 4);
+            const std::string layout_mode = params_->find<std::string>("bcsr_layout_mode", "flat");
+            const uint32_t colidx_row_stride_bytes = params_->find<uint32_t>("bcsr_colidx_row_stride_bytes", 0);
+            const uint32_t blockdata_row_stride_bytes = params_->find<uint32_t>("bcsr_blockdata_row_stride_bytes", 0);
+            const uint32_t blockids_row_stride_bytes = params_->find<uint32_t>("bcsr_blockids_row_stride_bytes", 0);
             const uint64_t rowptr_addr = base_addr + rp_off;
             const uint64_t colidx_addr = base_addr + ci_off;
             const uint64_t blockdata_addr = base_addr + bd_off;
             const uint64_t blockids_addr = id_off ? (base_addr + id_off) : 0;
-            bcsr_mgr_->configure(rowptr_addr, colidx_addr, blockdata_addr, blockids_addr, br, bc, idxb, valb);
+            bcsr_mgr_->configure(rowptr_addr, colidx_addr, blockdata_addr, blockids_addr,
+                                 br, bc, idxb, valb,
+                                 layout_mode,
+                                 colidx_row_stride_bytes,
+                                 blockdata_row_stride_bytes,
+                                 blockids_row_stride_bytes);
             // Row-index cache (colidx) 是 Apply 的关键路径：cap 太小会导致每窗重复 colidx burst → bursts 不降 → apply_ns 不降。
             // 默认不强制覆盖用户配置；仅当显式启用 auto_fit 时，自动扩到覆盖本 core 的全部 block rows（语义不变，仅减少重复读）。
             uint32_t row_cap = params_->find<uint32_t>("bcsr_row_index_cache_cap", 64);
@@ -508,6 +580,14 @@ void SnnWorkload::ensureWeightReaderOwned_() {
         ocfg.core_id = rt_.core_id;
         ocfg.weights_template = params_->find<std::string>("weights_template", "");
         ocfg.bcsr_mgr = bcsr_mgr_.get();
+        ocfg.synapse_weight_mode = synapse_weight_mode_;
+        ocfg.gcss_index_template = params_->find<std::string>("gcss_index_template", "");
+        ocfg.experimental_retire_policy =
+            params_->find<std::string>("experimental_retire_policy", "global_inorder");
+        ocfg.experimental_pre_window_profile_export_enable =
+            params_->find<int>("experimental_pre_window_profile_export_enable", 0) != 0;
+        ocfg.experimental_pre_window_profile_export_dir =
+            params_->find<std::string>("experimental_pre_window_profile_export_dir", "");
         wms->configureOrchestrator(std::move(ocfg));
 
         const uint32_t window_read_budget = params_->find<uint32_t>("window_read_budget", 1024);
@@ -601,6 +681,82 @@ bool SnnWorkload::windowScatterModeActive_() const {
     // - scheme1（slice/superstep 驱动的 Scatter 阶段）
     const bool scheme1_enable = params_ ? (params_->find<int>("scheme1_enable", 0) != 0) : false;
     return (apply_acc_enable_ && gas_window_mode_) || scheme1_enable;
+}
+
+bool SnnWorkload::shouldDeferScatterCommit_() const {
+    if (!weight_mem_subsystem_) return false;
+    if (weight_mem_subsystem_->pendingSize() > 0) return true;
+    return weight_mem_subsystem_->hasDeferredWork();
+}
+
+void SnnWorkload::finalizeScatterCommit_(uint32_t superstep) {
+    last_scatter_spikes_emitted_ = 0;
+
+    // Apply accumulated deltas deterministically (sorted by post id).
+    std::vector<std::pair<uint32_t, float>> pairs;
+    if (acc_ops_) acc_ops_->collectSortedPairs(pairs);
+    for (const auto& pr : pairs) {
+        const uint32_t post = pr.first;
+        const float dv = pr.second;
+        if (dv == 0.0f) continue;
+        if (compute_core_) compute_core_->applySynapticDelta(post, dv);
+    }
+
+    // End cycle + drain fired neurons, then delegate route/comm.
+    if (compute_core_) {
+        compute_core_->endCycle(now_cycle_cached_);
+        std::vector<FireEvent> fired;
+        compute_core_->drainOutputs(fired, /*clear=*/true);
+        if (!fired.empty()) {
+            std::vector<uint32_t> neuron_indices;
+            neuron_indices.reserve(fired.size());
+            for (const auto& fe : fired) neuron_indices.push_back(fe.neuron_idx);
+
+            const uint64_t emitted = emitNeuronFireBatch(neuron_indices, now_cycle_cached_);
+            last_scatter_spikes_emitted_ = emitted ? emitted : neuron_indices.size();
+
+            const uint64_t fired_cnt = static_cast<uint64_t>(neuron_indices.size());
+            if (rt_.sinks.neurons_fired) (*rt_.sinks.neurons_fired) += fired_cnt;
+            if (rt_.sinks.spikes_generated) (*rt_.sinks.spikes_generated) += fired_cnt;
+            addCountStat_(rt_.sinks.stat_neurons_fired_total, fired_cnt);
+            addCountStat_(rt_.sinks.stat_spikes_generated_total, fired_cnt);
+        }
+    }
+    if (acc_ops_) acc_ops_->reset();
+
+    // Report scatter spikes for per-window aggregation/stats.
+    if (rt_.sinks.spikes_emitted_window) (*rt_.sinks.spikes_emitted_window) = last_scatter_spikes_emitted_;
+    if (rt_.sinks.window_spikes_all) (*rt_.sinks.window_spikes_all) += last_scatter_spikes_emitted_;
+    total_scatter_spikes_emitted_ += last_scatter_spikes_emitted_;
+    if (rt_.sinks.stat_gas_scatter_spikes_emitted_total && last_scatter_spikes_emitted_ > 0) {
+        rt_.sinks.stat_gas_scatter_spikes_emitted_total->addData(last_scatter_spikes_emitted_);
+    }
+    if (rt_.reporting.report_apply_scatter) {
+        rt_.reporting.report_apply_scatter(rt_.reporting.ctx,
+                                           /*acc_updates=*/0,
+                                           /*posts_touched=*/0,
+                                           /*spikes_emitted=*/last_scatter_spikes_emitted_,
+                                           /*hwm_bytes=*/0,
+                                           /*spill_records=*/0,
+                                           /*spilled_bytes=*/0);
+    }
+
+    // Step-gate explicit end handshake: request EndScatter after finishing Scatter work.
+    if (!scatter_end_requested_ && rt_.reporting.request_gas_end_scatter) {
+        rt_.reporting.request_gas_end_scatter(rt_.reporting.ctx, superstep);
+        scatter_end_requested_ = true;
+    }
+}
+
+bool SnnWorkload::tryFinalizeDeferredScatter_() {
+    if (!scatter_commit_pending_) return false;
+    if (gas_stage_ != GasStage::Scatter) return false;
+    if (shouldDeferScatterCommit_()) return false;
+    const uint32_t seq = scatter_commit_seq_;
+    scatter_commit_pending_ = false;
+    scatter_commit_seq_ = 0;
+    finalizeScatterCommit_(seq);
+    return true;
 }
 
 void SnnWorkload::ensureSpikeCommConfigured_() {
@@ -705,8 +861,18 @@ void SnnWorkload::ensureSpikeCommConfigured_() {
     SpikeCommRuntimeConfig crt{};
     crt.log = rt_.log;
     crt.transport = transport;
+    crt.noc = rt_.noc;
+    crt.src_core = static_cast<int>(rt_.core_id);
+    crt.node_id = static_cast<uint32_t>(rt_.node_id);
     crt.synapse_route = synapse_route_.get();
     crt.global_neuron_base = global_neuron_base_;
+    crt.experimental_spiketile_enable = experimental_spiketile_enable_;
+    crt.experimental_spiketile_max_pre_bits = experimental_spiketile_max_pre_bits_;
+    crt.experimental_spiketile_block_cols = experimental_spiketile_block_cols_;
+    crt.experimental_compact_mask_enable = experimental_compact_mask_enable_;
+    crt.experimental_inter_bundle_enable = experimental_inter_bundle_enable_;
+    crt.experimental_inter_bundle_max_entries = experimental_inter_bundle_max_entries_;
+    crt.experimental_inter_bundle_v2_enable = experimental_inter_bundle_v2_enable_;
     spike_comm_->bindRuntime(crt);
     spike_comm_->initRouting();
 
@@ -753,6 +919,10 @@ bool SnnWorkload::onClockTick(uint64_t now_cycle) {
         }
     }
 
+    if (tryFinalizeDeferredScatter_()) {
+        did = true;
+    }
+
     // Step-gate explicit end handshake: end Gather when input has been quiescent for N cycles.
     // This is only acted on when the host provides callbacks (otherwise GatherBufferIF's legacy
     // cycle-driven windowing remains in effect).
@@ -790,6 +960,7 @@ bool SnnWorkload::deliverPacket(NocPacketEvent* packet) {
 
     const auto kind = packet->packetKind();
     if (kind == NocPacketKind::Spike) {
+        ++snn_rx_spike_packets_total_;
         SpikeEvent* spike = SpikeNocCodec::decode(*packet);
         delete packet;
         if (!spike) return true;
@@ -799,70 +970,243 @@ bool SnnWorkload::deliverPacket(NocPacketEvent* packet) {
         return true;
     }
 
-    if (kind == NocPacketKind::SpikeKey) {
-        SpikeNocCodec::WireSpikeKeyV2 ws{};
-        const uint64_t ts = packet->timestamp;
-        const bool ok = SpikeNocCodec::decodeSpikeKeyAny(packet->payload, ws);
-        delete packet;
-        if (!ok || (ws.version != 1 && ws.version != 2)) return true;
-
-        ensureSpikeCommConfigured_();
-        if (!synapse_route_) return true;
-        auto routes = synapse_route_->routesShared();
-        if (!routes) return true;
-
-        if (routes.get() != routes_shared_for_posts_cache_.get()) {
-            routes_shared_for_posts_cache_ = routes;
-            pre_to_posts_local_.clear();
+    if (kind == NocPacketKind::SpikeKey || kind == NocPacketKind::SpikeTileKey) {
+        if (kind == NocPacketKind::SpikeKey) {
+            ++snn_rx_spikekey_total_;
+        } else {
+            ++snn_rx_spiketilekey_total_;
         }
+        const uint64_t ts = packet->timestamp;
+        const bool use_fastpath =
+            experimental_spikekey_fastpath_enable_ &&
+            workload_spike_input_enable_ &&
+            isWindowWorkload_() &&
+            window_read_enable_ &&
+            !scheme1_enable_;
 
-        const uint32_t pre_global = ws.pre_global;
-        auto itc = pre_to_posts_local_.find(pre_global);
-        if (itc == pre_to_posts_local_.end()) {
-            std::vector<uint32_t> posts_local;
-            auto itr = routes->find(pre_global);
-            if (itr != routes->end()) {
-                const uint32_t denom = (neurons_per_pe_cfg_ > 0) ? neurons_per_pe_cfg_ : num_neurons_;
-                if (denom > 0) {
-                    for (uint32_t dest_global : itr->second) {
-                        const uint32_t dest_node = dest_global / denom;
-                        if (dest_node != static_cast<uint32_t>(rt_.node_id)) continue;
-
-                        const uint32_t local_in_pe = dest_global % denom;
-                        const uint32_t dest_core = (num_neurons_ ? (local_in_pe / num_neurons_) : 0);
-                        if (dest_core != static_cast<uint32_t>(rt_.core_id)) continue;
-
-                        const uint32_t post_local = (num_neurons_ ? (local_in_pe % num_neurons_) : 0);
-                        if (post_local < num_neurons_) posts_local.push_back(post_local);
+        if (kind == NocPacketKind::SpikeTileKey && experimental_spiketile_enable_) {
+            SpikeTileNocCodec::WireSpikeTileKeyV1 tile_ws{};
+            const bool tile_ok = SpikeTileNocCodec::decode(packet->payload, tile_ws);
+            SpikeNocCodec::WireSpikeKeyV2 fallback_ws{};
+            const bool fallback_ok = SpikeNocCodec::decodeSpikeKeyAny(packet->payload, fallback_ws);
+            delete packet;
+            if (tile_ok &&
+                experimental_spiketile_block_cols_ > 0 &&
+                experimental_spiketile_block_cols_ <= 64 &&
+                experimental_spiketile_block_cols_ <= experimental_spiketile_max_pre_bits_) {
+                if (use_fastpath) {
+                    ++snn_rx_fastpath_packets_total_;
+                } else {
+                    ++snn_rx_fallback_packets_total_;
+                }
+                std::vector<uint32_t> pre_globals;
+                SpikeTileNocCodec::collectPreGlobals(tile_ws, experimental_spiketile_block_cols_, pre_globals);
+                for (uint32_t pre_global : pre_globals) {
+                    if (use_fastpath) {
+                        (void)expandPreGlobalToWindowEdgesFast_(pre_global);
+                    } else {
+                        (void)expandPreGlobalToLocalSpikes_(pre_global, ts);
                     }
                 }
+                return true;
             }
-
-            if (!posts_local.empty()) {
-                std::sort(posts_local.begin(), posts_local.end());
-                posts_local.erase(std::unique(posts_local.begin(), posts_local.end()), posts_local.end());
+            // Decode fallback: treat as classic SpikeKey-like single pre_global anchor.
+            if (fallback_ok && (fallback_ws.version == 1 || fallback_ws.version == 2 || fallback_ws.version == 3)) {
+                if (use_fastpath) {
+                    ++snn_rx_fastpath_packets_total_;
+                    (void)expandPreGlobalToWindowEdgesFast_(fallback_ws.pre_global);
+                } else {
+                    ++snn_rx_fallback_packets_total_;
+                    (void)expandPreGlobalToLocalSpikes_(fallback_ws.pre_global, ts);
+                }
+            } else {
+                ++snn_rx_decode_fail_total_;
             }
-
-            itc = pre_to_posts_local_.emplace(pre_global, std::move(posts_local)).first;
+            return true;
         }
 
-        const auto& posts_local = itc->second;
-        if (posts_local.empty()) return true;
-
-        for (uint32_t post_local : posts_local) {
-            const uint32_t dest_global = static_cast<uint32_t>(global_neuron_base_ + static_cast<uint64_t>(post_local));
-            auto* spike = new SpikeEvent(pre_global,
-                                         dest_global,
-                                         static_cast<uint32_t>(rt_.node_id),
-                                         /*weight=*/1.0,
-                                         ts);
-            deliverSpike(spike);
+        SpikeNocCodec::WireSpikeKeyV2 ws{};
+        const bool ok = SpikeNocCodec::decodeSpikeKeyAny(packet->payload, ws);
+        delete packet;
+        if (!ok || (ws.version != 1 && ws.version != 2 && ws.version != 3)) {
+            ++snn_rx_decode_fail_total_;
+            return true;
+        }
+        if (use_fastpath) {
+            ++snn_rx_fastpath_packets_total_;
+            (void)expandPreGlobalToWindowEdgesFast_(ws.pre_global);
+        } else {
+            ++snn_rx_fallback_packets_total_;
+            (void)expandPreGlobalToLocalSpikes_(ws.pre_global, ts);
         }
         return true;
     }
 
     // 非 Spike packet 由其它 workload 或上层消费；SNN workload 默认丢弃以避免语义漂移。
     delete packet;
+    return true;
+}
+
+const std::vector<uint32_t>* SnnWorkload::lookupPostsLocalForPre_(uint32_t pre_global) {
+    ensureSpikeCommConfigured_();
+    if (!synapse_route_) return nullptr;
+    auto routes = synapse_route_->routesShared();
+    if (!routes) return nullptr;
+
+    if (routes.get() != routes_shared_for_posts_cache_.get()) {
+        routes_shared_for_posts_cache_ = routes;
+        pre_to_posts_local_.clear();
+    }
+
+    auto itc = pre_to_posts_local_.find(pre_global);
+    if (itc == pre_to_posts_local_.end()) {
+        std::vector<uint32_t> posts_local;
+        auto itr = routes->find(pre_global);
+        if (itr != routes->end()) {
+            const uint32_t denom = (neurons_per_pe_cfg_ > 0) ? neurons_per_pe_cfg_ : num_neurons_;
+            if (denom > 0) {
+                for (uint32_t dest_global : itr->second) {
+                    const uint32_t dest_node = dest_global / denom;
+                    if (dest_node != static_cast<uint32_t>(rt_.node_id)) continue;
+
+                    const uint32_t local_in_pe = dest_global % denom;
+                    const uint32_t dest_core = (num_neurons_ ? (local_in_pe / num_neurons_) : 0);
+                    if (dest_core != static_cast<uint32_t>(rt_.core_id)) continue;
+
+                    const uint32_t post_local = (num_neurons_ ? (local_in_pe % num_neurons_) : 0);
+                    if (post_local < num_neurons_) posts_local.push_back(post_local);
+                }
+            }
+        }
+
+        if (!posts_local.empty()) {
+            std::sort(posts_local.begin(), posts_local.end());
+            posts_local.erase(std::unique(posts_local.begin(), posts_local.end()), posts_local.end());
+        }
+
+        itc = pre_to_posts_local_.emplace(pre_global, std::move(posts_local)).first;
+    }
+
+    return &(itc->second);
+}
+
+bool SnnWorkload::resolvePreRankForPost_(uint32_t pre_global, uint32_t post_local, uint32_t& out_rank) {
+    const auto* posts_local = lookupPostsLocalForPre_(pre_global);
+    if (!posts_local || posts_local->empty()) return false;
+    const auto it = std::lower_bound(posts_local->begin(), posts_local->end(), post_local);
+    if (it == posts_local->end() || *it != post_local) return false;
+    const size_t idx = static_cast<size_t>(std::distance(posts_local->begin(), it));
+    out_rank = static_cast<uint32_t>(idx);
+    return true;
+}
+
+bool SnnWorkload::expandPreGlobalToWindowEdgesFast_(uint32_t pre_global) {
+    if (!(workload_spike_input_enable_ && isWindowWorkload_() && window_read_enable_ && !scheme1_enable_)) {
+        return false;
+    }
+
+    ensureComputeCoreConfigured_();
+    ensureWeightReaderOwned_();
+
+    const auto* posts_local = lookupPostsLocalForPre_(pre_global);
+    if (!posts_local || posts_local->empty()) return false;
+    snn_rx_fastpath_posts_total_ += static_cast<uint64_t>(posts_local->size());
+
+    bool stage_ok = false;
+    const bool premphf_mode =
+        (synapse_weight_mode_ == "gcss_valueonly_dstcore_vlf_premphf") ||
+        (synapse_weight_mode_ == "gcss_valueonly_dstcore_vlf_premphf_plp");
+    const bool edge_record_backend_ready = enable_weight_fetch_ && rt_.mem;
+    if (edge_record_backend_ready) {
+        switch (gas_stage_) {
+            case GasStage::Gather:
+                stage_ok = true;
+                break;
+            case GasStage::Apply:
+                stage_ok = record_edge_apply_enable_;
+                break;
+            case GasStage::Idle:
+                stage_ok = record_edge_idle_enable_;
+                break;
+            case GasStage::Scatter:
+                stage_ok = record_edge_scatter_enable_;
+                break;
+            default:
+                stage_ok = false;
+                break;
+        }
+    }
+
+    bool did = false;
+    for (size_t pre_rank = 0; pre_rank < posts_local->size(); ++pre_rank) {
+        const uint32_t post_local = (*posts_local)[pre_rank];
+        if (rt_.sinks.spikes_received) (*rt_.sinks.spikes_received)++;
+        if (rt_.sinks.stat_spikes_received_total) rt_.sinks.stat_spikes_received_total->addData(1);
+
+        if (apply_acc_enable_ && compute_core_) {
+            if (!compute_core_->shouldAcceptSynapticInput(post_local, now_cycle_cached_)) {
+                ++snn_rx_fastpath_reject_total_;
+                ++snn_edge_record_skip_reject_total_;
+                continue;
+            }
+        }
+        ++snn_rx_fastpath_accept_total_;
+
+        if (gas_stage_ == GasStage::Gather) {
+            gather_last_activity_cycle_ = now_cycle_cached_;
+        }
+
+        if (weight_mem_subsystem_) {
+            ++snn_edge_record_attempt_total_;
+            weight_mem_subsystem_->noteWindowTouch(post_local, pre_global, num_neurons_);
+            if (stage_ok) {
+                const size_t curr_edges = weight_mem_subsystem_->edgesCurrSize();
+                if (curr_edges < edge_collector_max_capacity_) {
+                    if (premphf_mode) {
+                        weight_mem_subsystem_->recordEdgeWithPreRank(
+                            post_local,
+                            pre_global,
+                            std::numeric_limits<float>::quiet_NaN(),
+                            static_cast<uint32_t>(pre_rank));
+                    } else {
+                        weight_mem_subsystem_->recordEdgeWithWeight(
+                            post_local,
+                            pre_global,
+                            std::numeric_limits<float>::quiet_NaN());
+                    }
+                    ++snn_rx_fastpath_edges_recorded_total_;
+                    ++snn_edge_record_commit_total_;
+                } else {
+                    ++snn_edge_record_skip_capacity_total_;
+                }
+            } else {
+                ++snn_edge_record_skip_stage_total_;
+            }
+        } else {
+            ++snn_edge_record_skip_gate_total_;
+        }
+
+        if (rt_.sinks.synaptic_accesses) (*rt_.sinks.synaptic_accesses)++;
+        if (rt_.sinks.stat_synaptic_accesses_total) rt_.sinks.stat_synaptic_accesses_total->addData(1);
+        did = true;
+    }
+
+    return did;
+}
+
+bool SnnWorkload::expandPreGlobalToLocalSpikes_(uint32_t pre_global, uint64_t ts) {
+    const auto* posts_local = lookupPostsLocalForPre_(pre_global);
+    if (!posts_local || posts_local->empty()) return false;
+
+    for (uint32_t post_local : *posts_local) {
+        const uint32_t dest_global = static_cast<uint32_t>(global_neuron_base_ + static_cast<uint64_t>(post_local));
+        auto* spike = new SpikeEvent(pre_global,
+                                     dest_global,
+                                     static_cast<uint32_t>(rt_.node_id),
+                                     /*weight=*/1.0,
+                                     ts);
+        deliverSpike(spike);
+    }
     return true;
 }
 
@@ -944,6 +1288,7 @@ void SnnWorkload::processLocalSpike_(SpikeEvent* spike_event) {
     // Compute core gating (kept consistent with legacy: reject before recording any edge/access).
     if (apply_acc_enable_ && compute_core_) {
         if (!compute_core_->shouldAcceptSynapticInput(post_local, now_cycle_cached_)) {
+            ++snn_edge_record_skip_reject_total_;
             return;
         }
     }
@@ -953,8 +1298,12 @@ void SnnWorkload::processLocalSpike_(SpikeEvent* spike_event) {
     }
 
     // Strict window-read: record edge for BeginApply issueFromEdges() (no immediate dv application here).
-    if (enable_weight_fetch_ && rt_.mem) {
+    const bool edge_record_backend_ready = enable_weight_fetch_ && rt_.mem;
+    if (edge_record_backend_ready) {
         bool stage_ok = false;
+        const bool premphf_mode =
+        (synapse_weight_mode_ == "gcss_valueonly_dstcore_vlf_premphf") ||
+        (synapse_weight_mode_ == "gcss_valueonly_dstcore_vlf_premphf_plp");
         switch (gas_stage_) {
             case GasStage::Gather:
                 stage_ok = true;
@@ -972,12 +1321,44 @@ void SnnWorkload::processLocalSpike_(SpikeEvent* spike_event) {
                 stage_ok = false;
                 break;
         }
+        ++snn_edge_record_attempt_total_;
         if (stage_ok) {
             const size_t curr_edges = weight_mem_subsystem_->edgesCurrSize();
             if (curr_edges < edge_collector_max_capacity_) {
-                weight_mem_subsystem_->recordEdge(post_local, spike_event->getSourceNeuron());
+                const uint32_t pre_global = spike_event->getSourceNeuron();
+                if (premphf_mode) {
+                    uint32_t pre_rank = 0;
+                    if (!resolvePreRankForPost_(pre_global, post_local, pre_rank)) {
+                        if (rt_.log) {
+                            rt_.log->fatal(CALL_INFO, -1,
+                                           "SnnWorkload fatal: pre_rank miss in premphf mode "
+                                           "(pre=%u post_local=%u node=%u core=%u)\n",
+                                           pre_global, post_local,
+                                           static_cast<uint32_t>(rt_.node_id),
+                                           static_cast<uint32_t>(rt_.core_id));
+                        }
+                        std::abort();
+                    }
+                    weight_mem_subsystem_->recordEdgeWithPreRank(
+                        post_local,
+                        pre_global,
+                        static_cast<float>(spike_event->getWeight()),
+                        pre_rank);
+                } else {
+                    weight_mem_subsystem_->recordEdgeWithWeight(
+                        post_local,
+                        pre_global,
+                        static_cast<float>(spike_event->getWeight()));
+                }
+                ++snn_edge_record_commit_total_;
+            } else {
+                ++snn_edge_record_skip_capacity_total_;
             }
+        } else {
+            ++snn_edge_record_skip_stage_total_;
         }
+    } else {
+        ++snn_edge_record_skip_gate_total_;
     }
 
     // Record synaptic access counters (owned by CoreShell via runtime sinks).
@@ -1033,8 +1414,12 @@ void SnnWorkload::deliverSpike(SpikeEvent* spike) {
             weight_mem_subsystem_->noteWindowTouch(post_local, spike->getSourceNeuron(), num_neurons_);
 
             // Record edge for BeginApply issueFromEdges().
-            if (enable_weight_fetch_ && rt_.mem) {
+            const bool edge_record_backend_ready = enable_weight_fetch_ && rt_.mem;
+            if (edge_record_backend_ready) {
                 bool stage_ok = false;
+                const bool premphf_mode =
+        (synapse_weight_mode_ == "gcss_valueonly_dstcore_vlf_premphf") ||
+        (synapse_weight_mode_ == "gcss_valueonly_dstcore_vlf_premphf_plp");
                 switch (gas_stage_) {
                     case GasStage::Gather:
                         stage_ok = true;
@@ -1055,7 +1440,31 @@ void SnnWorkload::deliverSpike(SpikeEvent* spike) {
                 if (stage_ok) {
                     const size_t curr_edges = weight_mem_subsystem_->edgesCurrSize();
                     if (curr_edges < edge_collector_max_capacity_) {
-                        weight_mem_subsystem_->recordEdge(post_local, spike->getSourceNeuron());
+                        const uint32_t pre_global = spike->getSourceNeuron();
+                        if (premphf_mode) {
+                            uint32_t pre_rank = 0;
+                            if (!resolvePreRankForPost_(pre_global, post_local, pre_rank)) {
+                                if (rt_.log) {
+                                    rt_.log->fatal(CALL_INFO, -1,
+                                                   "SnnWorkload fatal: pre_rank miss in premphf mode "
+                                                   "(pre=%u post_local=%u node=%u core=%u)\n",
+                                                   pre_global, post_local,
+                                                   static_cast<uint32_t>(rt_.node_id),
+                                                   static_cast<uint32_t>(rt_.core_id));
+                                }
+                                std::abort();
+                            }
+                            weight_mem_subsystem_->recordEdgeWithPreRank(
+                                post_local,
+                                pre_global,
+                                static_cast<float>(spike->getWeight()),
+                                pre_rank);
+                        } else {
+                            weight_mem_subsystem_->recordEdgeWithWeight(
+                                post_local,
+                                pre_global,
+                                static_cast<float>(spike->getWeight()));
+                        }
                     }
                 }
             }
@@ -1129,11 +1538,49 @@ void SnnWorkload::getStatistics(std::map<std::string, uint64_t>& stats) const {
     const uint64_t spikes_generated = rt_.sinks.spikes_generated ? *rt_.sinks.spikes_generated : 0;
     const uint64_t neurons_fired = rt_.sinks.neurons_fired ? *rt_.sinks.neurons_fired : 0;
     const uint64_t syn_accesses = rt_.sinks.synaptic_accesses ? *rt_.sinks.synaptic_accesses : 0;
+    uint64_t snn_tx_spike_packets_total = 0;
+    uint64_t snn_tx_spikekey_packets_total = 0;
+    uint64_t snn_tx_spiketilekey_packets_total = 0;
+    if (spike_comm_) {
+        snn_tx_spike_packets_total = spike_comm_->txSpikePacketsTotal();
+        snn_tx_spikekey_packets_total = spike_comm_->txSpikeKeyPacketsTotal();
+        snn_tx_spiketilekey_packets_total = spike_comm_->txSpikeTileKeyPacketsTotal();
+    }
     stats["spikes_received"] = spikes_received;
     stats["spikes_generated"] = spikes_generated;
     stats["neurons_fired"] = neurons_fired;
     stats["synaptic_accesses"] = syn_accesses;
     stats["gas_scatter_spikes_emitted_total"] = total_scatter_spikes_emitted_;
+    stats["snn_tx_spike_packets_total"] = snn_tx_spike_packets_total;
+    stats["snn_tx_spikekey_packets_total"] = snn_tx_spikekey_packets_total;
+    stats["snn_tx_spiketilekey_packets_total"] = snn_tx_spiketilekey_packets_total;
+    stats["snn_rx_spike_packets_total"] = snn_rx_spike_packets_total_;
+    stats["snn_rx_spikekey_total"] = snn_rx_spikekey_total_;
+    stats["snn_rx_spiketilekey_total"] = snn_rx_spiketilekey_total_;
+    stats["snn_rx_fastpath_packets_total"] = snn_rx_fastpath_packets_total_;
+    stats["snn_rx_fallback_packets_total"] = snn_rx_fallback_packets_total_;
+    stats["snn_rx_decode_fail_total"] = snn_rx_decode_fail_total_;
+    stats["snn_rx_fastpath_posts_total"] = snn_rx_fastpath_posts_total_;
+    stats["snn_rx_fastpath_accept_total"] = snn_rx_fastpath_accept_total_;
+    stats["snn_rx_fastpath_reject_total"] = snn_rx_fastpath_reject_total_;
+    stats["snn_rx_fastpath_edges_recorded_total"] = snn_rx_fastpath_edges_recorded_total_;
+    if (compute_core_) {
+        std::map<std::string, uint64_t> core_stats;
+        compute_core_->getStatistics(core_stats);
+        auto copy_if = [&stats, &core_stats](const char* key) {
+            if (!key) return;
+            auto it = core_stats.find(key);
+            if (it == core_stats.end()) return;
+            stats[key] = it->second;
+        };
+        copy_if("core_state_sram_reads_total");
+        copy_if("core_state_sram_writes_total");
+        copy_if("core_state_sram_bytes_read_total");
+        copy_if("core_state_sram_bytes_write_total");
+        copy_if("core_state_sram_bank_conflict_ticks_total");
+        copy_if("core_state_sram_predicted_extra_cycles_total");
+        copy_if("core_state_sram_resident_bytes_peak");
+    }
 }
 
 void SnnWorkload::onInitPhase(unsigned phase) {
@@ -1233,67 +1680,31 @@ void SnnWorkload::onGasStageEvent(const GasStageEvent& ev) {
             }
 
             last_scatter_spikes_emitted_ = 0;
-
-            // Apply accumulated deltas deterministically (sorted by post id).
-            std::vector<std::pair<uint32_t, float>> pairs;
-            if (acc_ops_) acc_ops_->collectSortedPairs(pairs);
-            for (const auto& pr : pairs) {
-                const uint32_t post = pr.first;
-                const float dv = pr.second;
-                if (dv == 0.0f) continue;
-                if (compute_core_) compute_core_->applySynapticDelta(post, dv);
+            if (shouldDeferScatterCommit_()) {
+                scatter_commit_pending_ = true;
+                scatter_commit_seq_ = ev.superstep;
+                break;
             }
-
-            // End cycle + drain fired neurons, then delegate route/comm.
-            if (compute_core_) {
-                compute_core_->endCycle(now_cycle_cached_);
-                std::vector<FireEvent> fired;
-                compute_core_->drainOutputs(fired, /*clear=*/true);
-                if (!fired.empty()) {
-                    std::vector<uint32_t> neuron_indices;
-                    neuron_indices.reserve(fired.size());
-                    for (const auto& fe : fired) neuron_indices.push_back(fe.neuron_idx);
-
-                    const uint64_t emitted = emitNeuronFireBatch(neuron_indices, now_cycle_cached_);
-                    last_scatter_spikes_emitted_ = emitted ? emitted : neuron_indices.size();
-
-                    const uint64_t fired_cnt = static_cast<uint64_t>(neuron_indices.size());
-                    if (rt_.sinks.neurons_fired) (*rt_.sinks.neurons_fired) += fired_cnt;
-                    if (rt_.sinks.spikes_generated) (*rt_.sinks.spikes_generated) += fired_cnt;
-                    addCountStat_(rt_.sinks.stat_neurons_fired_total, fired_cnt);
-                    addCountStat_(rt_.sinks.stat_spikes_generated_total, fired_cnt);
-                }
-            }
-            if (acc_ops_) acc_ops_->reset();
-
-            // Report scatter spikes for per-window aggregation/stats.
-            if (rt_.sinks.spikes_emitted_window) (*rt_.sinks.spikes_emitted_window) = last_scatter_spikes_emitted_;
-            if (rt_.sinks.window_spikes_all) (*rt_.sinks.window_spikes_all) += last_scatter_spikes_emitted_;
-            total_scatter_spikes_emitted_ += last_scatter_spikes_emitted_;
-            if (rt_.sinks.stat_gas_scatter_spikes_emitted_total && last_scatter_spikes_emitted_ > 0) {
-                rt_.sinks.stat_gas_scatter_spikes_emitted_total->addData(last_scatter_spikes_emitted_);
-            }
-            if (rt_.reporting.report_apply_scatter) {
-                rt_.reporting.report_apply_scatter(rt_.reporting.ctx,
-                                                   /*acc_updates=*/0,
-                                                   /*posts_touched=*/0,
-                                                   /*spikes_emitted=*/last_scatter_spikes_emitted_,
-                                                   /*hwm_bytes=*/0,
-                                                   /*spill_records=*/0,
-                                                   /*spilled_bytes=*/0);
-            }
-
-            // Step-gate explicit end handshake: request EndScatter after finishing Scatter work.
-            if (!scatter_end_requested_ && rt_.reporting.request_gas_end_scatter) {
-                rt_.reporting.request_gas_end_scatter(rt_.reporting.ctx, ev.superstep);
-                scatter_end_requested_ = true;
-            }
+            scatter_commit_pending_ = false;
+            scatter_commit_seq_ = 0;
+            finalizeScatterCommit_(ev.superstep);
             break;
         }
         case GasOp::EndScatter:
+            if (scatter_commit_pending_) {
+                if (rt_.log) {
+                    rt_.log->fatal(CALL_INFO, -1,
+                                   "SnnWorkload fatal: EndScatter arrives before deferred scatter commit "
+                                   "(core=%u seq=%u pending_seq=%u)\n",
+                                   rt_.core_id,
+                                   ev.superstep,
+                                   scatter_commit_seq_);
+                }
+                std::abort();
+            }
             gas_stage_ = GasStage::Idle;
             if (compute_core_) compute_core_->onStageEndScatter(ev.superstep, last_scatter_spikes_emitted_);
-            if (weight_mem_subsystem_ && window_read_debug_) {
+            if (weight_mem_subsystem_) {
                 weight_mem_subsystem_->endScatterWindow(ev.superstep);
             }
             break;
