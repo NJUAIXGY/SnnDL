@@ -15,6 +15,7 @@ MemKCalBench::MemKCalBench(ComponentId_t id, Params& params)
 {
     const MemKCalBenchConfig cfg = parseMemKCalBenchConfig(params);
     out_ = new Output("MemKCalBench[@p:@l]: ", cfg.verbose, 0, Output::STDOUT);
+    base_addr_  = cfg.base_addr;
     row_bytes_  = cfg.row_bytes;
     bank_bits_  = cfg.bank_bits;
     bank_shift_ = cfg.bank_shift;

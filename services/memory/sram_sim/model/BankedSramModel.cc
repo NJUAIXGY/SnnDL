@@ -3,6 +3,7 @@
 #include "services/memory/sram_sim/model/BankedSramModel.h"
 
 #include <algorithm>
+#include <cctype>
 #include <limits>
 
 namespace SST { namespace SnnDL {
@@ -22,7 +23,33 @@ void BankedSramModel::configure(const BankedSramConfig& cfg) {
     if (cfg_.sample_log2 > 20) cfg_.sample_log2 = 20;
     if (cfg_.t_read_cycles == 0) cfg_.t_read_cycles = 1;
     if (cfg_.t_write_cycles == 0) cfg_.t_write_cycles = 1;
+
+    {
+        std::string model = cfg_.conflict_cost_model;
+        std::transform(model.begin(), model.end(), model.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (model == "max" || model == "warp_max" || model == "gpu_warp" ||
+            model == "gpu_sharedmem_warp" || model == "max_over_banks") {
+            conflict_cost_model_ = ConflictCostModel::MaxOverBanks;
+        } else {
+            conflict_cost_model_ = ConflictCostModel::SumOverBanks;
+        }
+    }
     reset();
+}
+
+void BankedSramModel::disable() {
+    cfg_.enable = false;
+    stats_ = BankedSramStats{};
+    cycle_valid_ = false;
+    cycle_now_ = 0;
+    cycle_bank_reads_.clear();
+    cycle_bank_writes_.clear();
+    cycle_bank_read_addrs_.clear();
+    bulk_rr_bank_cursor_ = 0;
+    sample_counter_ = 0;
+    last_cycle_predicted_extra_cycles_ = 0;
+    last_cycle_conflict_ticks_ = 0;
 }
 
 void BankedSramModel::reset() {
@@ -31,8 +58,29 @@ void BankedSramModel::reset() {
     cycle_now_ = 0;
     cycle_bank_reads_.assign(cfg_.banks, 0);
     cycle_bank_writes_.assign(cfg_.banks, 0);
+    cycle_bank_read_addrs_.clear();
+    if (cfg_.read_broadcast_enable) {
+        cycle_bank_read_addrs_.assign(cfg_.banks, {});
+        for (auto& addrs : cycle_bank_read_addrs_) {
+            addrs.reserve(32);
+        }
+    }
     bulk_rr_bank_cursor_ = 0;
     sample_counter_ = 0;
+    last_cycle_predicted_extra_cycles_ = 0;
+    last_cycle_conflict_ticks_ = 0;
+}
+
+uint64_t BankedSramModel::consumeLastCyclePredictedExtraCycles() {
+    const uint64_t out = last_cycle_predicted_extra_cycles_;
+    last_cycle_predicted_extra_cycles_ = 0;
+    return out;
+}
+
+uint64_t BankedSramModel::consumeLastCycleConflictTicks() {
+    const uint64_t out = last_cycle_conflict_ticks_;
+    last_cycle_conflict_ticks_ = 0;
+    return out;
 }
 
 void BankedSramModel::onClockTick(uint64_t now_cycle) {
@@ -98,41 +146,95 @@ void BankedSramModel::rollCycleIfNeeded_(uint64_t now_cycle) {
     cycle_now_ = now_cycle;
     std::fill(cycle_bank_reads_.begin(), cycle_bank_reads_.end(), 0ull);
     std::fill(cycle_bank_writes_.begin(), cycle_bank_writes_.end(), 0ull);
+    if (!cycle_bank_read_addrs_.empty()) {
+        for (auto& addrs : cycle_bank_read_addrs_) {
+            addrs.clear();
+        }
+    }
 }
 
 void BankedSramModel::flushCurrentCycle_() {
     if (!cycle_valid_) return;
     const uint64_t ports = static_cast<uint64_t>(cfg_.ports_per_bank);
     bool has_conflict = false;
-    for (uint32_t bank = 0; bank < cfg_.banks; ++bank) {
-        const uint64_t r = cycle_bank_reads_[bank];
-        const uint64_t w = cycle_bank_writes_[bank];
-        const uint64_t total = satAddU64(r, w);
-        stats_.bank_peak_accesses_per_tick = std::max(stats_.bank_peak_accesses_per_tick, total);
+    uint64_t cycle_extra_cycles = 0;
+    if (conflict_cost_model_ == ConflictCostModel::SumOverBanks) {
+        for (uint32_t bank = 0; bank < cfg_.banks; ++bank) {
+            const uint64_t r = cycle_bank_reads_[bank];
+            const uint64_t w = cycle_bank_writes_[bank];
+            const uint64_t total = satAddU64(r, w);
+            stats_.bank_peak_accesses_per_tick = std::max(stats_.bank_peak_accesses_per_tick, total);
 
-        if (total <= ports) continue;
-        has_conflict = true;
+            if (total <= ports) continue;
+            has_conflict = true;
 
-        const uint64_t over = total - ports;
-        stats_.bank_conflict_events_total = satAddU64(stats_.bank_conflict_events_total, over);
+            const uint64_t over = total - ports;
+            stats_.bank_conflict_events_total = satAddU64(stats_.bank_conflict_events_total, over);
 
-        const uint64_t weighted_cost = satAddU64(
-            r * static_cast<uint64_t>(cfg_.t_read_cycles),
-            w * static_cast<uint64_t>(cfg_.t_write_cycles));
-        const uint64_t avg_cost = (weighted_cost + total - 1ull) / total;
-        const uint64_t extra_cycles = over * std::max<uint64_t>(1ull, avg_cost);
-        stats_.predicted_extra_cycles_total = satAddU64(stats_.predicted_extra_cycles_total, extra_cycles);
+            const uint64_t weighted_cost = satAddU64(
+                r * static_cast<uint64_t>(cfg_.t_read_cycles),
+                w * static_cast<uint64_t>(cfg_.t_write_cycles));
+            const uint64_t avg_cost = (weighted_cost + total - 1ull) / total;
+            const uint64_t extra_cycles = over * std::max<uint64_t>(1ull, avg_cost);
+            stats_.predicted_extra_cycles_total = satAddU64(stats_.predicted_extra_cycles_total, extra_cycles);
+            cycle_extra_cycles = satAddU64(cycle_extra_cycles, extra_cycles);
+        }
+    } else {
+        uint64_t baseline_cycles = 0;
+        uint64_t max_required_cycles = 0;
+        uint64_t cycle_conflict_events = 0;
+        for (uint32_t bank = 0; bank < cfg_.banks; ++bank) {
+            const uint64_t r = cycle_bank_reads_[bank];
+            const uint64_t w = cycle_bank_writes_[bank];
+            const uint64_t total = satAddU64(r, w);
+            stats_.bank_peak_accesses_per_tick = std::max(stats_.bank_peak_accesses_per_tick, total);
+            if (total == 0) continue;
+
+            const uint64_t weighted_cost = satAddU64(
+                r * static_cast<uint64_t>(cfg_.t_read_cycles),
+                w * static_cast<uint64_t>(cfg_.t_write_cycles));
+            uint64_t avg_cost = (weighted_cost + total - 1ull) / total;
+            avg_cost = std::max<uint64_t>(1ull, avg_cost);
+            baseline_cycles = std::max<uint64_t>(baseline_cycles, avg_cost);
+
+            const uint64_t rounds = (total + ports - 1ull) / ports;
+            const uint64_t required_cycles = rounds * avg_cost;
+            max_required_cycles = std::max<uint64_t>(max_required_cycles, required_cycles);
+
+            if (total > ports) {
+                has_conflict = true;
+                cycle_conflict_events = satAddU64(cycle_conflict_events, total - ports);
+            }
+        }
+
+        if (has_conflict) {
+            stats_.bank_conflict_events_total = satAddU64(stats_.bank_conflict_events_total, cycle_conflict_events);
+        }
+        if (max_required_cycles > baseline_cycles) {
+            cycle_extra_cycles = max_required_cycles - baseline_cycles;
+            stats_.predicted_extra_cycles_total = satAddU64(stats_.predicted_extra_cycles_total, cycle_extra_cycles);
+        }
     }
     if (has_conflict) {
         stats_.bank_conflict_ticks_total = satAddU64(stats_.bank_conflict_ticks_total, 1);
     }
+    last_cycle_predicted_extra_cycles_ = cycle_extra_cycles;
+    last_cycle_conflict_ticks_ = has_conflict ? 1ull : 0ull;
 }
 
 void BankedSramModel::addReadAccess_(uint64_t addr, uint64_t scale, uint64_t bytes) {
+    const uint32_t bank = bankForAddr_(addr);
+    if (cfg_.read_broadcast_enable && bank < cycle_bank_read_addrs_.size()) {
+        auto& addrs = cycle_bank_read_addrs_[bank];
+        if (std::find(addrs.begin(), addrs.end(), addr) != addrs.end()) {
+            stats_.read_broadcast_elided_total = satAddU64(stats_.read_broadcast_elided_total, scale);
+            return;
+        }
+        addrs.push_back(addr);
+    }
     stats_.reads_total = satAddU64(stats_.reads_total, scale);
     stats_.bytes_read_total = satAddU64(stats_.bytes_read_total, bytes * scale);
     stats_.energy_read_pj_total += static_cast<double>(scale) * cfg_.energy_read_pj;
-    const uint32_t bank = bankForAddr_(addr);
     cycle_bank_reads_[bank] = satAddU64(cycle_bank_reads_[bank], scale);
 }
 
@@ -177,4 +279,3 @@ void BankedSramModel::distributeUniform_(uint64_t accesses, std::vector<uint64_t
 }
 
 }} // namespace SST::SnnDL
-

@@ -9,9 +9,10 @@
 
 ---
 
-## 快速构建与安装（修改生效必须 install）
+## 快速构建与安装（推荐 install；本地验证可走 --add-lib-path）
 
 > 说明：SnnDL 属于 `sst-elements` 的一部分，通常在已 configure 的工作区内增量编译安装。
+> 项目内 runner 默认会 `--add-lib-path "<.../SnnDL/.libs>"` 以优先加载工作区构建产物，因此本地验证不一定需要 install；但对外/系统级使用仍建议 `make install` 固化到 prefix。
 
 ```bash
 cd "sst_workspace/sst-elements/src/sst/elements/SnnDL"
@@ -24,6 +25,14 @@ make install
 ---
 
 ## 快速运行回归（4×4 mesh 模板）
+
+也可走统一 spec-first 入口（对齐对外 schema；stop/max_steps 由 spec 决定）：
+
+```bash
+cd "<repo_root>"
+python3 "tools/snndl_spec_cli.py" validate "tools/specs/mesh_minimal_v3.json"
+bash "tools/run_snndl_with_time.sh" --spec "tools/specs/mesh_minimal_v3.json"
+```
 
 推荐使用项目内 mesh 模板驱动（详细见 `sst_dram_si/docs/mesh_template_guide_20251122-000250.md`）：
 
@@ -143,6 +152,102 @@ SnnDL 的默认内存建模语义与 `memHierarchy` 保持一致：**以 cacheli
   - 其中 `memory_bytes` 为对 core 侧统计 `mem_req_size_bytes` 的汇总派生指标；
 - 若切换到 row-streaming/DMA 假设，必须显式标注并单列结果（不得与 cacheline 模式混算）。
 
+### SRAM 建模（SNN 第一阶段：stall budget 闭环）
+
+`SnnDL` 现已支持一版 **SNN 专用 SRAM timing 第一阶段**：当启用 `state_sram_*` / `weight_*_sram_*` 参数时，片上 SRAM 的 bank conflict 不再只是 observe-only 统计，而会转成下一拍的 **stall budget**，反馈到：
+
+- `compute/SnnComputeCore`：阻塞 neuron state sweep / fire 判定；
+- `services/synapse/weights/WeightMemorySubsystem`：阻塞新的 prefetch / deferred issue / direct drain。
+
+当前口径仍是**分层代理**，不是逐请求 local SRAM 控制器：
+
+- 保留现有 `BankedSramModel` 的统计字段与 mesh 参数；
+- 将 `predicted_extra_cycles_total` 变成真实时序反压；
+- 不改变 DRAM / StandardMem 接口边界。
+
+验证命令：
+
+```bash
+cd "sst_workspace/sst-elements/src/sst/elements/SnnDL"
+g++ -std=c++17 -I . tests/test_banked_sram_model.cc \
+  services/memory/sram_sim/model/BankedSramModel.cc \
+  -o /tmp/test_banked_sram_model && /tmp/test_banked_sram_model
+make -j4
+```
+
+### PE 级 DMA 读调度（SNN workload，Phase 1）
+
+`SnnDL` 当前已经落地一版 **PE 级共享 DMA 读调度**，用于给 `workload_impl=snn` 的运行期权重读取路径建模“同一 PE 内多核共享的读带宽/引擎/在途窗口/队列深度/阶段门控”。
+
+这条链路的实现边界是：
+
+- 仅对 `workload_impl=snn` 生效；非 SNN workload 即使配置了 `dma_enable=1` 也会被忽略。
+- 仅覆盖 `WeightMemorySubsystem` 发起的**运行期 read path**。
+- 当前只建模 **read-side DMA**；不覆盖 write-back DMA、跨 PE 共享 DMA、row-streaming 专用数据面。
+- 后端仍保持 `memHierarchy` / cacheline 语义；DMA 调度器不替代内存控制器或 DRAM 地址映射。
+
+当前实现由 3 个内部对象构成：
+
+- `api/IDmaTaggedAccess.h`
+  - 在不破坏 `IMemoryAccess` 边界的前提下，为上层读请求附带 `tag + priority`。
+- `services/memory/DmaMemAccessProxy.{h,cc}`
+  - 每 core 一个代理；对外仍表现为 `IMemoryAccess`，对内把 tagged read 提交到共享调度器。
+- `services/memory/PeDmaScheduler.{h,cc}`
+  - 每 PE 一个共享 DMA 调度器；维护多优先级队列、按 core 轮转公平、burst 发射、阶段预算和统计。
+
+调度语义（当前口径）：
+
+- 优先级：`P0 -> P1 -> P2 -> P3`，同优先级内部按 core round-robin。
+- GAS 阶段门控：`Gather / Apply / Scatter / Idle` 四阶段分别使用不同 budget scale，避免 prefetch/demand 在错误阶段吞掉主路径预算。
+- 资源上限：可分别建模 `bytes_per_cycle`、`read_engines`、`max_inflight`、`queue_depth`。
+- 可选细化：支持 `dma_burst_bytes`、`dma_setup_cycles`、`dma_channels`、`dma_channel_bytes_per_cycle`、`dma_channel_interleave_bytes`。
+- 队列溢出策略：`dma_overflow_policy=block|fail_fast`。
+- 稳定性护栏：调度器内部带有 backend reject 重试与 inflight timeout 收敛逻辑，避免长时间卡死。
+
+基础配置入口（spec-first，位于 `components.pe`）：
+
+```json
+{
+  "components": {
+    "pe": {
+      "dma_enable": 1,
+      "dma_bytes_per_cycle": 256,
+      "dma_read_engines": 2,
+      "dma_max_inflight": 64,
+      "dma_queue_depth": 1024
+    }
+  }
+}
+```
+
+进阶参数（仍位于 `components.pe`）：
+
+- `dma_overflow_policy`
+- `dma_burst_bytes`
+- `dma_setup_cycles`
+- `dma_channels`
+- `dma_channel_bytes_per_cycle`
+- `dma_channel_interleave_bytes`
+- `dma_stage_budget_scale_{gather|apply|scatter|idle}_{p0|p1|p2|p3}`
+
+可观测统计（`MultiCorePE`）：
+
+- `dma_issue_reqs_total`
+- `dma_issue_bytes_total`
+- `dma_queue_depth_max_p{0,1,2,3}`
+- `dma_inflight_max`
+- `dma_stall_cycles_{budget,engine,inflight,stage_gate,queue_full}`
+
+推荐验证入口：
+
+- case：
+  - `snndl-thing-exp/cases/pe_dma_ab_smoke`
+  - `snndl-thing-exp/cases/pe_dma_budget_throttle`
+  - `snndl-thing-exp/cases/pe_dma_stage_gate_prefetch`
+- tests：
+  - `snndl-thing-exp/tests/test_pe_dma_cases.py`
+  - `tests/test_pe_dma_scheduler.cc`
+
 ### GAS Apply 发射策略（DRAM-aware，可选）
 
 `components/GatherBufferIF` 在 Apply 阶段会把“已构建的 granule 列表”向下游发起读请求。默认策略 `apply_issue_policy=order` 保持确定性与可回归；当需要研究
@@ -184,7 +289,7 @@ DRAM 行局部性/BLP（bank-level parallelism）时，可显式开启 DRAM-awar
   - `MESH_GAS_DRAM_CMD_T_ROW_MISS_NS`（默认 120）
 
 复现脚本（dense microbench，快速验证映射/策略是否合理）：
-- `sst_dram_si/tools/run_dense_microbench_4x4_npc_sweep_apply_policy_matrix.sh`
+- `sst_dram_si/tools/run_dense_microbench_4x4_exec_mode_compare_with_time.sh`
 
 更多背景与校准说明见：`components/gather/README.md` 与 `docs/plans/2026-02-14-gas-ab-weights-phys-layout-v1.md`。
 

@@ -26,6 +26,7 @@ namespace SST { namespace SnnDL {
 
 class IMemoryAccess;
 class INocTransport;
+class ISnnAccelRuntimeServices;
 class NocPacketEvent;
 
 class ICoreWorkload {
@@ -42,6 +43,7 @@ public:
         SST::Statistics::Statistic<uint64_t>* stat_spikes_generated_total = nullptr;
         SST::Statistics::Statistic<uint64_t>* stat_neurons_fired_total = nullptr;
         SST::Statistics::Statistic<uint64_t>* stat_synaptic_accesses_total = nullptr;
+        SST::Statistics::Statistic<uint64_t>* stat_compute_active_cycles_total = nullptr;
         SST::Statistics::Statistic<uint64_t>* stat_gas_scatter_spikes_emitted_total = nullptr;
 
         // Optional: raw counters for aggregation (owned by CoreShell)
@@ -66,8 +68,16 @@ public:
 
         // Optional: routing/comm stats sinks (owned by CoreShell).
         // Keep generic shape (counters only) so non-SNN workloads can ignore safely.
+        uint64_t* route3d_native_activation_total = nullptr;
+        uint64_t* route3d_native_gating_activation_total = nullptr;
+        uint64_t* route3d_native_direct_activation_total = nullptr;
+        uint64_t* route3d_native_unique_sources_total = nullptr;
         SST::Statistics::Statistic<uint64_t>* stat_routes_entries_total = nullptr;
         SST::Statistics::Statistic<uint64_t>* stat_fanout_per_spike_total = nullptr;
+        SST::Statistics::Statistic<uint64_t>* stat_route3d_native_activation_total = nullptr;
+        SST::Statistics::Statistic<uint64_t>* stat_route3d_native_gating_activation_total = nullptr;
+        SST::Statistics::Statistic<uint64_t>* stat_route3d_native_direct_activation_total = nullptr;
+        SST::Statistics::Statistic<uint64_t>* stat_route3d_native_unique_sources_total = nullptr;
     };
 
     struct Reporting {
@@ -82,6 +92,15 @@ public:
                                      uint64_t hwm_bytes,
                                      uint64_t spill_records,
                                      uint64_t spilled_bytes) = nullptr;
+        // Optional: SNN receive-side gate diagnostics aggregated per step.
+        void (*report_step_rx_gate)(void* ctx,
+                                    uint32_t seq,
+                                    uint64_t accept_total,
+                                    uint64_t reject_refractory_total,
+                                    uint64_t direct_accept_total,
+                                    uint64_t direct_reject_refractory_total,
+                                    uint64_t fastpath_accept_total,
+                                    uint64_t fastpath_reject_refractory_total) = nullptr;
 
         // Optional: GAS/window explicit end handshake (for global step-gate sync).
         // When provided, workload may request ending the current Gather/Scatter stage.
@@ -103,6 +122,7 @@ public:
 
         IMemoryAccess* mem = nullptr;
         INocTransport* noc = nullptr;
+        ISnnAccelRuntimeServices* accel_runtime = nullptr;
 
         TimeSource time{};
         Sinks sinks{};
@@ -126,6 +146,8 @@ public:
     virtual void onFinish() {}
     // Optional: global step start hook (used by step-limited experiments / platform sync).
     virtual void onGlobalStepStart(uint32_t /*seq*/) {}
+    // Optional: explicit membrane reset hook (used by step_reset_mem_each_step / seed-only mode).
+    virtual void resetMembraneState(float /*v_rest*/) {}
 
     // === Optional metrics (default empty/zero) ===
     virtual bool hasWork() const { return false; }

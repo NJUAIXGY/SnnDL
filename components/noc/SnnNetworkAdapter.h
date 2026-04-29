@@ -366,6 +366,11 @@ private:
     std::map<int, uint64_t> port_counters;    ///< 端口计数器
     struct PendingSend { uint32_t dest_node = 0; SST::Event* payload = nullptr; };
     std::queue<PendingSend> pending_sends_;   ///< 待发送队列
+    uint64_t pending_send_enqueue_total_;     ///< pending_sends_ 累计入队数
+    uint64_t pending_send_dequeue_total_;     ///< pending_sends_ 累计出队数
+    uint64_t pending_send_high_watermark_;    ///< pending_sends_ 峰值深度
+    uint64_t pending_send_space_block_total_; ///< router->spaceToSend 阻塞次数
+    uint64_t pending_send_send_fail_total_;   ///< router->send 失败次数
     
     // 基础统计计数器
     uint64_t spikes_routed_count;

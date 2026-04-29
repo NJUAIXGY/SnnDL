@@ -46,7 +46,7 @@ struct SnnPESubComponentConfig {
     float init_default_weight = 0.5f;
     bool readresp_zero_fallback = false;
     uint32_t max_outstanding_requests = 16;
-    std::string synapse_weight_mode = "bcsr_gas"; // bcsr_gas | gcss_valueonly_dstcore | gcss_valueonly_dstcore_idx2 | gcss_valueonly_dstcore_vlf_premphf | gcss_valueonly_dstcore_vlf_premphf_plp
+    std::string synapse_weight_mode = "bcsr_gas"; // bcsr_gas | gcss_valueonly_dstcore | gcss_valueonly_dstcore_idx2 | gcss_idx2_rowmphf | gcss_valueonly_dstcore_vlf_premphf | gcss_valueonly_dstcore_vlf_premphf_plp
 
     // Weight cache
     uint32_t max_cache_entries = 65536;
@@ -202,8 +202,7 @@ inline SnnPESubComponentConfig parseSnnPESubComponentConfig(const SST::Params& p
             mode != "gcss_valueonly_dstcore_idx2" &&
             mode != "gcss_idx2_rowmphf" &&
             mode != "gcss_valueonly_dstcore_vlf_premphf" &&
-            mode != "gcss_valueonly_dstcore_vlf_premphf_plp" &&
-            mode != "gcss_valueonly_dstblock_naive_tass") {
+            mode != "gcss_valueonly_dstcore_vlf_premphf_plp") {
             mode = "bcsr_gas";
         }
         c.synapse_weight_mode = mode;

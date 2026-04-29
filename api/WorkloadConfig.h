@@ -23,15 +23,19 @@ inline uint64_t clampNonZeroU64(uint64_t v) { return v ? v : 1ull; }
 // Workload 分类（供 PE/CoreShell 做策略选择，避免散落的 string if/else 堆叠）。
 enum class WorkloadKind : uint8_t {
     Snn = 0,
-    Stream = 1,
-    Traffic = 2,
-    Tensor = 3,
+    RiscvSnn = 1,
+    Stream = 2,
+    Traffic = 3,
+    TrafficMem = 4,
+    Tensor = 5,
 };
 
 inline WorkloadKind workloadKindFromString(const std::string& impl) {
     const std::string w = toLowerCopy(std::string(impl));
+    if (w == "riscv_snn") return WorkloadKind::RiscvSnn;
     if (w == "stream") return WorkloadKind::Stream;
     if (w == "traffic") return WorkloadKind::Traffic;
+    if (w == "traffic_mem") return WorkloadKind::TrafficMem;
     if (w == "tensor") return WorkloadKind::Tensor;
     return WorkloadKind::Snn;
 }
@@ -39,8 +43,10 @@ inline WorkloadKind workloadKindFromString(const std::string& impl) {
 inline const char* workloadKindName(WorkloadKind k) {
     switch (k) {
         case WorkloadKind::Snn: return "snn";
+        case WorkloadKind::RiscvSnn: return "riscv_snn";
         case WorkloadKind::Stream: return "stream";
         case WorkloadKind::Traffic: return "traffic";
+        case WorkloadKind::TrafficMem: return "traffic_mem";
         case WorkloadKind::Tensor: return "tensor";
         default: return "snn";
     }
@@ -48,6 +54,19 @@ inline const char* workloadKindName(WorkloadKind k) {
 
 inline bool isNonSnnWorkloadKind(WorkloadKind k) {
     return k != WorkloadKind::Snn;
+}
+
+// `riscv_snn` still needs SNN-style stimulus injection when it fronts a shadow/runtime
+// datapath. Keep this narrower than "is SNN-like" so other feature gates can stay strict.
+inline bool workloadAllowsSnnStimulus(WorkloadKind k) {
+    return k == WorkloadKind::Snn || k == WorkloadKind::RiscvSnn;
+}
+
+// Pure SNN datapath features stay reserved for the native `snn` workload. Experimental
+// control-plane workloads such as `riscv_snn` may share stimulus semantics without inheriting
+// DMA/local-storage/pulse infrastructure by accident.
+inline bool workloadAllowsPureSnnDatapathFeatures(WorkloadKind k) {
+    return k == WorkloadKind::Snn;
 }
 
 inline const char* workloadImplFromEnvCached() {

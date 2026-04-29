@@ -3,11 +3,19 @@
 #include <cmath>
 #include <cstdio>
 #include <fstream>
+#include <limits>
 #include <sstream>
 
 #include "SnnDLStringUtil.h"
 
 namespace SST { namespace SnnDL {
+
+namespace {
+static inline uint64_t satAddU64Local(uint64_t a, uint64_t b) {
+    if (std::numeric_limits<uint64_t>::max() - a < b) return std::numeric_limits<uint64_t>::max();
+    return a + b;
+}
+} // namespace
 
 std::unique_ptr<ISnnComputeCore> createComputeCoreByName(const std::string& name) {
     if (name.empty() || name == "default" || name == "snn") {
@@ -212,6 +220,16 @@ void DefaultSnnComputeCore::onClockTick(uint64_t now_cycle) {
     state_sram_current_cycle_ = now_cycle;
     if (state_sram_enable_) {
         state_sram_model_.onClockTick(now_cycle);
+        state_sram_stall_budget_ = satAddU64Local(
+            state_sram_stall_budget_,
+            state_sram_model_.consumeLastCyclePredictedExtraCycles());
+        // GAS window mode: endCycle() is not invoked every tick. To avoid dropping or silently
+        // ignoring the SRAM stall budget, consume it during idle gaps (post EndScatter) so the
+        // global-step drain policy can observe "real" stall time before declaring PE_DONE.
+        if (gas_window_mode_ && gas_stage_ == GasStage::Idle && state_sram_stall_budget_ > 0) {
+            --state_sram_stall_budget_;
+            state_sram_stall_cycles_total_ = satAddU64Local(state_sram_stall_cycles_total_, 1ull);
+        }
     }
     total_cycles_++;
     if (hasWork()) active_cycles_++;
@@ -220,6 +238,11 @@ void DefaultSnnComputeCore::onClockTick(uint64_t now_cycle) {
 }
 
 void DefaultSnnComputeCore::endCycle(uint64_t now_cycle) {
+    if (state_sram_enable_ && !gas_window_mode_ && state_sram_stall_budget_ > 0) {
+        --state_sram_stall_budget_;
+        state_sram_stall_cycles_total_ = satAddU64Local(state_sram_stall_cycles_total_, 1ull);
+        return;
+    }
     // 诊断：观察 pending dv 列表与膜电位上限（限制次数）
     if (output_ && window_read_debug_ && output_->getVerboseLevel() >= 2) {
         static uint32_t diag_end_logs = 0;
@@ -252,6 +275,11 @@ void DefaultSnnComputeCore::endCycle(uint64_t now_cycle) {
 
 void DefaultSnnComputeCore::endCycleCandidates(uint64_t now_cycle,
                                                const std::vector<uint32_t>& candidates) {
+    if (state_sram_enable_ && !gas_window_mode_ && state_sram_stall_budget_ > 0) {
+        --state_sram_stall_budget_;
+        state_sram_stall_cycles_total_ = satAddU64Local(state_sram_stall_cycles_total_, 1ull);
+        return;
+    }
     // 与 endCycle() 保持一致的“先推进动力学，再判定发放”顺序。
     // candidates 允许控制层在 window/scatter 场景下仅检查触达的 post 集合。
     updateNeuronStates();
@@ -313,15 +341,24 @@ void DefaultSnnComputeCore::applySynapticDelta(uint32_t post_local, float dv) {
     core_engine_.addMem(post_local, dv);
 }
 
+void DefaultSnnComputeCore::noteStateSramRead_(uint64_t addr, uint64_t bytes) {
+    if (!state_sram_enable_) return;
+    state_sram_model_.noteRead(state_sram_current_cycle_, addr, bytes);
+}
+
+void DefaultSnnComputeCore::noteStateSramWrite_(uint64_t addr, uint64_t bytes) {
+    if (!state_sram_enable_) return;
+    state_sram_model_.noteWrite(state_sram_current_cycle_, addr, bytes);
+}
+
 void DefaultSnnComputeCore::applyPendingDeltas_() {
     if (pending_dv_list_.empty()) return;
-    if (state_sram_enable_) {
-        const uint64_t touched = static_cast<uint64_t>(pending_dv_list_.size());
-        const uint64_t bytes = touched * static_cast<uint64_t>(sizeof(float));
-        state_sram_model_.noteBulkUniform(state_sram_current_cycle_, touched, touched, bytes, bytes);
-    }
     for (uint32_t post_local : pending_dv_list_) {
         if (post_local >= num_neurons_) continue;
+        if (state_sram_enable_) {
+            noteStateSramRead_(state_sram_layout_.stateVmemAddr(post_local), sizeof(float));
+            noteStateSramWrite_(state_sram_layout_.stateVmemAddr(post_local), sizeof(float));
+        }
         const float dv = (post_local < pending_dv_.size()) ? pending_dv_[post_local] : 0.0f;
         if (dv != 0.0f) {
             core_engine_.addMem(post_local, dv);
@@ -368,10 +405,12 @@ void DefaultSnnComputeCore::onSynapticEvent(const SynapticEvent& ev) {
 void DefaultSnnComputeCore::updateNeuronStates() {
     cycles_update_neuron_count_ += num_neurons_;
     if (state_sram_enable_ && num_neurons_ > 0) {
-        const uint64_t n = static_cast<uint64_t>(num_neurons_);
-        const uint64_t bytes = n * static_cast<uint64_t>(sizeof(float) + sizeof(uint32_t));
-        // Per-neuron state sweep: read + write vmem/refrac.
-        state_sram_model_.noteBulkUniform(state_sram_current_cycle_, n * 2ull, n * 2ull, bytes, bytes);
+        for (uint32_t i = 0; i < num_neurons_; ++i) {
+            noteStateSramRead_(state_sram_layout_.stateVmemAddr(i), sizeof(float));
+            noteStateSramRead_(state_sram_layout_.stateRefracAddr(i), sizeof(uint32_t));
+            noteStateSramWrite_(state_sram_layout_.stateVmemAddr(i), sizeof(float));
+            noteStateSramWrite_(state_sram_layout_.stateRefracAddr(i), sizeof(uint32_t));
+        }
     }
     if (neuron_model_) {
         if (use_soa_state_) {
@@ -418,8 +457,37 @@ bool DefaultSnnComputeCore::fire(uint32_t idx, uint64_t now_cycles, INeuronModel
         if (gas_stage_ != GasStage::Scatter) return false;
         if (idx < fired_this_window_.size() && fired_this_window_[idx]) return false;
     }
+
+    float state_vmem_before = 0.0f;
+    uint32_t state_refrac_before = 0;
+    uint64_t state_last_spike_before = 0;
+    if (state_sram_enable_ && idx < num_neurons_) {
+        noteStateSramRead_(state_sram_layout_.stateVmemAddr(idx), sizeof(float));
+        noteStateSramRead_(state_sram_layout_.stateRefracAddr(idx), sizeof(uint32_t));
+        noteStateSramRead_(state_sram_layout_.stateLastSpikeAddr(idx), sizeof(uint64_t));
+        state_vmem_before = core_engine_.getMem(idx);
+        state_refrac_before = core_engine_.getRefrac(idx);
+        state_last_spike_before = core_engine_.getLastSpike(idx);
+    }
+
     INeuronModel* use_model = model ? model : neuron_model_.get();
     bool fired = core_engine_.fire(idx, now_cycles, use_model, v_before, v_after);
+
+    if (state_sram_enable_ && idx < num_neurons_) {
+        const float state_vmem_after = core_engine_.getMem(idx);
+        const uint32_t state_refrac_after = core_engine_.getRefrac(idx);
+        const uint64_t state_last_spike_after = core_engine_.getLastSpike(idx);
+        if (fired || state_vmem_after != state_vmem_before) {
+            noteStateSramWrite_(state_sram_layout_.stateVmemAddr(idx), sizeof(float));
+        }
+        if (fired || state_refrac_after != state_refrac_before) {
+            noteStateSramWrite_(state_sram_layout_.stateRefracAddr(idx), sizeof(uint32_t));
+        }
+        if (fired || state_last_spike_after != state_last_spike_before) {
+            noteStateSramWrite_(state_sram_layout_.stateLastSpikeAddr(idx), sizeof(uint64_t));
+        }
+    }
+
     if (fired && apply_acc_enable_ && gas_window_mode_ && idx < fired_this_window_.size()) {
         fired_this_window_[idx] = 1;
     }
@@ -537,6 +605,8 @@ void DefaultSnnComputeCore::onSpikeDelivered(SpikeEvent* spike) {
 }
 
 bool DefaultSnnComputeCore::hasWork() const {
+    if (gas_window_mode_) return state_sram_stall_budget_ > 0;
+    if (state_sram_stall_budget_ > 0) return true;
     if (use_soa_state_) {
         return std::any_of(soa_v_mem_.begin(), soa_v_mem_.end(), [](float v){ return v > 0.1f; });
     }
@@ -571,6 +641,10 @@ void DefaultSnnComputeCore::getStatistics(std::map<std::string, uint64_t>& out) 
     out["core_state_sram_bank_conflict_ticks_total"] = sram_stats.bank_conflict_ticks_total;
     out["core_state_sram_predicted_extra_cycles_total"] = sram_stats.predicted_extra_cycles_total;
     out["core_state_sram_resident_bytes_peak"] = sram_stats.resident_bytes_peak;
+    out["core_state_sram_bank_peak_accesses_per_tick"] = sram_stats.bank_peak_accesses_per_tick;
+    out["core_state_sram_energy_read_pj_total"] = static_cast<uint64_t>(sram_stats.energy_read_pj_total);
+    out["core_state_sram_energy_write_pj_total"] = static_cast<uint64_t>(sram_stats.energy_write_pj_total);
+    out["core_state_sram_stall_cycles_total"] = state_sram_stall_cycles_total_;
     if (learning_core_) {
         learning_core_->getStatistics(out);
     }

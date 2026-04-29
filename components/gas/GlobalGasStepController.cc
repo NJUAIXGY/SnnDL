@@ -7,9 +7,11 @@
 
 #include <algorithm>
 #include <inttypes.h>
+#include <set>
 #include <string>
 
 #include "GasStepBarrierEvent.h"
+#include "GatingDecisionEvent.h"
 #include "gas/experimental/P0BCreditPolicy.h"
 #include "gas/experimental/StepActivationPredictor.h"
 #include "gas/GlobalGasStepControllerConfig.h"
@@ -44,12 +46,21 @@ GlobalGasStepController::GlobalGasStepController(SST::ComponentId_t id, SST::Par
     credit_ctrl_pred_fraction_ = params.find<double>("credit_ctrl_pred_fraction", 0.0);
     credit_ctrl_pred_neurons_per_pe_ = params.find<uint32_t>("credit_ctrl_pred_neurons_per_pe", 0);
     credit_ctrl_pred_fanout_ = params.find<uint32_t>("credit_ctrl_pred_fanout", 0);
+    gating_event_enable_ = cfg.gating_event_enable;
+    gating_event_rows_per_pe_ = cfg.gating_event_rows_per_pe;
+    gating_event_top_k_ = cfg.gating_event_top_k;
+    gating_event_ttl_cycles_ = cfg.gating_event_ttl_cycles;
+    gating_event_target_offset_ = cfg.gating_event_target_offset;
+    gating_event_target_stride_ = cfg.gating_event_target_stride;
+    gating_event_include_self_ = cfg.gating_event_include_self;
     if (credit_ctrl_pred_fraction_ < 0.0) credit_ctrl_pred_fraction_ = 0.0;
     if (credit_ctrl_credit_min_ == 0) credit_ctrl_credit_min_ = 1;
     if (credit_ctrl_credit_max_ < credit_ctrl_credit_min_) credit_ctrl_credit_max_ = credit_ctrl_credit_min_;
     if (!credit_ctrl_enable_) credit_ctrl_top_k_ = 0;
     if (credit_ctrl_base_credit_ == 0) credit_ctrl_base_credit_ = credit_ctrl_credit_min_;
     if (credit_ctrl_apply_ratio_min_permille_ > 1000u) credit_ctrl_apply_ratio_min_permille_ = 1000u;
+    if (gating_event_target_stride_ == 0) gating_event_target_stride_ = 1;
+    if (!gating_event_enable_) gating_event_top_k_ = 0;
     if (start_seq_ == 0) {
         if (strict_seq_check_) {
             if (out_) {
@@ -130,6 +141,13 @@ GlobalGasStepController::GlobalGasStepController(SST::ComponentId_t id, SST::Par
     for (size_t i = 0; i < pe_node_ids_.size(); ++i) {
         pe_node_ids_[i] = static_cast<uint32_t>(i);
     }
+
+    stat_current_seq_last_ = registerStatistic<uint64_t>("current_seq_last");
+    stat_steps_started_total_ = registerStatistic<uint64_t>("steps_started_total");
+    stat_steps_completed_total_ = registerStatistic<uint64_t>("steps_completed_total");
+    stat_pe_ready_events_total_ = registerStatistic<uint64_t>("pe_ready_events_total");
+    stat_pe_done_events_total_ = registerStatistic<uint64_t>("pe_done_events_total");
+    stat_warn_count_total_ = registerStatistic<uint64_t>("warn_count_total");
 }
 
 GlobalGasStepController::~GlobalGasStepController() {
@@ -153,6 +171,12 @@ void GlobalGasStepController::setup() {
 }
 
 void GlobalGasStepController::finish() {
+    if (stat_current_seq_last_) stat_current_seq_last_->addData(static_cast<uint64_t>(current_seq_));
+    if (stat_steps_started_total_) stat_steps_started_total_->addData(steps_started_total_);
+    if (stat_steps_completed_total_) stat_steps_completed_total_->addData(static_cast<uint64_t>(steps_completed_));
+    if (stat_pe_ready_events_total_) stat_pe_ready_events_total_->addData(pe_ready_events_total_);
+    if (stat_pe_done_events_total_) stat_pe_done_events_total_->addData(pe_done_events_total_);
+    if (stat_warn_count_total_) stat_warn_count_total_->addData(static_cast<uint64_t>(warn_count_));
     if (!out_) return;
     size_t ready = 0;
     size_t done = 0;
@@ -197,6 +221,7 @@ bool GlobalGasStepController::allDone_() const {
 }
 
 void GlobalGasStepController::broadcastStart_(uint32_t seq) {
+    steps_started_total_ += 1;
     for (size_t i = 0; i < pe_links_.size(); ++i) {
         auto* ev = new GasStepBarrierEvent(GasStepBarrierOp::StartStep, seq, /*src_node*/0);
         if (credit_ctrl_enable_ &&
@@ -206,8 +231,50 @@ void GlobalGasStepController::broadcastStart_(uint32_t seq) {
         }
         pe_links_[i]->send(ev);
     }
+    broadcastSyntheticGating_(seq);
     if (out_) {
         out_->verbose(CALL_INFO, 1, 0, "[step-sync] START_STEP seq=%u broadcast to %zu PEs\n", seq, pe_links_.size());
+    }
+}
+
+void GlobalGasStepController::broadcastSyntheticGating_(uint32_t seq) {
+    if (!gating_event_enable_ || gating_event_top_k_ == 0 || pe_links_.empty()) return;
+
+    const size_t pe_count = pe_links_.size();
+    const uint32_t rows_per_pe = (gating_event_rows_per_pe_ > 0) ? gating_event_rows_per_pe_ : 1u;
+    const uint64_t ttl_cycles = (gating_event_ttl_cycles_ > 0) ? gating_event_ttl_cycles_ : 1ull;
+
+    for (size_t pe_index = 0; pe_index < pe_count; ++pe_index) {
+        const uint32_t src_pe =
+            (pe_index < pe_node_ids_.size()) ? pe_node_ids_[pe_index] : static_cast<uint32_t>(pe_index);
+
+        std::set<uint32_t> unique_targets;
+        std::vector<uint32_t> dest_pes;
+        dest_pes.reserve(static_cast<size_t>(gating_event_top_k_));
+        for (size_t probe = 0; probe < pe_count && dest_pes.size() < gating_event_top_k_; ++probe) {
+            const size_t candidate_index =
+                (pe_index + static_cast<size_t>(gating_event_target_offset_) +
+                 probe * static_cast<size_t>(gating_event_target_stride_)) % pe_count;
+            if (!gating_event_include_self_ && candidate_index == pe_index) continue;
+            const uint32_t candidate_pe =
+                (candidate_index < pe_node_ids_.size())
+                    ? pe_node_ids_[candidate_index]
+                    : static_cast<uint32_t>(candidate_index);
+            if (!unique_targets.insert(candidate_pe).second) continue;
+            dest_pes.push_back(candidate_pe);
+        }
+        if (dest_pes.empty()) continue;
+
+        for (uint32_t row = 0; row < rows_per_pe; ++row) {
+            auto* ev = new GatingDecisionEvent();
+            ev->token_id = (seq << 16) ^ row;
+            ev->src_pe = src_pe;
+            ev->src_row = row;
+            ev->top_k = static_cast<uint32_t>(dest_pes.size());
+            ev->ttl_cycles = ttl_cycles;
+            ev->dest_pes = dest_pes;
+            pe_links_[pe_index]->send(ev);
+        }
     }
 }
 
@@ -227,6 +294,7 @@ void GlobalGasStepController::handleBarrierEvent_(SST::Event* ev, int pe_index) 
     const uint32_t src_node = msg->src_node;
 
     if (op == GasStepBarrierOp::PeReady) {
+        pe_ready_events_total_ += 1;
         pe_ready_[pe_index] = 1;
         if (static_cast<size_t>(pe_index) < pe_node_ids_.size()) {
             pe_node_ids_[static_cast<size_t>(pe_index)] = src_node;
@@ -245,6 +313,7 @@ void GlobalGasStepController::handleBarrierEvent_(SST::Event* ev, int pe_index) 
     }
 
     if (op == GasStepBarrierOp::PeDone) {
+        pe_done_events_total_ += 1;
         if (!started_) {
             if (strict_seq_check_) {
                 if (out_) out_->fatal(CALL_INFO, -1, "GlobalGasStepController fatal: PE_DONE before started (pe=%d)\n", pe_index);

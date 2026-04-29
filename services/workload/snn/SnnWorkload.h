@@ -13,10 +13,12 @@
 #include <queue>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "IWeightReaderAdopter.h"
 #include "IGasStageSink.h"
+#include "ISynapseRoute.h"
 #include "ISpikeWorkload.h"
 #include "ISnnSpikeCommWorkload.h"
 
@@ -35,9 +37,9 @@ class WeightCacheOps;
 class BcsrWeightManager;
 struct WeightAccessor;
 class AccumulatorOps;
-class SynapseRouteSubsystem;
 class SpikeCommSubsystem;
 class NocSpikeTransport;
+class StreamWorkload;
 	struct SynapseRouteBuildConfig;
 
 	class SnnWorkload final : public ISpikeWorkload,
@@ -60,6 +62,7 @@ class NocSpikeTransport;
     void onInitPhase(unsigned phase) override;
     void onSetup() override;
     void onFinish() override;
+    void resetMembraneState(float v_rest) override;
 
     // ISnnSpikeCommWorkload
     void applyGatingDecision(uint32_t src_global,
@@ -79,6 +82,7 @@ class NocSpikeTransport;
 
 	private:
 	    enum class GasStage { Idle=0, Gather=1, Apply=2, Scatter=3 };
+        enum class StepRxGatePath { Direct=0, Fastpath=1 };
 
     uint64_t nowNs_() const;
     void normalizeLayout_();
@@ -89,7 +93,6 @@ class NocSpikeTransport;
     const std::vector<uint32_t>* lookupPostsLocalForPre_(uint32_t pre_global);
     bool resolvePreRankForPost_(uint32_t pre_global, uint32_t post_local, uint32_t& out_rank);
     bool expandPreGlobalToWindowEdgesFast_(uint32_t pre_global);
-
     bool isPreLocal_(uint32_t pre_global) const;
     uint32_t remapPreGlobalModulo_(uint32_t pre_global) const;
     uint32_t mapPreGlobalToLocal_(uint32_t pre_global) const;
@@ -98,10 +101,21 @@ class NocSpikeTransport;
     void ensureWeightReaderOwned_();
     void ensureComputeCoreConfigured_();
     void ensureSpikeCommConfigured_();
+    void ensureSemanticRegionWorkload_();
     bool windowScatterModeActive_() const;
     bool shouldDeferScatterCommit_() const;
     void finalizeScatterCommit_(uint32_t superstep);
+    void completeEndScatter_(uint32_t superstep);
+    void enterBeginGather_(uint32_t superstep);
     bool tryFinalizeDeferredScatter_();
+    void resetApplyScatterCounters_();
+    void resetStepRxGateCounters_();
+    void noteStepRxGateAccept_(StepRxGatePath path);
+    void noteStepRxGateRejectRefractory_(StepRxGatePath path);
+    void noteStepRxGateAcceptN_(StepRxGatePath path, uint64_t n);
+    void noteStepRxGateRejectRefractoryN_(StepRxGatePath path, uint64_t n);
+    void reportStepRxGateCounters_(uint32_t seq);
+    void markComputeActivity_();
 
     Runtime rt_{};
 
@@ -139,6 +153,7 @@ class NocSpikeTransport;
     bool use_bcsr_ = false;
     std::string synapse_weight_mode_ = "bcsr_gas";
     bool workload_spike_input_enable_ = false;
+    bool step_seed_only_mode_ = false;
     bool experimental_spiketile_enable_ = false;
     bool experimental_spikekey_fastpath_enable_ = false;
     uint32_t experimental_spiketile_max_pre_bits_ = 64;
@@ -150,6 +165,8 @@ class NocSpikeTransport;
     uint64_t snn_rx_spike_packets_total_ = 0;
     uint64_t snn_rx_spikekey_total_ = 0;
     uint64_t snn_rx_spiketilekey_total_ = 0;
+    uint64_t snn_rx_spikekey_v4_total_ = 0;
+    uint64_t snn_rx_spiketilekey_v4_total_ = 0;
     uint64_t snn_rx_fastpath_packets_total_ = 0;
     uint64_t snn_rx_fallback_packets_total_ = 0;
     uint64_t snn_rx_decode_fail_total_ = 0;
@@ -163,11 +180,25 @@ class NocSpikeTransport;
     uint64_t snn_edge_record_skip_stage_total_ = 0;
     uint64_t snn_edge_record_skip_capacity_total_ = 0;
     uint64_t snn_edge_record_skip_reject_total_ = 0;
+    uint64_t snn_edge_record_fastpath_handler_entry_total_ = 0;
+    uint64_t snn_edge_record_fastpath_wms_missing_total_ = 0;
+    uint64_t snn_edge_record_fastpath_backend_not_ready_total_ = 0;
+    uint64_t snn_edge_record_fastpath_stage_block_total_ = 0;
+    uint64_t snn_edge_record_process_local_handler_entry_total_ = 0;
+    uint64_t snn_edge_record_process_local_wms_missing_total_ = 0;
+    uint64_t snn_edge_record_process_local_backend_not_ready_total_ = 0;
+    uint64_t snn_edge_record_process_local_stage_block_total_ = 0;
+    uint64_t snn_edge_record_deliver_window_handler_entry_total_ = 0;
+    uint64_t snn_edge_record_deliver_window_wms_missing_total_ = 0;
+    uint64_t snn_edge_record_deliver_window_backend_not_ready_total_ = 0;
+    uint64_t snn_edge_record_deliver_window_stage_block_total_ = 0;
     uint64_t snn_begin_apply_prev_edges_total_ = 0;
     uint64_t snn_begin_apply_prev_empty_total_ = 0;
     uint64_t snn_issue_from_edges_calls_total_ = 0;
     uint64_t now_cycle_cached_ = 0;
+    bool compute_activity_pending_ = false;
     GasStage gas_stage_ = GasStage::Idle;
+    uint32_t window_touch_debug_log_count_ = 0;
 
     // Spike input handling migrated from CoreShell (Phase7 - Task1).
     std::queue<SpikeEvent*> incoming_spikes_;
@@ -181,6 +212,19 @@ class NocSpikeTransport;
     std::unique_ptr<AccumulatorOps> acc_ops_;
     uint64_t last_scatter_spikes_emitted_ = 0;
     uint64_t total_scatter_spikes_emitted_ = 0;
+    uint64_t total_gas_frontend_granules_built_ = 0;
+    uint64_t total_gas_apply_acc_updates_ = 0;
+    uint64_t acc_updates_count_ = 0;
+    uint64_t acc_posts_touched_count_ = 0;
+    uint64_t acc_spill_records_count_ = 0;
+    uint64_t acc_spilled_bytes_sum_ = 0;
+    uint64_t acc_hwm_bytes_max_ = 0;
+    uint64_t step_rx_gate_accept_total_ = 0;
+    uint64_t step_rx_gate_reject_refractory_total_ = 0;
+    uint64_t step_rx_gate_direct_accept_total_ = 0;
+    uint64_t step_rx_gate_direct_reject_refractory_total_ = 0;
+    uint64_t step_rx_gate_fastpath_accept_total_ = 0;
+    uint64_t step_rx_gate_fastpath_reject_refractory_total_ = 0;
 
     // Step-gate mode: end Gather/Scatter explicitly (load-driven), instead of fixed window_cycles_*.
     uint32_t gather_seq_ = 0;
@@ -192,6 +236,11 @@ class NocSpikeTransport;
     bool scatter_end_requested_ = false;
     bool scatter_commit_pending_ = false;
     uint32_t scatter_commit_seq_ = 0;
+    uint64_t scatter_defer_diag_next_cycle_ = 0;
+    bool end_scatter_event_pending_ = false;
+    uint32_t end_scatter_event_seq_ = 0;
+    bool begin_gather_event_pending_ = false;
+    uint32_t begin_gather_event_seq_ = 0;
 
     // WeightLoader barrier (shared signal)
     std::string loader_done_key_;
@@ -205,9 +254,11 @@ class NocSpikeTransport;
     bool compute_configured_ = false;
 
     // Phase4-Task6.3: route/comm owned by workload=snn.
-    std::unique_ptr<SynapseRouteSubsystem> synapse_route_;
+    std::unique_ptr<ISynapseRoute> synapse_route_;
+    ISynapseRoute::RouteSemanticDescriptor route_semantics_{};
     std::unique_ptr<SpikeCommSubsystem> spike_comm_;
     std::unique_ptr<NocSpikeTransport> noc_spike_transport_;
+    std::unique_ptr<StreamWorkload> semantic_region_workload_;
     bool spike_comm_configured_ = false;
 
     // Native multicast receive-side expansion cache: pre_global -> posts_local (for this core only).

@@ -90,6 +90,8 @@ private:
     uint32_t aosoa_block_rows_ = 16;
     bool state_sram_enable_ = false;
     uint64_t state_sram_current_cycle_ = 0;
+    uint64_t state_sram_stall_budget_ = 0;
+    uint64_t state_sram_stall_cycles_total_ = 0;
     VirtualSramLayout state_sram_layout_{};
     BankedSramModel state_sram_model_{};
 
@@ -176,6 +178,8 @@ private:
     void performWeightVerificationTick_(uint64_t now_cycle);
     void initCoreEngineState_();
     void initVerifyFile_();
+    void noteStateSramRead_(uint64_t addr, uint64_t bytes);
+    void noteStateSramWrite_(uint64_t addr, uint64_t bytes);
     void applyPendingDeltas_();
     void resetPendingDeltas_();
 };

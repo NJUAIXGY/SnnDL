@@ -53,21 +53,21 @@ std::vector<WorkloadStatsRegistry::ModulePtr> WorkloadStatsRegistry::buildModule
     if (!mod_raw.empty()) {
         names = splitCsv(mod_raw);
     } else {
-        if (wl == "stream" || wl == "traffic") {
+        if (wl == "stream" || wl == "traffic" || wl == "traffic_mem") {
             names.emplace_back("stream");
         } else if (wl == "tensor") {
             names.emplace_back("tensor");
-        } else if (wl == "snn") {
+        } else if (wl == "snn" || wl == "riscv_snn") {
             names.emplace_back("snn");
         }
     }
 
     for (const auto& name : names) {
         if (name == "snn") {
-            const bool active = (wl == "snn");
+            const bool active = (wl == "snn" || wl == "riscv_snn");
             modules.emplace_back(std::make_unique<SnnWorkloadStatsModule>(active));
         } else if (name == "stream") {
-            const bool active = (wl == "stream" || wl == "traffic");
+            const bool active = (wl == "stream" || wl == "traffic" || wl == "traffic_mem");
             modules.emplace_back(std::make_unique<StreamWorkloadStatsModule>(active));
         } else if (name == "tensor") {
             const bool active = (wl == "tensor");

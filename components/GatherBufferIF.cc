@@ -460,6 +460,14 @@ void GatherBufferIF::openStep(uint32_t seq) {
         return;
     }
 
+    if (step_gate_wait_cycles_pending_ > 0 && upstream_handler_) {
+        auto* s = new GasStatData(seq, 0, 0);
+        s->stall_on_step_gate_cycles = step_gate_wait_cycles_pending_;
+        auto* cr = new StandardMem::CustomResp((StandardMem::Request::id_t)0, s, 0, 0, 0);
+        (*upstream_handler_)(cr);
+        step_gate_wait_cycles_pending_ = 0;
+    }
+
     current_gather_id_ = seq;
     // Apply external credit target (if any) at the step boundary.
     if (apply_credit_external_enable_ && apply_credit_external_pending_seq_ == seq) {
@@ -912,6 +920,12 @@ void GatherBufferIF::issueMoreUnissuedFromOrder_(int buf) {
             // If we couldn't issue anything (most commonly due to inflight saturation),
             // stop here and wait for the next downstream response to free credits.
             if (g.frags_issued == before_frags && g.issued == before_issued) {
+                if (buf == apply_buf_index_ && stage_ == Stage::Apply) {
+                    const uint64_t inflight_total = static_cast<uint64_t>(inflight_counts_[0] + inflight_counts_[1]);
+                    if (inflight_total < max_inflight_reads_) {
+                        apply_issue_block_downstream_busy_total_++;
+                    }
+                }
                 return;
             }
 
@@ -950,6 +964,24 @@ void GatherBufferIF::issueUnissuedGranulesDeterministic_(int buf) {
     }
 }
 
+uint64_t GatherBufferIF::countApplyIssuableGranules_(int buf) const {
+    if (buf < 0 || buf >= 2) return 0;
+    const auto& gmap = sb_[buf].granules;
+    uint64_t issuable = 0;
+    for (const auto& kv : gmap) {
+        const Granule& g = kv.second;
+        if (g.ready) continue;
+        if (!g.issued) {
+            issuable += 1;
+            continue;
+        }
+        if (g.frags_total > 0 && g.frags_issued < g.frags_total) {
+            issuable += 1;
+        }
+    }
+    return issuable;
+}
+
 uint64_t GatherBufferIF::granuleSize() const {
     // Use downstream line size if available for cacheline policy
     auto ls = backend_ ? backend_->getLineSize() : 64;
@@ -974,6 +1006,11 @@ void GatherBufferIF::issueGranuleBufBudget_(int buf, const GranuleKey& key, Gran
         g.frags_done = 0;
     }
     if (g.frags_issued >= g.frags_total) return;
+    const bool is_apply_issue_ctx = (buf == apply_buf_index_ && stage_ == Stage::Apply);
+    const uint32_t frags_before_issue = g.frags_issued;
+    if (is_apply_issue_ctx) {
+        apply_issue_attempt_total_++;
+    }
 
     uint32_t issued_now = 0;
     while (g.frags_issued < g.frags_total &&
@@ -996,10 +1033,22 @@ void GatherBufferIF::issueGranuleBufBudget_(int buf, const GranuleKey& key, Gran
         g.down_id = id;
         inflight_down_[id] = DownFrag{buf, key, off, sz};
         inflight_counts_[buf]++;
+        if (buf == apply_buf_index_ && stage_ == Stage::Apply && apply_first_down_issue_ns_ == 0) {
+            apply_first_down_issue_ns_ = getCurrentSimTimeNano();
+        }
         if (stat_reads_issued_) stat_reads_issued_->addData(1);
         backend_->send(rd);
         g.frags_issued++;
         issued_now++;
+    }
+    if (is_apply_issue_ctx && g.frags_issued > frags_before_issue) {
+        apply_issue_success_total_++;
+    }
+    if (is_apply_issue_ctx &&
+        g.frags_issued == frags_before_issue &&
+        g.frags_issued < g.frags_total &&
+        (inflight_counts_[0] + inflight_counts_[1]) >= max_inflight_reads_) {
+        apply_issue_block_inflight_cap_total_++;
     }
 }
 
@@ -1042,6 +1091,12 @@ void GatherBufferIF::onDownstreamResp_(Request* r) {
 	            const GranuleKey key = it->second.key;
 	            const uint32_t frag_off = it->second.off;
 	            const uint32_t frag_sz = it->second.size;
+	            if (buf_index == apply_buf_index_ && stage_ == Stage::Apply) {
+	                if (apply_first_down_resp_ns_ == 0) {
+	                    apply_first_down_resp_ns_ = getCurrentSimTimeNano();
+	                }
+	                apply_down_resp_total_++;
+	            }
 	            inflight_down_.erase(it);
 	            if (buf_index >=0 && buf_index < 2) {
 	                auto& sb = sb_[buf_index];
@@ -1113,6 +1168,12 @@ void GatherBufferIF::onDownstreamResp_(Request* r) {
                     completed_now = true;
                 }
                 if (completed_now) {
+                    if (buf_index == apply_buf_index_ && stage_ == Stage::Apply) {
+                        if (apply_first_granule_done_ns_ == 0) {
+                            apply_first_granule_done_ns_ = getCurrentSimTimeNano();
+                        }
+                        apply_completed_granules_total_++;
+                    }
                     // Diagnostic: dump per-sub first-float values into CSV
                     // Use SRAM block (sram) as the source of truth so we still produce samples even if rr->data is empty.
                     #ifdef SNNDL_ENABLE_DEBUG_LOG
@@ -1156,7 +1217,7 @@ void GatherBufferIF::onDownstreamResp_(Request* r) {
 
                     // Also propagate a lightweight stat update upstream so PE层可累计到 CSV
                     if (upstream_handler_) {
-                        auto* s = new GasStatData(1, (uint64_t)g.size);
+                        auto* s = new GasStatData((uint32_t)current_gather_id_, 1, (uint64_t)g.size);
                         auto* cr = new StandardMem::CustomResp((StandardMem::Request::id_t)0, s, 0, 0, 0);
                         (*upstream_handler_)(cr);
                     }
@@ -1278,15 +1339,31 @@ void GatherBufferIF::maybeEnterApply_() {
         return;
     }
     // 进入 APPLY；对于延后发射模式，在此时统一构建/排序并下发；否则要求全部ready再进入
-    if (out_.getVerboseLevel() >= 1) {
-        out_.verbose(CALL_INFO, 1, 0,
-            "[diag-gbi] maybeEnterApply_: pre-switch stage=%d gid=%" PRIu64 " granules=%zu required_set=%zu inflight_g=%" PRIu64 " inflight_a=%" PRIu64 "\n",
-            (int)stage_, current_gather_id_,
-            sb_[gather_buf_index_].granules.size(), sb_[gather_buf_index_].required_set.size(),
-            (uint64_t)inflight_counts_[gather_buf_index_], (uint64_t)inflight_counts_[apply_buf_index_]);
-    }
     flushStageCycles_(Stage::Gather, false);
     stage_ = Stage::Apply; stage_counter_ = 0; apply_pending_emit_ = true;
+    apply_begin_ns_ = getCurrentSimTimeNano();
+    apply_first_down_issue_ns_ = 0;
+    apply_first_down_resp_ns_ = 0;
+    apply_first_granule_done_ns_ = 0;
+    apply_first_up_resp_ns_ = 0;
+    apply_down_resp_total_ = 0;
+    apply_completed_granules_total_ = 0;
+    apply_emitted_subreads_total_ = 0;
+    apply_backlog_granules_residual_peak_ = 0;
+    apply_backlog_pending_up_reads_residual_peak_ = 0;
+    apply_backlog_inflight_residual_peak_ = 0;
+    apply_backlog_granules_peak_after_due_ = 0;
+    apply_backlog_pending_up_reads_peak_after_due_ = 0;
+    apply_backlog_inflight_peak_after_due_ = 0;
+    apply_issue_attempt_total_ = 0;
+    apply_issue_success_total_ = 0;
+    apply_issue_block_no_ready_total_ = 0;
+    apply_issue_block_inflight_cap_total_ = 0;
+    apply_issue_block_bank_credit_total_ = 0;
+    apply_issue_block_downstream_busy_total_ = 0;
+    apply_issue_block_retire_guard_total_ = 0;
+    apply_ready_queue_peak_ = 0;
+    apply_ready_queue_nonempty_cycles_total_ = 0;
     // [DEBUG] 在切换前记录当前 Gather 缓冲区状态
     out_.verbose(CALL_INFO, 1, 0,
         "[diag-gbi] BEFORE switch: gather_buf=%d granules=%zu required_set=%zu pending_up_reads=%zu\n",
@@ -1401,6 +1478,9 @@ void GatherBufferIF::buildGranulesWithGapMergeBuf_(int buf) {
     const uint64_t line_bytes = (line_bytes_u64 > 0 && line_bytes_u64 <= (1ull << 20)) ? line_bytes_u64 : 64ull;
 
     uint64_t payload_bytes_total = 0;
+    uint64_t frontend_staged_reads_count = static_cast<uint64_t>(staged_reads.size());
+    uint64_t frontend_staged_line_touches = 0;
+    uint64_t frontend_granules_built_count = 0;
     uint64_t unique_line_count = 0;
     std::unordered_set<uint64_t> uniq_lines;
     uniq_lines.reserve(staged_reads.size() * 2);
@@ -1410,6 +1490,7 @@ void GatherBufferIF::buildGranulesWithGapMergeBuf_(int buf) {
         const uint64_t a1 = rd->pAddr + (uint64_t)rd->size;
         const uint64_t l0 = a0 / line_bytes;
         const uint64_t l1 = (a1 + line_bytes - 1) / line_bytes;
+        if (l1 > l0) frontend_staged_line_touches += (l1 - l0);
         for (uint64_t li = l0; li < l1; ++li) uniq_lines.insert(li);
     }
     unique_line_count = (uint64_t)uniq_lines.size();
@@ -1565,7 +1646,9 @@ void GatherBufferIF::buildGranulesWithGapMergeBuf_(int buf) {
                         sz, segSubs.size());
                     ++diag_granule_build_logged_;
                 }
+                const bool granule_exists = (S.granules.find(gkey) != S.granules.end());
                 auto& g = ensureGranule_(buf, gkey);
+                if (!granule_exists) ++frontend_granules_built_count;
                 if (seg_start_ns != 0) {
                     if (g.min_arrival_ns == 0 || seg_start_ns < g.min_arrival_ns) g.min_arrival_ns = seg_start_ns;
                 }
@@ -1591,7 +1674,7 @@ void GatherBufferIF::buildGranulesWithGapMergeBuf_(int buf) {
                 if (upstream_handler_) {
                     const uint64_t bursts = 1;
                     const uint64_t payload = seg_sum_bytes;
-                    auto* s = new GasStatData(0, 0, /*rwt=*/0, /*rwb=*/0, bursts, payload);
+                    auto* s = new GasStatData((uint32_t)current_gather_id_, 0, 0, /*rwt=*/0, /*rwb=*/0, bursts, payload);
                     auto* cr = new StandardMem::CustomResp((StandardMem::Request::id_t)0, s, 0, 0, 0);
                     (*upstream_handler_)(cr);
                 }
@@ -1642,8 +1725,11 @@ void GatherBufferIF::buildGranulesWithGapMergeBuf_(int buf) {
 
         // Surface VLF window-level metrics to PE stats sink (align with legacy semantics).
         if (upstream_handler_) {
-            auto* s = new GasStatData(0, 0, 0, 0, 0, 0, 0, 0,
+            auto* s = new GasStatData((uint32_t)current_gather_id_, 0, 0, 0, 0, 0, 0, 0, 0,
                                       /*gap_abs=*/0,
+                                      frontend_staged_reads_count,
+                                      frontend_staged_line_touches,
+                                      frontend_granules_built_count,
                                       unique_line_count,
                                       win_covered_line_count,
                                       win_overfetch_bytes,
@@ -1722,7 +1808,9 @@ void GatherBufferIF::buildGranulesWithGapMergeBuf_(int buf) {
                     sz, segSubs.size());
                 ++diag_granule_build_logged_;
             }
+            const bool granule_exists = (S.granules.find(gkey) != S.granules.end());
             auto& g = ensureGranule_(buf, gkey);
+            if (!granule_exists) ++frontend_granules_built_count;
             if (seg_start_ns != 0) {
                 if (g.min_arrival_ns == 0 || seg_start_ns < g.min_arrival_ns) g.min_arrival_ns = seg_start_ns;
             }
@@ -1750,7 +1838,7 @@ void GatherBufferIF::buildGranulesWithGapMergeBuf_(int buf) {
                 uint64_t rwb = (seg_used_row_window || mark_rowwin) ? (uint64_t)sz : 0;
                 uint64_t bursts = 1;
                 uint64_t payload = seg_sum_bytes; // sum of sub-read sizes in this segment
-                auto* s = new GasStatData(0, 0, rwt, rwb, bursts, payload);
+                auto* s = new GasStatData((uint32_t)current_gather_id_, 0, 0, rwt, rwb, bursts, payload);
                 auto* cr = new StandardMem::CustomResp((StandardMem::Request::id_t)0, s, 0, 0, 0);
                 (*upstream_handler_)(cr);
             }
@@ -1846,11 +1934,15 @@ void GatherBufferIF::buildGranulesWithGapMergeBuf_(int buf) {
     if (stat_gap_absorbed_bytes_ && gap_abs_sum) stat_gap_absorbed_bytes_->addData(gap_abs_sum);
     // Surface window-level merge diagnostics to the PE-level stats sink (SnnPESubComponent) via CustomResp,
     // because GatherBufferIF is instantiated during init() and cannot reliably emit CSV stats itself.
-    if ((gap_abs_sum || unique_line_count || win_covered_line_count || win_overfetch_bytes ||
+    if ((gap_abs_sum || frontend_staged_reads_count || frontend_staged_line_touches || frontend_granules_built_count ||
+         unique_line_count || win_covered_line_count || win_overfetch_bytes ||
          win_cmd_cost_veto || win_cmd_cost_veto_fine_gap || win_cmd_cost_veto_row_window) &&
         upstream_handler_) {
-        auto* s = new GasStatData(0, 0, 0, 0, 0, 0, 0, 0,
+        auto* s = new GasStatData((uint32_t)current_gather_id_, 0, 0, 0, 0, 0, 0, 0, 0,
                                   gap_abs_sum,
+                                  frontend_staged_reads_count,
+                                  frontend_staged_line_touches,
+                                  frontend_granules_built_count,
                                   unique_line_count,
                                   win_covered_line_count,
                                   win_overfetch_bytes,
@@ -2010,6 +2102,12 @@ void GatherBufferIF::emitApplyResponsesBuf_(int buf) {
                 }
             }
 #endif
+            if (buf == apply_buf_index_) {
+                if (apply_first_up_resp_ns_ == 0) {
+                    apply_first_up_resp_ns_ = getCurrentSimTimeNano();
+                }
+                apply_emitted_subreads_total_++;
+            }
             if (upstream_handler_) (*upstream_handler_)(resp);
             // 注意：上游StandardMem::Read的所有权由上游组件管理。
             // 这里不再delete上游请求指针，仅从追踪表移除，避免重复释放导致的崩溃。
@@ -2048,6 +2146,29 @@ void GatherBufferIF::emitApplyResponsesBuf_(int buf) {
     // Re-entrancy safety: do not clear staging_reads here; upstream callbacks during emission can
     // synchronously stage new reads that must be drained by clockTick() in the same Apply window.
     apply_pending_emit_ = !(S.granules.empty() && S.pending_up_reads.empty() && S.staging_reads.empty());
+}
+
+void GatherBufferIF::latchApplyBacklogResiduals_() {
+    const auto& S = sb_[apply_buf_index_];
+    apply_backlog_granules_residual_peak_ =
+        std::max<uint64_t>(apply_backlog_granules_residual_peak_, static_cast<uint64_t>(S.granules.size()));
+    apply_backlog_pending_up_reads_residual_peak_ =
+        std::max<uint64_t>(apply_backlog_pending_up_reads_residual_peak_,
+                           static_cast<uint64_t>(S.pending_up_reads.size()));
+    // Keep this aligned with the step-gate debug probe's `down=` notion of in-flight downstream fragments.
+    apply_backlog_inflight_residual_peak_ =
+        std::max<uint64_t>(apply_backlog_inflight_residual_peak_, static_cast<uint64_t>(inflight_down_.size()));
+}
+
+void GatherBufferIF::latchApplyBacklogPeakAfterDue_() {
+    const auto& S = sb_[apply_buf_index_];
+    apply_backlog_granules_peak_after_due_ =
+        std::max<uint64_t>(apply_backlog_granules_peak_after_due_, static_cast<uint64_t>(S.granules.size()));
+    apply_backlog_pending_up_reads_peak_after_due_ =
+        std::max<uint64_t>(apply_backlog_pending_up_reads_peak_after_due_,
+                           static_cast<uint64_t>(S.pending_up_reads.size()));
+    apply_backlog_inflight_peak_after_due_ =
+        std::max<uint64_t>(apply_backlog_inflight_peak_after_due_, static_cast<uint64_t>(inflight_down_.size()));
 }
 
 bool GatherBufferIF::rebuildPendingAsGranules_(int buf) {
@@ -2147,12 +2268,55 @@ bool GatherBufferIF::clockTick(Cycle_t) {
             (experimental_stepgate_progress_tick_ % experimental_stepgate_progress_period_cycles_) == 0) {
             const auto& gb = sb_[gather_buf_index_];
             const auto& ab = sb_[apply_buf_index_];
+            uint64_t ab_frags_issued = 0;
+            uint64_t ab_frags_done = 0;
+            uint64_t ab_frags_total = 0;
+            uint64_t ab_ready = 0;
+            uint64_t ab_subs = 0;
+            uint32_t ab_max_granule = 0;
+            const uint64_t progress_now_ns = getCurrentSimTimeNano();
+            uint64_t oldest_inflight_granule_age_ns = 0;
+            for (const auto& kv : ab.granules) {
+                const auto& g = kv.second;
+                ab_frags_issued += static_cast<uint64_t>(g.frags_issued);
+                ab_frags_done += static_cast<uint64_t>(g.frags_done);
+                ab_frags_total += static_cast<uint64_t>(g.frags_total);
+                ab_subs += static_cast<uint64_t>(g.subs.size());
+                if (g.ready) ab_ready += 1;
+                if (g.size > ab_max_granule) ab_max_granule = g.size;
+                if (g.issued && !g.ready && g.issue_ns != 0 && progress_now_ns >= g.issue_ns) {
+                    const uint64_t age_ns = progress_now_ns - g.issue_ns;
+                    if (age_ns > oldest_inflight_granule_age_ns) {
+                        oldest_inflight_granule_age_ns = age_ns;
+                    }
+                }
+            }
+            uint64_t apply_first_issue_delay_ns = 0;
+            if (apply_begin_ns_ != 0 && apply_first_down_issue_ns_ != 0 &&
+                apply_first_down_issue_ns_ >= apply_begin_ns_) {
+                apply_first_issue_delay_ns = apply_first_down_issue_ns_ - apply_begin_ns_;
+            }
+            uint64_t apply_first_resp_delay_ns = 0;
+            if (apply_begin_ns_ != 0 && apply_first_down_resp_ns_ != 0 &&
+                apply_first_down_resp_ns_ >= apply_begin_ns_) {
+                apply_first_resp_delay_ns = apply_first_down_resp_ns_ - apply_begin_ns_;
+            }
+            uint64_t apply_first_granule_done_delay_ns = 0;
+            if (apply_begin_ns_ != 0 && apply_first_granule_done_ns_ != 0 &&
+                apply_first_granule_done_ns_ >= apply_begin_ns_) {
+                apply_first_granule_done_delay_ns = apply_first_granule_done_ns_ - apply_begin_ns_;
+            }
+            uint64_t apply_first_up_resp_delay_ns = 0;
+            if (apply_begin_ns_ != 0 && apply_first_up_resp_ns_ != 0 &&
+                apply_first_up_resp_ns_ >= apply_begin_ns_) {
+                apply_first_up_resp_delay_ns = apply_first_up_resp_ns_ - apply_begin_ns_;
+            }
             out_.verbose(
                 CALL_INFO, 0, 0,
                 "[exp-gbi-progress] node=%u core=%u tick=%" PRIu64 " stage=%d gid=%" PRIu64 " sc=%" PRIu64
                 " inflight0=%" PRIu64 " inflight1=%" PRIu64 " down=%zu"
                 " gb(g=%zu req=%zu pend=%zu stg=%zu end_g=%d)"
-                " ab(g=%zu req=%zu pend=%zu stg=%zu)"
+                " ab(g=%zu req=%zu pend=%zu stg=%zu ready=%" PRIu64 " subs=%" PRIu64 " fi=%" PRIu64 " fd=%" PRIu64 " ft=%" PRIu64 " gmax=%u aid=%" PRIu64 " ard=%" PRIu64 " acd=%" PRIu64 " aud=%" PRIu64 " dr=%" PRIu64 " gd=%" PRIu64 " ur=%" PRIu64 " oldest=%" PRIu64 ")"
                 " end_scatter_pending=%d end_scatter_seq=%u apply_pending_emit=%d\n",
                 node_id_param_, core_id_param_,
                 (uint64_t)experimental_stepgate_progress_tick_,
@@ -2161,6 +2325,11 @@ bool GatherBufferIF::clockTick(Cycle_t) {
                 gb.granules.size(), gb.required_set.size(), gb.pending_up_reads.size(), gb.staging_reads.size(),
                 gb.end_gather_seen ? 1 : 0,
                 ab.granules.size(), ab.required_set.size(), ab.pending_up_reads.size(), ab.staging_reads.size(),
+                ab_ready, ab_subs, ab_frags_issued, ab_frags_done, ab_frags_total, ab_max_granule,
+                apply_first_issue_delay_ns, apply_first_resp_delay_ns,
+                apply_first_granule_done_delay_ns, apply_first_up_resp_delay_ns,
+                apply_down_resp_total_, apply_completed_granules_total_, apply_emitted_subreads_total_,
+                oldest_inflight_granule_age_ns,
                 end_scatter_req_pending_ ? 1 : 0,
                 (unsigned)end_scatter_req_seq_,
                 apply_pending_emit_ ? 1 : 0);
@@ -2172,6 +2341,7 @@ bool GatherBufferIF::clockTick(Cycle_t) {
         uint64_t inflight_total = (uint64_t)(inflight_counts_[0] + inflight_counts_[1]);
         if (stat_inflight_peak_) stat_inflight_peak_->addData(inflight_total);
         if (inflight_total > win_inflight_peak_) win_inflight_peak_ = inflight_total;
+        step_gate_wait_cycles_pending_++;
         return false;
     }
     if (!clock_tick_logged_) {
@@ -2186,6 +2356,17 @@ bool GatherBufferIF::clockTick(Cycle_t) {
     if (stage_ == Stage::Gather) stage_cycles_accum_[0]++;
     else if (stage_ == Stage::Apply) stage_cycles_accum_[1]++;
     else if (stage_ == Stage::Scatter) stage_cycles_accum_[2]++;
+    if (stage_ == Stage::Apply) {
+        const uint64_t ready_q = countApplyIssuableGranules_(apply_buf_index_);
+        if (ready_q > apply_ready_queue_peak_) {
+            apply_ready_queue_peak_ = ready_q;
+        }
+        if (ready_q > 0) {
+            apply_ready_queue_nonempty_cycles_total_++;
+        } else {
+            apply_issue_block_no_ready_total_++;
+        }
+    }
     if (stage_ == Stage::Gather) {
         // Step-gate mode: Gather should be ended explicitly by workload (EndGather),
         // not by fixed window_cycles_gather (preferred). For compatibility, window_cycles_gather
@@ -2241,6 +2422,16 @@ bool GatherBufferIF::clockTick(Cycle_t) {
             buildGranulesWithGapMergeBuf_(gather_buf_index_);
             // 直接按当前排序策略下发新窗口的 granule，实现与 Apply 并行（受 inflight 限制）。
             issueUnissuedGranulesDeterministic_(gather_buf_index_);
+        }
+        bool sample_apply_backlog_peak_after_due = false;
+        if (win_cyc_apply_ != 0) {
+            sample_apply_backlog_peak_after_due = (stage_counter_ >= win_cyc_apply_);
+        } else {
+            // No fixed Apply budget means the whole Apply residency is the overdue frontier we care about.
+            sample_apply_backlog_peak_after_due = (stage_counter_ > 0);
+        }
+        if (sample_apply_backlog_peak_after_due) {
+            latchApplyBacklogPeakAfterDue_();
         }
         if (apply_auto_end_enable_) {
             if (tryAutoEndApply_()) return false;
@@ -2319,13 +2510,6 @@ bool GatherBufferIF::clockTick(Cycle_t) {
                         scatter_reason, (uint64_t)fallback_end_scatter_count_);
                 }
             }
-            if (out_.getVerboseLevel() >= 1) {
-                out_.verbose(CALL_INFO, 1, 0,
-                    "[diag-gbi] EndScatter reason=%s gather_id=%" PRIu64 " stage_counter=%" PRIu64 " inflight_apply=%" PRIu64 " inflight_gather=%" PRIu64 "\n",
-                    scatter_reason ? scatter_reason : "scatter-unknown",
-                    current_gather_id_, stage_counter_,
-                    inflight_counts_[apply_buf_index_], inflight_counts_[gather_buf_index_]);
-            }
             // Byte-exact correctness: emit PASS marker (or fatal) at window boundary.
             finishByteExact_();
             flushStageCycles_(Stage::Scatter, true);
@@ -2339,6 +2523,29 @@ bool GatherBufferIF::clockTick(Cycle_t) {
                 // Step-level gate：停在 Idle，等待 openStep(seq) 进入下一窗
                 stage_ = Stage::Idle;
                 stage_counter_ = 0;
+                apply_begin_ns_ = 0;
+                apply_first_down_issue_ns_ = 0;
+                apply_first_down_resp_ns_ = 0;
+                apply_first_granule_done_ns_ = 0;
+                apply_first_up_resp_ns_ = 0;
+                apply_down_resp_total_ = 0;
+                apply_completed_granules_total_ = 0;
+                apply_emitted_subreads_total_ = 0;
+                apply_backlog_granules_residual_peak_ = 0;
+                apply_backlog_pending_up_reads_residual_peak_ = 0;
+                apply_backlog_inflight_residual_peak_ = 0;
+                apply_backlog_granules_peak_after_due_ = 0;
+                apply_backlog_pending_up_reads_peak_after_due_ = 0;
+                apply_backlog_inflight_peak_after_due_ = 0;
+                apply_issue_attempt_total_ = 0;
+                apply_issue_success_total_ = 0;
+                apply_issue_block_no_ready_total_ = 0;
+                apply_issue_block_inflight_cap_total_ = 0;
+                apply_issue_block_bank_credit_total_ = 0;
+                apply_issue_block_downstream_busy_total_ = 0;
+                apply_issue_block_retire_guard_total_ = 0;
+                apply_ready_queue_peak_ = 0;
+                apply_ready_queue_nonempty_cycles_total_ = 0;
                 sb_[gather_buf_index_].end_gather_seen = false;
                 end_scatter_req_pending_ = false;
                 end_scatter_req_seq_ = 0;
@@ -2454,6 +2661,7 @@ bool GatherBufferIF::finishApplyWindow_(const char* reason) {
     flushStageCycles_(Stage::Apply, false);
     // 始终在窗口结束时向上游发回已ready的响应，避免非defer路径丢失回传
     emitApplyResponsesBuf_(apply_buf_index_);
+    latchApplyBacklogResiduals_();
     // 非延后模式：确保 Apply 窗口不会在“仍有 required granule 未发/未完成”时结束；
     // 这类提前结束会导致权重读丢失，从而引入发放统计的非确定性。
     // 额外防护：如果 granules/required 已空、无 inflight，但 pending_up_reads 仍悬挂，
@@ -2465,10 +2673,12 @@ bool GatherBufferIF::finishApplyWindow_(const char* reason) {
         !sb_[apply_buf_index_].pending_up_reads.empty()) {
         if (rebuildPendingAsGranules_(apply_buf_index_)) {
             apply_pending_emit_ = true;
+            apply_issue_block_retire_guard_total_++;
             return false; // 等待重建后的读返回
         }
         // 如确实无法重建，保持等待，避免零填破坏发放
         apply_pending_emit_ = true;
+        apply_issue_block_retire_guard_total_++;
         return false;
     }
     if (!defer_issue_until_apply_) {
@@ -2479,6 +2689,7 @@ bool GatherBufferIF::finishApplyWindow_(const char* reason) {
             !sb_[apply_buf_index_].granules.empty() ||
             !sb_[apply_buf_index_].pending_up_reads.empty()) {
             apply_pending_emit_ = true;
+            apply_issue_block_retire_guard_total_++;
             return false;
         }
     }
@@ -2489,11 +2700,59 @@ bool GatherBufferIF::finishApplyWindow_(const char* reason) {
             (*upstream_handler_)(cr);
         } else {
             apply_pending_emit_ = true;
+            apply_issue_block_retire_guard_total_++;
             return false; // wait for downstream drain
         }
     }
     if (apply_credit_external_enable_ && stat_apply_bank_credit_effective_) {
         stat_apply_bank_credit_effective_->addData(apply_bank_credit_dyn_);
+    }
+    if (upstream_handler_) {
+        uint64_t apply_first_issue_delay_ns = 0;
+        if (apply_begin_ns_ != 0 && apply_first_down_issue_ns_ != 0 &&
+            apply_first_down_issue_ns_ >= apply_begin_ns_) {
+            apply_first_issue_delay_ns = apply_first_down_issue_ns_ - apply_begin_ns_;
+        }
+        uint64_t apply_first_down_resp_delay_ns = 0;
+        if (apply_begin_ns_ != 0 && apply_first_down_resp_ns_ != 0 &&
+            apply_first_down_resp_ns_ >= apply_begin_ns_) {
+            apply_first_down_resp_delay_ns = apply_first_down_resp_ns_ - apply_begin_ns_;
+        }
+        uint64_t apply_first_granule_done_delay_ns = 0;
+        if (apply_begin_ns_ != 0 && apply_first_granule_done_ns_ != 0 &&
+            apply_first_granule_done_ns_ >= apply_begin_ns_) {
+            apply_first_granule_done_delay_ns = apply_first_granule_done_ns_ - apply_begin_ns_;
+        }
+        uint64_t apply_first_up_resp_delay_ns = 0;
+        if (apply_begin_ns_ != 0 && apply_first_up_resp_ns_ != 0 &&
+            apply_first_up_resp_ns_ >= apply_begin_ns_) {
+            apply_first_up_resp_delay_ns = apply_first_up_resp_ns_ - apply_begin_ns_;
+        }
+        auto* s = new GasStatData((uint32_t)current_gather_id_, 0, 0);
+        s->apply_issue_attempt_total = apply_issue_attempt_total_;
+        s->apply_issue_success_total = apply_issue_success_total_;
+        s->apply_issue_block_no_ready_total = apply_issue_block_no_ready_total_;
+        s->apply_issue_block_inflight_cap_total = apply_issue_block_inflight_cap_total_;
+        s->apply_issue_block_bank_credit_total = apply_issue_block_bank_credit_total_;
+        s->apply_issue_block_downstream_busy_total = apply_issue_block_downstream_busy_total_;
+        s->apply_issue_block_retire_guard_total = apply_issue_block_retire_guard_total_;
+        s->apply_ready_queue_peak = apply_ready_queue_peak_;
+        s->apply_ready_queue_nonempty_cycles_total = apply_ready_queue_nonempty_cycles_total_;
+        s->apply_first_issue_delay_ns = apply_first_issue_delay_ns;
+        s->apply_first_down_resp_delay_ns = apply_first_down_resp_delay_ns;
+        s->apply_first_granule_done_delay_ns = apply_first_granule_done_delay_ns;
+        s->apply_first_up_resp_delay_ns = apply_first_up_resp_delay_ns;
+        s->apply_down_resp_total = apply_down_resp_total_;
+        s->apply_completed_granules_total = apply_completed_granules_total_;
+        s->apply_emitted_subreads_total = apply_emitted_subreads_total_;
+        s->apply_backlog_granules_residual = apply_backlog_granules_residual_peak_;
+        s->apply_backlog_pending_up_reads_residual = apply_backlog_pending_up_reads_residual_peak_;
+        s->apply_backlog_inflight_residual = apply_backlog_inflight_residual_peak_;
+        s->apply_backlog_granules_peak_after_due = apply_backlog_granules_peak_after_due_;
+        s->apply_backlog_pending_up_reads_peak_after_due = apply_backlog_pending_up_reads_peak_after_due_;
+        s->apply_backlog_inflight_peak_after_due = apply_backlog_inflight_peak_after_due_;
+        auto* cr = new StandardMem::CustomResp((StandardMem::Request::id_t)0, s, 0, 0, 0);
+        (*upstream_handler_)(cr);
     }
     stage_ = Stage::Scatter;
     stage_counter_ = 0;
@@ -2655,7 +2914,7 @@ void GatherBufferIF::controlStep_() {
         exportWindowMetricsRow_(current_gather_id_, win_payload, win_bursts, win_inflight, win_buffer);
     }
     if (upstream_handler_ && (win_inflight > 0 || win_buffer > 0)) {
-        auto* s = new GasStatData(0, 0, 0, 0, 0, 0, win_inflight, win_buffer);
+        auto* s = new GasStatData((uint32_t)current_gather_id_, 0, 0, 0, 0, 0, 0, win_inflight, win_buffer);
         auto* cr = new StandardMem::CustomResp((StandardMem::Request::id_t)0, s, 0, 0, 0);
         (*upstream_handler_)(cr);
     }

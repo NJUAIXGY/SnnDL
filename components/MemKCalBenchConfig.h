@@ -19,6 +19,7 @@ namespace SST { namespace SnnDL {
 
 struct MemKCalBenchConfig {
     int verbose = 0;
+    uint64_t base_addr = 0;
     uint32_t row_bytes = 8192;
     uint32_t bank_bits = 0;
     uint32_t bank_shift = 0;
@@ -38,6 +39,7 @@ inline MemKCalBenchConfig parseMemKCalBenchConfig(const SST::Params& params) {
     MemKCalBenchConfig c{};
 
     c.verbose = params.find<int>("verbose", 0);
+    c.base_addr = params.find<uint64_t>("base_addr", 0);
     c.row_bytes = params.find<uint32_t>("row_bytes", 8192);
     c.bank_bits = params.find<uint32_t>("bank_bits", 0);
     c.bank_shift = params.find<uint32_t>("bank_shift", 0);
@@ -76,4 +78,3 @@ inline MemKCalBenchConfig parseMemKCalBenchConfig(const SST::Params& params) {
 }
 
 }} // namespace SST::SnnDL
-

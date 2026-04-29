@@ -29,6 +29,13 @@ struct GlobalGasStepControllerConfig {
     uint32_t credit_ctrl_credit_min = 1;
     uint32_t credit_ctrl_credit_max = 2;
     uint32_t credit_ctrl_top_k = 0; // 0=disable (even if enable=1)
+    bool gating_event_enable = false;
+    uint32_t gating_event_rows_per_pe = 0;
+    uint32_t gating_event_top_k = 0;
+    uint64_t gating_event_ttl_cycles = 0;
+    uint32_t gating_event_target_offset = 1;
+    uint32_t gating_event_target_stride = 1;
+    bool gating_event_include_self = false;
 };
 
 inline GlobalGasStepControllerConfig parseGlobalGasStepControllerConfig(const SST::Params& params) {
@@ -46,6 +53,13 @@ inline GlobalGasStepControllerConfig parseGlobalGasStepControllerConfig(const SS
     c.credit_ctrl_credit_min = params.find<uint32_t>("credit_ctrl_credit_min", 1);
     c.credit_ctrl_credit_max = params.find<uint32_t>("credit_ctrl_credit_max", 2);
     c.credit_ctrl_top_k = params.find<uint32_t>("credit_ctrl_top_k", 0);
+    c.gating_event_enable = params.find<int>("gating_event_enable", 0) != 0;
+    c.gating_event_rows_per_pe = params.find<uint32_t>("gating_event_rows_per_pe", 0);
+    c.gating_event_top_k = params.find<uint32_t>("gating_event_top_k", 0);
+    c.gating_event_ttl_cycles = params.find<uint64_t>("gating_event_ttl_cycles", 0);
+    c.gating_event_target_offset = params.find<uint32_t>("gating_event_target_offset", 1);
+    c.gating_event_target_stride = params.find<uint32_t>("gating_event_target_stride", 1);
+    c.gating_event_include_self = params.find<int>("gating_event_include_self", 0) != 0;
     return c;
 }
 

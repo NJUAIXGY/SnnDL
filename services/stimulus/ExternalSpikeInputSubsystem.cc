@@ -41,6 +41,10 @@ int ExternalSpikeInputSubsystem::determineTargetUnit_(uint32_t global_neuron_id)
 
 void ExternalSpikeInputSubsystem::onSpike(SpikeEvent* spike) {
     if (!spike) return;
+    if (!rt_.enabled) {
+        delete spike;
+        return;
+    }
 
     if (!rt_.noc || !rt_.layout || !rt_.layout->valid()) {
         delete spike;

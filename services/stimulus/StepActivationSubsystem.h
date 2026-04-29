@@ -94,6 +94,7 @@ public:
         // NoC 抽象接口（Phase4-A1.3）：优先使用该接口进行注入/外发
         INocTransport* noc = nullptr;
         std::function<void()> reset_membranes;
+        std::function<void(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t)> report_injection_summary;
     };
 
     struct Stats {

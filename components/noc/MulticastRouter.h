@@ -33,7 +33,7 @@ public:
 
     SST_ELI_DOCUMENT_PARAMS(
         {"node_id", "Router node id (must match PE node_id)", "0"},
-        {"mesh_shape", "Mesh shape as 'WxH' (e.g. '4x4')", "4x4"},
+        {"mesh_shape", "Mesh shape as 'WxH' or 'WxHxZ' (e.g. '4x4'|'4x4x2')", "4x4"},
         {"router_latency_cycles", "Additional per-hop latency in cycles (1 cycle ~= 1ns under 1GHz)", "0"},
         {"serialize_output_enable", "Enable per-output-port serialization (simple contention model)", "0"},
         {"serialize_service_cycles", "Per-packet service time per output port (cycles)", "1"},
@@ -91,7 +91,14 @@ private:
     void sendOnPort_(SST::Link* link, uint32_t port_idx, NocPacketEvent* pkt);
     uint64_t packetBytes_(const NocPacketEvent* pkt) const;
 
-    static bool parseMeshShape_(const std::string& shape, uint32_t& out_w, uint32_t& out_h);
+    static bool parseMeshShape_(const std::string& shape, uint32_t& out_w, uint32_t& out_h, uint32_t& out_z);
+    static bool nodeIdToCoord2DLayered_(uint32_t node_id,
+                                        uint32_t mesh_w,
+                                        uint32_t mesh_h,
+                                        uint32_t mesh_z,
+                                        uint32_t& out_x,
+                                        uint32_t& out_y,
+                                        uint32_t& out_z);
     static bool parseInterPolicy_(const std::string& s, InterBlockRoutePolicy& out);
     static bool parseIntraPolicy_(const std::string& s, IntraBlockTreePolicy& out);
 
@@ -99,6 +106,7 @@ private:
     uint32_t node_id_ = 0;
     uint32_t mesh_w_ = 0;
     uint32_t mesh_h_ = 0;
+    uint32_t mesh_z_ = 1;
     SST::TimeConverter timebase_;
     uint64_t router_latency_cycles_ = 0;
     bool serialize_output_enable_ = false;

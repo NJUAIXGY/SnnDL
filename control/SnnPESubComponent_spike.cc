@@ -107,17 +107,39 @@ void SnnPESubComponent::legacySnnDeliverSpike(SpikeEvent* spike) {
         // 当前版本将此逻辑移到了 processLocalSpike()，但由于 clockTick 的时间戳延迟检查
         // (spike->getTimestamp() >= now_ns)，同周期到达的 spike 会被延迟处理，
         // 导致 BeginApply 时容器为空，神经元无法发放。
-        if (weight_mem_subsystem_ && post_local_valid && post_local < num_neurons_) {
+        bool stage_ok_for_window_touch = false;
+        switch (gas_stage_) {
+            case GasStage::Gather:
+                stage_ok_for_window_touch = true;
+                break;
+            case GasStage::Apply:
+                stage_ok_for_window_touch = record_edge_apply_enable_;
+                break;
+            case GasStage::Idle:
+                stage_ok_for_window_touch = record_edge_idle_enable_;
+                break;
+            case GasStage::Scatter:
+                stage_ok_for_window_touch = record_edge_scatter_enable_;
+                break;
+            default:
+                stage_ok_for_window_touch = false;
+                break;
+        }
+        if (weight_mem_subsystem_ &&
+            post_local_valid &&
+            post_local < num_neurons_ &&
+            stage_ok_for_window_touch) {
             weight_mem_subsystem_->noteWindowTouch(post_local, spike->getSourceNeuron(), num_neurons_);
             recordActivePre_(spike->getSourceNeuron());
         } else if (window_read_debug_ || debug_window_log_count_ < 8) {
             // 诊断：记录条件不满足的原因
             output_->verbose(CALL_INFO, 1, 0,
-                "[DeliverDiag] core=%d skip noteWindowTouch: wms=%s post_valid=%d post_l=%u num=%u\n",
+                "[DeliverDiag] core=%d skip noteWindowTouch: wms=%s post_valid=%d post_l=%u num=%u stage=%d\n",
                 core_id_,
                 weight_mem_subsystem_ ? "set" : "null",
                 post_local_valid ? 1 : 0,
-                post_local, num_neurons_);
+                post_local, num_neurons_,
+                static_cast<int>(gas_stage_));
         }
         static const uint32_t kLogLimit = 8;
         if (debug_window_log_count_ < kLogLimit) {
@@ -285,7 +307,27 @@ void SnnPESubComponent::processLocalSpike(SpikeEvent* spike_event) {
     }
     // 记录本窗触达的post（仅用于窗口读发起；不改变语义）
     if (window_read_enable_) {
-        if (weight_mem_subsystem_ && target_neuron < num_neurons_) {
+        bool stage_ok_for_window_touch = false;
+        switch (gas_stage_) {
+            case GasStage::Gather:
+                stage_ok_for_window_touch = true;
+                break;
+            case GasStage::Apply:
+                stage_ok_for_window_touch = record_edge_apply_enable_;
+                break;
+            case GasStage::Idle:
+                stage_ok_for_window_touch = record_edge_idle_enable_;
+                break;
+            case GasStage::Scatter:
+                stage_ok_for_window_touch = record_edge_scatter_enable_;
+                break;
+            default:
+                stage_ok_for_window_touch = false;
+                break;
+        }
+        if (weight_mem_subsystem_ &&
+            target_neuron < num_neurons_ &&
+            stage_ok_for_window_touch) {
             weight_mem_subsystem_->noteWindowTouch(target_neuron, spike_event->getSourceNeuron(), num_neurons_);
             recordActivePre_(spike_event->getSourceNeuron());
         }

@@ -57,11 +57,27 @@ public:
         {"credit_ctrl_pred_seed", "global credit(p0c): predictor seed (mirror step_activation_seed)", "0"},
         {"credit_ctrl_pred_fraction", "global credit(p0c): predictor fraction (mirror step_activation_fraction)", "0"},
         {"credit_ctrl_pred_neurons_per_pe", "global credit(p0c): predictor neurons per PE", "0"},
-        {"credit_ctrl_pred_fanout", "global credit(p0c): predictor fanout (mirror step_activation_fanout)", "0"}
+        {"credit_ctrl_pred_fanout", "global credit(p0c): predictor fanout (mirror step_activation_fanout)", "0"},
+        {"gating_event_enable", "emit synthetic gating events on the step control plane (0/1)", "0"},
+        {"gating_event_rows_per_pe", "how many src_row entries per PE receive synthetic gating decisions", "0"},
+        {"gating_event_top_k", "synthetic gating: number of destination PEs per source row", "0"},
+        {"gating_event_ttl_cycles", "synthetic gating: TTL in cycles for emitted gating decisions", "0"},
+        {"gating_event_target_offset", "synthetic gating: starting PE offset relative to the source PE", "1"},
+        {"gating_event_target_stride", "synthetic gating: PE stride used when choosing next targets", "1"},
+        {"gating_event_include_self", "synthetic gating: whether the source PE can appear in its own destination list (0/1)", "0"}
     )
 
     SST_ELI_DOCUMENT_PORTS(
-        {"pe_link%(pe)d", "Links to PEs. Connect pe_link0, pe_link1, ...", {"SnnDL.GasStepBarrierEvent"}}
+        {"pe_link%(pe)d", "Links to PEs. Connect pe_link0, pe_link1, ...", {"SnnDL.GasStepBarrierEvent", "SnnDL.GatingDecisionEvent"}}
+    )
+
+    SST_ELI_DOCUMENT_STATISTICS(
+        {"current_seq_last", "last controller sequence observed at finish", "steps", 1},
+        {"steps_started_total", "total START_STEP broadcasts issued by the controller", "steps", 1},
+        {"steps_completed_total", "total steps fully completed by the controller", "steps", 1},
+        {"pe_ready_events_total", "total PE_READY barrier events received", "events", 1},
+        {"pe_done_events_total", "total PE_DONE barrier events received", "events", 1},
+        {"warn_count_total", "total controller warnings accumulated by finish", "events", 1}
     )
 
     GlobalGasStepController(SST::ComponentId_t id, SST::Params& params);
@@ -75,6 +91,7 @@ private:
     bool clockTick_(SST::Cycle_t);
     void handleBarrierEvent_(SST::Event* ev, int pe_index);
     void broadcastStart_(uint32_t seq);
+    void broadcastSyntheticGating_(uint32_t seq);
     bool allReady_() const;
     bool allDone_() const;
     void computeNextCredits_(uint32_t completed_seq);
@@ -97,6 +114,9 @@ private:
     bool started_ = false;
     uint32_t max_steps_ = 0;         // 0=unbounded
     uint32_t steps_completed_ = 0;   // count of completed steps (allDone barriers observed)
+    uint64_t steps_started_total_ = 0;
+    uint64_t pe_ready_events_total_ = 0;
+    uint64_t pe_done_events_total_ = 0;
     bool primary_keepalive_ = false; // only enabled when max_steps_ > 0
 
     int verbose_ = 0;
@@ -129,8 +149,22 @@ private:
     double credit_ctrl_pred_fraction_ = 0.0;
     uint32_t credit_ctrl_pred_neurons_per_pe_ = 0;
     uint32_t credit_ctrl_pred_fanout_ = 0;
+    bool gating_event_enable_ = false;
+    uint32_t gating_event_rows_per_pe_ = 0;
+    uint32_t gating_event_top_k_ = 0;
+    uint64_t gating_event_ttl_cycles_ = 0;
+    uint32_t gating_event_target_offset_ = 1;
+    uint32_t gating_event_target_stride_ = 1;
+    bool gating_event_include_self_ = false;
     // best-effort mapping from pe_index -> runtime node_id (src_node in barrier events)
     std::vector<uint32_t> pe_node_ids_;
+
+    Statistic<uint64_t>* stat_current_seq_last_ = nullptr;
+    Statistic<uint64_t>* stat_steps_started_total_ = nullptr;
+    Statistic<uint64_t>* stat_steps_completed_total_ = nullptr;
+    Statistic<uint64_t>* stat_pe_ready_events_total_ = nullptr;
+    Statistic<uint64_t>* stat_pe_done_events_total_ = nullptr;
+    Statistic<uint64_t>* stat_warn_count_total_ = nullptr;
 };
 
 }} // namespace SST::SnnDL

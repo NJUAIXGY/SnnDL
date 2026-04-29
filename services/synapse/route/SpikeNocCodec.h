@@ -12,13 +12,15 @@
 #include <cstdint>
 #include <cstring>
 #include <type_traits>
+#include <vector>
 
 #include "api/MulticastLimits.h"
 #include "GlobalNeuronLayout.h"
-#include "NocPacketEvent.h"
-#include "events/SpikeEvent.h"
 
 namespace SST { namespace SnnDL {
+
+class NocPacketEvent;
+class SpikeEvent;
 
 class SpikeNocCodec final {
 public:
@@ -93,8 +95,33 @@ public:
         std::is_trivially_copyable<WireSpikeKeyV3Prefix>::value,
         "WireSpikeKeyV3Prefix must be trivially copyable");
 
+    struct WireSpikeKeyV4 final {
+        uint16_t version = 4;
+        uint16_t route_mode = 0;
+        uint16_t stage = 0;
+        uint16_t reserved0 = 0;
+
+        uint16_t block_w = 0;
+        uint16_t block_h = 0;
+        uint16_t block_d = 1;
+        uint16_t reserved1 = 0;
+
+        uint32_t block_id = 0;
+        uint32_t ingress_node = 0;
+
+        uint32_t pre_global = 0;
+        uint64_t group_id = 0;
+
+        std::array<uint32_t, kMaxMulticastBlockCells> core_mask{};
+    };
+
+    static_assert(std::is_trivially_copyable<WireSpikeKeyV4>::value, "WireSpikeKeyV4 must be trivially copyable");
+
     struct DecodedSpikeKeyMeta final {
         uint16_t version = 0;
+        uint32_t block_w = 0;
+        uint32_t block_h = 0;
+        uint32_t block_d = 1;
         uint32_t block_cells = 0;
         size_t route_bytes = 0;  // bytes consumed by route header + mask segment
         bool compact_mask = false;
@@ -108,6 +135,11 @@ public:
     static void encodeSpikeKey(const WireSpikeKeyV2& ws, std::vector<uint8_t>& out_payload) {
         out_payload.resize(sizeof(WireSpikeKeyV2));
         std::memcpy(out_payload.data(), &ws, sizeof(WireSpikeKeyV2));
+    }
+
+    static void encodeSpikeKey(const WireSpikeKeyV4& ws, std::vector<uint8_t>& out_payload) {
+        out_payload.resize(sizeof(WireSpikeKeyV4));
+        std::memcpy(out_payload.data(), &ws, sizeof(WireSpikeKeyV4));
     }
 
     // Encode compact V3 payload: fixed prefix + block_cells mask words.
@@ -155,6 +187,43 @@ public:
 
         uint16_t version = 0;
         std::memcpy(&version, payload.data(), sizeof(version));
+        if (version == 4) {
+            if (payload.size() < sizeof(WireSpikeKeyV4)) return false;
+            WireSpikeKeyV4 v4{};
+            std::memcpy(&v4, payload.data(), sizeof(WireSpikeKeyV4));
+
+            const uint64_t block_cells64 =
+                static_cast<uint64_t>(v4.block_w) *
+                static_cast<uint64_t>(v4.block_h) *
+                static_cast<uint64_t>(v4.block_d);
+            if (v4.block_w == 0 || v4.block_h == 0 || v4.block_d == 0 ||
+                block_cells64 == 0 || block_cells64 > static_cast<uint64_t>(kMaxMulticastBlockCells)) {
+                return false;
+            }
+
+            out_ws = WireSpikeKeyV2{};
+            out_ws.version = v4.version;
+            out_ws.route_mode = v4.route_mode;
+            out_ws.stage = v4.stage;
+            out_ws.block_w_h = static_cast<uint16_t>(((static_cast<uint32_t>(v4.block_w) & 0xffu) << 8) |
+                                                     (static_cast<uint32_t>(v4.block_h) & 0xffu));
+            out_ws.block_id = v4.block_id;
+            out_ws.ingress_node = v4.ingress_node;
+            out_ws.pre_global = v4.pre_global;
+            out_ws.group_id = v4.group_id;
+            out_ws.core_mask = v4.core_mask;
+
+            if (out_meta) {
+                out_meta->version = 4;
+                out_meta->block_w = v4.block_w;
+                out_meta->block_h = v4.block_h;
+                out_meta->block_d = v4.block_d;
+                out_meta->block_cells = static_cast<uint32_t>(block_cells64);
+                out_meta->route_bytes = sizeof(WireSpikeKeyV4);
+                out_meta->compact_mask = false;
+            }
+            return true;
+        }
         if (version == 3) {
             if (payload.size() < sizeof(WireSpikeKeyV3Prefix)) return false;
             WireSpikeKeyV3Prefix v3{};
@@ -186,6 +255,9 @@ public:
 
             if (out_meta) {
                 out_meta->version = 3;
+                out_meta->block_w = block_w;
+                out_meta->block_h = block_h;
+                out_meta->block_d = 1;
                 out_meta->block_cells = block_cells;
                 out_meta->route_bytes = route_bytes;
                 out_meta->compact_mask = true;
@@ -199,6 +271,9 @@ public:
                 const uint32_t block_w = static_cast<uint32_t>((out_ws.block_w_h >> 8) & 0xffu);
                 const uint32_t block_h = static_cast<uint32_t>(out_ws.block_w_h & 0xffu);
                 out_meta->version = out_ws.version;
+                out_meta->block_w = block_w;
+                out_meta->block_h = block_h;
+                out_meta->block_d = 1;
                 out_meta->block_cells = block_w * block_h;
                 out_meta->route_bytes = sizeof(WireSpikeKeyV2);
                 out_meta->compact_mask = false;
@@ -224,6 +299,9 @@ public:
                 const uint32_t block_w = static_cast<uint32_t>((out_ws.block_w_h >> 8) & 0xffu);
                 const uint32_t block_h = static_cast<uint32_t>(out_ws.block_w_h & 0xffu);
                 out_meta->version = 1;
+                out_meta->block_w = block_w;
+                out_meta->block_h = block_h;
+                out_meta->block_d = 1;
                 out_meta->block_cells = block_w * block_h;
                 out_meta->route_bytes = sizeof(WireSpikeKeyV1);
                 out_meta->compact_mask = false;
@@ -243,47 +321,18 @@ public:
         if (version == 1 && payload.size() < sizeof(WireSpikeKeyV1)) return false;
         if (version == 2 && payload.size() < sizeof(WireSpikeKeyV2)) return false;
         if (version == 3 && payload.size() < sizeof(WireSpikeKeyV3Prefix)) return false;
-        if (version != 1 && version != 2 && version != 3) return false;
+        if (version == 4 && payload.size() < sizeof(WireSpikeKeyV4)) return false;
+        if (version != 1 && version != 2 && version != 3 && version != 4) return false;
 
-        const size_t stage_off = offsetof(WireSpikeKeyV3Prefix, stage);
+        const size_t stage_off = offsetof(WireSpikeKeyV4, stage);
         if (payload.size() < stage_off + sizeof(uint16_t)) return false;
         std::memcpy(payload.data() + stage_off, &new_stage, sizeof(new_stage));
         return true;
     }
 
-    static NocPacketEvent* encode(const SpikeEvent& spike, const GlobalNeuronLayout& layout) {
-        const uint64_t src_global = static_cast<uint64_t>(spike.getSourceNeuron());
-        const uint64_t dst_global = static_cast<uint64_t>(spike.getDestinationNeuron());
+    static NocPacketEvent* encode(const SpikeEvent& spike, const GlobalNeuronLayout& layout);
 
-        auto* pkt = new NocPacketEvent();
-        pkt->src_node = layout.nodeOf(src_global);
-        pkt->dst_node = layout.nodeOf(dst_global);
-        pkt->src_endpoint = static_cast<uint16_t>(layout.coreOf(src_global));
-        pkt->dst_endpoint = static_cast<uint16_t>(layout.coreOf(dst_global));
-        pkt->kind = static_cast<uint16_t>(NocPacketKind::Spike);
-        pkt->hop_count = static_cast<uint16_t>(spike.getHopCount());
-        pkt->timestamp = spike.getTimestamp();
-
-        WireSpike ws;
-        ws.src_neuron = spike.getSourceNeuron();
-        ws.dst_neuron = spike.getDestinationNeuron();
-        ws.weight = spike.getWeight();
-        ws.timestamp = spike.getTimestamp();
-
-        pkt->payload.resize(sizeof(WireSpike));
-        std::memcpy(pkt->payload.data(), &ws, sizeof(WireSpike));
-        return pkt;
-    }
-
-    static SpikeEvent* decode(const NocPacketEvent& pkt) {
-        if (pkt.payload.size() != sizeof(WireSpike)) return nullptr;
-        WireSpike ws;
-        std::memcpy(&ws, pkt.payload.data(), sizeof(WireSpike));
-
-        auto* spike = new SpikeEvent(ws.src_neuron, ws.dst_neuron, pkt.dst_node, ws.weight, ws.timestamp);
-        spike->hop_count = pkt.hop_count;
-        return spike;
-    }
+    static SpikeEvent* decode(const NocPacketEvent& pkt);
 };
 
 }} // namespace SST::SnnDL

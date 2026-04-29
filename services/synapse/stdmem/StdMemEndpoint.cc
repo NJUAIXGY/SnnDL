@@ -104,23 +104,7 @@ void StdMemEndpoint::handleResponseOpaque(void* req) {
         }
         if (auto* st = dynamic_cast<GasStatData*>(&data)) {
             if (rt_.gas_stage_sink) {
-                GasStatEvent sev{};
-                sev.unique_reads = st->unique_reads;
-                sev.unique_bytes = st->unique_bytes;
-                sev.rowwin_triggers = st->rowwin_triggers;
-                sev.rowwin_bytes = st->rowwin_bytes;
-                sev.bursts = st->bursts;
-                sev.payload_bytes = st->payload_bytes;
-                sev.window_inflight_peak = st->window_inflight_peak;
-                sev.window_buffer_max_bytes = st->window_buffer_max_bytes;
-                sev.gap_absorbed_bytes = st->gap_absorbed_bytes;
-                sev.unique_line_count = st->unique_line_count;
-                sev.covered_line_count = st->covered_line_count;
-                sev.overfetch_bytes = st->overfetch_bytes;
-                sev.apply_bank_credit_effective = st->apply_bank_credit_effective;
-                sev.cmd_cost_veto = st->cmd_cost_veto;
-                sev.cmd_cost_veto_fine_gap = st->cmd_cost_veto_fine_gap;
-                sev.cmd_cost_veto_row_window = st->cmd_cost_veto_row_window;
+                const GasStatEvent sev = toGasStatEvent(*st);
                 rt_.gas_stage_sink->onGasStatEvent(sev);
             }
             delete stdmem_req;

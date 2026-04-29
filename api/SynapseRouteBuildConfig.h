@@ -25,6 +25,9 @@ struct SynapseRouteBuildConfig {
     bool multicast_enable = false;
     uint32_t multicast_block_w = 2;
     uint32_t multicast_block_h = 2;
+    uint32_t multicast_block_d = 1;
+    bool multicast_die_local_only = false;
+    bool route3d_native_targets = false;
     std::string multicast_ingress_policy = "top_left";
     // Orthogonal policy points (string-based for backward compatibility & easy extension):
     // - inter: how INTER-stage unicast is routed across mesh (router-level)
@@ -38,9 +41,11 @@ struct SynapseRouteBuildConfig {
     uint32_t rows = 0;
     uint32_t cols = 0;            // global cols (weights_cols)
     uint32_t total_nodes = 16;    // total PEs
+    std::string mesh_shape;       // optional 'WxH' or 'WxHxZ'; native_3d route uses it directly
     uint32_t cores_per_pe = 1;    // total_cores
     uint32_t neurons_per_pe = 0;  // derived; used for denom & cache-key
     bool use_post_row_pre_col = false;
+    bool real_synapse_inputs_available = false;
 
     std::string weights_template;
     float routing_epsilon = 1e-8f;

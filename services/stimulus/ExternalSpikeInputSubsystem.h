@@ -24,6 +24,7 @@ public:
         int node_id = 0;
         const GlobalNeuronLayout* layout = nullptr;
         INocTransport* noc = nullptr;
+        bool enabled = true;
 
         // Legacy fields (kept for diagnostics/compat): not used for routing when layout is available.
         uint64_t global_neuron_base = 0;

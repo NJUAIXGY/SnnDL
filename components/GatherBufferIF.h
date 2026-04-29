@@ -302,6 +302,7 @@ private:
 	    void rebuildIssueOrder_(int buf);
     void issueMoreUnissuedFromOrder_(int buf);
     void issueUnissuedGranulesDeterministic_(int buf);
+    uint64_t countApplyIssuableGranules_(int buf) const;
     bool attachReadToGranule_(int tgt_buf,
                               SST::Interfaces::StandardMem::Read* rd,
                               ReadAttachKind kind,
@@ -427,6 +428,8 @@ private:
     uint64_t win_buffer_max_bytes_ = 0; // track per-window max buffer occupancy
     void exportWindowMetricsRow_(uint64_t window_id, uint64_t payload_bytes, uint64_t bursts,
                                  uint64_t inflight_peak, uint64_t buffer_max);
+    void latchApplyBacklogResiduals_();
+    void latchApplyBacklogPeakAfterDue_();
     // Coarse row-window knobs (skeleton; default disabled)
     bool row_window_enable_ = false;
     uint64_t row_window_bytes_ = 0;
@@ -584,6 +587,32 @@ private:
 
 	    bool warned_auto_custom_req_ = false;
 	    bool warned_defer_issue_path_ = false;
+
+    // Apply observability: keep cumulative counters so instant retire does not hide progress.
+    uint64_t apply_begin_ns_ = 0;
+    uint64_t apply_first_down_issue_ns_ = 0;
+    uint64_t apply_first_down_resp_ns_ = 0;
+    uint64_t apply_first_granule_done_ns_ = 0;
+    uint64_t apply_first_up_resp_ns_ = 0;
+    uint64_t apply_down_resp_total_ = 0;
+    uint64_t apply_completed_granules_total_ = 0;
+    uint64_t apply_emitted_subreads_total_ = 0;
+    uint64_t apply_backlog_granules_residual_peak_ = 0;
+    uint64_t apply_backlog_pending_up_reads_residual_peak_ = 0;
+    uint64_t apply_backlog_inflight_residual_peak_ = 0;
+    uint64_t apply_backlog_granules_peak_after_due_ = 0;
+    uint64_t apply_backlog_pending_up_reads_peak_after_due_ = 0;
+    uint64_t apply_backlog_inflight_peak_after_due_ = 0;
+    uint64_t step_gate_wait_cycles_pending_ = 0;
+    uint64_t apply_issue_attempt_total_ = 0;
+    uint64_t apply_issue_success_total_ = 0;
+    uint64_t apply_issue_block_no_ready_total_ = 0;
+    uint64_t apply_issue_block_inflight_cap_total_ = 0;
+    uint64_t apply_issue_block_bank_credit_total_ = 0;
+    uint64_t apply_issue_block_downstream_busy_total_ = 0;
+    uint64_t apply_issue_block_retire_guard_total_ = 0;
+    uint64_t apply_ready_queue_peak_ = 0;
+    uint64_t apply_ready_queue_nonempty_cycles_total_ = 0;
 
     bool diagEnabled_(int level = 1) const;
 };

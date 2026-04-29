@@ -32,31 +32,31 @@ class SynapseRouteSubsystem final : public ISynapseRoute {
 public:
     using RouteMap = ISynapseRoute::RouteMap;
     using RouteWeightMap = std::unordered_map<uint64_t, float>;
+    using BlockTarget = ISynapseRoute::BlockTarget;
+    using RouteSemanticDescriptor = ISynapseRoute::RouteSemanticDescriptor;
+    using RouteRuntimeStatSinks = ISynapseRoute::RouteRuntimeStatSinks;
 
-    struct BlockTarget final {
-        uint32_t block_id = 0;
-        uint32_t ingress_node = 0;
-        std::array<uint32_t, kMaxMulticastBlockCells> core_mask{};
-    };
-
-    void configure(const SynapseRouteBuildConfig& cfg);
+    void configure(const SynapseRouteBuildConfig& cfg) override;
     void configureGating(bool gating_event_mode,
                          uint64_t gating_ttl_cycles,
-                         bool gating_scope_inputs_only);
+                         bool gating_scope_inputs_only) override;
 
     void bindRuntime(Output* log,
                      uint32_t node_id,
                      uint32_t core_id,
                      uint32_t num_neurons,
                      uint32_t neurons_per_pe_cfg,
-                     SST::Statistics::Statistic<uint64_t>* stat_routes_entries);
-    void bindFanoutStat(SST::Statistics::Statistic<uint64_t>* stat_fanout_per_spike);
+                     SST::Statistics::Statistic<uint64_t>* stat_routes_entries) override;
+    void bindFanoutStat(SST::Statistics::Statistic<uint64_t>* stat_fanout_per_spike) override;
+    void bindRouteRuntimeStats(const RouteRuntimeStatSinks& stats) override;
 
     // ISynapseRoute
     bool initRoutes() override;
     bool routingWeightDrivenActive() const override { return routing_weight_driven_active_; }
     std::shared_ptr<const RouteMap> routesShared() const override { return routes_shared_; }
     const RouteMap* routesLocalFallback() const override { return &routes_local_fallback_; }
+    std::shared_ptr<const RouteWeightMap> routeWeightsShared() const { return route_weights_shared_; }
+    const RouteWeightMap* routeWeightsLocalFallback() const { return &route_weights_local_fallback_; }
     void computeFanout(uint32_t source_global, uint32_t neuron_idx,
                        uint64_t now_cycles,
                        std::vector<FanoutEntry>& out_entries,
@@ -66,10 +66,12 @@ public:
                              uint64_t current_cycle,
                              uint64_t ttl_cycles) override;
 
-    bool multicastEnabled() const;
-    uint32_t multicastBlockW() const { return cfg_.multicast_block_w; }
-    uint32_t multicastBlockH() const { return cfg_.multicast_block_h; }
-    uint32_t bcsrBlockCols() const { return cfg_.bcsr_bc; }
+    bool multicastEnabled() const override;
+    uint32_t multicastBlockW() const override { return cfg_.multicast_block_w; }
+    uint32_t multicastBlockH() const override { return cfg_.multicast_block_h; }
+    uint32_t multicastBlockD() const override { return 1u; }
+    uint32_t bcsrBlockCols() const override { return cfg_.bcsr_bc; }
+    RouteSemanticDescriptor describeRouteSemantics() const override;
 
     // 计算 blocked multicast targets（不改变 ISynapseRoute 接口，仅供 SpikeCommSubsystem 使用）。
     // applied_gating=true 表示命中 gating 且已对目标集合做过滤。
@@ -77,7 +79,7 @@ public:
                                  uint32_t neuron_idx,
                                  uint64_t now_cycles,
                                  std::vector<BlockTarget>& out_targets,
-                                 bool& applied_gating) const;
+                                 bool& applied_gating) const override;
 
 private:
     void logRoutingSummary_(const char* phase, const char* reason) const;
@@ -92,6 +94,7 @@ private:
     uint32_t neurons_per_pe_cfg_ = 0;
     SST::Statistics::Statistic<uint64_t>* stat_routes_entries_ = nullptr;
     SST::Statistics::Statistic<uint64_t>* stat_fanout_per_spike_ = nullptr;
+    RouteRuntimeStatSinks route_runtime_stats_{};
 
     bool routing_weight_driven_active_ = false;
     bool route_summary_logged_ = false;

@@ -10,6 +10,10 @@
 
 #include "SnnBcsrWeightManager.h"
 #include "SnnDLStringUtil.h"
+#include "services/local_storage/PeInternalPodShadowGate.h"
+#include "services/local_storage/PodOwnerServiceTable.h"
+#include "services/pe_fabric/PeSharedCoreFabric.h"
+#include "services/pe_fabric/PulseAgendaScorer.h"
 
 #include <sst/core/output.h>
 
@@ -24,6 +28,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 using namespace SST;
@@ -43,6 +48,24 @@ static inline uint64_t alignUpU64(uint64_t v, uint64_t a) {
     if (!a) return v;
     const uint64_t m = a - 1u;
     return (v + m) & ~m;
+}
+
+static inline uint32_t pulseMetadataKindMaskBit_(
+    PodMetadataObjectPlane::MetadataKind kind) {
+    switch (kind) {
+        case PodMetadataObjectPlane::MetadataKind::PreMphfBase:
+            return PeLocalServiceObjectTable::kMetadataKindMaskPreMphfBase;
+        case PodMetadataObjectPlane::MetadataKind::PreMphfBand:
+            return PeLocalServiceObjectTable::kMetadataKindMaskPreMphfBand;
+        case PodMetadataObjectPlane::MetadataKind::Idx2Row:
+            return PeLocalServiceObjectTable::kMetadataKindMaskIdx2Row;
+        case PodMetadataObjectPlane::MetadataKind::RowIndex:
+            return PeLocalServiceObjectTable::kMetadataKindMaskRowIndex;
+        case PodMetadataObjectPlane::MetadataKind::RowDescriptor:
+            return PeLocalServiceObjectTable::kMetadataKindMaskRowDescriptor;
+        default:
+            return 0u;
+    }
 }
 
 static inline void prepareAlignedRead(uint64_t addr, size_t size, uint32_t line_size,
@@ -67,6 +90,120 @@ static std::string resolveWeightsTemplatePath(const std::string& tmpl, uint32_t 
     return resolvePeCoreTemplate(tmpl, pe, core);
 }
 
+struct PulsePeSharedWindowKey {
+    uint32_t scope_id = 0;
+    uint32_t window_seq = 0;
+
+    bool operator==(const PulsePeSharedWindowKey& other) const {
+        return scope_id == other.scope_id &&
+               window_seq == other.window_seq;
+    }
+};
+
+struct PulsePeSharedWindowKeyHash {
+    size_t operator()(const PulsePeSharedWindowKey& key) const {
+        size_t seed = static_cast<size_t>(key.scope_id);
+        seed ^= static_cast<size_t>(key.window_seq) + 0x9e3779b9u + (seed << 6) + (seed >> 2);
+        return seed;
+    }
+};
+
+struct PulseSharedGatherBandProbeEntry {
+    uint64_t band_id = 0;
+    uint32_t head_distance = 0;
+    std::vector<uint64_t> selected_line_addrs;
+};
+
+struct PulsePeSharedWindowFinalizeEntry {
+    uint64_t arrived_core_bitmap = 0;
+    uint32_t arrived_cores = 0;
+    uint32_t expected_cores = 1;
+    std::vector<PulseSharedGatherBandProbeEntry> launched_bands;
+};
+
+struct PulsePeSharedWindowArrivalResult {
+    bool final_arrival = false;
+    std::vector<PulseSharedGatherBandProbeEntry> launched_bands;
+};
+
+static std::mutex& pulsePeSharedWindowFinalizeMutex_() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+static std::unordered_map<
+    PulsePeSharedWindowKey,
+    PulsePeSharedWindowFinalizeEntry,
+    PulsePeSharedWindowKeyHash>& pulsePeSharedWindowFinalizeEntries_() {
+    static std::unordered_map<
+        PulsePeSharedWindowKey,
+        PulsePeSharedWindowFinalizeEntry,
+        PulsePeSharedWindowKeyHash> entries;
+    return entries;
+}
+
+static PulsePeSharedWindowArrivalResult registerPulsePeSharedWindowArrival_(
+    uint32_t scope_id,
+    uint32_t window_seq,
+    uint32_t core_id,
+    uint32_t total_cores,
+    const std::vector<PulseSharedGatherBandProbeEntry>& local_bands) {
+    std::lock_guard<std::mutex> lock(pulsePeSharedWindowFinalizeMutex_());
+
+    PulsePeSharedWindowKey key{};
+    key.scope_id = scope_id;
+    key.window_seq = window_seq;
+
+    auto& entry = pulsePeSharedWindowFinalizeEntries_()[key];
+    entry.expected_cores = std::max<uint32_t>(
+        entry.expected_cores,
+        std::max<uint32_t>(1u, total_cores));
+
+    const uint64_t bit = (core_id < 64u) ? (1ull << core_id) : 0ull;
+    const bool already_arrived =
+        (bit != 0ull) ? ((entry.arrived_core_bitmap & bit) != 0ull) : false;
+    if (!already_arrived) {
+        if (bit != 0ull) entry.arrived_core_bitmap |= bit;
+        entry.arrived_cores += 1u;
+
+        for (const auto& local_band : local_bands) {
+            auto band_it = std::find_if(
+                entry.launched_bands.begin(),
+                entry.launched_bands.end(),
+                [&local_band](const PulseSharedGatherBandProbeEntry& existing) {
+                    return existing.band_id == local_band.band_id;
+                });
+            if (band_it == entry.launched_bands.end()) {
+                entry.launched_bands.push_back(local_band);
+                continue;
+            }
+
+            band_it->head_distance = std::min<uint32_t>(
+                band_it->head_distance,
+                local_band.head_distance);
+            for (uint64_t line_addr : local_band.selected_line_addrs) {
+                const auto existing = std::find(
+                    band_it->selected_line_addrs.begin(),
+                    band_it->selected_line_addrs.end(),
+                    line_addr);
+                if (existing == band_it->selected_line_addrs.end()) {
+                    band_it->selected_line_addrs.push_back(line_addr);
+                }
+            }
+        }
+    }
+
+    PulsePeSharedWindowArrivalResult result{};
+    if (entry.arrived_cores < entry.expected_cores) {
+        return result;
+    }
+
+    result.final_arrival = true;
+    result.launched_bands = entry.launched_bands;
+    pulsePeSharedWindowFinalizeEntries_().erase(key);
+    return result;
+}
+
 static bool readFileSlice(const std::string& path, uint64_t offset, size_t bytes, std::vector<uint8_t>& out) {
     out.clear();
     if (bytes == 0) return false;
@@ -77,149 +214,6 @@ static bool readFileSlice(const std::string& path, uint64_t offset, size_t bytes
     out.resize(bytes, 0);
     f.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(bytes));
     return static_cast<size_t>(f.gcount()) == bytes;
-}
-
-
-struct TassLfP0Aggregate {
-    uint64_t block_epochs_total = 0;
-    uint64_t block_active_pres_total = 0;
-    uint64_t block_shared_pres_total = 0;
-    uint64_t cross_core_joins_total = 0;
-    uint64_t payload_bytes_total = 0;
-    uint64_t current_vlf_line_groups_total = 0;
-    uint64_t block_naive_line_count_total = 0;
-    uint64_t block_fused_lb_line_count_total = 0;
-    uint64_t response_fanout_total = 0;
-};
-
-struct TassLfP0BlockEpoch {
-    uint32_t expected_contributors = 0;
-    uint32_t line_size_bytes = 64;
-    std::unordered_set<uint64_t> contributors;
-    std::unordered_map<uint32_t, uint64_t> pre_payload_bytes;
-    std::unordered_map<uint32_t, uint32_t> pre_contributors;
-    uint64_t payload_bytes_total = 0;
-    uint64_t current_vlf_line_groups_total = 0;
-};
-
-struct TassLfP0Registry {
-    std::mutex mu;
-    std::unordered_map<uint64_t, TassLfP0BlockEpoch> pending;
-    std::unordered_map<uint64_t, TassLfP0Aggregate> completed_by_reporter;
-};
-
-static inline uint64_t ceilDivU64(uint64_t num, uint64_t den) {
-    if (den == 0) return 0;
-    return (num + den - 1ull) / den;
-}
-
-static inline uint64_t packTassContributorKey(uint32_t node_id, uint32_t core_id) {
-    return (static_cast<uint64_t>(node_id) << 32) | static_cast<uint64_t>(core_id);
-}
-
-static inline uint64_t packTassBlockEpochKey(uint32_t block_origin_node, uint32_t window_seq) {
-    return (static_cast<uint64_t>(window_seq) << 32) | static_cast<uint64_t>(block_origin_node);
-}
-
-static TassLfP0Registry& tassLfP0Registry() {
-    static TassLfP0Registry reg;
-    return reg;
-}
-
-static void accumulateTassLfP0Aggregate(TassLfP0Aggregate& dst, const TassLfP0Aggregate& src) {
-    dst.block_epochs_total += src.block_epochs_total;
-    dst.block_active_pres_total += src.block_active_pres_total;
-    dst.block_shared_pres_total += src.block_shared_pres_total;
-    dst.cross_core_joins_total += src.cross_core_joins_total;
-    dst.payload_bytes_total += src.payload_bytes_total;
-    dst.current_vlf_line_groups_total += src.current_vlf_line_groups_total;
-    dst.block_naive_line_count_total += src.block_naive_line_count_total;
-    dst.block_fused_lb_line_count_total += src.block_fused_lb_line_count_total;
-    dst.response_fanout_total += src.response_fanout_total;
-}
-
-static void computeTassLfP0BlockInfo(const TassLfP0WindowReport& report,
-                                     uint32_t& block_origin_node,
-                                     uint32_t& expected_contributors) {
-    const uint32_t mesh_rows = std::max<uint32_t>(1u, report.mesh_rows);
-    const uint32_t mesh_cols = std::max<uint32_t>(1u, report.mesh_cols);
-    const uint32_t block_h = std::max<uint32_t>(1u, report.block_h);
-    const uint32_t block_w = std::max<uint32_t>(1u, report.block_w);
-    const uint32_t cores_per_pe = std::max<uint32_t>(1u, report.cores_per_pe);
-    const uint32_t pe_row = report.node_id / mesh_cols;
-    const uint32_t pe_col = report.node_id % mesh_cols;
-    const uint32_t block_row0 = (pe_row / block_h) * block_h;
-    const uint32_t block_col0 = (pe_col / block_w) * block_w;
-    const uint32_t block_rows = std::min<uint32_t>(block_h, mesh_rows > block_row0 ? (mesh_rows - block_row0) : 1u);
-    const uint32_t block_cols = std::min<uint32_t>(block_w, mesh_cols > block_col0 ? (mesh_cols - block_col0) : 1u);
-    block_origin_node = block_row0 * mesh_cols + block_col0;
-    expected_contributors = std::max<uint32_t>(1u, block_rows * block_cols * cores_per_pe);
-}
-
-static void submitTassLfP0WindowReport(const TassLfP0WindowReport& report) {
-    TassLfP0Registry& reg = tassLfP0Registry();
-    uint32_t block_origin_node = 0;
-    uint32_t expected_contributors = 1;
-    computeTassLfP0BlockInfo(report, block_origin_node, expected_contributors);
-    const uint64_t epoch_key = packTassBlockEpochKey(block_origin_node, report.window_seq);
-    const uint64_t contributor_key = packTassContributorKey(report.node_id, report.core_id);
-
-    std::lock_guard<std::mutex> lock(reg.mu);
-    TassLfP0BlockEpoch& epoch = reg.pending[epoch_key];
-    if (epoch.expected_contributors == 0) {
-        epoch.expected_contributors = expected_contributors;
-        epoch.line_size_bytes = std::max<uint32_t>(1u, report.line_size_bytes);
-    }
-    const auto insert_res = epoch.contributors.insert(contributor_key);
-    if (!insert_res.second) {
-        return;
-    }
-
-    epoch.payload_bytes_total += report.payload_bytes_total;
-    epoch.current_vlf_line_groups_total += report.current_vlf_line_groups_total;
-    for (const auto& kv : report.pre_payload_entries) {
-        epoch.pre_payload_bytes[kv.pre_global] += kv.payload_bytes;
-        epoch.pre_contributors[kv.pre_global] += 1u;
-    }
-
-    if (epoch.contributors.size() < static_cast<size_t>(epoch.expected_contributors)) {
-        return;
-    }
-
-    TassLfP0Aggregate agg{};
-    agg.block_epochs_total = 1;
-    agg.block_active_pres_total = static_cast<uint64_t>(epoch.pre_payload_bytes.size());
-    agg.payload_bytes_total = epoch.payload_bytes_total;
-    agg.current_vlf_line_groups_total = epoch.current_vlf_line_groups_total;
-    const uint64_t line_size = std::max<uint64_t>(1ull, static_cast<uint64_t>(epoch.line_size_bytes));
-    agg.block_fused_lb_line_count_total = ceilDivU64(epoch.payload_bytes_total, line_size);
-    for (const auto& kv : epoch.pre_payload_bytes) {
-        agg.block_naive_line_count_total += ceilDivU64(kv.second, line_size);
-    }
-    for (const auto& kv : epoch.pre_contributors) {
-        const uint64_t fanout = static_cast<uint64_t>(kv.second);
-        agg.response_fanout_total += fanout;
-        if (fanout > 1) {
-            agg.block_shared_pres_total += 1;
-            agg.cross_core_joins_total += (fanout - 1);
-        }
-    }
-    accumulateTassLfP0Aggregate(reg.completed_by_reporter[contributor_key], agg);
-    reg.pending.erase(epoch_key);
-}
-
-static TassLfP0Aggregate drainTassLfP0Completed(uint32_t node_id, uint32_t core_id) {
-    TassLfP0Registry& reg = tassLfP0Registry();
-    const uint64_t key = packTassContributorKey(node_id, core_id);
-    std::lock_guard<std::mutex> lock(reg.mu);
-    TassLfP0Aggregate out{};
-    auto it = reg.completed_by_reporter.find(key);
-    if (it == reg.completed_by_reporter.end()) {
-        return out;
-    }
-    out = it->second;
-    reg.completed_by_reporter.erase(it);
-    return out;
 }
 
 struct RowIndexPrefetchPolicy {
@@ -259,25 +253,104 @@ static RowIndexPrefetchPolicy computeRowIndexPrefetchPolicy(const WeightMemorySu
 
 void WeightMemorySubsystem::onClockTick(uint64_t now_cycle) {
     setNowCycle(now_cycle);
+    if (usePerPostRetire_()) {
+        tryRetireEdgesPerPost_();
+    }
+    noteShadowRecoverableOnTick_();
+    drainShadowPerPostRetire_();
     updateRetireHolStatsOnTick_();
     if (weight_sram_enable_) {
         idx_sram_model_.onClockTick(now_cycle);
         l0_sram_model_.onClockTick(now_cycle);
+        weight_sram_stall_budget_cycles_ = std::min<uint64_t>(
+            std::numeric_limits<uint64_t>::max(),
+            weight_sram_stall_budget_cycles_ + idx_sram_model_.consumeLastCyclePredictedExtraCycles());
+        weight_sram_stall_budget_cycles_ = std::min<uint64_t>(
+            std::numeric_limits<uint64_t>::max(),
+            weight_sram_stall_budget_cycles_ + l0_sram_model_.consumeLastCyclePredictedExtraCycles());
+    }
+    if (shared_weight_object_plane_) {
+        shared_weight_object_plane_->onClockTick(now_cycle);
+    }
+    if (pe_local_service_object_table_ && pe_local_service_object_table_->enabled()) {
+        pe_local_service_object_table_->onClockTick(now_cycle);
+    }
+    if (weight_sram_stall_budget_cycles_ > 0) {
+        --weight_sram_stall_budget_cycles_;
+        weight_sram_stall_cycles_total_ = std::min<uint64_t>(
+            std::numeric_limits<uint64_t>::max(),
+            weight_sram_stall_cycles_total_ + 1ull);
+        if (!observeOnlyWeightSramStall_()) {
+            return;
+        }
     }
     // BCSR rowptr 预取与后续 prefetchAll 都在内存子系统内闭环
     maybeIssueBcsrRowptrPrefetch_();
     drainExperimentalNocRowidxPrefetch_();
-    drainExperimentalIdx2IngressPrefetch_();
     drainPendingReads_();
     drainRowIndexPrefetch_();
     drainPendingDirectReads_();
     drainPendingBcsrRowptrWaiters_();
 }
 
+void WeightMemorySubsystem::noteIdxSramReadMirror_(uint64_t addr, size_t bytes) {
+    if (weight_sram_enable_ && weight_idx_sram_enable_) {
+        idx_sram_model_.noteRead(now_cycle_, addr, bytes);
+    }
+    if (shared_weight_object_plane_) {
+        shared_weight_object_plane_->noteIdxRead(now_cycle_, addr, bytes);
+    }
+}
+
+void WeightMemorySubsystem::noteIdxSramResidentMirror_(uint64_t bytes) {
+    if (shared_weight_object_plane_ && shared_weight_object_plane_residency_authority_) {
+        shared_weight_object_plane_->noteResidentIdxBytes(bytes);
+        return;
+    }
+    if (weight_sram_enable_ && weight_idx_sram_enable_) {
+        idx_sram_model_.noteResidentBytes(bytes);
+    }
+    if (shared_weight_object_plane_) {
+        shared_weight_object_plane_->noteResidentIdxBytes(bytes);
+    }
+}
+
+void WeightMemorySubsystem::noteL0SramReadMirror_(uint64_t addr) {
+    if (weight_sram_enable_ && weight_l0_sram_enable_) {
+        l0_sram_model_.noteRead(now_cycle_, sram_layout_.l0SlotAddr(addr), sizeof(float));
+    }
+    if (shared_weight_object_plane_) {
+        shared_weight_object_plane_->noteL0Read(now_cycle_, addr);
+    }
+}
+
+void WeightMemorySubsystem::noteL0SramWriteMirror_(uint64_t addr) {
+    if (weight_sram_enable_ && weight_l0_sram_enable_) {
+        l0_sram_model_.noteWrite(now_cycle_, sram_layout_.l0SlotAddr(addr), sizeof(float));
+    }
+    if (shared_weight_object_plane_) {
+        shared_weight_object_plane_->noteL0Write(now_cycle_, addr);
+    }
+}
+
+void WeightMemorySubsystem::noteL0SramResidentMirror_(uint64_t bytes) {
+    if (shared_weight_object_plane_ && shared_weight_object_plane_residency_authority_) {
+        shared_weight_object_plane_->noteResidentL0Bytes(bytes);
+        return;
+    }
+    if (weight_sram_enable_ && weight_l0_sram_enable_) {
+        l0_sram_model_.noteResidentBytes(bytes);
+    }
+    if (shared_weight_object_plane_) {
+        shared_weight_object_plane_->noteResidentL0Bytes(bytes);
+    }
+}
+
 WeightMemorySubsystem::IssueStatus
 WeightMemorySubsystem::tryIssueRead_(PendingMeta meta, bool count_budget, bool budget_reserved) {
     if (!mem_access_ || meta.size == 0) {
         if (meta.has_single_cb && meta.single_cb) meta.single_cb(0.0f);
+        if (meta.has_bytes_cb && meta.bytes_cb) { const std::vector<uint8_t> empty{}; meta.bytes_cb(empty); }
         return IssueStatus::Failed;
     }
 
@@ -291,7 +364,9 @@ WeightMemorySubsystem::tryIssueRead_(PendingMeta meta, bool count_budget, bool b
     // Correctness must not depend on whether requests were coalesced.
     (void)budget_limited;
 
-    const bool inflight_ok = (window_.outstanding + 1u <= window_.max_outstanding);
+    const bool inflight_ok =
+        (window_.max_outstanding == 0u) ||
+        (window_.outstanding + 1u <= window_.max_outstanding);
     if (!inflight_ok) {
         // Hard throttle remains max_outstanding.
         return IssueStatus::DeferredInflight;
@@ -307,9 +382,16 @@ WeightMemorySubsystem::tryIssueRead_(PendingMeta meta, bool count_budget, bool b
     }
     if (orch_.update_pending_peak) orch_.update_pending_peak(peakOutstanding());
 
+    const size_t tracked_retire_seq = meta.retire_seq;
+    const int tracked_kind = meta.bcsr_kind;
     meta.counted_inflight = true;
     const uint64_t req = issueRead_(std::move(meta));
-    if (req != 0) return IssueStatus::Issued;
+    if (req != 0) {
+        if (tracked_kind == 4 && tracked_retire_seq != std::numeric_limits<size_t>::max()) {
+            setEdgeRetireIssued_(tracked_retire_seq);
+        }
+        return IssueStatus::Issued;
+    }
 
     // Roll back accounting on issue failure.
     if (!budget_reserved && in_window_budget) {
@@ -397,6 +479,7 @@ void WeightMemorySubsystem::drainPendingReads_() {
             meta.bcsr_target_block_col = UINT32_MAX;
             meta.bcsr_row_start = inflight.row_start;
             meta.bcsr_prefetch_all = false;
+            meta.experimental_noc_rowidx = inflight.experimental_noc_rowidx;
             meta.has_single_cb = false;
             meta.is_weight = true;
             meta.count_weight_read = false;
@@ -481,13 +564,29 @@ void WeightMemorySubsystem::drainPendingDirectReads_() {
         // Direct reads can be used by naive baseline and by BCSR paths when coalescing is disabled.
         const bool count_budget = (window_seq_ != 0);
         const IssueStatus st = tryIssueRead_(meta, /*count_budget*/count_budget, /*budget_reserved*/false);
-        if (st == IssueStatus::Issued) continue;
-        if (st == IssueStatus::DeferredInflight) {
+        if (st == IssueStatus::Issued) {
+            if (meta.bcsr_kind == 4 &&
+                meta.pending_enqueue_cycle != std::numeric_limits<uint64_t>::max() &&
+                now_cycle_ >= meta.pending_enqueue_cycle) {
+                const uint64_t residency_cycles = now_cycle_ - meta.pending_enqueue_cycle;
+                retire_gcss_qni_pending_direct_queue_residency_cycles_total_ += residency_cycles;
+                retire_gcss_qni_pending_direct_queue_residency_samples_total_ += 1;
+                retire_gcss_qni_pending_direct_queue_residency_cycles_max_ = std::max<uint64_t>(
+                    retire_gcss_qni_pending_direct_queue_residency_cycles_max_,
+                    residency_cycles);
+            }
+            continue;
+        }
+        if (st == IssueStatus::DeferredInflight || st == IssueStatus::DeferredBudget) {
             pending_direct_reads_.push_front(std::move(meta));
             break;
         }
         // Failed: preserve forward progress by failing the request (callback returns 0.0f).
         if (meta.has_single_cb && meta.single_cb) meta.single_cb(0.0f);
+        if (meta.has_bytes_cb && meta.bytes_cb) {
+            const std::vector<uint8_t> empty{};
+            meta.bytes_cb(empty);
+        }
     }
 }
 
@@ -524,15 +623,83 @@ void WeightMemorySubsystem::maybeExportPreWindowProfile_(uint32_t seq) {
     fout << "\"\n";
 }
 
+void WeightMemorySubsystem::maybeExportOfflineLayoutProfile_(
+    uint32_t seq,
+    const std::vector<GcssVlfEdgeIssueEntry>& raw_edges,
+    const std::vector<GcssVlfEdgeIssueEntry>& ordered_edges,
+    uint64_t line_size,
+    const std::string& queue_policy) {
+    if (!orch_.experimental_pre_window_profile_export_enable) return;
+    if (seq == 0u) return;
+    if (orch_.experimental_pre_window_profile_export_dir.empty()) return;
+    if (raw_edges.empty() || ordered_edges.empty()) return;
+
+    const uint64_t safe_line_size = std::max<uint64_t>(1u, line_size);
+    char path_buf[1024];
+    std::snprintf(path_buf, sizeof(path_buf), "%s/pe%02u/core%02u.offline_layout_profile.csv",
+                  orch_.experimental_pre_window_profile_export_dir.c_str(),
+                  static_cast<unsigned>(orch_.node_id),
+                  static_cast<unsigned>(orch_.core_id));
+    const std::string path(path_buf);
+
+    bool need_header = true;
+    {
+        std::ifstream probe(path.c_str(), std::ios::in);
+        if (probe.good()) {
+            need_header = (probe.peek() == std::ifstream::traits_type::eof());
+        }
+    }
+
+    std::ofstream fout(path.c_str(), std::ios::out | std::ios::app);
+    if (!fout.is_open()) return;
+    if (need_header) {
+        fout << "window_id,queue_policy,retire_seq,local_age_rank,ordered_rank,younger_ahead_depth,"
+                "post_local,pre_global,pre_rank,count,addr,line_id\n";
+    }
+
+    std::unordered_map<size_t, size_t> ordered_rank_by_seq;
+    ordered_rank_by_seq.reserve(ordered_edges.size());
+    for (size_t i = 0; i < ordered_edges.size(); ++i) {
+        ordered_rank_by_seq.emplace(ordered_edges[i].retire_seq, i);
+    }
+
+    const size_t unknown_rank = std::numeric_limits<size_t>::max();
+    for (const auto& e : raw_edges) {
+        const auto it = ordered_rank_by_seq.find(e.retire_seq);
+        const size_t ordered_rank = (it == ordered_rank_by_seq.end()) ? unknown_rank : it->second;
+        uint64_t younger_ahead_depth = 0;
+        if (ordered_rank != unknown_rank && ordered_rank > e.local_age_rank) {
+            younger_ahead_depth = static_cast<uint64_t>(ordered_rank - e.local_age_rank);
+        }
+        const uint64_t line_id = e.addr / safe_line_size;
+
+        fout << seq
+             << "," << queue_policy
+             << "," << e.retire_seq
+             << "," << e.local_age_rank
+             << "," << (ordered_rank == unknown_rank ? -1 : static_cast<long long>(ordered_rank))
+             << "," << younger_ahead_depth
+             << "," << e.post_local
+             << "," << e.pre_global
+             << "," << e.pre_rank
+             << "," << e.count
+             << "," << e.addr
+             << "," << line_id
+             << "\n";
+    }
+}
+
 bool WeightMemorySubsystem::experimentalNocRowidxPrefetchEnabled_() const {
     return orch_.experimental_noc_rowidx_prefetch_enable && orch_.use_bcsr && (orch_.bcsr_mgr != nullptr);
 }
 
 void WeightMemorySubsystem::resetExperimentalNocRowidxWindow_() {
     experimental_noc_rowidx_pending_rows_.clear();
+    experimental_noc_rowidx_owner_close_rows_.clear();
     if (!experimentalNocRowidxPrefetchEnabled_()) {
         experimental_noc_rowidx_touched_rows_.clear();
         experimental_noc_rowidx_touch_counts_.clear();
+        experimental_noc_rowidx_owner_close_seen_.clear();
         return;
     }
     const uint32_t br = orch_.bcsr_mgr->effectiveBlockRows();
@@ -547,6 +714,14 @@ void WeightMemorySubsystem::resetExperimentalNocRowidxWindow_() {
         experimental_noc_rowidx_touch_counts_.assign(n_block_rows, 0);
     } else {
         std::fill(experimental_noc_rowidx_touch_counts_.begin(), experimental_noc_rowidx_touch_counts_.end(), 0);
+    }
+    if (experimental_noc_rowidx_owner_close_seen_.size() != n_block_rows) {
+        experimental_noc_rowidx_owner_close_seen_.assign(n_block_rows, 0);
+    } else {
+        std::fill(
+            experimental_noc_rowidx_owner_close_seen_.begin(),
+            experimental_noc_rowidx_owner_close_seen_.end(),
+            0);
     }
 }
 
@@ -580,8 +755,41 @@ void WeightMemorySubsystem::noteExperimentalNocRowidxTouch_(uint32_t post_local)
     }
 
     experimental_noc_rowidx_touched_rows_[block_row] = 1;
+    if (window_seq_ != 0u) {
+        observePeInternalPodMetadataObject_(
+            PodMetadataObjectPlane::MetadataKind::RowIndex,
+            static_cast<uint64_t>(block_row),
+            /*experimental_rowindex_owner_track=*/true);
+    }
     experimental_noc_rowidx_pending_rows_.push_back(block_row);
     experimental_noc_rowidx_stats_.rows_touched_enqueued += 1;
+}
+
+void WeightMemorySubsystem::maybePromoteExperimentalNocRowidxTouchesToApplyWindow_() {
+    if (window_seq_ == 0u) return;
+    if (!experimentalNocRowidxPrefetchEnabled_()) return;
+    if (experimental_noc_rowidx_touched_rows_.empty()) return;
+
+    for (uint32_t block_row = 0; block_row < experimental_noc_rowidx_touched_rows_.size(); ++block_row) {
+        if (!experimental_noc_rowidx_touched_rows_[block_row]) continue;
+
+        experimental_noc_rowidx_stats_.apply_promote_rows_total += 1u;
+        observePeInternalPodMetadataObject_(
+            PodMetadataObjectPlane::MetadataKind::RowIndex,
+            static_cast<uint64_t>(block_row),
+            /*experimental_rowindex_owner_track=*/true);
+
+        const auto cache_it = experimental_noc_rowidx_cache_.find(block_row);
+        if (cache_it == experimental_noc_rowidx_cache_.end()) continue;
+
+        experimental_noc_rowidx_stats_.apply_promote_cached_ready_total += 1u;
+        if (notePeInternalPodServiceObjectReady_(
+                PodMetadataObjectPlane::MetadataKind::RowIndex,
+                static_cast<uint64_t>(block_row),
+                window_seq_)) {
+            experimental_noc_rowidx_stats_.ready_transition_apply_promote_cached_total += 1u;
+        }
+    }
 }
 
 uint32_t WeightMemorySubsystem::computeExperimentalNocRowidxBudget_() {
@@ -669,51 +877,74 @@ void WeightMemorySubsystem::storeExperimentalNocRowidxCache_(uint32_t block_row,
 
 void WeightMemorySubsystem::drainExperimentalNocRowidxPrefetch_() {
     if (!experimentalNocRowidxPrefetchEnabled_()) return;
-    if (orch_.experimental_noc_rowidx_prefetch_gather_only && window_seq_ != 0) return;
-    if (experimental_noc_rowidx_pending_rows_.empty()) return;
-    if (orch_.ensure_loader_ready && !orch_.ensure_loader_ready()) return;
-    if (orch_.bcsr_rowptr_ready && !orch_.bcsr_rowptr_ready()) return;
+    if (orch_.experimental_noc_rowidx_prefetch_gather_only) {
+        if (orch_.experimental_noc_rowidx_prefetch_carry_to_apply_enable) {
+            if (window_seq_ == 0u) {
+                experimental_noc_rowidx_stats_.drain_skip_phase_gather_total += 1u;
+                return;
+            }
+        } else if (window_seq_ != 0u) {
+            experimental_noc_rowidx_stats_.drain_skip_phase_apply_disabled_total += 1u;
+            return;
+        }
+    }
+    if (experimental_noc_rowidx_pending_rows_.empty()) {
+        experimental_noc_rowidx_stats_.drain_skip_no_pending_total += 1u;
+        return;
+    }
+    if (orch_.ensure_loader_ready && !orch_.ensure_loader_ready()) {
+        experimental_noc_rowidx_stats_.drain_skip_loader_not_ready_total += 1u;
+        return;
+    }
+    if (orch_.bcsr_rowptr_ready && !orch_.bcsr_rowptr_ready()) {
+        experimental_noc_rowidx_stats_.drain_skip_rowptr_not_ready_total += 1u;
+        return;
+    }
 
     uint32_t budget = computeExperimentalNocRowidxBudget_();
-    if (budget == 0) return;
+    if (budget == 0) {
+        experimental_noc_rowidx_stats_.drain_skip_budget_zero_total += 1u;
+        return;
+    }
     while (budget > 0 && !experimental_noc_rowidx_pending_rows_.empty()) {
         const uint32_t block_row = experimental_noc_rowidx_pending_rows_.front();
         experimental_noc_rowidx_pending_rows_.pop_front();
         budget -= 1;
 
         if (experimental_noc_rowidx_cache_.find(block_row) != experimental_noc_rowidx_cache_.end()) {
+            experimental_noc_rowidx_stats_.drain_skip_cache_hit_total += 1u;
             continue;
         }
 
-        const uint64_t inflight_key = makeInflightKey_(0u, block_row);
+        if (experimental_noc_rowidx_detached_inflight_rows_.find(block_row) !=
+            experimental_noc_rowidx_detached_inflight_rows_.end()) {
+            experimental_noc_rowidx_stats_.drain_skip_detached_inflight_total += 1u;
+            continue;
+        }
+
+        const uint32_t inflight_window_seq = window_seq_;
+        const uint64_t inflight_key = makeInflightKey_(inflight_window_seq, block_row);
         if (inflight_colidx_.find(inflight_key) != inflight_colidx_.end()) {
+            experimental_noc_rowidx_stats_.drain_skip_colidx_inflight_total += 1u;
             continue;
         }
 
         uint32_t start = 0;
         uint32_t end = 0;
         if (!orch_.bcsr_mgr->rowBounds(block_row, start, end)) {
+            experimental_noc_rowidx_stats_.drain_skip_empty_row_total += 1u;
             continue;
         }
         if (end <= start) {
+            experimental_noc_rowidx_stats_.drain_skip_empty_row_total += 1u;
             continue;
         }
         const uint32_t block_count = end - start;
         const size_t bytes = orch_.bcsr_mgr->colIndexBytes(block_count);
         const uint64_t addr = orch_.bcsr_mgr->colIndexAddr(start);
 
-        ColidxInflight inflight{};
-        inflight.window_seq = 0;
-        inflight.block_row = block_row;
-        inflight.row_start = start;
-        inflight.row_end = end;
-        inflight.issued = false;
-        inflight.queued = false;
-        inflight.count_budget = false;
-        inflight_colidx_.emplace(inflight_key, std::move(inflight));
-
         PendingMeta meta{};
-        meta.window_seq = 0;
+        meta.window_seq = inflight_window_seq;
         meta.address = addr;
         meta.size = bytes;
         meta.orig_address = addr;
@@ -725,9 +956,38 @@ void WeightMemorySubsystem::drainExperimentalNocRowidxPrefetch_() {
         meta.bcsr_target_block_col = UINT32_MAX;
         meta.bcsr_row_start = start;
         meta.bcsr_prefetch_all = false;
+        meta.experimental_noc_rowidx = true;
         meta.has_single_cb = false;
         meta.is_weight = true;
         meta.count_weight_read = false;
+
+        if (orch_.experimental_noc_rowidx_prefetch_detached_enable) {
+            const IssueStatus st = tryIssueRead_(std::move(meta), /*count_budget*/false, /*budget_reserved*/false);
+            if (st == IssueStatus::Issued) {
+                experimental_noc_rowidx_detached_inflight_rows_[block_row] = inflight_window_seq;
+                experimental_noc_rowidx_stats_.prefetch_rows_issued += 1;
+                experimental_noc_rowidx_stats_.prefetch_bytes_issued += static_cast<uint64_t>(bytes);
+                continue;
+            }
+            if (st == IssueStatus::DeferredInflight) {
+                experimental_noc_rowidx_pending_rows_.push_front(block_row);
+                experimental_noc_rowidx_stats_.prefetch_rows_deferred += 1;
+                break;
+            }
+            experimental_noc_rowidx_stats_.prefetch_rows_failed += 1;
+            continue;
+        }
+
+        ColidxInflight inflight{};
+        inflight.window_seq = inflight_window_seq;
+        inflight.block_row = block_row;
+        inflight.row_start = start;
+        inflight.row_end = end;
+        inflight.issued = false;
+        inflight.queued = false;
+        inflight.count_budget = false;
+        inflight.experimental_noc_rowidx = true;
+        inflight_colidx_.emplace(inflight_key, std::move(inflight));
 
         const IssueStatus st = tryIssueRead_(std::move(meta), /*count_budget*/false, /*budget_reserved*/false);
         if (st == IssueStatus::Issued) {
@@ -756,241 +1016,27 @@ void WeightMemorySubsystem::drainExperimentalNocRowidxPrefetch_() {
 }
 
 bool WeightMemorySubsystem::experimentalIdx2IngressPrefetchEnabled_() const {
-    return orch_.experimental_idx2_ingress_prefetch_enable &&
-           isGcssValueOnlyIdx2Mode_() &&
-           (mem_access_ != nullptr);
-}
-
-bool WeightMemorySubsystem::shouldTailGuardIdx2RespDrop_() const {
-    return orch_.experimental_idx2_ingress_tail_guard_enable &&
-           orch_.experimental_idx2_ingress_prefetch_gather_only &&
-           (window_seq_ != 0);
-}
-
-uint32_t WeightMemorySubsystem::computeExperimentalIdx2IngressBudget_() const {
-    return std::max<uint32_t>(1u, orch_.experimental_idx2_ingress_prefetch_budget_per_tick);
-}
-
-bool WeightMemorySubsystem::lookupExperimentalIdx2IngressCache_(uint64_t addr, float& value_out) {
-    auto it = experimental_idx2_ingress_value_cache_.find(addr);
-    if (it == experimental_idx2_ingress_value_cache_.end()) {
-        noteL0SramLookup_(addr, /*hit=*/false);
-        return false;
-    }
-    noteL0SramLookup_(addr, /*hit=*/true);
-    value_out = it->second;
-    return true;
-}
-
-void WeightMemorySubsystem::storeExperimentalIdx2IngressCache_(uint64_t addr, float value) {
-    const uint32_t cap = orch_.experimental_idx2_ingress_prefetch_cache_entries;
-    if (cap == 0) return;
-
-    auto it = experimental_idx2_ingress_value_cache_.find(addr);
-    if (it != experimental_idx2_ingress_value_cache_.end()) {
-        it->second = value;
-        noteL0SramFill_(addr);
-        l0_sram_model_.noteResidentBytes(
-            static_cast<uint64_t>(experimental_idx2_ingress_value_cache_.size()) * sizeof(float));
-        return;
-    }
-
-    while (experimental_idx2_ingress_value_cache_.size() >= static_cast<size_t>(cap) &&
-           !experimental_idx2_ingress_value_cache_lru_.empty()) {
-        const uint64_t victim = experimental_idx2_ingress_value_cache_lru_.front();
-        experimental_idx2_ingress_value_cache_lru_.pop_front();
-        const size_t erased = experimental_idx2_ingress_value_cache_.erase(victim);
-        if (erased > 0) {
-            experimental_idx2_ingress_stats_.cache_evict_total += 1;
-            noteL0SramEvict_(victim);
-            break;
-        }
-    }
-    if (experimental_idx2_ingress_value_cache_.size() >= static_cast<size_t>(cap) &&
-        !experimental_idx2_ingress_value_cache_.empty()) {
-        const uint64_t victim = experimental_idx2_ingress_value_cache_.begin()->first;
-        experimental_idx2_ingress_value_cache_.erase(experimental_idx2_ingress_value_cache_.begin());
-        experimental_idx2_ingress_stats_.cache_evict_total += 1;
-        noteL0SramEvict_(victim);
-    }
-
-    experimental_idx2_ingress_value_cache_[addr] = value;
-    experimental_idx2_ingress_value_cache_lru_.push_back(addr);
-    experimental_idx2_ingress_stats_.cache_fill_total += 1;
-    noteL0SramFill_(addr);
-    l0_sram_model_.noteResidentBytes(
-        static_cast<uint64_t>(experimental_idx2_ingress_value_cache_.size()) * sizeof(float));
-}
-
-void WeightMemorySubsystem::noteExperimentalIdx2IngressTouch_(uint32_t post_local, uint32_t pre_global) {
-    if (!experimentalIdx2IngressPrefetchEnabled_()) return;
-    if (post_local >= orch_.num_neurons) return;
-    if (orch_.experimental_idx2_ingress_prefetch_gather_only && window_seq_ != 0) return;
-    if (orch_.ensure_loader_ready && !orch_.ensure_loader_ready()) return;
-
-    experimental_idx2_ingress_stats_.touch_events_total += 1;
-
-    uint32_t widx = 0;
-    if (!lookupGcssWidx_(pre_global, post_local, widx)) {
-        experimental_idx2_ingress_stats_.lookup_miss_total += 1;
-        return;
-    }
-    const uint64_t addr = orch_.base_addr + static_cast<uint64_t>(widx) * sizeof(float);
-
-    float cached = 0.0f;
-    if (lookupExperimentalIdx2IngressCache_(addr, cached)) {
-        (void)cached;
-        experimental_idx2_ingress_stats_.dedup_cache_total += 1;
-        return;
-    }
-    if (experimental_idx2_ingress_pending_set_.find(addr) != experimental_idx2_ingress_pending_set_.end()) {
-        experimental_idx2_ingress_stats_.dedup_pending_total += 1;
-        return;
-    }
-    if (experimental_idx2_ingress_inflight_.find(addr) != experimental_idx2_ingress_inflight_.end()) {
-        experimental_idx2_ingress_stats_.dedup_inflight_total += 1;
-        return;
-    }
-
-    experimental_idx2_ingress_pending_addrs_.push_back(addr);
-    experimental_idx2_ingress_pending_set_.insert(addr);
-    experimental_idx2_ingress_stats_.enqueued_total += 1;
-}
-
-bool WeightMemorySubsystem::tryServeExperimentalIdx2Ingress_(uint64_t addr, std::function<void(float)> cb) {
-    if (!experimentalIdx2IngressPrefetchEnabled_()) return false;
-
-    float cached = 0.0f;
-    if (lookupExperimentalIdx2IngressCache_(addr, cached)) {
-        experimental_idx2_ingress_stats_.demand_hit_total += 1;
-        if (cb) cb(applyReadRespZeroFallback_(cached));
-        return true;
-    }
-
-    auto it = experimental_idx2_ingress_inflight_.find(addr);
-    if (it != experimental_idx2_ingress_inflight_.end()) {
-        experimental_idx2_ingress_stats_.demand_join_total += 1;
-        if (cb) {
-            experimental_idx2_ingress_stats_.demand_join_cb_nonnull_total += 1;
-            it->second.waiters.push_back(std::move(cb));
-        } else {
-            experimental_idx2_ingress_stats_.demand_join_cb_null_total += 1;
-        }
-        return true;
-    }
     return false;
 }
 
-void WeightMemorySubsystem::completeExperimentalIdx2IngressPrefetch_(uint64_t addr, bool ok, float value) {
-    const bool drop_tail_no_waiter = shouldTailGuardIdx2RespDrop_();
-    auto it = experimental_idx2_ingress_inflight_.find(addr);
-    if (it == experimental_idx2_ingress_inflight_.end()) {
-        experimental_idx2_ingress_stats_.prefetch_complete_inflight_miss_total += 1;
-        if (ok) experimental_idx2_ingress_stats_.prefetch_resp_ok_total += 1;
-        else experimental_idx2_ingress_stats_.prefetch_resp_short_total += 1;
-        if (ok) {
-            if (drop_tail_no_waiter) {
-                experimental_idx2_ingress_stats_.prefetch_resp_drop_tail_total += 1;
-            } else {
-                storeExperimentalIdx2IngressCache_(addr, value);
-            }
-        }
-        return;
-    }
-
-    auto waiters = std::move(it->second.waiters);
-    experimental_idx2_ingress_inflight_.erase(it);
-    experimental_idx2_ingress_stats_.prefetch_complete_waiters_total += static_cast<uint64_t>(waiters.size());
-    if (waiters.empty()) {
-        experimental_idx2_ingress_stats_.prefetch_complete_zero_waiters_total += 1;
-    }
-    if (!waiters.empty()) {
-        experimental_idx2_ingress_stats_.waiters_served_total += static_cast<uint64_t>(waiters.size());
-    }
-    if (ok) experimental_idx2_ingress_stats_.prefetch_resp_ok_total += 1;
-    else experimental_idx2_ingress_stats_.prefetch_resp_short_total += 1;
-
-    if (ok) {
-        if (drop_tail_no_waiter && waiters.empty()) {
-            experimental_idx2_ingress_stats_.prefetch_resp_drop_tail_total += 1;
-            return;
-        }
-        storeExperimentalIdx2IngressCache_(addr, value);
-        const float resolved = applyReadRespZeroFallback_(value);
-        for (auto& cb : waiters) {
-            if (cb) cb(resolved);
-        }
-        return;
-    }
-
-    for (auto& cb : waiters) {
-        experimental_idx2_ingress_stats_.demand_fallback_total += 1;
-        issueGcssByAddr_(addr, std::move(cb), /*count_weight_read*/true);
-    }
+bool WeightMemorySubsystem::experimentalIdx2IngressAllowApplyCarry_() const {
+    return false;
 }
 
-void WeightMemorySubsystem::drainExperimentalIdx2IngressPrefetch_() {
-    if (!experimentalIdx2IngressPrefetchEnabled_()) return;
-    if (orch_.experimental_idx2_ingress_prefetch_gather_only && window_seq_ != 0) return;
-    if (experimental_idx2_ingress_pending_addrs_.empty()) return;
-    if (orch_.ensure_loader_ready && !orch_.ensure_loader_ready()) return;
+bool WeightMemorySubsystem::shouldTailGuardIdx2RespDrop_() const {
+    return false;
+}
 
-    uint32_t budget = computeExperimentalIdx2IngressBudget_();
-    while (budget > 0 && !experimental_idx2_ingress_pending_addrs_.empty()) {
-        const uint64_t addr = experimental_idx2_ingress_pending_addrs_.front();
-        experimental_idx2_ingress_pending_addrs_.pop_front();
-        experimental_idx2_ingress_pending_set_.erase(addr);
-        budget -= 1;
+bool WeightMemorySubsystem::observeOnlyWeightSramStall_() const {
+    return false;
+}
 
-        float cached = 0.0f;
-        if (lookupExperimentalIdx2IngressCache_(addr, cached)) {
-            (void)cached;
-            experimental_idx2_ingress_stats_.dedup_cache_total += 1;
-            continue;
-        }
-        if (experimental_idx2_ingress_inflight_.find(addr) != experimental_idx2_ingress_inflight_.end()) {
-            experimental_idx2_ingress_stats_.dedup_inflight_total += 1;
-            continue;
-        }
+uint32_t WeightMemorySubsystem::computeExperimentalIdx2IngressBudget_() {
+    return 0u;
+}
 
-        ExperimentalIdx2IngressInflightEntry inflight{};
-        inflight.issued = false;
-        experimental_idx2_ingress_inflight_[addr] = std::move(inflight);
-
-        PendingMeta meta{};
-        meta.window_seq = 0;
-        meta.address = addr;
-        meta.size = sizeof(float);
-        meta.orig_address = addr;
-        meta.orig_size = sizeof(float);
-        meta.slice_offset = 0;
-        meta.issue_cycle = now_cycle_;
-        meta.bcsr_kind = 5;  // STORM-NIP ingress prefetch
-        meta.has_single_cb = false;
-        meta.is_weight = true;
-        meta.count_weight_read = false;
-
-        const IssueStatus st = tryIssueRead_(meta, /*count_budget*/false, /*budget_reserved*/false);
-        if (st == IssueStatus::Issued) {
-            auto it = experimental_idx2_ingress_inflight_.find(addr);
-            if (it != experimental_idx2_ingress_inflight_.end()) {
-                it->second.issued = true;
-            }
-            experimental_idx2_ingress_stats_.prefetch_issued_total += 1;
-            experimental_idx2_ingress_stats_.prefetch_bytes_total += sizeof(float);
-            continue;
-        }
-        if (st == IssueStatus::DeferredInflight || st == IssueStatus::DeferredBudget) {
-            experimental_idx2_ingress_inflight_.erase(addr);
-            experimental_idx2_ingress_pending_addrs_.push_front(addr);
-            experimental_idx2_ingress_pending_set_.insert(addr);
-            experimental_idx2_ingress_stats_.prefetch_deferred_total += 1;
-            break;
-        }
-
-        experimental_idx2_ingress_inflight_.erase(addr);
-        experimental_idx2_ingress_stats_.prefetch_failed_total += 1;
-    }
+uint32_t WeightMemorySubsystem::experimentalIdx2IngressPrefetchMaxInflight_() const {
+    return 0u;
 }
 
 void WeightMemorySubsystem::maybeEnqueueRowIndexPrefetchAllRows_() {
@@ -1191,6 +1237,9 @@ void WeightMemorySubsystem::noteReadSourceIssue_(int bcsr_kind, size_t req_bytes
             read_src_blockdata_bytes_ += bytes;
             break;
         case 4:
+        case 7:
+        case 6:
+        case 8:
             read_src_gcss_reqs_ += 1;
             read_src_gcss_bytes_ += bytes;
             break;
@@ -1207,6 +1256,7 @@ void WeightMemorySubsystem::noteReadSourceIssue_(int bcsr_kind, size_t req_bytes
 uint64_t WeightMemorySubsystem::issueRead_(PendingMeta meta) {
     if (!mem_access_ || meta.size == 0) {
         if (meta.has_single_cb && meta.single_cb) meta.single_cb(0.0f);
+        if (meta.has_bytes_cb && meta.bytes_cb) { const std::vector<uint8_t> empty{}; meta.bytes_cb(empty); }
         return 0;
     }
     // Window diagnostic (debug-only): attribute raw issue traffic to current window.
@@ -1216,6 +1266,7 @@ uint64_t WeightMemorySubsystem::issueRead_(PendingMeta meta) {
         switch (meta.bcsr_kind) {
             case 0:
             case 4:
+            case 8:
                 diag_win_.issue_cnt_dense += 1;
                 diag_win_.issue_bytes_dense += static_cast<uint64_t>(meta.size);
                 break;
@@ -1243,16 +1294,17 @@ uint64_t WeightMemorySubsystem::issueRead_(PendingMeta meta) {
         }
     }
     if (orch_.report_mem_issue) {
-        orch_.report_mem_issue(meta.size, meta.count_weight_read);
+        const size_t report_bytes = meta.report_bytes ? meta.report_bytes : meta.size;
+        orch_.report_mem_issue(report_bytes, meta.count_weight_read);
     }
     const int bcsr_kind = meta.bcsr_kind;
     const uint64_t addr = meta.address;
     const size_t bytes = meta.size;
-    const uint64_t req_id = mem_access_->read(
-        addr, bytes,
-        [this, meta = std::move(meta)](uint64_t req_id, uint64_t resp_addr, std::vector<uint8_t>&& data) mutable {
-            handleReadResp_(req_id, resp_addr, std::move(meta), std::move(data));
-        });
+    auto cb = [this, meta = std::move(meta)](uint64_t req_id, uint64_t resp_addr, std::vector<uint8_t>&& data) mutable {
+        handleReadResp_(req_id, resp_addr, std::move(meta), std::move(data));
+    };
+
+    const uint64_t req_id = mem_access_->read(addr, bytes, std::move(cb));
     if (req_id != 0) {
         noteReadSourceIssue_(bcsr_kind, bytes);
     }
@@ -1414,8 +1466,7 @@ bool WeightMemorySubsystem::isGcssValueOnlyMode_() const {
            mode == "gcss_valueonly_dstcore_vlf_premphf" ||
            mode == "gscc_valueonly_dstcore_vlf_premphf" ||
            mode == "gcss_valueonly_dstcore_vlf_premphf_plp" ||
-           mode == "gscc_valueonly_dstcore_vlf_premphf_plp" ||
-           mode == "gcss_valueonly_dstblock_naive_tass";
+           mode == "gscc_valueonly_dstcore_vlf_premphf_plp";
 }
 
 bool WeightMemorySubsystem::isGcssValueOnlyIdx2Mode_() const {
@@ -1429,53 +1480,6 @@ bool WeightMemorySubsystem::isGcssValueOnlyPreMphfMode_() const {
            mode == "gscc_valueonly_dstcore_vlf_premphf" ||
            mode == "gcss_valueonly_dstcore_vlf_premphf_plp" ||
            mode == "gscc_valueonly_dstcore_vlf_premphf_plp";
-}
-
-bool WeightMemorySubsystem::isGcssValueOnlyBlockNaiveTassMode_() const {
-    return toLowerCopy(orch_.synapse_weight_mode) == "gcss_valueonly_dstblock_naive_tass";
-}
-
-uint32_t WeightMemorySubsystem::computeNaiveTassBlockPostLocal_(uint32_t post_local) const {
-    const uint32_t mesh_cols = std::max<uint32_t>(1u, orch_.tass_lf_p0_mesh_cols);
-    const uint32_t mesh_rows = std::max<uint32_t>(1u, orch_.tass_lf_p0_mesh_rows);
-    const uint32_t block_h = std::max<uint32_t>(1u, orch_.tass_lf_p0_block_h);
-    const uint32_t block_w = std::max<uint32_t>(1u, orch_.tass_lf_p0_block_w);
-    const uint32_t cores_per_pe = std::max<uint32_t>(1u, orch_.tass_lf_p0_cores_per_pe);
-    const uint32_t node_id = orch_.node_id;
-    const uint32_t pe_row = node_id / mesh_cols;
-    const uint32_t pe_col = node_id % mesh_cols;
-    const uint32_t block_row0 = (pe_row / block_h) * block_h;
-    const uint32_t block_col0 = (pe_col / block_w) * block_w;
-    const uint32_t block_cols = std::min<uint32_t>(block_w, mesh_cols > block_col0 ? (mesh_cols - block_col0) : 1u);
-    const uint32_t block_rows = std::min<uint32_t>(block_h, mesh_rows > block_row0 ? (mesh_rows - block_row0) : 1u);
-    const uint32_t local_row = pe_row - block_row0;
-    const uint32_t local_col = pe_col - block_col0;
-    if (local_row >= block_rows || local_col >= block_cols) {
-        SST::Output* out = diagOutOrFallback_();
-        out->fatal(CALL_INFO, -1,
-                   "WeightMemorySubsystem fatal: naive_tass invalid block slot (node=%u core=%u local_row=%u local_col=%u block_rows=%u block_cols=%u)\n",
-                   orch_.node_id,
-                   orch_.core_id,
-                   local_row,
-                   local_col,
-                   block_rows,
-                   block_cols);
-    }
-    const uint64_t local_block_slot = static_cast<uint64_t>(local_row) * static_cast<uint64_t>(block_cols) +
-                                      static_cast<uint64_t>(local_col);
-    const uint64_t block_post = ((local_block_slot * static_cast<uint64_t>(cores_per_pe)) +
-                                 static_cast<uint64_t>(orch_.core_id)) *
-                                    static_cast<uint64_t>(orch_.num_neurons) +
-                                static_cast<uint64_t>(post_local);
-    if (block_post > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
-        SST::Output* out = diagOutOrFallback_();
-        out->fatal(CALL_INFO, -1,
-                   "WeightMemorySubsystem fatal: naive_tass block_post overflow (node=%u core=%u block_post=%llu)\n",
-                   orch_.node_id,
-                   orch_.core_id,
-                   static_cast<unsigned long long>(block_post));
-    }
-    return static_cast<uint32_t>(block_post);
 }
 
 bool WeightMemorySubsystem::ensureGcssIndexLoaded_() {
@@ -1532,11 +1536,11 @@ bool WeightMemorySubsystem::ensureGcssIndexLoaded_() {
         gcss_index_path_ = resolved;
         gcss_index_loaded_ = true;
     }
-    if (weight_sram_enable_ && weight_idx_sram_enable_) {
+    if ((weight_sram_enable_ && weight_idx_sram_enable_) || shared_weight_object_plane_) {
         std::ifstream fin(resolved, std::ios::in | std::ios::binary | std::ios::ate);
         if (fin.good()) {
             const std::streamoff sz = fin.tellg();
-            if (sz > 0) idx_sram_model_.noteResidentBytes(static_cast<uint64_t>(sz));
+            if (sz > 0) noteIdxSramResidentMirror_(static_cast<uint64_t>(sz));
         }
     }
     return true;
@@ -1583,19 +1587,54 @@ bool WeightMemorySubsystem::lookupGcssPreBaseLen_(uint32_t pre_global,
                                                   uint32_t& out_len) {
     if (!isGcssValueOnlyPreMphfMode_()) return false;
     if (!ensureGcssIndexLoaded_()) return false;
+    const uint32_t lookup_scope_id = pulsePrebaseLookupScopeId_();
+    if (orch_.pulse_prebase_shared_lookup_enable && window_seq_ != 0u) {
+        const auto shared = PulseMetadataLookupRegistry::findPreBase(
+            lookup_scope_id,
+            window_seq_,
+            pre_global,
+            orch_.core_id);
+        if (shared.hit) {
+            out_base = shared.base;
+            out_len = shared.len;
+            pulse_prebase_lookup_shared_hits_total_ += 1u;
+            pulse_prebase_lookup_entries_peak_ = std::max<uint64_t>(
+                pulse_prebase_lookup_entries_peak_,
+                static_cast<uint64_t>(shared.active_entries));
+            return true;
+        }
+    }
+
     idx_lookup_total_ += 1;
     idx_lookup_idx2_total_ += 1;
-    if (weight_sram_enable_ && weight_idx_sram_enable_) {
+    if ((weight_sram_enable_ && weight_idx_sram_enable_) || shared_weight_object_plane_) {
         // pre-MPHF lookup path: global seed/bucket pilot + slot {base,len}.
         const uint64_t base_addr = sram_layout_.idxLegacyLookupAddr(pre_global, 0u);
-        idx_sram_model_.noteRead(now_cycle_, base_addr + 0ull, sizeof(uint32_t));   // seed
-        idx_sram_model_.noteRead(now_cycle_, base_addr + 4ull, sizeof(uint32_t));   // bucket_count
-        idx_sram_model_.noteRead(now_cycle_, base_addr + 8ull, sizeof(uint8_t));    // pilot
-        idx_sram_model_.noteRead(now_cycle_, base_addr + 12ull, sizeof(uint32_t));  // slot_base
-        idx_sram_model_.noteRead(now_cycle_, base_addr + 16ull, sizeof(uint32_t));  // slot_len
+        noteIdxSramReadMirror_(base_addr + 0ull, sizeof(uint32_t));   // seed
+        noteIdxSramReadMirror_(base_addr + 4ull, sizeof(uint32_t));   // bucket_count
+        noteIdxSramReadMirror_(base_addr + 8ull, sizeof(uint8_t));    // pilot
+        noteIdxSramReadMirror_(base_addr + 12ull, sizeof(uint32_t));  // slot_base
+        noteIdxSramReadMirror_(base_addr + 16ull, sizeof(uint32_t));  // slot_len
     }
     const bool ok = gcss_premphf_index_.lookup(pre_global, out_base, out_len);
-    if (ok) return true;
+    if (ok) {
+        if (orch_.pulse_prebase_shared_lookup_enable && window_seq_ != 0u) {
+            const auto published = PulseMetadataLookupRegistry::publishPreBase(
+                lookup_scope_id,
+                window_seq_,
+                pre_global,
+                out_base,
+                out_len,
+                orch_.core_id);
+            if (published.owner_fill) {
+                pulse_prebase_lookup_owner_fill_total_ += 1u;
+            }
+            pulse_prebase_lookup_entries_peak_ = std::max<uint64_t>(
+                pulse_prebase_lookup_entries_peak_,
+                static_cast<uint64_t>(published.active_entries));
+        }
+        return true;
+    }
 
     SST::Output* out = diagOutOrFallback_();
     out->fatal(CALL_INFO, -1,
@@ -1609,11 +1648,115 @@ bool WeightMemorySubsystem::lookupGcssPreBaseLen_(uint32_t pre_global,
     return false;
 }
 
-void WeightMemorySubsystem::issueGcssByAddr_(uint64_t addr, std::function<void(float)> cb, bool count_weight_read) {
+void WeightMemorySubsystem::issueGcssByAddr_(uint64_t addr, std::function<void(float)> cb, bool count_weight_read,
+                                             size_t retire_seq) {
     if (!mem_access_) {
         if (cb) cb(0.0f);
         return;
     }
+
+    tryActivateDeferredRowdescriptorOwnerFormReplay_();
+
+    if (pulseAnySeededResidencyEnable_() &&
+        window_seq_ != 0u &&
+        orch_.line_size_bytes >= sizeof(float)) {
+        const uint64_t line_size = std::max<uint64_t>(
+            static_cast<uint64_t>(sizeof(float)),
+            static_cast<uint64_t>(orch_.line_size_bytes));
+        const uint64_t line_addr = (addr / line_size) * line_size;
+        const auto resident = PulseSeededLineResidency::lookupLine(
+            orch_.node_id,
+            window_seq_,
+            line_addr);
+        if (resident.hit) {
+            PulseSeededLineTracker::noteResidentHit(
+                orch_.node_id,
+                window_seq_,
+                line_addr);
+            notePulseSeedFirstDemand_(line_addr, /*ready_before_demand=*/true);
+            float w = 0.0f;
+            const uint64_t offset = addr - line_addr;
+            if (offset + sizeof(float) <= resident.line_bytes.size()) {
+                std::memcpy(&w, resident.line_bytes.data() + offset, sizeof(float));
+            }
+            if (cb) cb(applyReadRespZeroFallback_(w));
+            return;
+        }
+    }
+
+    if (!orch_.pulse_descriptor_actual_enable) {
+        pulse_actual_gate_enable_false_total_ += 1;
+    } else if (window_seq_ == 0) {
+        pulse_actual_gate_window_zero_total_ += 1;
+    } else if (orch_.line_size_bytes < sizeof(float)) {
+        pulse_actual_gate_line_too_small_total_ += 1;
+    } else {
+        pulse_actual_gate_taken_total_ += 1;
+        const uint64_t line_size = std::max<uint64_t>(
+            static_cast<uint64_t>(sizeof(float)),
+            static_cast<uint64_t>(orch_.line_size_bytes));
+        const uint64_t line_addr = (addr / line_size) * line_size;
+        PulseSharedLineService::ServiceKey key{};
+        key.scope_id = orch_.node_id;
+        key.window_seq = window_seq_;
+        key.line_addr = line_addr;
+
+        auto join = PulseSharedLineService::joinOrRegister(
+            key,
+            [addr, cb = std::move(cb)](bool ok,
+                                       uint64_t service_line_addr,
+                                       const std::vector<uint8_t>& line_bytes) mutable {
+                float w = 0.0f;
+                if (ok && addr >= service_line_addr) {
+                    const uint64_t offset = addr - service_line_addr;
+                    if (offset + sizeof(float) <= line_bytes.size()) {
+                        std::memcpy(&w, line_bytes.data() + offset, sizeof(float));
+                    }
+                }
+                if (cb) cb(w);
+            });
+        pulse_region_service_entries_peak_ = std::max<uint64_t>(
+            pulse_region_service_entries_peak_,
+            static_cast<uint64_t>(join.active_entries));
+        if (!join.owner) {
+            notePulseSeedFirstDemand_(line_addr, /*ready_before_demand=*/false);
+            pulse_shared_service_hits_total_ += 1;
+            return;
+        }
+        pulse_shared_service_misses_total_ += 1;
+
+        PendingMeta meta{};
+        meta.window_seq = window_seq_;
+        meta.address = line_addr;
+        meta.size = static_cast<size_t>(line_size);
+        meta.orig_address = line_addr;
+        meta.orig_size = static_cast<size_t>(line_size);
+        meta.slice_offset = 0;
+        meta.issue_cycle = now_cycle_;
+        meta.pending_enqueue_cycle = std::numeric_limits<uint64_t>::max();
+        meta.retire_seq = retire_seq;
+        meta.bcsr_kind = 7;  // PULSE GCSS shared-line demand
+        meta.pulse_scope_id = orch_.node_id;
+        meta.pulse_service_line_addr = line_addr;
+        meta.has_single_cb = false;
+        meta.is_weight = true;
+        meta.count_weight_read = count_weight_read;
+
+        const bool count_budget = (window_seq_ != 0);
+        const IssueStatus st = tryIssueRead_(meta, /*count_budget*/count_budget, /*budget_reserved*/false);
+        if (st == IssueStatus::Issued) return;
+        if (st == IssueStatus::DeferredInflight || st == IssueStatus::DeferredBudget) {
+            if (retire_seq != std::numeric_limits<size_t>::max()) {
+                retire_gcss_qni_issue_deferred_total_ += 1;
+            }
+            meta.pending_enqueue_cycle = now_cycle_;
+            pending_direct_reads_.push_back(std::move(meta));
+            return;
+        }
+        (void)PulseSharedLineService::complete(key, false, line_addr, std::vector<uint8_t>{});
+        return;
+    }
+
     PendingMeta meta{};
     meta.window_seq = window_seq_;
     meta.address = addr;
@@ -1622,6 +1765,8 @@ void WeightMemorySubsystem::issueGcssByAddr_(uint64_t addr, std::function<void(f
     meta.orig_size = sizeof(float);
     meta.slice_offset = 0;
     meta.issue_cycle = now_cycle_;
+    meta.pending_enqueue_cycle = std::numeric_limits<uint64_t>::max();
+    meta.retire_seq = retire_seq;
     meta.bcsr_kind = 4;  // GCSS value-only demand
     meta.has_single_cb = (cb != nullptr);
     meta.single_cb = std::move(cb);
@@ -1632,6 +1777,10 @@ void WeightMemorySubsystem::issueGcssByAddr_(uint64_t addr, std::function<void(f
     const IssueStatus st = tryIssueRead_(meta, /*count_budget*/count_budget, /*budget_reserved*/false);
     if (st == IssueStatus::Issued) return;
     if (st == IssueStatus::DeferredInflight || st == IssueStatus::DeferredBudget) {
+        if (retire_seq != std::numeric_limits<size_t>::max()) {
+            retire_gcss_qni_issue_deferred_total_ += 1;
+        }
+        meta.pending_enqueue_cycle = now_cycle_;
         pending_direct_reads_.push_back(std::move(meta));
         return;
     }
@@ -1643,21 +1792,21 @@ void WeightMemorySubsystem::noteIdxSramLookup_(uint32_t pre_global, uint32_t pos
     if (idx2_mode) idx_lookup_idx2_total_ += 1;
     else idx_lookup_legacy_total_ += 1;
 
-    if (!(weight_sram_enable_ && weight_idx_sram_enable_)) return;
+    if (!(weight_sram_enable_ && weight_idx_sram_enable_) && !shared_weight_object_plane_) return;
 
     const uint64_t row_addr = sram_layout_.idxRowBaseAddr(post_local);
-    idx_sram_model_.noteRead(now_cycle_, row_addr + 0ull, sizeof(uint32_t));   // row_base
-    idx_sram_model_.noteRead(now_cycle_, row_addr + 4ull, sizeof(uint16_t));   // row_len
-    idx_sram_model_.noteRead(now_cycle_, row_addr + 6ull, sizeof(uint16_t));   // row_bucket_count
-    idx_sram_model_.noteRead(now_cycle_, row_addr + 8ull, sizeof(uint32_t));   // row_seed
-    idx_sram_model_.noteRead(now_cycle_, row_addr + 12ull, sizeof(uint32_t));  // row_bucket_off
+    noteIdxSramReadMirror_(row_addr + 0ull, sizeof(uint32_t));   // row_base
+    noteIdxSramReadMirror_(row_addr + 4ull, sizeof(uint16_t));   // row_len
+    noteIdxSramReadMirror_(row_addr + 6ull, sizeof(uint16_t));   // row_bucket_count
+    noteIdxSramReadMirror_(row_addr + 8ull, sizeof(uint32_t));   // row_seed
+    noteIdxSramReadMirror_(row_addr + 12ull, sizeof(uint32_t));  // row_bucket_off
     if (idx2_mode) {
         const uint32_t bucket = (pre_global ^ post_local) & 0xffu;
-        idx_sram_model_.noteRead(now_cycle_, sram_layout_.idxPilotAddr(post_local, bucket), sizeof(uint8_t));
+        noteIdxSramReadMirror_(sram_layout_.idxPilotAddr(post_local, bucket), sizeof(uint8_t));
     } else {
         const uint64_t legacy_addr = sram_layout_.idxLegacyLookupAddr(pre_global, post_local);
-        idx_sram_model_.noteRead(now_cycle_, legacy_addr, sizeof(uint32_t));
-        idx_sram_model_.noteRead(now_cycle_, legacy_addr + 4ull, sizeof(uint32_t));
+        noteIdxSramReadMirror_(legacy_addr, sizeof(uint32_t));
+        noteIdxSramReadMirror_(legacy_addr + 4ull, sizeof(uint32_t));
     }
 }
 
@@ -1665,30 +1814,43 @@ void WeightMemorySubsystem::noteL0SramLookup_(uint64_t addr, bool hit) {
     l0_lookup_total_ += 1;
     if (hit) l0_hit_total_ += 1;
     else l0_miss_total_ += 1;
-    if (!(weight_sram_enable_ && weight_l0_sram_enable_)) return;
-    l0_sram_model_.noteRead(now_cycle_, sram_layout_.l0SlotAddr(addr), sizeof(float));
+    if (!(weight_sram_enable_ && weight_l0_sram_enable_) && !shared_weight_object_plane_) return;
+    noteL0SramReadMirror_(addr);
 }
 
 void WeightMemorySubsystem::noteL0SramFill_(uint64_t addr) {
     l0_fill_total_ += 1;
-    if (!(weight_sram_enable_ && weight_l0_sram_enable_)) return;
-    l0_sram_model_.noteWrite(now_cycle_, sram_layout_.l0SlotAddr(addr), sizeof(float));
+    if (!(weight_sram_enable_ && weight_l0_sram_enable_) && !shared_weight_object_plane_) return;
+    if (shared_weight_object_plane_ && shared_weight_object_plane_residency_authority_) {
+        if (weight_sram_enable_ && weight_l0_sram_enable_) {
+            l0_sram_model_.noteWrite(now_cycle_, sram_layout_.l0SlotAddr(addr), sizeof(float));
+        }
+        shared_weight_object_plane_->noteL0Fill(now_cycle_, addr);
+        return;
+    }
+    noteL0SramWriteMirror_(addr);
 }
 
 void WeightMemorySubsystem::noteL0SramEvict_(uint64_t addr) {
     l0_evict_total_ += 1;
-    if (!(weight_sram_enable_ && weight_l0_sram_enable_)) return;
-    l0_sram_model_.noteWrite(now_cycle_, sram_layout_.l0SlotAddr(addr), sizeof(float));
+    if (!(weight_sram_enable_ && weight_l0_sram_enable_) && !shared_weight_object_plane_) return;
+    if (shared_weight_object_plane_ && shared_weight_object_plane_residency_authority_) {
+        if (weight_sram_enable_ && weight_l0_sram_enable_) {
+            l0_sram_model_.noteWrite(now_cycle_, sram_layout_.l0SlotAddr(addr), sizeof(float));
+        }
+        shared_weight_object_plane_->noteL0Evict(now_cycle_, addr);
+        return;
+    }
+    noteL0SramWriteMirror_(addr);
 }
 
-void WeightMemorySubsystem::requestGCSS_(uint32_t widx, std::function<void(float)> cb) {
+void WeightMemorySubsystem::requestGCSS_(uint32_t widx, std::function<void(float)> cb, size_t retire_seq) {
     if (!mem_access_) {
         if (cb) cb(0.0f);
         return;
     }
-    const uint64_t addr = orch_.base_addr + static_cast<uint64_t>(widx) * sizeof(float);
-    if (tryServeExperimentalIdx2Ingress_(addr, cb)) return;
-    issueGcssByAddr_(addr, std::move(cb), /*count_weight_read*/true);
+    const uint64_t addr = gcssValuesBaseAddr_() + static_cast<uint64_t>(widx) * sizeof(float);
+    issueGcssByAddr_(addr, std::move(cb), /*count_weight_read*/true, retire_seq);
 }
 
 void WeightMemorySubsystem::resetGcssVlfIssueQueue_() {
@@ -1696,16 +1858,1151 @@ void WeightMemorySubsystem::resetGcssVlfIssueQueue_() {
     gcss_vlf_issue_queue_prepared_ = false;
 }
 
+bool WeightMemorySubsystem::popNextGcssVlfIssueEntry_(GcssVlfEdgeIssueEntry& out) {
+    if (gcss_vlf_issue_queue_.empty()) return false;
+    out = std::move(gcss_vlf_issue_queue_.front());
+    gcss_vlf_issue_queue_.pop_front();
+    return true;
+}
+
+void WeightMemorySubsystem::observePulseFrontier_(
+    const std::vector<GcssVlfEdgeIssueEntry>& ordered_edges,
+    uint64_t line_size) {
+    if (!orch_.pulse_agenda_enable ||
+        !orch_.pulse_frontier_observe_enable ||
+        window_seq_ == 0u ||
+        ordered_edges.empty()) {
+        return;
+    }
+
+    const size_t budget = std::max<size_t>(
+        1u,
+        static_cast<size_t>(std::max<uint32_t>(1u, orch_.pulse_frontier_top_lines)));
+    std::unordered_set<uint64_t> seen_lines;
+    seen_lines.reserve(std::min<size_t>(ordered_edges.size(), budget * 2u));
+
+    uint64_t exported = 0;
+    uint64_t overlap_lines = 0;
+    uint64_t overlap_peers = 0;
+    const uint64_t eff_line_size = std::max<uint64_t>(1u, line_size);
+    for (const auto& e : ordered_edges) {
+        const uint64_t line_addr = (e.addr / eff_line_size) * eff_line_size;
+        if (!seen_lines.insert(line_addr).second) continue;
+        const auto result = PulseFrontierObserveRegistry::observeLine(
+            orch_.node_id,
+            window_seq_,
+            line_addr,
+            orch_.core_id);
+        exported += 1u;
+        if (result.prior_consumers > 0u) {
+            overlap_lines += 1u;
+            overlap_peers += static_cast<uint64_t>(result.prior_consumers);
+        }
+        if (exported >= budget) break;
+    }
+
+    if (exported == 0u) return;
+    pulse_frontier_windows_total_ += 1u;
+    pulse_frontier_lines_exported_total_ += exported;
+    pulse_frontier_overlap_lines_total_ += overlap_lines;
+    pulse_frontier_overlap_peer_total_ += overlap_peers;
+    pulse_frontier_max_exported_per_window_ = std::max<uint64_t>(
+        pulse_frontier_max_exported_per_window_,
+        exported);
+}
+
+void WeightMemorySubsystem::observePulseMetadataFrontier_(
+    const std::vector<GcssVlfEdgeIssueEntry>& ordered_edges) {
+    if (!orch_.pulse_agenda_enable ||
+        !orch_.pulse_metadata_frontier_observe_enable ||
+        window_seq_ == 0u ||
+        ordered_edges.empty()) {
+        return;
+    }
+
+    const size_t top_items = std::max<size_t>(
+        1u,
+        static_cast<size_t>(
+            std::max<uint32_t>(1u, orch_.pulse_metadata_frontier_top_items)));
+    const uint32_t band_slots =
+        std::max<uint32_t>(1u, orch_.pulse_metadata_frontier_band_slots);
+    const uint32_t block_rows =
+        (orch_.use_bcsr && orch_.bcsr_mgr != nullptr)
+            ? std::max<uint32_t>(1u, orch_.bcsr_mgr->effectiveBlockRows())
+            : 1u;
+
+    size_t service_items = 0u;
+    size_t observe_only_items = 0u;
+    for (const auto& edge : ordered_edges) {
+        if (service_items < top_items &&
+            pulseMetadataFrontierObserveEligible_(
+                PodMetadataObjectPlane::MetadataKind::PreMphfBase)) {
+            observePeInternalPodMetadataObject_(
+                PodMetadataObjectPlane::MetadataKind::PreMphfBase,
+                static_cast<uint64_t>(edge.pre_base));
+            service_items += 1u;
+        }
+        if (service_items < top_items &&
+            pulseMetadataFrontierObserveEligible_(
+                PodMetadataObjectPlane::MetadataKind::PreMphfBand)) {
+            const uint64_t band_id =
+                (static_cast<uint64_t>(edge.pre_base) << 1u) ^
+                0x1ull ^
+                static_cast<uint64_t>(edge.pre_rank / band_slots);
+            observePeInternalPodMetadataObject_(
+                PodMetadataObjectPlane::MetadataKind::PreMphfBand,
+                band_id);
+            service_items += 1u;
+        }
+
+        if (observe_only_items < top_items &&
+            pulseMetadataFrontierObserveEligible_(
+                PodMetadataObjectPlane::MetadataKind::Idx2Row)) {
+            notePulseMetadataFrontierObserved_(
+                PodMetadataObjectPlane::MetadataKind::Idx2Row,
+                PodMetadataObjectPlane::composeObjectKey(
+                    PodMetadataObjectPlane::MetadataKind::Idx2Row,
+                    static_cast<uint64_t>(edge.pre_global)));
+            observe_only_items += 1u;
+        }
+        if (observe_only_items < top_items &&
+            pulseMetadataFrontierObserveEligible_(
+                PodMetadataObjectPlane::MetadataKind::RowIndex)) {
+            const uint64_t rowindex_object =
+                static_cast<uint64_t>(edge.post_local / block_rows);
+            notePulseMetadataFrontierObserved_(
+                PodMetadataObjectPlane::MetadataKind::RowIndex,
+                PodMetadataObjectPlane::composeObjectKey(
+                    PodMetadataObjectPlane::MetadataKind::RowIndex,
+                    rowindex_object));
+            observe_only_items += 1u;
+        }
+
+        if (service_items >= top_items && observe_only_items >= top_items) {
+            break;
+        }
+    }
+}
+
+bool WeightMemorySubsystem::peInternalPodShadowEnabled_() const {
+    PeInternalPodShadowGateConfig cfg{};
+    cfg.pe_internal_cpe_enable = orch_.pe_internal_cpe_enable;
+    cfg.pe_internal_pod_enable = orch_.pe_internal_pod_enable;
+    cfg.pe_internal_pod_metadata_enable = orch_.pe_internal_pod_metadata_enable;
+    cfg.pe_internal_pod_owner_enable = orch_.pe_internal_pod_owner_enable;
+    cfg.pod_count = orch_.pe_internal_pod_count;
+
+    PeInternalPodShadowGateBindings bindings{};
+    bindings.metadata_plane = pod_metadata_object_plane_;
+    bindings.owner_table = pod_owner_service_table_;
+    bindings.fabric = pe_shared_core_fabric_;
+    return PeInternalPodShadowGate::enabled(cfg, bindings);
+}
+
+bool WeightMemorySubsystem::pulseOsaMetadataTxnEnabledForKind_(
+    PodMetadataObjectPlane::MetadataKind kind) const {
+    if (!orch_.pulse_osa_metadata_txn_enable) return false;
+    const uint32_t bit = pulseMetadataKindMaskBit_(kind);
+    if (bit == 0u) return false;
+    return (orch_.pulse_osa_metadata_object_mask & bit) != 0u;
+}
+
+bool WeightMemorySubsystem::pulseMetadataFrontierTrackedKind_(
+    PodMetadataObjectPlane::MetadataKind kind) const {
+    switch (kind) {
+        case PodMetadataObjectPlane::MetadataKind::PreMphfBase:
+        case PodMetadataObjectPlane::MetadataKind::PreMphfBand:
+        case PodMetadataObjectPlane::MetadataKind::Idx2Row:
+        case PodMetadataObjectPlane::MetadataKind::RowIndex:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool WeightMemorySubsystem::pulseMetadataFrontierObserveEligible_(
+    PodMetadataObjectPlane::MetadataKind kind) const {
+    if (!orch_.pulse_metadata_frontier_observe_enable) return false;
+    if (window_seq_ == 0u) return false;
+    if (!pulseMetadataFrontierTrackedKind_(kind)) return false;
+
+    const uint32_t bit = pulseMetadataKindMaskBit_(kind);
+    if (bit == 0u) return false;
+    if (orch_.pulse_osa_metadata_object_mask == 0u) return true;
+    return (orch_.pulse_osa_metadata_object_mask & bit) != 0u;
+}
+
+void WeightMemorySubsystem::notePulseMetadataFrontierObserved_(
+    PodMetadataObjectPlane::MetadataKind kind,
+    uint64_t object_key) {
+    if (!pulseMetadataFrontierTrackedKind_(kind) || window_seq_ == 0u) return;
+
+    if (pulse_metadata_frontier_seen_window_seq_ != window_seq_) {
+        pulse_metadata_frontier_seen_window_seq_ = window_seq_;
+        pulse_metadata_frontier_seen_keys_.clear();
+    }
+
+    const bool first_observe =
+        pulse_metadata_frontier_seen_keys_.insert(object_key).second;
+    if (first_observe) {
+        pulse_metadata_frontier_observed_total_ += 1u;
+    } else {
+        pulse_metadata_frontier_same_window_reobserve_total_ += 1u;
+    }
+
+    switch (kind) {
+        case PodMetadataObjectPlane::MetadataKind::PreMphfBase:
+            if (first_observe) {
+                pulse_metadata_frontier_premphf_base_observed_total_ += 1u;
+            } else {
+                pulse_metadata_frontier_premphf_base_same_window_reobserve_total_ += 1u;
+            }
+            break;
+        case PodMetadataObjectPlane::MetadataKind::PreMphfBand:
+            if (first_observe) {
+                pulse_metadata_frontier_premphf_band_observed_total_ += 1u;
+            } else {
+                pulse_metadata_frontier_premphf_band_same_window_reobserve_total_ += 1u;
+            }
+            break;
+        case PodMetadataObjectPlane::MetadataKind::Idx2Row:
+            if (first_observe) {
+                pulse_metadata_frontier_idx2row_observed_total_ += 1u;
+            } else {
+                pulse_metadata_frontier_idx2row_same_window_reobserve_total_ += 1u;
+            }
+            break;
+        case PodMetadataObjectPlane::MetadataKind::RowIndex:
+            if (first_observe) {
+                pulse_metadata_frontier_rowindex_observed_total_ += 1u;
+            } else {
+                pulse_metadata_frontier_rowindex_same_window_reobserve_total_ += 1u;
+            }
+            break;
+        default:
+            break;
+    }
+
+    if (kind == PodMetadataObjectPlane::MetadataKind::PreMphfBase ||
+        kind == PodMetadataObjectPlane::MetadataKind::PreMphfBand) {
+        const auto reg_kind =
+            (kind == PodMetadataObjectPlane::MetadataKind::PreMphfBase)
+                ? PulseMetadataFrontierObserveRegistry::MetadataKind::PreMphfBase
+                : PulseMetadataFrontierObserveRegistry::MetadataKind::PreMphfBand;
+        const uint64_t object_id = object_key & 0x00ffffffffffffffull;
+        (void)PulseMetadataFrontierObserveRegistry::observeObject(
+            orch_.node_id,
+            window_seq_,
+            reg_kind,
+            object_id,
+            orch_.core_id);
+    }
+}
+
+void WeightMemorySubsystem::notePulseMetadataFrontierOwnerFormCandidate_(
+    PodMetadataObjectPlane::MetadataKind kind) {
+    if (!pulseMetadataFrontierTrackedKind_(kind)) return;
+    pulse_metadata_frontier_owner_form_candidate_total_ += 1u;
+    switch (kind) {
+        case PodMetadataObjectPlane::MetadataKind::PreMphfBase:
+            pulse_metadata_frontier_premphf_base_owner_form_candidate_total_ += 1u;
+            break;
+        case PodMetadataObjectPlane::MetadataKind::PreMphfBand:
+            pulse_metadata_frontier_premphf_band_owner_form_candidate_total_ += 1u;
+            break;
+        case PodMetadataObjectPlane::MetadataKind::Idx2Row:
+            pulse_metadata_frontier_idx2row_owner_form_candidate_total_ += 1u;
+            break;
+        case PodMetadataObjectPlane::MetadataKind::RowIndex:
+            pulse_metadata_frontier_rowindex_owner_form_candidate_total_ += 1u;
+            break;
+        default:
+            break;
+    }
+}
+
+void WeightMemorySubsystem::notePulseMetadataFrontierJoinReadyCandidate_(
+    PodMetadataObjectPlane::MetadataKind kind) {
+    if (!pulseMetadataFrontierTrackedKind_(kind)) return;
+    pulse_metadata_frontier_join_ready_candidate_total_ += 1u;
+    switch (kind) {
+        case PodMetadataObjectPlane::MetadataKind::PreMphfBase:
+            pulse_metadata_frontier_premphf_base_join_ready_candidate_total_ += 1u;
+            break;
+        case PodMetadataObjectPlane::MetadataKind::PreMphfBand:
+            pulse_metadata_frontier_premphf_band_join_ready_candidate_total_ += 1u;
+            break;
+        case PodMetadataObjectPlane::MetadataKind::Idx2Row:
+            pulse_metadata_frontier_idx2row_join_ready_candidate_total_ += 1u;
+            break;
+        case PodMetadataObjectPlane::MetadataKind::RowIndex:
+            pulse_metadata_frontier_rowindex_join_ready_candidate_total_ += 1u;
+            break;
+        default:
+            break;
+    }
+}
+
+void WeightMemorySubsystem::notePulseOsaMetadataTxnEnvelope_(
+    PodMetadataObjectPlane::MetadataKind kind,
+    uint64_t envelope_size) {
+    if (!pulseOsaMetadataTxnEnabledForKind_(kind)) return;
+    pulse_osa_metadata_txn_envelope_size_sum_total_ += envelope_size;
+}
+
+void WeightMemorySubsystem::observePeInternalPodMetadataObject_(
+    PodMetadataObjectPlane::MetadataKind kind,
+    uint64_t object_id,
+    bool experimental_rowindex_owner_track) {
+    const uint64_t object_key =
+        PodMetadataObjectPlane::composeObjectKey(kind, object_id);
+    const bool pulse_frontier_track =
+        pulseMetadataFrontierObserveEligible_(kind);
+    if (pulse_frontier_track) {
+        notePulseMetadataFrontierObserved_(kind, object_key);
+    }
+
+    PeInternalPodShadowGateConfig cfg{};
+    cfg.pe_internal_cpe_enable = orch_.pe_internal_cpe_enable;
+    cfg.pe_internal_pod_enable = orch_.pe_internal_pod_enable;
+    cfg.pe_internal_pod_metadata_enable = orch_.pe_internal_pod_metadata_enable;
+    cfg.pe_internal_pod_owner_enable = orch_.pe_internal_pod_owner_enable;
+    cfg.core_id = orch_.core_id;
+    cfg.pod_id = orch_.pe_internal_pod_id;
+    cfg.pod_count = orch_.pe_internal_pod_count;
+    cfg.window_seq = window_seq_;
+
+    PeInternalPodShadowGateBindings bindings{};
+    bindings.metadata_plane = pod_metadata_object_plane_;
+    bindings.owner_table = pod_owner_service_table_;
+    bindings.fabric = pe_shared_core_fabric_;
+
+    PeInternalPodShadowGateCounters counters{};
+    counters.guard_drop_total = pe_internal_pod_guard_drop_total_;
+    counters.guard_disabled_total = pe_internal_pod_guard_disabled_total_;
+    counters.guard_missing_metadata_plane_total =
+        pe_internal_pod_guard_missing_metadata_plane_total_;
+    counters.guard_missing_owner_table_total =
+        pe_internal_pod_guard_missing_owner_table_total_;
+    counters.guard_zero_pod_count_total =
+        pe_internal_pod_guard_zero_pod_count_total_;
+    counters.guard_window_zero_total =
+        pe_internal_pod_guard_window_zero_total_;
+    counters.guard_invalid_cfg_pod_total =
+        pe_internal_pod_guard_invalid_cfg_pod_total_;
+    counters.guard_rowdescriptor_disabled_total =
+        pe_internal_pod_guard_rowdescriptor_disabled_total_;
+    counters.guard_rowdescriptor_missing_metadata_plane_total =
+        pe_internal_pod_guard_rowdescriptor_missing_metadata_plane_total_;
+    counters.guard_rowdescriptor_missing_owner_table_total =
+        pe_internal_pod_guard_rowdescriptor_missing_owner_table_total_;
+    counters.guard_rowdescriptor_zero_pod_count_total =
+        pe_internal_pod_guard_rowdescriptor_zero_pod_count_total_;
+    counters.guard_rowdescriptor_window_zero_total =
+        pe_internal_pod_guard_rowdescriptor_window_zero_total_;
+    counters.guard_rowdescriptor_invalid_cfg_pod_total =
+        pe_internal_pod_guard_rowdescriptor_invalid_cfg_pod_total_;
+    counters.guard_base_total = pe_internal_pod_guard_base_total_;
+    counters.guard_band_total = pe_internal_pod_guard_band_total_;
+    counters.guard_other_total = pe_internal_pod_guard_other_total_;
+    counters.guard_idx2row_total = pe_internal_pod_guard_idx2row_total_;
+    counters.guard_rowindex_total = pe_internal_pod_guard_rowindex_total_;
+    counters.guard_rowdescriptor_total = pe_internal_pod_guard_rowdescriptor_total_;
+    counters.frontier_export_total = pe_internal_pod_frontier_export_total_;
+    counters.frontier_consumer_count_sum_total =
+        pe_internal_pod_frontier_consumer_count_sum_total_;
+    counters.frontier_overlap_strength_sum_total =
+        pe_internal_pod_frontier_overlap_strength_sum_total_;
+    counters.frontier_base_consumer_count_sum_total =
+        pe_internal_pod_frontier_base_consumer_count_sum_total_;
+    counters.frontier_base_overlap_strength_sum_total =
+        pe_internal_pod_frontier_base_overlap_strength_sum_total_;
+    counters.frontier_band_consumer_count_sum_total =
+        pe_internal_pod_frontier_band_consumer_count_sum_total_;
+    counters.frontier_band_overlap_strength_sum_total =
+        pe_internal_pod_frontier_band_overlap_strength_sum_total_;
+    counters.owner_lookup_total = pe_internal_pod_owner_lookup_total_;
+    counters.owner_alloc_total = pe_internal_pod_owner_alloc_total_;
+    counters.owner_alloc_idx2row_total =
+        pe_internal_pod_owner_alloc_idx2row_total_;
+    counters.owner_alloc_rowindex_total =
+        pe_internal_pod_owner_alloc_rowindex_total_;
+    counters.owner_alloc_rowdescriptor_total =
+        pe_internal_pod_owner_alloc_rowdescriptor_total_;
+    counters.owner_hit_total = pe_internal_pod_owner_hit_total_;
+    counters.owner_hit_idx2row_total = pe_internal_pod_owner_hit_idx2row_total_;
+    counters.owner_hit_rowindex_total =
+        pe_internal_pod_owner_hit_rowindex_total_;
+    counters.owner_hit_rowdescriptor_total =
+        pe_internal_pod_owner_hit_rowdescriptor_total_;
+    counters.owner_reject_total = pe_internal_pod_owner_reject_total_;
+    counters.owner_disabled_reject_total =
+        pe_internal_pod_owner_disabled_reject_total_;
+    counters.owner_invalid_pod_reject_total =
+        pe_internal_pod_owner_invalid_pod_reject_total_;
+    counters.owner_table_full_reject_total =
+        pe_internal_pod_owner_table_full_reject_total_;
+    counters.join_request_total = pe_internal_pod_join_request_total_;
+    counters.join_grant_total = pe_internal_pod_join_grant_total_;
+    counters.join_reject_total = pe_internal_pod_join_reject_total_;
+    counters.join_table_disabled_reject_total =
+        pe_internal_pod_join_table_disabled_reject_total_;
+    counters.join_duplicate_consumer_reject_total =
+        pe_internal_pod_join_duplicate_consumer_reject_total_;
+    counters.join_table_full_reject_total =
+        pe_internal_pod_join_table_full_reject_total_;
+    counters.join_before_private_issue_total =
+        pe_internal_pod_join_before_private_issue_total_;
+    counters.owner_first_issue_deferred_total =
+        pe_internal_pod_owner_first_issue_deferred_total_;
+    counters.owner_first_issue_deferred_idx2row_total =
+        pe_internal_pod_owner_first_issue_deferred_idx2row_total_;
+    counters.owner_first_issue_deferred_rowindex_total =
+        pe_internal_pod_owner_first_issue_deferred_rowindex_total_;
+    counters.owner_first_issue_deferred_rowdescriptor_total =
+        pe_internal_pod_owner_first_issue_deferred_rowdescriptor_total_;
+    counters.owner_first_private_issue_avoided_total =
+        pe_internal_pod_owner_first_private_issue_avoided_total_;
+    counters.owner_first_private_issue_avoided_idx2row_total =
+        pe_internal_pod_owner_first_private_issue_avoided_idx2row_total_;
+    counters.owner_first_private_issue_avoided_rowindex_total =
+        pe_internal_pod_owner_first_private_issue_avoided_rowindex_total_;
+    counters.owner_first_private_issue_avoided_rowdescriptor_total =
+        pe_internal_pod_owner_first_private_issue_avoided_rowdescriptor_total_;
+    counters.reject_base_total = pe_internal_pod_reject_base_total_;
+    counters.reject_band_total = pe_internal_pod_reject_band_total_;
+    counters.reject_other_total = pe_internal_pod_reject_other_total_;
+    counters.reject_idx2row_total = pe_internal_pod_reject_idx2row_total_;
+    counters.reject_rowindex_total = pe_internal_pod_reject_rowindex_total_;
+    counters.reject_rowdescriptor_total = pe_internal_pod_reject_rowdescriptor_total_;
+    counters.useful_total = pe_internal_pod_useful_total_;
+    counters.useful_join_grant_total =
+        pe_internal_pod_useful_join_grant_total_;
+    counters.useful_duplicate_replay_elide_total =
+        pe_internal_pod_useful_duplicate_replay_elide_total_;
+    counters.useful_base_total = pe_internal_pod_useful_base_total_;
+    counters.useful_band_total = pe_internal_pod_useful_band_total_;
+    counters.useful_other_total = pe_internal_pod_useful_other_total_;
+    counters.useful_idx2row_total = pe_internal_pod_useful_idx2row_total_;
+    counters.useful_rowindex_total = pe_internal_pod_useful_rowindex_total_;
+    counters.useful_rowdescriptor_total = pe_internal_pod_useful_rowdescriptor_total_;
+    counters.duplicate_metadata_replay_elided_total =
+        pe_internal_pod_duplicate_metadata_replay_elided_total_;
+    counters.duplicate_metadata_issue_elided_total =
+        pe_internal_pod_duplicate_metadata_issue_elided_total_;
+    counters.fallback_private_issue_total =
+        pe_internal_pod_fallback_private_issue_total_;
+
+    const uint64_t prev_owner_alloc_total = counters.owner_alloc_total;
+    const uint64_t prev_join_grant_total = counters.join_grant_total;
+
+    PeInternalPodShadowGate::observe(cfg, bindings, kind, object_id, counters);
+
+    if (pulseOsaMetadataTxnEnabledForKind_(kind)) {
+        pulse_osa_metadata_txn_export_total_ += 1u;
+        notePulseOsaMetadataTxnEnvelope_(kind, 1u);
+    }
+    if (pulse_frontier_track &&
+        counters.owner_alloc_total > prev_owner_alloc_total) {
+        notePulseMetadataFrontierOwnerFormCandidate_(kind);
+    }
+
+    if (pe_local_service_object_table_ != nullptr &&
+        pe_local_service_object_table_->enabled()) {
+        const auto note_kind_counter =
+            [&](uint64_t& idx2row_counter,
+                uint64_t& rowindex_counter,
+                uint64_t& rowdescriptor_counter) {
+                switch (kind) {
+                    case PodMetadataObjectPlane::MetadataKind::Idx2Row:
+                        idx2row_counter += 1u;
+                        break;
+                    case PodMetadataObjectPlane::MetadataKind::RowIndex:
+                        rowindex_counter += 1u;
+                        break;
+                    case PodMetadataObjectPlane::MetadataKind::RowDescriptor:
+                        rowdescriptor_counter += 1u;
+                        break;
+                    default:
+                        break;
+                }
+            };
+
+        if (counters.owner_alloc_total > prev_owner_alloc_total) {
+            PeLocalServiceObjectTable::OwnerRequest owner{};
+            owner.pod_id = orch_.pe_internal_pod_id;
+            owner.window_seq = window_seq_;
+            owner.object_key = object_key;
+            owner.owner_core_id = orch_.core_id;
+            (void)pe_local_service_object_table_->noteOwnerForm(owner);
+            if (kind == PodMetadataObjectPlane::MetadataKind::RowIndex &&
+                experimental_rowindex_owner_track) {
+                noteExperimentalNocRowidxOwnerCloseCandidate_(
+                    static_cast<uint32_t>(object_id));
+            }
+            if (pulseOsaMetadataTxnEnabledForKind_(kind)) {
+                pulse_osa_metadata_txn_owner_launch_total_ += 1u;
+            }
+        }
+
+        if (counters.join_grant_total > prev_join_grant_total) {
+            PeLocalServiceObjectTable::JoinRequest join{};
+            join.pod_id = orch_.pe_internal_pod_id;
+            join.window_seq = window_seq_;
+            join.object_key = object_key;
+            join.consumer_core_id = orch_.core_id;
+            const auto join_result = pe_local_service_object_table_->join(join);
+            if (join_result.joined_live) {
+                pe_internal_pod_service_join_live_total_ += 1u;
+                if (pulseOsaMetadataTxnEnabledForKind_(kind)) {
+                    pulse_osa_metadata_txn_join_live_total_ += 1u;
+                }
+                note_kind_counter(
+                    pe_internal_pod_service_join_live_idx2row_total_,
+                    pe_internal_pod_service_join_live_rowindex_total_,
+                    pe_internal_pod_service_join_live_rowdescriptor_total_);
+            }
+            if (join_result.joined_ready) {
+                pe_internal_pod_service_join_ready_total_ += 1u;
+                if (pulseOsaMetadataTxnEnabledForKind_(kind)) {
+                    pulse_osa_metadata_txn_join_ready_total_ += 1u;
+                    if (join_result.ready_lease_hit) {
+                        pulse_osa_metadata_txn_ready_lease_hit_total_ += 1u;
+                    }
+                }
+                note_kind_counter(
+                    pe_internal_pod_service_join_ready_idx2row_total_,
+                    pe_internal_pod_service_join_ready_rowindex_total_,
+                    pe_internal_pod_service_join_ready_rowdescriptor_total_);
+                if (pulse_frontier_track) {
+                    notePulseMetadataFrontierJoinReadyCandidate_(kind);
+                }
+            }
+            if (join_result.late_join) {
+                pe_internal_pod_service_late_join_total_ += 1u;
+                if (pulseOsaMetadataTxnEnabledForKind_(kind)) {
+                    pulse_osa_metadata_txn_late_join_total_ += 1u;
+                    if (join_result.ready_lease_expired) {
+                        pulse_osa_metadata_txn_ready_lease_expired_total_ += 1u;
+                    }
+                }
+                note_kind_counter(
+                    pe_internal_pod_service_late_join_idx2row_total_,
+                    pe_internal_pod_service_late_join_rowindex_total_,
+                    pe_internal_pod_service_late_join_rowdescriptor_total_);
+            }
+            if (join_result.joined_live || join_result.joined_ready) {
+                pe_internal_pod_service_potential_private_service_elide_total_ += 1u;
+                note_kind_counter(
+                    pe_internal_pod_service_potential_private_service_elide_idx2row_total_,
+                    pe_internal_pod_service_potential_private_service_elide_rowindex_total_,
+                    pe_internal_pod_service_potential_private_service_elide_rowdescriptor_total_);
+                pe_internal_pod_owner_first_service_elide_total_ += 1u;
+                note_kind_counter(
+                    pe_internal_pod_owner_first_service_elide_idx2row_total_,
+                    pe_internal_pod_owner_first_service_elide_rowindex_total_,
+                    pe_internal_pod_owner_first_service_elide_rowdescriptor_total_);
+                if (kind == PodMetadataObjectPlane::MetadataKind::RowDescriptor) {
+                    if (join_result.joined_live) {
+                        pulse_rowdescriptor_owner_first_service_elide_join_live_total_ += 1u;
+                    }
+                    if (join_result.joined_ready) {
+                        pulse_rowdescriptor_owner_first_service_elide_join_ready_total_ += 1u;
+                    }
+                }
+            }
+        }
+    }
+
+    pe_internal_pod_guard_drop_total_ = counters.guard_drop_total;
+    pe_internal_pod_guard_disabled_total_ = counters.guard_disabled_total;
+    pe_internal_pod_guard_missing_metadata_plane_total_ =
+        counters.guard_missing_metadata_plane_total;
+    pe_internal_pod_guard_missing_owner_table_total_ =
+        counters.guard_missing_owner_table_total;
+    pe_internal_pod_guard_zero_pod_count_total_ =
+        counters.guard_zero_pod_count_total;
+    pe_internal_pod_guard_window_zero_total_ =
+        counters.guard_window_zero_total;
+    pe_internal_pod_guard_invalid_cfg_pod_total_ =
+        counters.guard_invalid_cfg_pod_total;
+    pe_internal_pod_guard_rowdescriptor_disabled_total_ =
+        counters.guard_rowdescriptor_disabled_total;
+    pe_internal_pod_guard_rowdescriptor_missing_metadata_plane_total_ =
+        counters.guard_rowdescriptor_missing_metadata_plane_total;
+    pe_internal_pod_guard_rowdescriptor_missing_owner_table_total_ =
+        counters.guard_rowdescriptor_missing_owner_table_total;
+    pe_internal_pod_guard_rowdescriptor_zero_pod_count_total_ =
+        counters.guard_rowdescriptor_zero_pod_count_total;
+    pe_internal_pod_guard_rowdescriptor_window_zero_total_ =
+        counters.guard_rowdescriptor_window_zero_total;
+    pe_internal_pod_guard_rowdescriptor_invalid_cfg_pod_total_ =
+        counters.guard_rowdescriptor_invalid_cfg_pod_total;
+    pe_internal_pod_guard_base_total_ = counters.guard_base_total;
+    pe_internal_pod_guard_band_total_ = counters.guard_band_total;
+    pe_internal_pod_guard_other_total_ = counters.guard_other_total;
+    pe_internal_pod_guard_idx2row_total_ = counters.guard_idx2row_total;
+    pe_internal_pod_guard_rowindex_total_ = counters.guard_rowindex_total;
+    pe_internal_pod_guard_rowdescriptor_total_ = counters.guard_rowdescriptor_total;
+    pe_internal_pod_frontier_export_total_ = counters.frontier_export_total;
+    pe_internal_pod_frontier_consumer_count_sum_total_ =
+        counters.frontier_consumer_count_sum_total;
+    pe_internal_pod_frontier_overlap_strength_sum_total_ =
+        counters.frontier_overlap_strength_sum_total;
+    pe_internal_pod_frontier_base_consumer_count_sum_total_ =
+        counters.frontier_base_consumer_count_sum_total;
+    pe_internal_pod_frontier_base_overlap_strength_sum_total_ =
+        counters.frontier_base_overlap_strength_sum_total;
+    pe_internal_pod_frontier_band_consumer_count_sum_total_ =
+        counters.frontier_band_consumer_count_sum_total;
+    pe_internal_pod_frontier_band_overlap_strength_sum_total_ =
+        counters.frontier_band_overlap_strength_sum_total;
+    pe_internal_pod_owner_lookup_total_ = counters.owner_lookup_total;
+    pe_internal_pod_owner_alloc_total_ = counters.owner_alloc_total;
+    pe_internal_pod_owner_alloc_idx2row_total_ =
+        counters.owner_alloc_idx2row_total;
+    pe_internal_pod_owner_alloc_rowindex_total_ =
+        counters.owner_alloc_rowindex_total;
+    pe_internal_pod_owner_alloc_rowdescriptor_total_ =
+        counters.owner_alloc_rowdescriptor_total;
+    pe_internal_pod_owner_hit_total_ = counters.owner_hit_total;
+    pe_internal_pod_owner_hit_idx2row_total_ =
+        counters.owner_hit_idx2row_total;
+    pe_internal_pod_owner_hit_rowindex_total_ =
+        counters.owner_hit_rowindex_total;
+    pe_internal_pod_owner_hit_rowdescriptor_total_ =
+        counters.owner_hit_rowdescriptor_total;
+    pe_internal_pod_owner_reject_total_ = counters.owner_reject_total;
+    pe_internal_pod_owner_disabled_reject_total_ =
+        counters.owner_disabled_reject_total;
+    pe_internal_pod_owner_invalid_pod_reject_total_ =
+        counters.owner_invalid_pod_reject_total;
+    pe_internal_pod_owner_table_full_reject_total_ =
+        counters.owner_table_full_reject_total;
+    pe_internal_pod_join_request_total_ = counters.join_request_total;
+    pe_internal_pod_join_grant_total_ = counters.join_grant_total;
+    pe_internal_pod_join_reject_total_ = counters.join_reject_total;
+    pe_internal_pod_join_table_disabled_reject_total_ =
+        counters.join_table_disabled_reject_total;
+    pe_internal_pod_join_duplicate_consumer_reject_total_ =
+        counters.join_duplicate_consumer_reject_total;
+    pe_internal_pod_join_table_full_reject_total_ =
+        counters.join_table_full_reject_total;
+    pe_internal_pod_join_before_private_issue_total_ =
+        counters.join_before_private_issue_total;
+    pe_internal_pod_owner_first_issue_deferred_total_ =
+        counters.owner_first_issue_deferred_total;
+    pe_internal_pod_owner_first_issue_deferred_idx2row_total_ =
+        counters.owner_first_issue_deferred_idx2row_total;
+    pe_internal_pod_owner_first_issue_deferred_rowindex_total_ =
+        counters.owner_first_issue_deferred_rowindex_total;
+    pe_internal_pod_owner_first_issue_deferred_rowdescriptor_total_ =
+        counters.owner_first_issue_deferred_rowdescriptor_total;
+    pe_internal_pod_owner_first_private_issue_avoided_total_ =
+        counters.owner_first_private_issue_avoided_total;
+    pe_internal_pod_owner_first_private_issue_avoided_idx2row_total_ =
+        counters.owner_first_private_issue_avoided_idx2row_total;
+    pe_internal_pod_owner_first_private_issue_avoided_rowindex_total_ =
+        counters.owner_first_private_issue_avoided_rowindex_total;
+    pe_internal_pod_owner_first_private_issue_avoided_rowdescriptor_total_ =
+        counters.owner_first_private_issue_avoided_rowdescriptor_total;
+    pe_internal_pod_reject_base_total_ = counters.reject_base_total;
+    pe_internal_pod_reject_band_total_ = counters.reject_band_total;
+    pe_internal_pod_reject_other_total_ = counters.reject_other_total;
+    pe_internal_pod_reject_idx2row_total_ = counters.reject_idx2row_total;
+    pe_internal_pod_reject_rowindex_total_ = counters.reject_rowindex_total;
+    pe_internal_pod_reject_rowdescriptor_total_ = counters.reject_rowdescriptor_total;
+    pe_internal_pod_useful_total_ = counters.useful_total;
+    pe_internal_pod_useful_join_grant_total_ =
+        counters.useful_join_grant_total;
+    pe_internal_pod_useful_duplicate_replay_elide_total_ =
+        counters.useful_duplicate_replay_elide_total;
+    pe_internal_pod_useful_base_total_ = counters.useful_base_total;
+    pe_internal_pod_useful_band_total_ = counters.useful_band_total;
+    pe_internal_pod_useful_other_total_ = counters.useful_other_total;
+    pe_internal_pod_useful_idx2row_total_ = counters.useful_idx2row_total;
+    pe_internal_pod_useful_rowindex_total_ = counters.useful_rowindex_total;
+    pe_internal_pod_useful_rowdescriptor_total_ = counters.useful_rowdescriptor_total;
+    pe_internal_pod_duplicate_metadata_replay_elided_total_ =
+        counters.duplicate_metadata_replay_elided_total;
+    pe_internal_pod_duplicate_metadata_issue_elided_total_ =
+        counters.duplicate_metadata_issue_elided_total;
+    pe_internal_pod_fallback_private_issue_total_ =
+        counters.fallback_private_issue_total;
+}
+
+bool WeightMemorySubsystem::notePeInternalPodServiceObjectReady_(
+    PodMetadataObjectPlane::MetadataKind kind,
+    uint64_t object_id,
+    uint32_t window_seq) {
+    const uint32_t effective_window_seq = (window_seq != 0u) ? window_seq : window_seq_;
+    if (effective_window_seq == 0u) return false;
+    if (pe_local_service_object_table_ == nullptr ||
+        !pe_local_service_object_table_->enabled()) {
+        return false;
+    }
+
+    PeLocalServiceObjectTable::ReadyRequest ready{};
+    ready.pod_id = orch_.pe_internal_pod_id;
+    ready.window_seq = effective_window_seq;
+    ready.object_key = PodMetadataObjectPlane::composeObjectKey(kind, object_id);
+    const auto ready_result = pe_local_service_object_table_->markReady(ready);
+    if (!ready_result.valid || !ready_result.transitioned) {
+        return false;
+    }
+
+    pe_internal_pod_service_ready_transition_total_ += 1u;
+    pe_internal_pod_service_ready_fanout_total_ += 1u;
+    pe_internal_pod_service_ready_fanout_consumers_sum_total_ +=
+        static_cast<uint64_t>(ready_result.consumer_count);
+
+    switch (kind) {
+        case PodMetadataObjectPlane::MetadataKind::Idx2Row:
+            pe_internal_pod_service_ready_transition_idx2row_total_ += 1u;
+            pe_internal_pod_service_ready_fanout_idx2row_total_ += 1u;
+            pe_internal_pod_service_ready_fanout_consumers_sum_idx2row_total_ +=
+                static_cast<uint64_t>(ready_result.consumer_count);
+            break;
+        case PodMetadataObjectPlane::MetadataKind::RowIndex:
+            pe_internal_pod_service_ready_transition_rowindex_total_ += 1u;
+            pe_internal_pod_service_ready_fanout_rowindex_total_ += 1u;
+            pe_internal_pod_service_ready_fanout_consumers_sum_rowindex_total_ +=
+                static_cast<uint64_t>(ready_result.consumer_count);
+            break;
+        case PodMetadataObjectPlane::MetadataKind::RowDescriptor:
+            pe_internal_pod_service_ready_transition_rowdescriptor_total_ += 1u;
+            pe_internal_pod_service_ready_fanout_rowdescriptor_total_ += 1u;
+            pe_internal_pod_service_ready_fanout_consumers_sum_rowdescriptor_total_ +=
+                static_cast<uint64_t>(ready_result.consumer_count);
+            break;
+        default:
+            break;
+    }
+
+    if (pe_shared_core_fabric_ != nullptr) {
+        PeSharedCoreFabric::ControlMessage message{};
+        message.kind = PeSharedCoreFabric::ControlMessageKind::ReadyFanout;
+        message.scope_id = orch_.pe_internal_pod_id;
+        message.producer_core_id = orch_.core_id;
+        message.owner_core_id = orch_.core_id;
+        message.window_seq = effective_window_seq;
+        message.object_key = ready.object_key;
+        message.consumer_bitmap = ready_result.consumer_bitmap;
+        message.ready_token = ready_result.ready_token;
+        pe_shared_core_fabric_->enqueueControlMessage(message);
+    }
+
+    if (ready_result.released_after_transition) {
+        pe_internal_pod_service_ready_release_total_ += 1u;
+        switch (kind) {
+            case PodMetadataObjectPlane::MetadataKind::Idx2Row:
+                pe_internal_pod_service_ready_release_idx2row_total_ += 1u;
+                pe_internal_pod_service_released_idx2row_total_ += 1u;
+                break;
+            case PodMetadataObjectPlane::MetadataKind::RowIndex:
+                pe_internal_pod_service_ready_release_rowindex_total_ += 1u;
+                pe_internal_pod_service_released_rowindex_total_ += 1u;
+                break;
+            case PodMetadataObjectPlane::MetadataKind::RowDescriptor:
+                pe_internal_pod_service_ready_release_rowdescriptor_total_ += 1u;
+                pe_internal_pod_service_released_rowdescriptor_total_ += 1u;
+                break;
+            default:
+                break;
+        }
+    }
+
+    return true;
+}
+
+void WeightMemorySubsystem::notePeInternalPodServiceObjectReleased_(
+    PodMetadataObjectPlane::MetadataKind kind,
+    uint64_t object_id,
+    uint32_t window_seq,
+    bool defer_until_ready) {
+    const uint32_t effective_window_seq = (window_seq != 0u) ? window_seq : window_seq_;
+    if (effective_window_seq == 0u) return;
+    if (pe_local_service_object_table_ == nullptr ||
+        !pe_local_service_object_table_->enabled()) {
+        return;
+    }
+
+    PeLocalServiceObjectTable::ReleaseRequest release{};
+    release.pod_id = orch_.pe_internal_pod_id;
+    release.window_seq = effective_window_seq;
+    release.object_key = PodMetadataObjectPlane::composeObjectKey(kind, object_id);
+    release.defer_until_ready = defer_until_ready;
+    const auto release_result = pe_local_service_object_table_->release(release);
+    const bool released = release_result.valid && release_result.released;
+    const bool deferred = release_result.valid && release_result.deferred;
+    if (deferred) {
+        pe_internal_pod_service_release_deferred_total_ += 1u;
+    }
+    switch (kind) {
+        case PodMetadataObjectPlane::MetadataKind::Idx2Row:
+            if (released) {
+                pe_internal_pod_service_released_idx2row_total_ += 1u;
+            } else if (deferred) {
+                pe_internal_pod_service_release_deferred_idx2row_total_ += 1u;
+            } else if (!deferred) {
+                pe_internal_pod_service_release_missing_idx2row_total_ += 1u;
+            }
+            break;
+        case PodMetadataObjectPlane::MetadataKind::RowIndex:
+            if (released) {
+                pe_internal_pod_service_released_rowindex_total_ += 1u;
+            } else if (deferred) {
+                pe_internal_pod_service_release_deferred_rowindex_total_ += 1u;
+            } else if (!deferred) {
+                pe_internal_pod_service_release_missing_rowindex_total_ += 1u;
+            }
+            break;
+        case PodMetadataObjectPlane::MetadataKind::RowDescriptor:
+            if (released) {
+                pe_internal_pod_service_released_rowdescriptor_total_ += 1u;
+            } else if (deferred) {
+                pe_internal_pod_service_release_deferred_rowdescriptor_total_ += 1u;
+            } else if (!deferred) {
+                pe_internal_pod_service_release_missing_rowdescriptor_total_ += 1u;
+            }
+            break;
+        default:
+            break;
+    }
+    if (kind == PodMetadataObjectPlane::MetadataKind::RowDescriptor &&
+        orch_.experimental_rowdescriptor_ready_join_dedup_enable &&
+        !released) {
+        pulse_rowdescriptor_ready_join_shortcut_release_missing_total_ += 1u;
+    }
+}
+
+void WeightMemorySubsystem::noteExperimentalNocRowidxOwnerCloseCandidate_(uint32_t block_row) {
+    if (!experimentalNocRowidxPrefetchEnabled_()) return;
+    if (experimental_noc_rowidx_owner_close_seen_.empty()) return;
+    if (block_row >= experimental_noc_rowidx_owner_close_seen_.size()) return;
+    if (experimental_noc_rowidx_owner_close_seen_[block_row]) return;
+    experimental_noc_rowidx_owner_close_seen_[block_row] = 1u;
+    experimental_noc_rowidx_owner_close_rows_.push_back(block_row);
+}
+
+void WeightMemorySubsystem::maybeReleaseExperimentalNocRowidxServiceObjects_(uint32_t seq) {
+    if (seq == 0u) return;
+    if (!experimentalNocRowidxPrefetchEnabled_()) return;
+    if (pe_local_service_object_table_ == nullptr ||
+        !pe_local_service_object_table_->enabled()) {
+        return;
+    }
+
+    while (!experimental_noc_rowidx_owner_close_rows_.empty()) {
+        const uint32_t block_row = experimental_noc_rowidx_owner_close_rows_.front();
+        experimental_noc_rowidx_owner_close_rows_.pop_front();
+        experimental_noc_rowidx_stats_.close_attempt_total += 1u;
+
+        PeLocalServiceObjectTable::ProbeRequest probe{};
+        probe.pod_id = orch_.pe_internal_pod_id;
+        probe.window_seq = seq;
+        probe.object_key = PodMetadataObjectPlane::composeObjectKey(
+            PodMetadataObjectPlane::MetadataKind::RowIndex,
+            static_cast<uint64_t>(block_row));
+        const auto probe_result = pe_local_service_object_table_->probe(probe);
+        if (!probe_result.valid || !probe_result.active) {
+            experimental_noc_rowidx_stats_.close_attempt_not_active_total += 1u;
+            continue;
+        }
+        if (probe_result.owner_core_id != orch_.core_id) {
+            experimental_noc_rowidx_stats_.close_attempt_not_owner_total += 1u;
+            continue;
+        }
+        experimental_noc_rowidx_stats_.close_attempt_active_owner_total += 1u;
+        if (probe_result.release_pending) {
+            experimental_noc_rowidx_stats_.close_attempt_already_pending_total += 1u;
+        }
+
+        notePeInternalPodServiceObjectReleased_(
+            PodMetadataObjectPlane::MetadataKind::RowIndex,
+            static_cast<uint64_t>(block_row),
+            seq,
+            /*defer_until_ready=*/true);
+    }
+}
+
+void WeightMemorySubsystem::notePulseSeedFirstDemand_(uint64_t line_addr,
+                                                      bool ready_before_demand) {
+    (void)ready_before_demand;
+    const auto tracked = PulseSeededLineTracker::noteDemand(
+        orch_.node_id,
+        window_seq_,
+        line_addr);
+    (void)tracked;
+}
+
+void WeightMemorySubsystem::issuePulseSeededLine_(uint64_t line_addr,
+                                                  PulseSeedSource source,
+                                                  uint32_t selection_slot) {
+    if (!pulseAnySeededResidencyEnable_() ||
+        !orch_.pulse_descriptor_actual_enable ||
+        window_seq_ == 0u ||
+        !mem_access_) {
+        return;
+    }
+
+    const uint64_t line_size = std::max<uint64_t>(
+        static_cast<uint64_t>(sizeof(float)),
+        static_cast<uint64_t>(orch_.line_size_bytes));
+    if (line_size < sizeof(float)) return;
+    line_addr = (line_addr / line_size) * line_size;
+
+    const auto resident = PulseSeededLineResidency::lookupLine(
+        orch_.node_id,
+        window_seq_,
+        line_addr);
+    if (resident.hit) return;
+
+    PulseSharedLineService::ServiceKey key{};
+    key.scope_id = orch_.node_id;
+    key.window_seq = window_seq_;
+    key.line_addr = line_addr;
+    const auto gather_quality_bucket =
+        (source == PulseSeedSource::MfbGatherPreband &&
+         selection_slot != std::numeric_limits<uint32_t>::max())
+            ? pulseGatherQualityBucketForSelectionIndex_(static_cast<size_t>(selection_slot))
+            : PulseGatherQualityBucket::Unknown;
+
+    auto join = PulseSharedLineService::joinOrRegister(
+        key,
+        [scope_id = orch_.node_id, window_seq = window_seq_, line_addr, this](
+            bool ok,
+            uint64_t,
+            const std::vector<uint8_t>& line_bytes) {
+            if (!ok || line_bytes.empty()) return;
+            const size_t active_entries = PulseSeededLineResidency::storeLine(
+                scope_id,
+                window_seq,
+                line_addr,
+                line_bytes);
+            PulseSeededLineTracker::markReady(
+                scope_id,
+                window_seq,
+                line_addr,
+                now_cycle_);
+            (void)active_entries;
+        });
+    pulse_region_service_entries_peak_ = std::max<uint64_t>(
+        pulse_region_service_entries_peak_,
+        static_cast<uint64_t>(join.active_entries));
+    if (!join.owner) return;
+    PulseSeededLineTracker::registerLine(
+        orch_.node_id,
+        window_seq_,
+        line_addr,
+        now_cycle_,
+        static_cast<uint8_t>(source),
+        static_cast<uint8_t>(gather_quality_bucket));
+
+    PendingMeta meta{};
+    meta.window_seq = window_seq_;
+    meta.address = line_addr;
+    meta.size = static_cast<size_t>(line_size);
+    meta.orig_address = line_addr;
+    meta.orig_size = static_cast<size_t>(line_size);
+    meta.slice_offset = 0;
+    meta.issue_cycle = now_cycle_;
+    meta.pending_enqueue_cycle = std::numeric_limits<uint64_t>::max();
+    meta.retire_seq = std::numeric_limits<size_t>::max();
+    meta.bcsr_kind = 8;  // PULSE metadata-seeded shared-line prefetch
+    meta.pulse_scope_id = orch_.node_id;
+    meta.pulse_service_line_addr = line_addr;
+    meta.has_single_cb = false;
+    meta.is_weight = true;
+    meta.count_weight_read = true;
+
+    const bool count_budget = (window_seq_ != 0u);
+    const IssueStatus st = tryIssueRead_(meta, /*count_budget*/count_budget, /*budget_reserved*/false);
+    if (st == IssueStatus::Issued) return;
+    if (st == IssueStatus::DeferredInflight || st == IssueStatus::DeferredBudget) {
+        meta.pending_enqueue_cycle = now_cycle_;
+        pending_direct_reads_.push_back(std::move(meta));
+        return;
+    }
+    PulseSeededLineTracker::eraseLine(orch_.node_id, window_seq_, line_addr);
+    (void)PulseSharedLineService::complete(key, false, line_addr, std::vector<uint8_t>{});
+}
+
+bool WeightMemorySubsystem::finalizePulseSharedWindowIfNeeded_(uint32_t seq) {
+    if (seq == 0u) return false;
+
+    const auto arrival = registerPulsePeSharedWindowArrival_(
+        orch_.node_id,
+        seq,
+        orch_.core_id,
+        std::max<uint32_t>(1u, orch_.total_cores),
+        {});
+    if (!arrival.final_arrival) {
+        return false;
+    }
+
+    if (orch_.pulse_frontier_observe_enable) {
+        PulseFrontierObserveRegistry::closeWindow(orch_.node_id, seq);
+    }
+    if (orch_.pulse_metadata_frontier_observe_enable) {
+        PulseMetadataFrontierObserveRegistry::closeWindow(orch_.node_id, seq);
+    }
+    if (orch_.pulse_metadata_seed_enable) {
+        PulseMetadataSeedRegistry::closeWindow(orch_.node_id, seq);
+        PulseSeededLineResidency::closeWindow(orch_.node_id, seq);
+        PulseSeededLineTracker::closeWindow(orch_.node_id, seq);
+    }
+    if (orch_.pulse_prebase_shared_lookup_enable &&
+        !gcss_premphf_index_path_.empty()) {
+        PulseMetadataLookupRegistry::closeWindow(pulsePrebaseLookupScopeId_(), seq);
+    }
+    return true;
+}
+
+bool WeightMemorySubsystem::shouldReplayDeferredRowdescriptorOwnerFormLine_(
+    uint64_t line_addr) const {
+    if (window_seq_ == 0u) return false;
+
+    const uint64_t line_size = std::max<uint64_t>(
+        static_cast<uint64_t>(sizeof(float)),
+        static_cast<uint64_t>(orch_.line_size_bytes));
+    if (line_size < sizeof(float)) return false;
+    line_addr = (line_addr / line_size) * line_size;
+
+    if (pulseAnySeededResidencyEnable_()) {
+        const auto resident = PulseSeededLineResidency::probeLine(
+            orch_.node_id,
+            window_seq_,
+            line_addr);
+        if (resident.hit) {
+            return false;
+        }
+    }
+
+    PulseSharedLineService::ServiceKey key{};
+    key.scope_id = orch_.node_id;
+    key.window_seq = window_seq_;
+    key.line_addr = line_addr;
+    const auto live_service = PulseSharedLineService::probe(key);
+    if (live_service.active) {
+        return false;
+    }
+
+    return true;
+}
+
+void WeightMemorySubsystem::tryDrainDeferredRowdescriptorReadyJoinShortcut_() {
+    if (pulse_rowdescriptor_ready_join_shortcut_deferred_live_.empty()) return;
+    if (window_seq_ == 0u) return;
+    if (pe_local_service_object_table_ == nullptr ||
+        !pe_local_service_object_table_->enabled()) {
+        return;
+    }
+
+    std::vector<PulseDeferredReadyJoinShortcutEntry> pending_entries;
+    pending_entries.reserve(pulse_rowdescriptor_ready_join_shortcut_deferred_live_.size());
+
+    for (const auto& entry : pulse_rowdescriptor_ready_join_shortcut_deferred_live_) {
+        PeLocalServiceObjectTable::ProbeRequest probe{};
+        probe.pod_id = orch_.pe_internal_pod_id;
+        probe.window_seq = window_seq_;
+        probe.object_key = PodMetadataObjectPlane::composeObjectKey(
+            PodMetadataObjectPlane::MetadataKind::RowDescriptor,
+            entry.band_id);
+        const auto probe_result = pe_local_service_object_table_->probe(probe);
+        if (!probe_result.valid || (!probe_result.ready && !probe_result.released)) {
+            pending_entries.push_back(entry);
+            continue;
+        }
+
+        pulse_rowdescriptor_ready_join_shortcut_taken_total_ += 1u;
+        pulse_rowdescriptor_ready_join_shortcut_deferred_live_apply_total_ += 1u;
+        pulse_rowdescriptor_ready_join_shortcut_apply_complete_total_ += 1u;
+        pulse_rowdescriptor_ready_join_shortcut_release_deferred_total_ += 1u;
+        pulse_rowdescriptor_ready_join_shortcut_release_forwarded_total_ += 1u;
+        pulse_rowdescriptor_ready_join_descriptor_elide_total_ += 1u;
+        pulse_rowdescriptor_ready_join_lines_elide_total_ +=
+            static_cast<uint64_t>(entry.selected_line_count);
+    }
+
+    pulse_rowdescriptor_ready_join_shortcut_deferred_live_.swap(pending_entries);
+}
+
+void WeightMemorySubsystem::tryActivateDeferredRowdescriptorOwnerFormReplay_() {
+    if (pulse_rowdescriptor_owner_form_deferred_replays_.empty()) return;
+    if (window_seq_ == 0u) return;
+
+    std::vector<PulseDeferredOwnerFormReplayEntry> pending_entries;
+    pending_entries.reserve(pulse_rowdescriptor_owner_form_deferred_replays_.size());
+
+    for (const auto& entry : pulse_rowdescriptor_owner_form_deferred_replays_) {
+        const auto probe = PulseMetadataSeedRegistry::probeGatherBand(
+            orch_.node_id,
+            window_seq_,
+            entry.band_id);
+        if (!probe.valid || !probe.seed_triggered) {
+            pending_entries.push_back(entry);
+            continue;
+        }
+
+        const auto& selected_line_addrs =
+            !probe.selected_line_addrs.empty()
+                ? probe.selected_line_addrs
+                : entry.selected_line_addrs;
+        if (selected_line_addrs.empty()) {
+            continue;
+        }
+
+        std::vector<std::pair<uint64_t, uint32_t>> replay_lines;
+        replay_lines.reserve(selected_line_addrs.size());
+        for (size_t line_idx = 0; line_idx < selected_line_addrs.size(); ++line_idx) {
+            const uint64_t line_addr = selected_line_addrs[line_idx];
+            if (!shouldReplayDeferredRowdescriptorOwnerFormLine_(line_addr)) {
+                continue;
+            }
+            replay_lines.push_back(std::make_pair(
+                line_addr,
+                static_cast<uint32_t>(line_idx)));
+        }
+        if (replay_lines.empty()) {
+            continue;
+        }
+
+        pulse_rowdescriptor_owner_form_deferred_activate_total_ += 1u;
+        for (const auto& replay_line : replay_lines) {
+            issuePulseSeededLine_(
+                replay_line.first,
+                PulseSeedSource::MfbGatherPreband,
+                replay_line.second);
+        }
+    }
+
+    pulse_rowdescriptor_owner_form_deferred_replays_.swap(pending_entries);
+}
+
+void WeightMemorySubsystem::drainPendingPulseGatherPrebandReplay_() {
+}
+
+void WeightMemorySubsystem::maybeLaunchPulseMetadataSeeds_(
+    const std::vector<GcssVlfEdgeIssueEntry>& ordered_edges) {
+    (void)ordered_edges;
+}
+
+void WeightMemorySubsystem::maybeLaunchPulseMfbPrebandSeeds_(
+    const std::vector<GcssVlfEdgeIssueEntry>& ordered_edges) {
+    (void)ordered_edges;
+}
+
 void WeightMemorySubsystem::prepareGcssVlfIssueQueue_() {
     if (gcss_vlf_issue_queue_prepared_) return;
     gcss_vlf_issue_queue_prepared_ = true;
     gcss_vlf_issue_queue_.clear();
     if (!isGcssValueOnlyPreMphfMode_()) return;
+    drainPendingPulseGatherPrebandReplay_();
 
     std::vector<GcssVlfEdgeIssueEntry> edges;
     edges.reserve(edgesPrevSize());
-    std::unordered_map<uint32_t, uint64_t> tass_pre_payload_bytes;
-    uint64_t tass_payload_bytes = 0;
+    const uint64_t line_size = std::max<uint64_t>(1u, static_cast<uint64_t>(orch_.line_size_bytes));
     while (true) {
         uint64_t key = 0;
         uint32_t count = 0;
@@ -1715,13 +3012,12 @@ void WeightMemorySubsystem::prepareGcssVlfIssueQueue_() {
         const uint32_t pre_global = static_cast<uint32_t>(key & 0xffffffffu);
         if (orch_.num_neurons > 0 && post_local >= orch_.num_neurons) continue;
 
-        const size_t seq = registerEdgeRetire_(post_local, pre_global, count, EdgeSrc::Dense);
+        const size_t seq = registerEdgeRetire_(post_local, pre_global, count, EdgeSrc::GCSS);
         auto rank_it = edge_pre_rank_prev_.find(key);
         if (rank_it == edge_pre_rank_prev_.end()) {
             SST::Output* out = diagOutOrFallback_();
             out->fatal(CALL_INFO, -1,
-                       "WeightMemorySubsystem fatal: GCSS-VLF missing pre_rank "
-                       "(mode=%s node=%u core=%u pre=%u post=%u)\n",
+                       "WeightMemorySubsystem fatal: GCSS-VLF missing pre_rank (mode=%s node=%u core=%u pre=%u post=%u)\n",
                        orch_.synapse_weight_mode.c_str(),
                        orch_.node_id,
                        orch_.core_id,
@@ -1733,7 +3029,6 @@ void WeightMemorySubsystem::prepareGcssVlfIssueQueue_() {
         uint32_t base = 0;
         uint32_t len = 0;
         if (!lookupGcssPreBaseLen_(pre_global, base, len)) {
-            // Strict mode uses fatal in lookup; keep a local fallback for robustness.
             setEdgeRetireReady_(seq, 0.0f, EdgeSrc::Dense);
             tryRetireEdges_();
             continue;
@@ -1743,8 +3038,7 @@ void WeightMemorySubsystem::prepareGcssVlfIssueQueue_() {
         if (pre_rank >= len) {
             SST::Output* out = diagOutOrFallback_();
             out->fatal(CALL_INFO, -1,
-                       "WeightMemorySubsystem fatal: GCSS-VLF rank overflow "
-                       "(mode=%s node=%u core=%u pre=%u post=%u pre_rank=%u len=%u)\n",
+                       "WeightMemorySubsystem fatal: GCSS-VLF rank overflow (mode=%s node=%u core=%u pre=%u post=%u pre_rank=%u len=%u)\n",
                        orch_.synapse_weight_mode.c_str(),
                        orch_.node_id,
                        orch_.core_id,
@@ -1756,136 +3050,172 @@ void WeightMemorySubsystem::prepareGcssVlfIssueQueue_() {
         }
 
         const uint64_t widx = static_cast<uint64_t>(base) + static_cast<uint64_t>(pre_rank);
-        const uint64_t addr = orch_.base_addr + widx * sizeof(float);
+        const uint64_t addr = gcssValuesBaseAddr_() + widx * sizeof(float);
         GcssVlfEdgeIssueEntry e{};
         e.retire_seq = seq;
+        e.local_age_rank = edges.size();
         e.post_local = post_local;
         e.pre_global = pre_global;
         e.pre_rank = pre_rank;
+        e.pre_base = base;
+        e.pre_len = len;
         e.count = count;
         e.addr = addr;
         edges.push_back(e);
-        const uint64_t payload_bytes = static_cast<uint64_t>(count) * sizeof(float);
-        tass_payload_bytes += payload_bytes;
-        tass_pre_payload_bytes[pre_global] += payload_bytes;
     }
 
     if (edges.empty()) return;
 
+    auto sort_by_addr = [](const GcssVlfEdgeIssueEntry& a, const GcssVlfEdgeIssueEntry& b) {
+        if (a.addr != b.addr) return a.addr < b.addr;
+        if (a.pre_global != b.pre_global) return a.pre_global < b.pre_global;
+        if (a.post_local != b.post_local) return a.post_local < b.post_local;
+        return a.retire_seq < b.retire_seq;
+    };
+
     std::vector<GcssVlfEdgeIssueEntry> sorted = edges;
-    std::stable_sort(sorted.begin(), sorted.end(),
-                     [](const GcssVlfEdgeIssueEntry& a, const GcssVlfEdgeIssueEntry& b) {
-                         if (a.addr != b.addr) return a.addr < b.addr;
-                         if (a.pre_global != b.pre_global) return a.pre_global < b.pre_global;
-                         if (a.post_local != b.post_local) return a.post_local < b.post_local;
-                         return a.retire_seq < b.retire_seq;
-                     });
+    std::stable_sort(sorted.begin(), sorted.end(), sort_by_addr);
+
+    std::string queue_policy = orch_.experimental_gcss_vlf_queue_policy;
+    std::transform(queue_policy.begin(), queue_policy.end(), queue_policy.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (queue_policy.empty()) queue_policy = "locality_first";
+
+    std::vector<GcssVlfEdgeIssueEntry> ordered = sorted;
+    if (queue_policy == "banded_line_fair") {
+        const size_t fair_band_size = std::max<size_t>(
+            1u, static_cast<size_t>(orch_.experimental_gcss_vlf_fair_band_size));
+        struct LineChunk {
+            size_t age_band = 0;
+            uint64_t line_id = 0;
+            size_t chunk_min_retire_seq = 0;
+            std::vector<GcssVlfEdgeIssueEntry> entries;
+        };
+
+        std::vector<LineChunk> line_chunks;
+        line_chunks.reserve(sorted.size());
+        for (const auto& e : sorted) {
+            const uint64_t line_id = e.addr / line_size;
+            const size_t age_band = e.local_age_rank / fair_band_size;
+            if (line_chunks.empty() ||
+                line_chunks.back().line_id != line_id ||
+                line_chunks.back().age_band != age_band) {
+                LineChunk chunk{};
+                chunk.age_band = age_band;
+                chunk.line_id = line_id;
+                chunk.chunk_min_retire_seq = e.retire_seq;
+                line_chunks.push_back(std::move(chunk));
+            }
+            line_chunks.back().chunk_min_retire_seq =
+                std::min(line_chunks.back().chunk_min_retire_seq, e.retire_seq);
+            line_chunks.back().entries.push_back(e);
+        }
+
+        std::stable_sort(line_chunks.begin(), line_chunks.end(),
+                         [](const LineChunk& a, const LineChunk& b) {
+                             if (a.age_band != b.age_band) return a.age_band < b.age_band;
+                             if (a.line_id != b.line_id) return a.line_id < b.line_id;
+                             if (a.chunk_min_retire_seq != b.chunk_min_retire_seq) {
+                                 return a.chunk_min_retire_seq < b.chunk_min_retire_seq;
+                             }
+                             return a.entries.size() < b.entries.size();
+                         });
+
+        ordered.clear();
+        ordered.reserve(sorted.size());
+        for (const auto& chunk : line_chunks) {
+            ordered.insert(ordered.end(), chunk.entries.begin(), chunk.entries.end());
+        }
+    }
 
     bool reordered = false;
-    for (size_t i = 0; i < sorted.size(); ++i) {
-        if (sorted[i].retire_seq != edges[i].retire_seq) {
+    for (size_t i = 0; i < ordered.size(); ++i) {
+        if (ordered[i].retire_seq != edges[i].retire_seq) {
             reordered = true;
             break;
         }
     }
 
+    maybeExportOfflineLayoutProfile_(window_seq_, edges, ordered, line_size, queue_policy);
+    observePulseFrontier_(ordered, line_size);
+    observePulseMetadataFrontier_(ordered);
+    maybeLaunchPulseMfbPrebandSeeds_(ordered);
+    maybeLaunchPulseMetadataSeeds_(ordered);
+
+    PulseAgendaScorer agenda_scorer{};
+    auto score_line_group = [&](size_t group_size,
+                                size_t group_min_retire_seq,
+                                size_t group_max_retire_seq) {
+        if (!orch_.pulse_agenda_enable || group_size == 0) return;
+
+        const size_t retire_span =
+            (group_max_retire_seq >= group_min_retire_seq)
+                ? (group_max_retire_seq - group_min_retire_seq)
+                : 0;
+        PulseAgendaScorer::Candidate candidate{};
+        candidate.same_line = true;
+        candidate.row_safe = true;
+        candidate.segment_safe = true;
+        candidate.retire_span_ok = (retire_span <= 64u);
+        candidate.head_pressure_ok = true;
+        candidate.reuse_gain = static_cast<uint32_t>(std::min<size_t>(
+            (group_size > 0) ? (group_size - 1) : 0,
+            static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+        candidate.residency_gain = static_cast<uint32_t>(std::min<size_t>(
+            group_size,
+            static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+        candidate.ingress_relief = (group_size > 1) ? 1u : 0u;
+        candidate.head_block_risk = static_cast<uint32_t>(std::min<size_t>(
+            retire_span,
+            static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+        candidate.bank_conflict_risk = 0;
+        candidate.split_risk = (group_size > 1) ? 0u : 1u;
+
+        const auto result = agenda_scorer.evaluate(candidate);
+        pulse_agenda_candidates_total_ += 1;
+        if (result.accepted) {
+            pulse_agenda_accepted_total_ += 1;
+        } else {
+            pulse_agenda_rejected_total_ += 1;
+            if (result.reject_reason != PulseAgendaScorer::RejectReason::None) {
+                pulse_agenda_reject_gate_total_ += 1;
+            }
+        }
+    };
+
     uint64_t line_groups = 0;
-    const uint64_t line_size = std::max<uint64_t>(1u, static_cast<uint64_t>(orch_.line_size_bytes));
     uint64_t last_line = std::numeric_limits<uint64_t>::max();
-    for (const auto& e : sorted) {
+    size_t group_size = 0;
+    size_t group_min_retire_seq = 0;
+    size_t group_max_retire_seq = 0;
+    for (const auto& e : ordered) {
         const uint64_t line = e.addr / line_size;
         if (line != last_line) {
+            score_line_group(group_size, group_min_retire_seq, group_max_retire_seq);
             line_groups += 1;
             last_line = line;
+            group_size = 0;
+            group_min_retire_seq = e.retire_seq;
+            group_max_retire_seq = e.retire_seq;
         }
+        if (group_size == 0) {
+            group_min_retire_seq = e.retire_seq;
+            group_max_retire_seq = e.retire_seq;
+        } else {
+            group_min_retire_seq = std::min(group_min_retire_seq, e.retire_seq);
+            group_max_retire_seq = std::max(group_max_retire_seq, e.retire_seq);
+        }
+        group_size += 1;
         gcss_vlf_issue_queue_.push_back(e);
     }
-
-    noteTassLfP0PreparedWindow_(tass_pre_payload_bytes, tass_payload_bytes, line_groups);
+    score_line_group(group_size, group_min_retire_seq, group_max_retire_seq);
     gcss_vlf_issue_prepare_total_ += 1;
-    gcss_vlf_issue_edges_total_ += static_cast<uint64_t>(sorted.size());
+    gcss_vlf_issue_edges_total_ += static_cast<uint64_t>(ordered.size());
     if (reordered) gcss_vlf_issue_reorder_trigger_total_ += 1;
     gcss_vlf_issue_line_groups_total_ += line_groups;
-}
-
-void WeightMemorySubsystem::noteTassLfP0PreparedWindow_(
-    const std::unordered_map<uint32_t, uint64_t>& pre_payload_bytes,
-    uint64_t payload_bytes,
-    uint64_t current_vlf_line_groups) {
-    if (!tass_lf_p0_enabled_ || !tass_lf_p0_window_started_) return;
-    tass_lf_p0_window_payload_bytes_ += payload_bytes;
-    tass_lf_p0_window_current_vlf_line_groups_ += current_vlf_line_groups;
-    for (const auto& kv : pre_payload_bytes) {
-        tass_lf_p0_window_pre_payload_bytes_[kv.first] += kv.second;
-    }
-}
-
-void WeightMemorySubsystem::flushTassLfP0WindowIfNeeded_(bool force) {
-    (void)force;
-    if (!tass_lf_p0_enabled_ || !tass_lf_p0_window_started_) return;
-    tass_lf_p0_stats_.reports_flushed_total += 1;
-    if (tass_lf_p0_window_payload_bytes_ > 0) tass_lf_p0_stats_.reports_nonzero_payload_total += 1;
-    tass_lf_p0_stats_.reports_pre_entries_total += static_cast<uint64_t>(tass_lf_p0_window_pre_payload_bytes_.size());
-    if (!tass_lf_p0_flush_branch_logged_) {
-        if (SST::Output* out = diagOutOrFallback_()) {
-            out->verbose(CALL_INFO, 1, 0,
-                         "[tass-debug] flush node=%u core=%u callback=%d payload=%" PRIu64 " pres=%zu\n",
-                         orch_.node_id,
-                         orch_.core_id,
-                         orch_.submit_tass_lf_p0_window_report ? 1 : 0,
-                         tass_lf_p0_window_payload_bytes_,
-                         tass_lf_p0_window_pre_payload_bytes_.size());
-        }
-        tass_lf_p0_flush_branch_logged_ = true;
-    }
-    TassLfP0WindowReport report{};
-    report.mesh_rows = std::max<uint32_t>(1u, orch_.tass_lf_p0_mesh_rows);
-    report.mesh_cols = std::max<uint32_t>(1u, orch_.tass_lf_p0_mesh_cols);
-    report.block_h = std::max<uint32_t>(1u, orch_.tass_lf_p0_block_h);
-    report.block_w = std::max<uint32_t>(1u, orch_.tass_lf_p0_block_w);
-    report.cores_per_pe = std::max<uint32_t>(1u, orch_.tass_lf_p0_cores_per_pe);
-    report.node_id = orch_.node_id;
-    report.core_id = orch_.core_id;
-    report.window_seq = tass_lf_p0_window_seq_;
-    report.line_size_bytes = std::max<uint32_t>(1u, orch_.line_size_bytes);
-    report.payload_bytes_total = tass_lf_p0_window_payload_bytes_;
-    report.current_vlf_line_groups_total = tass_lf_p0_window_current_vlf_line_groups_;
-    report.pre_payload_entries.reserve(tass_lf_p0_window_pre_payload_bytes_.size());
-    for (const auto& kv : tass_lf_p0_window_pre_payload_bytes_) {
-        TassLfP0PrePayloadEntry entry{};
-        entry.pre_global = kv.first;
-        entry.payload_bytes = kv.second;
-        report.pre_payload_entries.push_back(entry);
-    }
-    if (orch_.submit_tass_lf_p0_window_report) {
-        tass_lf_p0_stats_.reports_via_callback_total += 1;
-        orch_.submit_tass_lf_p0_window_report(report);
-    } else {
-        tass_lf_p0_stats_.reports_via_fallback_total += 1;
-        submitTassLfP0WindowReport(report);
-    }
-    tass_lf_p0_window_started_ = false;
-    tass_lf_p0_window_seq_ = 0;
-    tass_lf_p0_window_pre_payload_bytes_.clear();
-    tass_lf_p0_window_payload_bytes_ = 0;
-    tass_lf_p0_window_current_vlf_line_groups_ = 0;
-    if (!orch_.submit_tass_lf_p0_window_report) {
-        harvestTassLfP0Completions_();
-    }
-}
-
-void WeightMemorySubsystem::harvestTassLfP0Completions_() {
-    if (!tass_lf_p0_enabled_) return;
-    const TassLfP0Aggregate agg = drainTassLfP0Completed(orch_.node_id, orch_.core_id);
-    tass_lf_p0_stats_.block_epochs_total += agg.block_epochs_total;
-    tass_lf_p0_stats_.block_active_pres_total += agg.block_active_pres_total;
-    tass_lf_p0_stats_.block_shared_pres_total += agg.block_shared_pres_total;
-    tass_lf_p0_stats_.cross_core_joins_total += agg.cross_core_joins_total;
-    tass_lf_p0_stats_.payload_bytes_total += agg.payload_bytes_total;
-    tass_lf_p0_stats_.current_vlf_line_groups_total += agg.current_vlf_line_groups_total;
-    tass_lf_p0_stats_.block_naive_line_count_total += agg.block_naive_line_count_total;
-    tass_lf_p0_stats_.block_fused_lb_line_count_total += agg.block_fused_lb_line_count_total;
-    tass_lf_p0_stats_.response_fanout_total += agg.response_fanout_total;
+    pulse_correctness_scoreboard_occupancy_peak_ = std::max<uint64_t>(
+        pulse_correctness_scoreboard_occupancy_peak_,
+        static_cast<uint64_t>(ordered.size()));
 }
 
 float WeightMemorySubsystem::applyWeightGuards_(float w) const {
@@ -2111,6 +3441,7 @@ void WeightMemorySubsystem::requestBCSR_(uint32_t pre_global, uint32_t post_loca
     uint32_t experimental_row_start = 0;
     if (lookupExperimentalNocRowidxCache_(block_row, experimental_row_start, experimental_cols) &&
         experimental_cols && !experimental_cols->empty()) {
+        experimental_noc_rowidx_stats_.ready_bypass_experimental_cache_hit_total += 1u;
         uint32_t idx_in_row = 0;
         bool found = false;
         for (size_t i = 0; i < experimental_cols->size(); ++i) {
@@ -2179,7 +3510,24 @@ void WeightMemorySubsystem::requestBCSR_(uint32_t pre_global, uint32_t post_loca
         }
 
         const uint32_t win_seq = window_seq_;
+        const auto detached_inflight_it =
+            experimental_noc_rowidx_detached_inflight_rows_.find(block_row);
         const uint64_t inflight_key = makeInflightKey_(win_seq, block_row);
+        if (orch_.experimental_noc_rowidx_prefetch_detached_enable &&
+            detached_inflight_it != experimental_noc_rowidx_detached_inflight_rows_.end()) {
+            ColidxWaiter waiter{};
+            waiter.pre_global = pre_global;
+            waiter.post_local = post_local;
+            waiter.target_block_col = block_col;
+            waiter.intra_row = intra_row;
+            waiter.intra_col = intra_col;
+            waiter.cb = std::move(cb);
+            const uint64_t detached_waiter_key =
+                makeInflightKey_(detached_inflight_it->second, block_row);
+            detached_colidx_waiters_[detached_waiter_key].push_back(std::move(waiter));
+            experimental_noc_rowidx_stats_.detached_demand_join_total += 1u;
+            return;
+        }
         auto& inflight = inflight_colidx_[inflight_key];
         if (!inflight.issued) {
             inflight.window_seq = win_seq;
@@ -2239,6 +3587,7 @@ void WeightMemorySubsystem::requestBCSR_(uint32_t pre_global, uint32_t post_loca
         return;
     }
     if (diag_debug_ && diag_window_active_) diag_win_.rowidx_hit += 1;
+    experimental_noc_rowidx_stats_.ready_bypass_rowindex_get_hit_total += 1u;
 
     uint32_t idx_in_row = 0;
     bool found = false;
@@ -2471,6 +3820,8 @@ void WeightMemorySubsystem::handleReadResp_(uint64_t req_id, uint64_t addr, Pend
         switch (meta.bcsr_kind) {
             case 0:
             case 4:
+            case 7:
+            case 8:
                 diag_win_.resp_cnt_dense += 1;
                 diag_win_.resp_bytes_dense += static_cast<uint64_t>(bytes.size());
                 break;
@@ -2613,6 +3964,94 @@ void WeightMemorySubsystem::handleReadResp_(uint64_t req_id, uint64_t addr, Pend
         }
         const uint8_t* slice = bytes.data() + slice_off;
         const uint32_t idx_bytes = orch_.bcsr_mgr->effectiveIdxBytes();
+        const bool rowindex_prefetch_only =
+            !meta.has_single_cb &&
+            meta.bcsr_target_block_col == UINT32_MAX &&
+            !meta.bcsr_prefetch_all &&
+            !meta.bcsr_colidx_bulk_all_rows;
+        if (rowindex_prefetch_only && meta.experimental_noc_rowidx) {
+            experimental_noc_rowidx_detached_inflight_rows_.erase(meta.bcsr_block_row);
+        }
+        enum class RowidxReadyResponseSource : uint8_t {
+            InflightWaiters,
+            InflightZeroWaiters,
+            NonInflightPrefetchOnly,
+        };
+        auto noteRowidxReadyFromResponse =
+            [&](RowidxReadyResponseSource source, bool experimental_prefetch) {
+                experimental_noc_rowidx_stats_.ready_signal_rowindex_response_total += 1u;
+                switch (source) {
+                    case RowidxReadyResponseSource::InflightWaiters:
+                        experimental_noc_rowidx_stats_
+                            .ready_signal_rowindex_response_inflight_waiters_total += 1u;
+                        break;
+                    case RowidxReadyResponseSource::InflightZeroWaiters:
+                        experimental_noc_rowidx_stats_
+                            .ready_signal_rowindex_response_inflight_zero_waiters_total += 1u;
+                        break;
+                    case RowidxReadyResponseSource::NonInflightPrefetchOnly:
+                        experimental_noc_rowidx_stats_
+                            .ready_signal_rowindex_response_noninflight_prefetch_only_total += 1u;
+                        break;
+                }
+                if (experimental_prefetch) {
+                    experimental_noc_rowidx_stats_.ready_signal_prefetch_response_total += 1u;
+                    switch (source) {
+                        case RowidxReadyResponseSource::InflightWaiters:
+                            experimental_noc_rowidx_stats_
+                                .ready_signal_prefetch_response_inflight_waiters_total += 1u;
+                            break;
+                        case RowidxReadyResponseSource::InflightZeroWaiters:
+                            experimental_noc_rowidx_stats_
+                                .ready_signal_prefetch_response_inflight_zero_waiters_total += 1u;
+                            break;
+                        case RowidxReadyResponseSource::NonInflightPrefetchOnly:
+                            experimental_noc_rowidx_stats_
+                                .ready_signal_prefetch_response_noninflight_prefetch_only_total += 1u;
+                            break;
+                    }
+                }
+
+                if (!notePeInternalPodServiceObjectReady_(
+                        PodMetadataObjectPlane::MetadataKind::RowIndex,
+                        static_cast<uint64_t>(meta.bcsr_block_row),
+                        meta.window_seq)) {
+                    return;
+                }
+
+                experimental_noc_rowidx_stats_.ready_transition_rowindex_response_total += 1u;
+                switch (source) {
+                    case RowidxReadyResponseSource::InflightWaiters:
+                        experimental_noc_rowidx_stats_
+                            .ready_transition_rowindex_response_inflight_waiters_total += 1u;
+                        break;
+                    case RowidxReadyResponseSource::InflightZeroWaiters:
+                        experimental_noc_rowidx_stats_
+                            .ready_transition_rowindex_response_inflight_zero_waiters_total += 1u;
+                        break;
+                    case RowidxReadyResponseSource::NonInflightPrefetchOnly:
+                        experimental_noc_rowidx_stats_
+                            .ready_transition_rowindex_response_noninflight_prefetch_only_total += 1u;
+                        break;
+                }
+                if (experimental_prefetch) {
+                    experimental_noc_rowidx_stats_.ready_transition_prefetch_response_total += 1u;
+                    switch (source) {
+                        case RowidxReadyResponseSource::InflightWaiters:
+                            experimental_noc_rowidx_stats_
+                                .ready_transition_prefetch_response_inflight_waiters_total += 1u;
+                            break;
+                        case RowidxReadyResponseSource::InflightZeroWaiters:
+                            experimental_noc_rowidx_stats_
+                                .ready_transition_prefetch_response_inflight_zero_waiters_total += 1u;
+                            break;
+                        case RowidxReadyResponseSource::NonInflightPrefetchOnly:
+                            experimental_noc_rowidx_stats_
+                                .ready_transition_prefetch_response_noninflight_prefetch_only_total += 1u;
+                            break;
+                    }
+                }
+            };
 
         if (meta.bcsr_colidx_bulk_all_rows) {
             const uint32_t br = orch_.bcsr_mgr->effectiveBlockRows();
@@ -2646,6 +4085,9 @@ void WeightMemorySubsystem::handleReadResp_(uint64_t req_id, uint64_t addr, Pend
                 return;
             }
 
+            experimental_noc_rowidx_stats_.bulk_fill_total += 1;
+            uint64_t bulk_rows_cached_this_fill = 0;
+
             // Populate row_index_cache_ for all rows from a single contiguous colidx slice.
             for (uint32_t block_row = 0; block_row < nBlockRows; ++block_row) {
                 uint32_t start = 0;
@@ -2673,7 +4115,10 @@ void WeightMemorySubsystem::handleReadResp_(uint64_t req_id, uint64_t addr, Pend
                 }
                 storeExperimentalNocRowidxCache_(block_row, start, cols);
                 orch_.bcsr_mgr->rowIndexPut(block_row, std::move(cols));
+                bulk_rows_cached_this_fill += 1;
             }
+
+            experimental_noc_rowidx_stats_.bulk_rows_cached_total += bulk_rows_cached_this_fill;
 
             row_index_prefetch_bulk_inflight_ = false;
 
@@ -2683,6 +4128,7 @@ void WeightMemorySubsystem::handleReadResp_(uint64_t req_id, uint64_t addr, Pend
             for (const auto& kv : inflight_colidx_) {
                 if (kv.second.window_seq == meta.window_seq) keys.push_back(kv.first);
             }
+            uint64_t bulk_waiters_resolved_this_fill = 0;
             for (uint64_t k : keys) {
                 auto inflight_it = inflight_colidx_.find(k);
                 if (inflight_it == inflight_colidx_.end()) continue;
@@ -2727,6 +4173,7 @@ void WeightMemorySubsystem::handleReadResp_(uint64_t req_id, uint64_t addr, Pend
                         continue;
                     }
                     const uint32_t global_block_index = inflight.row_start + idx_in_row;
+                    bulk_waiters_resolved_this_fill += 1;
                     enqueueBcsrBlockReadCoalesced_(meta.window_seq,
                                                    inflight.block_row,
                                                    w.target_block_col,
@@ -2739,6 +4186,8 @@ void WeightMemorySubsystem::handleReadResp_(uint64_t req_id, uint64_t addr, Pend
                                                    std::move(w.cb));
                 }
             }
+            experimental_noc_rowidx_stats_.bulk_waiters_resolved_total +=
+                bulk_waiters_resolved_this_fill;
             return;
         }
 
@@ -2785,13 +4234,80 @@ void WeightMemorySubsystem::handleReadResp_(uint64_t req_id, uint64_t addr, Pend
             return;
         }
 
-        // A: coalesced waiters for this (window, block_row)
         const uint64_t inflight_key = makeInflightKey_(meta.window_seq, meta.bcsr_block_row);
+        auto detached_waiters_it = detached_colidx_waiters_.find(inflight_key);
+        if (detached_waiters_it != detached_colidx_waiters_.end()) {
+            auto waiters = std::move(detached_waiters_it->second);
+            detached_colidx_waiters_.erase(detached_waiters_it);
+            experimental_noc_rowidx_stats_.detached_demand_ready_signal_total += 1u;
+            if (notePeInternalPodServiceObjectReady_(
+                    PodMetadataObjectPlane::MetadataKind::RowIndex,
+                    static_cast<uint64_t>(meta.bcsr_block_row),
+                    meta.window_seq)) {
+                experimental_noc_rowidx_stats_.detached_demand_ready_transition_total += 1u;
+            }
+
+            std::unordered_map<uint32_t, uint32_t> idx_lookup;
+            if (waiters.size() > 1 && !cols.empty()) {
+                idx_lookup.reserve(cols.size());
+                for (size_t i = 0; i < cols.size(); ++i) {
+                    idx_lookup[cols[i]] = static_cast<uint32_t>(i);
+                }
+            }
+            auto findIdx = [&](uint32_t target, uint32_t& out_idx) -> bool {
+                if (!idx_lookup.empty()) {
+                    auto it = idx_lookup.find(target);
+                    if (it == idx_lookup.end()) return false;
+                    out_idx = it->second;
+                    return true;
+                }
+                for (size_t i = 0; i < cols.size(); ++i) {
+                    if (cols[i] == target) {
+                        out_idx = static_cast<uint32_t>(i);
+                        return true;
+                    }
+                }
+                return false;
+            };
+
+            for (auto& w : waiters) {
+                uint32_t idx_in_row = 0;
+                if (!findIdx(w.target_block_col, idx_in_row)) {
+                    experimental_noc_rowidx_stats_.detached_demand_fallback_zero_total += 1u;
+                    if (w.cb) w.cb(0.0f);
+                    experimental_noc_rowidx_stats_.detached_demand_waiters_resolved_total += 1u;
+                    continue;
+                }
+                const uint32_t global_block_index = meta.bcsr_row_start + idx_in_row;
+                enqueueBcsrBlockReadCoalesced_(meta.window_seq,
+                                               meta.bcsr_block_row,
+                                               w.target_block_col,
+                                               global_block_index,
+                                               idx_in_row,
+                                               w.intra_row,
+                                               w.intra_col,
+                                               w.pre_global,
+                                               w.post_local,
+                                               std::move(w.cb));
+                experimental_noc_rowidx_stats_.detached_demand_waiters_resolved_total += 1u;
+            }
+            if (row_index_cap != 0) orch_.bcsr_mgr->rowIndexPut(meta.bcsr_block_row, std::move(cols));
+            return;
+        }
+
+        // A: coalesced waiters for this (window, block_row)
         auto inflight_it = inflight_colidx_.find(inflight_key);
         if (inflight_it != inflight_colidx_.end()) {
             auto waiters = std::move(inflight_it->second.waiters);
             const uint32_t row_start = inflight_it->second.row_start;
             inflight_colidx_.erase(inflight_it);
+            if (rowindex_prefetch_only && meta.experimental_noc_rowidx) {
+                if (waiters.empty()) {
+                    experimental_noc_rowidx_stats_.prefetch_complete_zero_waiters_total += 1u;
+                } else {
+                    experimental_noc_rowidx_stats_.prefetch_complete_waiters_total += 1u;
+                }
+            }
 
             // Build quick index (block_col -> idx_in_row) once for this row.
             std::unordered_map<uint32_t, uint32_t> idx_lookup;
@@ -2835,6 +4351,13 @@ void WeightMemorySubsystem::handleReadResp_(uint64_t req_id, uint64_t addr, Pend
                                                w.post_local,
                                                std::move(w.cb));
             }
+            if (rowindex_prefetch_only) {
+                const RowidxReadyResponseSource source =
+                    waiters.empty()
+                        ? RowidxReadyResponseSource::InflightZeroWaiters
+                        : RowidxReadyResponseSource::InflightWaiters;
+                noteRowidxReadyFromResponse(source, meta.experimental_noc_rowidx);
+            }
             if (row_index_cap != 0) orch_.bcsr_mgr->rowIndexPut(meta.bcsr_block_row, std::move(cols));
             return;
         }
@@ -2849,12 +4372,24 @@ void WeightMemorySubsystem::handleReadResp_(uint64_t req_id, uint64_t addr, Pend
             }
         }
         if (!found) {
+            if (rowindex_prefetch_only && meta.experimental_noc_rowidx) {
+                experimental_noc_rowidx_stats_.prefetch_complete_inflight_miss_total += 1u;
+                noteRowidxReadyFromResponse(
+                    RowidxReadyResponseSource::NonInflightPrefetchOnly,
+                    meta.experimental_noc_rowidx);
+            }
             if (meta.has_single_cb && meta.single_cb) meta.single_cb(0.0f);
             if (row_index_cap != 0) orch_.bcsr_mgr->rowIndexPut(meta.bcsr_block_row, std::move(cols));
             return;
         }
         const uint32_t global_block_index = meta.bcsr_row_start + idx_in_row;
         if (row_index_cap != 0) orch_.bcsr_mgr->rowIndexPut(meta.bcsr_block_row, std::move(cols));
+        if (rowindex_prefetch_only && meta.experimental_noc_rowidx) {
+            experimental_noc_rowidx_stats_.prefetch_complete_inflight_miss_total += 1u;
+            noteRowidxReadyFromResponse(
+                RowidxReadyResponseSource::NonInflightPrefetchOnly,
+                meta.experimental_noc_rowidx);
+        }
         enqueueBcsrBlockReadCoalesced_(meta.window_seq,
                                        meta.bcsr_block_row,
                                        meta.bcsr_target_block_col,
@@ -3004,16 +4539,38 @@ void WeightMemorySubsystem::handleReadResp_(uint64_t req_id, uint64_t addr, Pend
         return;
     }
 
-    if (meta.bcsr_kind == 5) {
-        float w = 0.0f;
-        bool ok = false;
-        const size_t need = meta.slice_offset + sizeof(float);
-        if (bytes.size() >= need) {
-            std::memcpy(&w, bytes.data() + meta.slice_offset, sizeof(float));
-            ok = true;
+    if (meta.bcsr_kind == 6) {
+        if (meta.has_bytes_cb && meta.bytes_cb) {
+            meta.bytes_cb(data);
         }
-        const uint64_t key_addr = meta.orig_address ? meta.orig_address : meta.address;
-        completeExperimentalIdx2IngressPrefetch_(key_addr, ok, w);
+        return;
+    }
+
+    if (meta.bcsr_kind == 7) {
+        PulseSharedLineService::ServiceKey key{};
+        key.scope_id = meta.pulse_scope_id;
+        key.window_seq = meta.window_seq;
+        key.line_addr = meta.pulse_service_line_addr;
+        const bool service_ok = (bytes.size() >= meta.size);
+        const size_t fanout = PulseSharedLineService::complete(
+            key, service_ok, meta.pulse_service_line_addr, bytes);
+        if (service_ok) {
+            pulse_ready_fanout_total_ += static_cast<uint64_t>(fanout);
+        }
+        return;
+    }
+
+    if (meta.bcsr_kind == 8) {
+        PulseSharedLineService::ServiceKey key{};
+        key.scope_id = meta.pulse_scope_id;
+        key.window_seq = meta.window_seq;
+        key.line_addr = meta.pulse_service_line_addr;
+        const bool service_ok = (bytes.size() >= meta.size);
+        const size_t fanout = PulseSharedLineService::complete(
+            key, service_ok, meta.pulse_service_line_addr, bytes);
+        if (service_ok && fanout > 1u) {
+            pulse_ready_fanout_total_ += static_cast<uint64_t>(fanout - 1u);
+        }
         return;
     }
 

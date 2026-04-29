@@ -13,6 +13,7 @@
 #include "SnnDLStringUtil.h"
 
 #include <algorithm>
+#include <inttypes.h>
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
@@ -150,6 +151,11 @@ SnnNetworkAdapter::SnnNetworkAdapter(SST::ComponentId_t id, SST::Params& params)
     max_hops_observed = 0;
     bandwidth_bytes_sent = 0;
     packets_dropped = 0;
+    pending_send_enqueue_total_ = 0;
+    pending_send_dequeue_total_ = 0;
+    pending_send_high_watermark_ = 0;
+    pending_send_space_block_total_ = 0;
+    pending_send_send_fail_total_ = 0;
 
     stat_spikes_routed = registerStatistic<uint64_t>("spikes_routed");
     stat_local_spikes = registerStatistic<uint64_t>("local_spikes");
@@ -299,9 +305,13 @@ bool SnnNetworkAdapter::spaceAvailable(int vn)
         bool sent = false;
         if (router->spaceToSend(req->vn, req->size_in_bits)) {
             sent = router->send(req, req->vn);
+            if (!sent) pending_send_send_fail_total_++;
+        } else {
+            pending_send_space_block_total_++;
         }
         if (sent) {
             pending_sends_.pop();
+            pending_send_dequeue_total_++;
             continue;
         }
         SST::Event* payload = req->takePayload();
@@ -371,6 +381,16 @@ void SnnNetworkAdapter::setup()
 
 void SnnNetworkAdapter::finish()
 {
+    output->verbose(CALL_INFO, 0, 0,
+        "[snn-nic-pending] node=%u enq=%" PRIu64 " deq=%" PRIu64 " hwm=%" PRIu64
+        " space_block=%" PRIu64 " send_fail=%" PRIu64 " final=%zu\n",
+        node_id,
+        pending_send_enqueue_total_,
+        pending_send_dequeue_total_,
+        pending_send_high_watermark_,
+        pending_send_space_block_total_,
+        pending_send_send_fail_total_,
+        pending_sends_.size());
     if (router) router->finish();
 }
 
@@ -449,12 +469,18 @@ void SnnNetworkAdapter::sendViaMerlinRouter_(SST::Event* event, uint32_t dest_no
     bool sent = false;
     if (router->spaceToSend(req->vn, req->size_in_bits)) {
         sent = router->send(req, req->vn);
+        if (!sent) pending_send_send_fail_total_++;
+    } else {
+        pending_send_space_block_total_++;
     }
     if (sent) return;
 
     SST::Event* payload = req->takePayload();
     delete req;
     pending_sends_.push(PendingSend{dest_node, payload});
+    pending_send_enqueue_total_++;
+    const uint64_t pending_depth = static_cast<uint64_t>(pending_sends_.size());
+    if (pending_depth > pending_send_high_watermark_) pending_send_high_watermark_ = pending_depth;
 }
 
 void SnnNetworkAdapter::sendViaMultiPortLink_(SST::Event* event, uint32_t dest_node, int /*next_port*/)

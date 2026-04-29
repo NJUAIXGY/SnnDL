@@ -11,18 +11,50 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "api/ICoreWorkload.h"
+#include "services/synapse/route3d/Route3DNodeMapper.h"
 
 namespace SST { namespace SnnDL {
 
 class NocSpikeTransport;
 class SpikeCommSubsystem;
-class SynapseRouteSubsystem;
+class ISynapseRoute;
 
 class TrafficWorkload final : public ICoreWorkload {
 public:
+    struct SemanticMemoryDemand {
+        uint64_t metadata_lookup_demands = 0;
+        uint64_t synapse_gather_demands = 0;
+        uint64_t stream_region_demands = 0;
+        uint64_t writeback_region_demands = 0;
+        uint64_t tier_local_home_gather_demands = 0;
+        uint64_t same_xy_cross_tier_gather_demands = 0;
+        uint64_t remote_home_gather_demands = 0;
+        uint64_t tier_local_home_stream_region_demands = 0;
+        uint64_t same_xy_cross_tier_stream_region_demands = 0;
+        uint64_t remote_home_stream_region_demands = 0;
+        uint64_t emitted_pres = 0;
+        uint64_t multicast_packets = 0;
+
+        bool empty() const {
+            return metadata_lookup_demands == 0 &&
+                   synapse_gather_demands == 0 &&
+                   stream_region_demands == 0 &&
+                   writeback_region_demands == 0 &&
+                   tier_local_home_gather_demands == 0 &&
+                   same_xy_cross_tier_gather_demands == 0 &&
+                   remote_home_gather_demands == 0 &&
+                   tier_local_home_stream_region_demands == 0 &&
+                   same_xy_cross_tier_stream_region_demands == 0 &&
+                   remote_home_stream_region_demands == 0 &&
+                   emitted_pres == 0 &&
+                   multicast_packets == 0;
+        }
+    };
+
     TrafficWorkload();
     ~TrafficWorkload() override;
 
@@ -39,6 +71,7 @@ public:
     bool hasWork() const override;
     double getUtilization() const override;
     void getStatistics(std::map<std::string, uint64_t>& stats) const override;
+    SemanticMemoryDemand takeSemanticDemand();
 
 private:
     void ensureCommReady_();
@@ -73,17 +106,38 @@ private:
     uint32_t spikekey_check_log_cap_ = 8;
     uint32_t spikekey_group_log_cap_ = 8;
     uint32_t spikekey_check_logged_ = 0;
+    MeshShape3D traffic_mesh_shape_{};
+    bool traffic_mesh_shape_valid_ = false;
+    std::string traffic_memory_kind_ = "hbm_like";
+    uint64_t source_global_neuron_base_ = 0;
+    uint64_t metadata_base_addr_ = 0;
+    uint64_t gather_base_addr_ = 0;
+    uint64_t stream_base_addr_ = 0;
+    uint64_t writeback_base_addr_ = 0;
 
     uint64_t next_cycle_ = 0;
     uint32_t seq_ = 1;
 
     uint64_t tx_batches_ = 0;
     uint64_t tx_pres_total_ = 0;
+    SemanticMemoryDemand pending_semantic_demand_{};
+    uint64_t total_semantic_metadata_lookup_demands_ = 0;
+    uint64_t total_semantic_synapse_gather_demands_ = 0;
+    uint64_t total_semantic_stream_region_demands_ = 0;
+    uint64_t total_semantic_writeback_region_demands_ = 0;
+    uint64_t total_semantic_tier_local_home_gather_demands_ = 0;
+    uint64_t total_semantic_same_xy_cross_tier_gather_demands_ = 0;
+    uint64_t total_semantic_remote_home_gather_demands_ = 0;
+    uint64_t total_semantic_tier_local_home_stream_region_demands_ = 0;
+    uint64_t total_semantic_same_xy_cross_tier_stream_region_demands_ = 0;
+    uint64_t total_semantic_remote_home_stream_region_demands_ = 0;
     uint64_t rx_spike_total_ = 0;
     // Key-like packets delivered to this core (SpikeKey + SpikeTileKey).
     uint64_t rx_spikekey_total_ = 0;
     // Subset counter for SpikeTileKey.
     uint64_t rx_spiketilekey_total_ = 0;
+    uint64_t rx_spikekey_v4_total_ = 0;
+    uint64_t rx_spiketilekey_v4_total_ = 0;
     uint64_t rx_spiketilekey_bad_decode_ = 0;
     uint64_t rx_spike_hops_sum_ = 0;
     uint64_t rx_spike_hops_max_ = 0;
@@ -99,7 +153,7 @@ private:
     uint64_t rx_spikekey_bad_blockpos_ = 0;
     uint64_t rx_spikekey_bad_mask_ = 0;
 
-    std::unique_ptr<SynapseRouteSubsystem> synapse_route_;
+    std::unique_ptr<ISynapseRoute> synapse_route_;
     std::unique_ptr<SpikeCommSubsystem> spike_comm_;
     std::unique_ptr<NocSpikeTransport> noc_spike_transport_;
 };

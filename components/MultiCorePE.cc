@@ -20,13 +20,20 @@
 #include "NocPacketBatchEvent.h"
 #include "GasStepBarrierEvent.h"
 #include "LoaderDoneEvent.h"
-#include "TassLfP0ReportEvent.h"
-#include "TassNaiveWindowRequestEvent.h"
-#include "TassNaiveResponseEvent.h"
 #include "WorkloadConfig.h"
 #include "SnnDLLogging.h"
 #include "SnnCoreAPI.h"
 #include "multicore/MultiCorePEConfig.h"
+#include "multicore/GlobalStepDrainDecision.h"
+#include "services/memory/PeDmaScheduler.h"
+#include "services/local_storage/LocalStorageHierarchyController.h"
+#include "services/local_storage/PeLocalServiceObjectTable.h"
+#include "services/local_storage/PodMetadataObjectPlane.h"
+#include "services/local_storage/PodOwnerServiceTable.h"
+#include "services/local_storage/PeWeightObjectPlane.h"
+#include "services/pe_fabric/PeSharedCoreFabric.h"
+#include "synapse/route/SpikeNocCodec.h"
+#include "synapse/route/SpikeTileNocCodec.h"
 #include "workload_stats/WorkloadStatsRegistry.h"
 
 #include <fstream>
@@ -37,6 +44,7 @@
 #include <functional>
 #include <iomanip>
 #include <cstdlib>
+#include <cctype>
 #include <random>
 #include <cstdlib>
 #include <climits>
@@ -98,68 +106,164 @@ inline uint64_t ceilDivU64_(uint64_t num, uint64_t den) {
     return (num + den - 1ull) / den;
 }
 
-inline uint64_t packTassContributorKey_(uint32_t node_id, uint32_t core_id) {
-    return (static_cast<uint64_t>(node_id) << 32) | static_cast<uint64_t>(core_id);
+inline size_t normalizePodCount_(size_t num_cores,
+                                 uint32_t configured_pod_count,
+                                 uint32_t configured_pod_size) {
+    const size_t cores = std::max<size_t>(num_cores, 1u);
+    size_t pods = 0;
+    if (configured_pod_count > 0) {
+        pods = static_cast<size_t>(configured_pod_count);
+    } else if (configured_pod_size > 0) {
+        pods = static_cast<size_t>(ceilDivU64_(cores, configured_pod_size));
+    } else {
+        pods = cores;
+    }
+    if (pods == 0) pods = 1;
+    if (pods > cores) pods = cores;
+    return pods;
 }
 
-inline uint64_t packTassBlockEpochKey_(uint32_t block_origin_node, uint32_t window_seq) {
-    return (static_cast<uint64_t>(window_seq) << 32) | static_cast<uint64_t>(block_origin_node);
+static constexpr uint32_t kPodMetadataShadowEntryBytes = 32u;
+
+inline NocPacketEvent* buildSyntheticSpikeKeyPacket_(uint32_t src_node,
+                                                     uint16_t src_endpoint,
+                                                     uint32_t dst_node,
+                                                     uint16_t dst_endpoint,
+                                                     uint32_t pre_global,
+                                                     uint64_t now_cycle) {
+    auto* pkt = new NocPacketEvent();
+    pkt->src_node = src_node;
+    pkt->dst_node = dst_node;
+    pkt->src_endpoint = src_endpoint;
+    pkt->dst_endpoint = dst_endpoint;
+    pkt->kind = static_cast<uint16_t>(NocPacketKind::SpikeKey);
+    pkt->timestamp = now_cycle;
+
+    SpikeNocCodec::WireSpikeKeyV2 ws{};
+    ws.version = 2;
+    ws.route_mode = 1; // blocked route
+    ws.stage = 0;      // INTER
+    ws.block_w_h = static_cast<uint16_t>((1u << 8) | 1u);
+    ws.block_id = dst_node;
+    ws.ingress_node = dst_node;
+    ws.pre_global = pre_global;
+    ws.group_id = (now_cycle << 32) | static_cast<uint64_t>(pre_global);
+    ws.core_mask.fill(0u);
+    if (dst_endpoint < 32u) {
+        ws.core_mask[0] = static_cast<uint32_t>(1u << dst_endpoint);
+    }
+    SpikeNocCodec::encodeSpikeKey(ws, pkt->payload);
+    return pkt;
 }
 
-inline void computeTassBlockInfo_(uint32_t mesh_rows,
-                                  uint32_t mesh_cols,
-                                  uint32_t block_h,
-                                  uint32_t block_w,
-                                  uint32_t node_id,
-                                  uint32_t cores_per_pe,
-                                  uint32_t& block_origin_node,
-                                  uint32_t& expected_contributors) {
-    mesh_rows = std::max<uint32_t>(1u, mesh_rows);
-    mesh_cols = std::max<uint32_t>(1u, mesh_cols);
-    block_h = std::max<uint32_t>(1u, block_h);
-    block_w = std::max<uint32_t>(1u, block_w);
-    cores_per_pe = std::max<uint32_t>(1u, cores_per_pe);
-    const uint32_t pe_row = node_id / mesh_cols;
-    const uint32_t pe_col = node_id % mesh_cols;
-    const uint32_t block_row0 = (pe_row / block_h) * block_h;
-    const uint32_t block_col0 = (pe_col / block_w) * block_w;
-    const uint32_t block_rows = std::min<uint32_t>(block_h, mesh_rows > block_row0 ? (mesh_rows - block_row0) : 1u);
-    const uint32_t block_cols = std::min<uint32_t>(block_w, mesh_cols > block_col0 ? (mesh_cols - block_col0) : 1u);
-    block_origin_node = block_row0 * mesh_cols + block_col0;
-    expected_contributors = std::max<uint32_t>(1u, block_rows * block_cols * cores_per_pe);
+inline PeSharedCoreFabric::PacketKind pulsePacketKindFromNoc_(NocPacketKind kind) {
+    switch (kind) {
+        case NocPacketKind::Spike:
+            return PeSharedCoreFabric::PacketKind::Spike;
+        case NocPacketKind::SpikeKey:
+            return PeSharedCoreFabric::PacketKind::SpikeKey;
+        case NocPacketKind::SpikeTileKey:
+            return PeSharedCoreFabric::PacketKind::SpikeTileKey;
+        default:
+            return PeSharedCoreFabric::PacketKind::Other;
+    }
 }
 
-inline void computeTassBlockInfo_(const TassLfP0WindowReport& report,
-                                  uint32_t& block_origin_node,
-                                  uint32_t& expected_contributors) {
-    computeTassBlockInfo_(report.mesh_rows,
-                          report.mesh_cols,
-                          report.block_h,
-                          report.block_w,
-                          report.node_id,
-                          report.cores_per_pe,
-                          block_origin_node,
-                          expected_contributors);
+struct PulseDescriptorSurrogate_ {
+    bool valid = false;
+    uint32_t post_block_id = 0;
+    uint32_t weight_region_id = 0;
+    uint32_t retire_domain_id = 0;
+    bool region_safe = true;
+};
+
+inline uint32_t pulseDescriptorTaggedRegion_(uint32_t tag, uint32_t value) {
+    return (tag << 28) ^ value;
 }
 
-inline void computeTassBlockInfo_(const TassNaiveWindowRequest& request,
-                                  uint32_t& block_origin_node,
-                                  uint32_t& expected_contributors) {
-    computeTassBlockInfo_(request.mesh_rows,
-                          request.mesh_cols,
-                          request.block_h,
-                          request.block_w,
-                          request.source_node,
-                          request.cores_per_pe,
-                          block_origin_node,
-                          expected_contributors);
+inline std::string normalizePulseMetadataMaskToken_(std::string token) {
+    for (char& ch : token) {
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+    token.erase(
+        std::remove_if(
+            token.begin(),
+            token.end(),
+            [](unsigned char ch) {
+                return ch == '_' || ch == '-' || std::isspace(ch) != 0;
+            }),
+        token.end());
+    return token;
 }
 
-inline float loadTassNaiveWeight_(const std::vector<uint8_t>& data, uint32_t byte_offset) {
-    if (byte_offset + sizeof(float) > data.size()) return 0.0f;
-    float value = 0.0f;
-    std::memcpy(&value, data.data() + byte_offset, sizeof(float));
-    return value;
+inline uint32_t parsePulseMetadataObjectMask_(const std::string& raw_mask) {
+    if (raw_mask.empty()) return 0u;
+
+    uint32_t mask = 0u;
+    size_t start = 0u;
+    while (start <= raw_mask.size()) {
+        const size_t end = raw_mask.find_first_of(",|+; ", start);
+        const std::string token = normalizePulseMetadataMaskToken_(
+            raw_mask.substr(start, (end == std::string::npos) ? std::string::npos : (end - start)));
+        if (!token.empty()) {
+            if (token == "all") {
+                mask |= PeLocalServiceObjectTable::kMetadataKindMaskAll;
+            } else if (token == "preband") {
+                mask |= PeLocalServiceObjectTable::kMetadataKindMaskPreband;
+            } else if (token == "prebase" || token == "base" || token == "premphfbase") {
+                mask |= PeLocalServiceObjectTable::kMetadataKindMaskPreMphfBase;
+            } else if (token == "band" || token == "premphfband") {
+                mask |= PeLocalServiceObjectTable::kMetadataKindMaskPreMphfBand;
+            } else if (token == "idx2" || token == "idx2row") {
+                mask |= PeLocalServiceObjectTable::kMetadataKindMaskIdx2Row;
+            } else if (token == "rowidx" || token == "rowindex") {
+                mask |= PeLocalServiceObjectTable::kMetadataKindMaskRowIndex;
+            } else if (token == "rowdescriptor") {
+                mask |= PeLocalServiceObjectTable::kMetadataKindMaskRowDescriptor;
+            }
+        }
+        if (end == std::string::npos) break;
+        start = end + 1u;
+    }
+    return mask;
+}
+
+inline PulseDescriptorSurrogate_ buildPulseDescriptorSurrogate_(const NocPacketEvent& pkt,
+                                                                const GlobalNeuronLayout& layout) {
+    PulseDescriptorSurrogate_ surrogate{};
+
+    if (pkt.packetKind() == NocPacketKind::Spike) {
+        if (pkt.payload.size() < sizeof(SpikeNocCodec::WireSpike)) return surrogate;
+        SpikeNocCodec::WireSpike wire{};
+        std::memcpy(&wire, pkt.payload.data(), sizeof(wire));
+        surrogate.valid = true;
+        surrogate.post_block_id = layout.valid() ? layout.nodeOf(wire.dst_neuron) : pkt.dst_node;
+        surrogate.weight_region_id = pulseDescriptorTaggedRegion_(1u, wire.src_neuron);
+        surrogate.retire_domain_id = surrogate.post_block_id;
+        return surrogate;
+    }
+
+    if (pkt.packetKind() == NocPacketKind::SpikeKey) {
+        SpikeNocCodec::WireSpikeKeyV2 wire{};
+        if (!SpikeNocCodec::decodeSpikeKeyAny(pkt.payload, wire, nullptr)) return surrogate;
+        surrogate.valid = true;
+        surrogate.post_block_id = wire.block_id;
+        surrogate.weight_region_id = pulseDescriptorTaggedRegion_(2u, wire.pre_global);
+        surrogate.retire_domain_id = surrogate.post_block_id;
+        return surrogate;
+    }
+
+    if (pkt.packetKind() == NocPacketKind::SpikeTileKey) {
+        SpikeTileNocCodec::WireSpikeTileKeyV1 wire{};
+        if (!SpikeTileNocCodec::decode(pkt.payload, wire)) return surrogate;
+        surrogate.valid = true;
+        surrogate.post_block_id = wire.route.block_id;
+        surrogate.weight_region_id = pulseDescriptorTaggedRegion_(3u, wire.tile.block_col);
+        surrogate.retire_domain_id = surrogate.post_block_id;
+        return surrogate;
+    }
+
+    return surrogate;
 }
 } // namespace
 
@@ -239,6 +343,7 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
     
     // 测试流量参数
     enable_test_traffic_ = cfg.enable_test_traffic;
+    test_traffic_packet_kind_ = cfg.test_traffic_packet_kind;
     test_target_node_ = cfg.test_target_node;
     test_period_ = cfg.test_period;
     test_spikes_per_burst_ = cfg.test_spikes_per_burst;
@@ -270,6 +375,7 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
     use_event_weight_fallback_ = cfg.use_event_weight_fallback;
     enable_memory_weights_ = cfg.enable_memory_weights;
     write_weights_on_init_ = cfg.write_weights_on_init;
+    step_seed_only_mode_ = params.find<int>("step_seed_only_mode", 0) != 0;
 
     // 时间窗口化统计参数（默认关闭）
     window_stats_enable_ = cfg.window_stats_enable;
@@ -289,6 +395,335 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
             oss << unknown_modules[i];
         }
         output_->verbose(CALL_INFO, 1, 0, "[workload_stats] unknown modules ignored: %s\n", oss.str().c_str());
+    }
+
+    pure_snn_datapath_workload_eligible_ =
+        workloadAllowsPureSnnDatapathFeatures(cfg.workload_kind);
+
+    dma_enable_ = cfg.dma_enable && pure_snn_datapath_workload_eligible_;
+    if (cfg.dma_enable && !dma_enable_ && output_) {
+        output_->verbose(CALL_INFO, 1, 0,
+                         "[dma] ignore dma_enable for non-SNN workload_impl=%s node=%d\n",
+                         cfg.workload_impl.c_str(),
+                         node_id_);
+    }
+    if (dma_enable_) {
+        PeDmaScheduler::Config dma_cfg{};
+        dma_cfg.num_cores = static_cast<size_t>(std::max(1, num_cores_));
+        dma_cfg.bytes_per_cycle = cfg.dma_bytes_per_cycle;
+        dma_cfg.read_engines = cfg.dma_read_engines;
+        dma_cfg.max_inflight = cfg.dma_max_inflight;
+        dma_cfg.queue_depth = cfg.dma_queue_depth;
+        dma_cfg.overflow_policy =
+            (cfg.dma_overflow_policy == "fail_fast")
+                ? PeDmaScheduler::Config::OverflowPolicy::FailFast
+                : PeDmaScheduler::Config::OverflowPolicy::Block;
+        dma_cfg.burst_bytes = cfg.dma_burst_bytes;
+        dma_cfg.setup_cycles = cfg.dma_setup_cycles;
+        dma_cfg.channels = cfg.dma_channels;
+        dma_cfg.channel_bytes_per_cycle = cfg.dma_channel_bytes_per_cycle;
+        dma_cfg.channel_interleave_bytes = cfg.dma_channel_interleave_bytes;
+        dma_cfg.stage_budget_permille = cfg.dma_stage_budget_permille;
+        dma_scheduler_ = std::make_unique<PeDmaScheduler>(dma_cfg);
+    }
+
+    local_storage_enable_ =
+        cfg.local_storage_enable && pure_snn_datapath_workload_eligible_;
+    if (cfg.local_storage_enable && !local_storage_enable_ && output_) {
+        output_->verbose(CALL_INFO, 1, 0,
+                         "[local-storage] ignore local_storage_enable for non-SNN workload_impl=%s node=%d\n",
+                         cfg.workload_impl.c_str(),
+                         node_id_);
+    }
+    pe_internal_pod_requested_ = cfg.pe_internal_pod_enable;
+    pe_internal_pod_metadata_requested_ = cfg.pe_internal_pod_metadata_enable;
+    pe_internal_pod_owner_requested_ = cfg.pe_internal_pod_owner_enable;
+    pe_internal_cpe_enable_cfg_ = local_storage_enable_ && cfg.pe_internal_cpe_enable;
+    pe_internal_pod_enable_cfg_ =
+        pe_internal_cpe_enable_cfg_ && cfg.pe_internal_pod_enable;
+    pe_internal_pod_metadata_enable_cfg_ =
+        pe_internal_pod_enable_cfg_ && cfg.pe_internal_pod_metadata_enable;
+    pe_internal_pod_owner_enable_cfg_ =
+        pe_internal_pod_enable_cfg_ && cfg.pe_internal_pod_owner_enable;
+    pulse_osa_metadata_txn_enable_ = cfg.pulse_osa_metadata_txn_enable;
+    pulse_osa_metadata_ready_lease_enable_ =
+        cfg.pulse_osa_metadata_ready_lease_enable;
+    pulse_osa_metadata_ready_lease_ttl_ =
+        cfg.pulse_osa_metadata_ready_lease_ttl;
+    pulse_osa_metadata_object_mask_ = cfg.pulse_osa_metadata_object_mask;
+    pulse_osa_metadata_object_mask_bits_ =
+        parsePulseMetadataObjectMask_(pulse_osa_metadata_object_mask_);
+    pe_internal_pod_count_cfg_ = pe_internal_pod_enable_cfg_
+        ? static_cast<uint32_t>(normalizePodCount_(
+              static_cast<size_t>(std::max(1, num_cores_)),
+              cfg.pe_internal_pod_count,
+              cfg.pe_internal_pod_size))
+        : 1u;
+    pe_internal_pod_size_cfg_ = cfg.pe_internal_pod_size;
+    if (pe_internal_pod_size_cfg_ == 0u) {
+        pe_internal_pod_size_cfg_ = static_cast<uint32_t>(ceilDivU64_(
+            static_cast<uint64_t>(std::max(1, num_cores_)),
+            static_cast<uint64_t>(std::max<uint32_t>(1u, pe_internal_pod_count_cfg_))));
+    }
+    pe_internal_pod_size_cfg_ =
+        std::max<uint32_t>(1u, pe_internal_pod_size_cfg_);
+    if (local_storage_enable_) {
+        const bool cpe_scope_enable = cfg.pe_internal_cpe_enable;
+        const bool pod_scope_enable = cpe_scope_enable && cfg.pe_internal_pod_enable;
+        const size_t pod_count = pod_scope_enable
+            ? normalizePodCount_(static_cast<size_t>(std::max(1, num_cores_)),
+                                 cfg.pe_internal_pod_count,
+                                 cfg.pe_internal_pod_size)
+            : 1u;
+        LocalStorageHierarchyController::Config ls_cfg{};
+        ls_cfg.enable = true;
+        ls_cfg.num_cores = static_cast<size_t>(std::max(1, num_cores_));
+        ls_cfg.num_pods = pod_count;
+        local_storage_controller_ = std::make_unique<LocalStorageHierarchyController>(ls_cfg);
+
+        PhaseALocalStorageRegistrationConfig phase_cfg{};
+        phase_cfg.num_cores = ls_cfg.num_cores;
+        phase_cfg.num_pods = ls_cfg.num_pods;
+
+        phase_cfg.activation_ingress.name = "activation_ingress_store";
+        phase_cfg.activation_ingress.kind = LocalStorageObjectKind::QueueStore;
+        phase_cfg.activation_ingress.scope = LocalStorageScope::PerPe;
+        phase_cfg.activation_ingress.enable = cfg.ls_activation_ingress_enable;
+        phase_cfg.activation_ingress.queue_depth = cfg.ls_activation_ingress_entries;
+
+        phase_cfg.weight_idx.name = "weight_idx_store";
+        phase_cfg.weight_idx.kind = LocalStorageObjectKind::AddressableStore;
+        phase_cfg.weight_idx.scope = LocalStorageScope::PerPe;
+        phase_cfg.weight_idx.enable = cfg.ls_weight_idx_enable;
+        phase_cfg.weight_idx.capacity_bytes = cfg.ls_weight_idx_capacity_bytes;
+        phase_cfg.weight_idx.banks = cfg.ls_weight_idx_banks;
+        phase_cfg.weight_idx.read_ports = cfg.ls_weight_idx_read_ports;
+        phase_cfg.weight_idx.write_ports = cfg.ls_weight_idx_write_ports;
+        phase_cfg.weight_idx.queue_depth = cfg.ls_weight_idx_queue_depth;
+
+        phase_cfg.weight_value.name = "weight_value_store";
+        phase_cfg.weight_value.kind = LocalStorageObjectKind::AddressableStore;
+        phase_cfg.weight_value.scope = LocalStorageScope::PerPe;
+        phase_cfg.weight_value.enable = cfg.ls_weight_value_enable;
+        phase_cfg.weight_value.capacity_bytes = cfg.ls_weight_value_capacity_bytes;
+        phase_cfg.weight_value.banks = cfg.ls_weight_value_banks;
+        phase_cfg.weight_value.read_ports = cfg.ls_weight_value_read_ports;
+        phase_cfg.weight_value.write_ports = cfg.ls_weight_value_write_ports;
+        phase_cfg.weight_value.queue_depth = cfg.ls_weight_value_queue_depth;
+
+        if (pod_scope_enable) {
+            phase_cfg.pod_metadata_template.name = "pod_metadata_store";
+            phase_cfg.pod_metadata_template.kind = LocalStorageObjectKind::AddressableStore;
+            phase_cfg.pod_metadata_template.scope = LocalStorageScope::PerPod;
+            phase_cfg.pod_metadata_template.enable = cfg.pe_internal_pod_metadata_enable;
+            phase_cfg.pod_metadata_template.capacity_bytes =
+                cfg.pe_internal_pod_metadata_capacity_bytes;
+            phase_cfg.pod_metadata_template.banks =
+                std::max<uint32_t>(cfg.pe_internal_pod_metadata_banks, 1u);
+
+            phase_cfg.pod_owner_template.name = "pod_owner_table";
+            phase_cfg.pod_owner_template.kind = LocalStorageObjectKind::AddressableStore;
+            phase_cfg.pod_owner_template.scope = LocalStorageScope::PerPod;
+            phase_cfg.pod_owner_template.enable = cfg.pe_internal_pod_owner_enable;
+            phase_cfg.pod_owner_template.capacity_bytes =
+                static_cast<uint64_t>(cfg.pe_internal_pod_owner_entries) *
+                static_cast<uint64_t>(std::max<uint32_t>(cfg.pe_internal_pod_owner_entry_bytes, 1u));
+
+            phase_cfg.pod_join_template.name = "pod_join_table";
+            phase_cfg.pod_join_template.kind = LocalStorageObjectKind::AddressableStore;
+            phase_cfg.pod_join_template.scope = LocalStorageScope::PerPod;
+            phase_cfg.pod_join_template.enable = cfg.pe_internal_pod_join_enable;
+            phase_cfg.pod_join_template.capacity_bytes =
+                static_cast<uint64_t>(cfg.pe_internal_pod_join_entries) *
+                static_cast<uint64_t>(std::max<uint32_t>(cfg.pe_internal_pod_join_entry_bytes, 1u));
+
+            phase_cfg.pod_ready_template.name = "pod_ready_table";
+            phase_cfg.pod_ready_template.kind = LocalStorageObjectKind::QueueStore;
+            phase_cfg.pod_ready_template.scope = LocalStorageScope::PerPod;
+            phase_cfg.pod_ready_template.enable = cfg.pe_internal_pod_ready_enable;
+            phase_cfg.pod_ready_template.queue_depth = cfg.pe_internal_pod_ready_entries;
+        }
+
+        phase_cfg.state_template.name = "state_store";
+        phase_cfg.state_template.kind = LocalStorageObjectKind::AddressableStore;
+        phase_cfg.state_template.scope = LocalStorageScope::PerCore;
+        phase_cfg.state_template.enable = cfg.ls_state_enable;
+        phase_cfg.state_template.capacity_bytes = cfg.ls_state_capacity_bytes;
+        phase_cfg.state_template.banks = cfg.ls_state_banks;
+        phase_cfg.state_template.read_ports = cfg.ls_state_read_ports;
+        phase_cfg.state_template.write_ports = cfg.ls_state_write_ports;
+        phase_cfg.state_template.update_ports = cfg.ls_state_update_ports;
+        phase_cfg.state_template.queue_depth = cfg.ls_state_queue_depth;
+
+        phase_cfg.activation_core_template.name = "activation_core_queue";
+        phase_cfg.activation_core_template.kind = LocalStorageObjectKind::QueueStore;
+        phase_cfg.activation_core_template.scope = LocalStorageScope::PerCore;
+        phase_cfg.activation_core_template.enable = cfg.ls_activation_core_enable;
+        phase_cfg.activation_core_template.queue_depth = cfg.ls_activation_core_entries;
+
+        phase_cfg.acc_template.name = "accumulator_store";
+        phase_cfg.acc_template.kind = LocalStorageObjectKind::AddressableStore;
+        phase_cfg.acc_template.scope = LocalStorageScope::PerCore;
+        phase_cfg.acc_template.enable = cfg.ls_acc_enable;
+        phase_cfg.acc_template.capacity_bytes = cfg.ls_acc_capacity_bytes;
+        phase_cfg.acc_template.banks = cfg.ls_acc_banks;
+        phase_cfg.acc_template.read_ports = cfg.ls_acc_read_ports;
+        phase_cfg.acc_template.write_ports = cfg.ls_acc_write_ports;
+        phase_cfg.acc_template.update_ports = cfg.ls_acc_update_ports;
+        phase_cfg.acc_template.queue_depth = cfg.ls_acc_queue_depth;
+
+        phase_cfg.rf_template.name = "register_file";
+        phase_cfg.rf_template.kind = LocalStorageObjectKind::RegisterFile;
+        phase_cfg.rf_template.scope = LocalStorageScope::PerCore;
+        phase_cfg.rf_template.enable = cfg.ls_rf_enable;
+        phase_cfg.rf_template.entries = cfg.ls_rf_entries;
+        phase_cfg.rf_template.entry_bytes = cfg.ls_rf_entry_bytes;
+        phase_cfg.rf_template.read_ports = cfg.ls_rf_read_ports;
+        phase_cfg.rf_template.write_ports = cfg.ls_rf_write_ports;
+
+        if (!registerDefaultPhaseAObjects(*local_storage_controller_, phase_cfg)) {
+            output_->fatal(CALL_INFO, -1,
+                           "LocalStorageHierarchyController registration failed at node=%d\n",
+                           node_id_);
+        }
+
+        if (pod_scope_enable && cfg.pe_internal_pod_metadata_enable) {
+            PodMetadataObjectPlane::Config pod_metadata_cfg{};
+            pod_metadata_cfg.enable = true;
+            pod_metadata_cfg.num_pods = static_cast<uint32_t>(pod_count);
+            if (cfg.pe_internal_pod_metadata_capacity_bytes > 0) {
+                const uint64_t raw_entries =
+                    cfg.pe_internal_pod_metadata_capacity_bytes /
+                    static_cast<uint64_t>(kPodMetadataShadowEntryBytes);
+                pod_metadata_cfg.capacity_entries_per_pod =
+                    static_cast<uint32_t>(std::max<uint64_t>(1u, raw_entries));
+            }
+            pod_metadata_object_plane_ =
+                std::make_unique<PodMetadataObjectPlane>(pod_metadata_cfg);
+        }
+        if (pod_scope_enable && cfg.pe_internal_pod_owner_enable) {
+            PodOwnerServiceTable::Config pod_owner_cfg{};
+            pod_owner_cfg.enable = true;
+            pod_owner_cfg.num_pods = static_cast<uint32_t>(pod_count);
+            pod_owner_cfg.owner_entries_per_pod = cfg.pe_internal_pod_owner_entries;
+            pod_owner_cfg.join_entries_per_pod = cfg.pe_internal_pod_join_entries;
+            pod_owner_service_table_ =
+                std::make_unique<PodOwnerServiceTable>(pod_owner_cfg);
+        }
+        if (pod_scope_enable &&
+            cfg.pe_internal_pod_metadata_enable &&
+            cfg.pe_internal_pod_owner_enable &&
+            (cfg.pe_internal_pod_join_enable || cfg.pe_internal_pod_ready_enable)) {
+            PeLocalServiceObjectTable::Config service_cfg{};
+            const bool pulse_osa_metadata_ready_lease_gate =
+                (cfg.pulse_osa_enable &&
+                 workloadAllowsPureSnnDatapathFeatures(cfg.workload_kind) &&
+                 cfg.pulse_osa_metadata_txn_enable &&
+                 cfg.pulse_osa_metadata_ready_lease_enable &&
+                 cfg.pulse_osa_metadata_ready_lease_ttl > 0u);
+            const uint32_t pulse_metadata_mask =
+                parsePulseMetadataObjectMask_(cfg.pulse_osa_metadata_object_mask);
+            const bool ready_lease_enable =
+                pulse_osa_metadata_ready_lease_gate &&
+                pulse_metadata_mask != 0u;
+            service_cfg.enable = true;
+            service_cfg.num_pods = static_cast<uint32_t>(pod_count);
+            service_cfg.active_entries_per_pod =
+                std::max(cfg.pe_internal_pod_owner_entries, cfg.pe_internal_pod_join_entries);
+            service_cfg.released_entries_per_pod =
+                std::max(cfg.pe_internal_pod_ready_entries, cfg.pe_internal_pod_join_entries);
+            service_cfg.ready_lease_enable = ready_lease_enable;
+            service_cfg.ready_lease_ttl =
+                ready_lease_enable ? cfg.pulse_osa_metadata_ready_lease_ttl : 0u;
+            service_cfg.ready_lease_kind_mask =
+                ready_lease_enable ? pulse_metadata_mask : 0u;
+            pe_local_service_object_table_ =
+                std::make_unique<PeLocalServiceObjectTable>(service_cfg);
+        }
+    }
+
+    pulse_osa_requested_ = cfg.pulse_osa_enable;
+    pulse_osa_shared_weight_owner_requested_ = cfg.pulse_osa_shared_weight_owner_enable;
+    pulse_osa_shared_weight_owner_actual_requested_ =
+        cfg.pulse_osa_shared_weight_owner_actual_enable;
+    pulse_osa_enable_ =
+        cfg.pulse_osa_enable && pure_snn_datapath_workload_eligible_;
+    pulse_osa_shared_weight_owner_enable_ =
+        pulse_osa_enable_ &&
+        cfg.pulse_osa_shared_weight_owner_enable &&
+        local_storage_enable_;
+    pulse_osa_shared_weight_owner_actual_enable_ =
+        pulse_osa_shared_weight_owner_enable_ &&
+        cfg.pulse_osa_shared_weight_owner_actual_enable;
+    if (pulse_osa_enable_ && pulse_osa_shared_weight_owner_enable_) {
+        PeWeightObjectPlane::Config osa_weight_cfg{};
+        osa_weight_cfg.enable = true;
+        osa_weight_cfg.owner_scope_enable = true;
+        osa_weight_cfg.actual_owner_enable = pulse_osa_shared_weight_owner_actual_enable_;
+        osa_weight_cfg.idx_enable = cfg.ls_weight_idx_enable;
+        osa_weight_cfg.l0_enable = cfg.ls_weight_value_enable;
+        osa_weight_cfg.idx_capacity_bytes = cfg.ls_weight_idx_capacity_bytes;
+        osa_weight_cfg.l0_capacity_bytes = cfg.ls_weight_value_capacity_bytes;
+        osa_weight_cfg.idx_banks = cfg.ls_weight_idx_banks;
+        osa_weight_cfg.l0_banks = cfg.ls_weight_value_banks;
+        osa_weight_cfg.ports_per_bank = std::max<uint32_t>(
+            1u,
+            std::max(
+                std::max(cfg.ls_weight_idx_read_ports, cfg.ls_weight_idx_write_ports),
+                std::max(cfg.ls_weight_value_read_ports, cfg.ls_weight_value_write_ports)));
+        pe_weight_object_plane_ = std::make_unique<PeWeightObjectPlane>(osa_weight_cfg);
+    }
+
+    pulse_enable_requested_ = cfg.pulse_enable;
+    pulse_descriptor_actual_requested_ = cfg.pulse_descriptor_actual_enable;
+    pulse_enable_ = cfg.pulse_enable && pure_snn_datapath_workload_eligible_;
+    if (cfg.pulse_enable && !pulse_enable_ && output_) {
+        output_->verbose(CALL_INFO, 1, 0,
+                         "[pulse] ignore pulse_enable for non-SNN workload_impl=%s node=%d\n",
+                         cfg.workload_impl.c_str(),
+                         node_id_);
+    }
+    if (pulse_enable_) {
+        PeSharedCoreFabric::Config pulse_cfg{};
+        pulse_cfg.enable = true;
+        pulse_cfg.observe_only = cfg.pulse_observe_only;
+        pulse_cfg.ingress_enable = cfg.pulse_ingress_enable;
+        pulse_cfg.agenda_observe_only = cfg.pulse_agenda_observe_only;
+        pulse_cfg.harbor_enable = cfg.pulse_harbor_enable;
+        pulse_cfg.descriptor_enable = cfg.pulse_descriptor_enable;
+        pulse_cfg.descriptor_actual_enable = cfg.pulse_descriptor_actual_enable;
+        pulse_cfg.num_cores = static_cast<size_t>(std::max(1, num_cores_));
+        pulse_cfg.ingress_entries = cfg.pulse_ingress_entries;
+        pulse_cfg.core_queue_entries = cfg.pulse_core_queue_entries;
+        pulse_cfg.descriptor_packet_min = cfg.pulse_descriptor_packet_min;
+        pulse_cfg.bypass_high_watermark_pct = cfg.pulse_bypass_high_watermark_pct;
+        pulse_cfg.bypass_mode =
+            (cfg.pulse_bypass_mode == "high_watermark")
+                ? PeSharedCoreFabric::BypassMode::HighWatermark
+                : PeSharedCoreFabric::BypassMode::Disabled;
+        if (!pulse_cfg.observe_only &&
+            (!pulse_cfg.ingress_enable || pulse_cfg.ingress_entries == 0) &&
+            output_) {
+            output_->verbose(CALL_INFO, 1, 0,
+                             "[pulse] disable actual ingress path without ingress store (node=%d ingress_enable=%d ingress_entries=%u)\n",
+                             node_id_,
+                             pulse_cfg.ingress_enable ? 1 : 0,
+                             pulse_cfg.ingress_entries);
+            pulse_cfg.observe_only = true;
+        }
+        if (!pulse_cfg.agenda_observe_only && output_) {
+            output_->verbose(CALL_INFO, 1, 0,
+                             "[pulse] current rollout keeps agenda observe-only semantics at node=%d\n",
+                             node_id_);
+            pulse_cfg.agenda_observe_only = true;
+        }
+        if (pulse_cfg.descriptor_actual_enable && output_) {
+            output_->verbose(CALL_INFO, 1, 0,
+                             "[pulse] fabric-side descriptor actual service remains disabled at node=%d; core-side WMS actual path may still be enabled\n",
+                             node_id_);
+            pulse_cfg.descriptor_actual_enable = false;
+        }
+        pulse_fabric_ = std::make_unique<PeSharedCoreFabric>(pulse_cfg);
     }
 
     // Global Step/GAS barrier sync (Phase-step-sync)
@@ -320,24 +755,10 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
         loader_done_shared_ = std::make_unique<SST::Shared::SharedArray<int>>();
         loader_done_shared_->initialize(loader_done_key_, 1, 0);
     }
-    tass_lf_p0_enable_ = params.find<int>("experimental_tass_lf_p0_enable", 0) != 0;
-    naive_tass_enable_ = params.find<int>("experimental_naive_tass_enable", 0) != 0;
-    tass_lf_p0_mesh_rows_ = std::max<uint32_t>(1u, params.find<uint32_t>("tass_lf_p0_mesh_rows", 1));
-    tass_lf_p0_mesh_cols_ = std::max<uint32_t>(1u, params.find<uint32_t>("tass_lf_p0_mesh_cols", 1));
-    tass_lf_p0_block_h_ = std::max<uint32_t>(1u, params.find<uint32_t>("tass_lf_p0_block_h", 2));
-    tass_lf_p0_block_w_ = std::max<uint32_t>(1u, params.find<uint32_t>("tass_lf_p0_block_w", 2));
-    output_->verbose(CALL_INFO, 1, 0,
-                     "[tass-debug] node=%d naive_tass_enable=%d tass_lf_p0_enable=%d mesh=%ux%u block=%ux%u\n",
-                     node_id_,
-                     naive_tass_enable_ ? 1 : 0,
-                     tass_lf_p0_enable_ ? 1 : 0,
-                     tass_lf_p0_mesh_rows_,
-                     tass_lf_p0_mesh_cols_,
-                     tass_lf_p0_block_h_,
-                     tass_lf_p0_block_w_);
 
     // Step-level random activation injection (Phase3-B): 下沉为独立子系统（MultiCorePE 仅转发 tick/阶段事件）
     {
+        const bool step_seed_only_mode = params.find<int>("step_seed_only_mode", 0) != 0;
         StepActivationSubsystem::Config step_cfg;
         step_cfg.enable = cfg.step_activation_enable;
         step_cfg.fraction = cfg.step_activation_fraction;
@@ -345,7 +766,7 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
         step_cfg.seed = cfg.step_activation_seed;
         step_cfg.period_cycles = cfg.step_activation_period_cycles;
         step_cfg.trigger_core = cfg.step_activation_trigger_core;
-        step_cfg.reset_mem_each_step = cfg.step_reset_mem_each_step;
+        step_cfg.reset_mem_each_step = cfg.step_reset_mem_each_step || step_seed_only_mode;
         step_cfg.event_weight = cfg.step_activation_event_weight;
         {
             const std::string& pat = cfg.step_activation_pre_pattern;
@@ -375,9 +796,9 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
         step_cfg.build_local_only = cfg.step_activation_build_local_only;
         step_cfg.bcsr_align = cfg.step_activation_bcsr_align;
 
-        // 通用 workload（例如 stream）下必须禁用 Step/Synapse 语义注入，否则会污染纯通信/纯内存负载。
-        // 选择来源：优先 Params.workload_impl，其次环境变量 SNNDL_WORKLOAD_IMPL（保持脚本不改的兼容路径）。
-        if (isNonSnnWorkloadKind(cfg.workload_kind)) {
+        // 仅对真正的非 SNN datapath workload 禁用 step stimulus；`riscv_snn` 的 runtime_bridge
+        // 仍需要 seed 注入来驱动 shadow SNN 数据面，否则 transport surface 会被静默饿死。
+        if (!workloadAllowsSnnStimulus(cfg.workload_kind)) {
             step_cfg.enable = false;
             step_cfg.fraction = 0.0;
             step_cfg.fanout = 0;
@@ -402,6 +823,16 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
         step_rt.step_diag_enable_cfg = step_diag_enable_cfg_;
         step_rt.noc = &noc_subsys_;
         step_rt.reset_membranes = [this]() { resetAllCoreMembranes(); };
+        step_rt.report_injection_summary = [this](uint32_t seq,
+                                                 uint64_t pre_selected,
+                                                 uint64_t spike_attempts,
+                                                 uint64_t spikes_injected,
+                                                 uint64_t route_hits,
+                                                 uint64_t route_misses,
+                                                 uint64_t local_drops) {
+            recordStepActivationSummary(seq, pre_selected, spike_attempts, spikes_injected,
+                                        route_hits, route_misses, local_drops);
+        };
 
         step_activation_subsys_.bindRuntime(step_rt);
         step_activation_subsys_.initBcsrReachabilityIfEnabled();
@@ -414,6 +845,7 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
         ex_rt.node_id = node_id_;
         ex_rt.layout = &global_layout_;
         ex_rt.noc = &noc_subsys_;
+        ex_rt.enabled = workloadAllowsSnnStimulus(cfg.workload_kind);
         ex_rt.global_neuron_base = global_neuron_base_;
         ex_rt.num_cores = num_cores_;
         ex_rt.neurons_per_core = neurons_per_core_;
@@ -471,7 +903,6 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
     
     // 初始化组件指针为空
     l2_cache_ = nullptr;
-    memory_interface_ = nullptr;
     external_nic_ = nullptr;
     optimized_ring_ = nullptr;
     controller_ = nullptr;
@@ -522,17 +953,6 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
         };
         noc_subsys_.bindRuntime(noc_rt);
     }
-    if (naive_tass_enable_) {
-        memory_interface_ = loadUserSubComponent<SST::Interfaces::StandardMem>(
-            "memory_interface", ComponentInfo::SHARE_NONE,
-            registerTimeBase("1ns"),
-            new SST::Interfaces::StandardMem::Handler2<MultiCorePE, &MultiCorePE::handleTassNaiveMemoryResponse_>(this));
-        if (!memory_interface_) {
-            output_->fatal(CALL_INFO, -1,
-                           "MultiCorePE fatal: experimental_naive_tass_enable=1 but memory_interface subcomponent is missing on node=%d\n",
-                           node_id_);
-        }
-    }
     // 记录路径（若提供），用于派生输出目录
     stage_events_csv_path_ = cfg.stage_events_csv_path;
     stats_csv_path_ = cfg.stats_csv_path;
@@ -543,6 +963,7 @@ MultiCorePE::MultiCorePE(ComponentId_t id, Params& params) : Component(id) {
 
 MultiCorePE::~MultiCorePE() {
     clearAllDeferredPackets_();
+    clearAllPulseIngressPackets_();
 
     // 清理SnnPE SubComponent核心（SST会自动管理SubComponent的生命周期）
     cores_.clear();
@@ -590,24 +1011,6 @@ void MultiCorePE::init(unsigned int phase) {
         loader_done_link_ = configureLink(
             "loader_done",
             new Event::Handler2<MultiCorePE, &MultiCorePE::handleLoaderDoneEvent>(this));
-        tass_p0_out_link_ = configureLink("tass_p0_out");
-        tass_p0_in_links_.clear();
-        tass_p0_in_links_.reserve(static_cast<size_t>(std::max(0, total_nodes_)));
-        tass_p0_rsp_out_links_.clear();
-        tass_p0_rsp_out_links_.reserve(static_cast<size_t>(std::max(0, total_nodes_)));
-        for (int src = 0; src < total_nodes_; ++src) {
-            std::ostringstream port;
-            port << "tass_p0_in" << src;
-            SST::Link* link = configureLink(
-                port.str(),
-                new Event::Handler2<MultiCorePE, &MultiCorePE::handleTassLfP0ReportEvent>(this));
-            tass_p0_in_links_.push_back(link);
-        }
-        for (int dst = 0; dst < total_nodes_; ++dst) {
-            std::ostringstream port;
-            port << "tass_p0_rsp_out" << dst;
-            tass_p0_rsp_out_links_.push_back(configureLink(port.str()));
-        }
         if (loader_done_link_) {
             SST::Event* ev = loader_done_link_->recvUntimedData();
             while (ev) {
@@ -672,9 +1075,6 @@ void MultiCorePE::init(unsigned int phase) {
         if (external_nic_) {
             external_nic_->init(phase);
         }
-        if (memory_interface_) {
-            memory_interface_->init(phase);
-        }
         if (sentinel_enabled_ && output_) { output_->verbose(CALL_INFO, 2, 0, "[[sentinel-pe-init]] node=%d phase=0 nic-init-done\n", node_id_); }
         // 标记 Step 注入就绪（保证 NIC 已完成 init）
         step_activation_subsys_.setInjectionReady(true);
@@ -695,9 +1095,6 @@ void MultiCorePE::init(unsigned int phase) {
         if (external_nic_) {
             external_nic_->init(phase);
         }
-        if (memory_interface_) {
-            memory_interface_->init(phase);
-        }
         if (sentinel_enabled_ && output_) { output_->verbose(CALL_INFO, 2, 0, "[[sentinel-pe-init]] node=%d phase=1 nic-init-done\n", node_id_); }
     }
     else {
@@ -710,9 +1107,6 @@ void MultiCorePE::init(unsigned int phase) {
         // 转发init到网络接口
         if (external_nic_) {
             external_nic_->init(phase);
-        }
-        if (memory_interface_) {
-            memory_interface_->init(phase);
         }
         if (sentinel_enabled_ && output_) { output_->verbose(CALL_INFO, 2, 0, "[[sentinel-pe-init]] node=%d phase=%u done\n", node_id_, phase); }
     }
@@ -727,9 +1121,6 @@ void MultiCorePE::complete(unsigned int phase) {
     }
     if (external_nic_) {
         external_nic_->complete(phase);
-    }
-    if (memory_interface_) {
-        memory_interface_->complete(phase);
     }
 }
 
@@ -766,9 +1157,6 @@ void MultiCorePE::setup() {
     if (external_nic_) {
         external_nic_->setup();
     }
-    if (memory_interface_) {
-        memory_interface_->setup();
-    }
     if (sentinel_enabled_ && output_) { output_->verbose(CALL_INFO, 2, 0, "[[sentinel-pe-setup]] node=%d nic-setup\n", node_id_); }
     
     if (!controller_) {
@@ -792,8 +1180,185 @@ void MultiCorePE::setup() {
 }
 
 void MultiCorePE::finish() {
+    if (pulse_fabric_) {
+        pulse_fabric_->finalizeGatherHarbor();
+    }
     // 更新最终统计信息
     updateStatistics();
+    if (pe_local_service_object_table_) {
+        const auto service_stats = pe_local_service_object_table_->snapshotStats();
+        if (stat_atlas_service_enabled_) {
+            stat_atlas_service_enabled_->addData(service_stats.enabled ? 1u : 0u);
+        }
+        if (stat_atlas_service_owner_form_total_) {
+            stat_atlas_service_owner_form_total_->addData(service_stats.owner_form_total);
+        }
+        if (stat_atlas_service_join_live_total_) {
+            stat_atlas_service_join_live_total_->addData(service_stats.join_live_total);
+        }
+        if (stat_atlas_service_join_ready_total_) {
+            stat_atlas_service_join_ready_total_->addData(service_stats.join_ready_total);
+        }
+        if (stat_atlas_service_late_join_total_) {
+            stat_atlas_service_late_join_total_->addData(service_stats.late_join_total);
+        }
+        if (stat_atlas_service_duplicate_join_total_) {
+            stat_atlas_service_duplicate_join_total_->addData(service_stats.duplicate_join_total);
+        }
+        if (stat_atlas_service_ready_transition_total_) {
+            stat_atlas_service_ready_transition_total_->addData(
+                service_stats.ready_transition_total);
+        }
+        if (stat_atlas_service_ready_fanout_total_) {
+            stat_atlas_service_ready_fanout_total_->addData(service_stats.ready_fanout_total);
+        }
+        if (stat_atlas_service_ready_fanout_consumers_sum_) {
+            stat_atlas_service_ready_fanout_consumers_sum_->addData(
+                service_stats.ready_fanout_consumers_sum);
+        }
+        if (stat_atlas_service_ready_fanout_consumers_peak_) {
+            stat_atlas_service_ready_fanout_consumers_peak_->addData(
+                service_stats.ready_fanout_consumers_peak);
+        }
+        if (stat_atlas_service_released_total_) {
+            stat_atlas_service_released_total_->addData(service_stats.released_total);
+        }
+        if (stat_atlas_service_release_deferred_total_) {
+            stat_atlas_service_release_deferred_total_->addData(
+                service_stats.release_deferred_total);
+        }
+        if (stat_atlas_service_ready_release_total_) {
+            stat_atlas_service_ready_release_total_->addData(
+                service_stats.ready_release_total);
+        }
+        if (stat_atlas_service_ready_lease_hit_total_) {
+            stat_atlas_service_ready_lease_hit_total_->addData(
+                service_stats.ready_lease_hit_total);
+        }
+        if (stat_atlas_service_ready_lease_expired_total_) {
+            stat_atlas_service_ready_lease_expired_total_->addData(
+                service_stats.ready_lease_expired_total);
+        }
+        if (stat_atlas_service_potential_private_service_elide_total_) {
+            stat_atlas_service_potential_private_service_elide_total_->addData(
+                service_stats.potential_private_service_elide_total);
+        }
+        if (stat_atlas_service_active_entries_total_) {
+            stat_atlas_service_active_entries_total_->addData(service_stats.active_entries_total);
+        }
+        if (stat_atlas_service_release_pending_active_total_) {
+            stat_atlas_service_release_pending_active_total_->addData(
+                service_stats.release_pending_active_total);
+        }
+        if (stat_atlas_service_atlas_obj_materialize_total_) {
+            stat_atlas_service_atlas_obj_materialize_total_->addData(
+                service_stats.atlas_obj_materialize_total);
+        }
+        if (stat_atlas_service_atlas_obj_publicize_total_) {
+            stat_atlas_service_atlas_obj_publicize_total_->addData(
+                service_stats.atlas_obj_publicize_total);
+        }
+        if (stat_atlas_service_atlas_obj_owner_form_total_) {
+            stat_atlas_service_atlas_obj_owner_form_total_->addData(
+                service_stats.atlas_obj_owner_form_total);
+        }
+        if (stat_atlas_service_atlas_obj_ready_total_) {
+            stat_atlas_service_atlas_obj_ready_total_->addData(
+                service_stats.atlas_obj_ready_total);
+        }
+        if (stat_atlas_service_atlas_obj_release_total_) {
+            stat_atlas_service_atlas_obj_release_total_->addData(
+                service_stats.atlas_obj_release_total);
+        }
+        if (stat_atlas_service_atlas_obj_private_only_total_) {
+            stat_atlas_service_atlas_obj_private_only_total_->addData(
+                service_stats.atlas_obj_private_only_total);
+        }
+    } else {
+        if (stat_atlas_service_enabled_) stat_atlas_service_enabled_->addData(0u);
+        if (stat_atlas_service_owner_form_total_) stat_atlas_service_owner_form_total_->addData(0u);
+        if (stat_atlas_service_join_live_total_) stat_atlas_service_join_live_total_->addData(0u);
+        if (stat_atlas_service_join_ready_total_) stat_atlas_service_join_ready_total_->addData(0u);
+        if (stat_atlas_service_late_join_total_) stat_atlas_service_late_join_total_->addData(0u);
+        if (stat_atlas_service_duplicate_join_total_) {
+            stat_atlas_service_duplicate_join_total_->addData(0u);
+        }
+        if (stat_atlas_service_ready_transition_total_) {
+            stat_atlas_service_ready_transition_total_->addData(0u);
+        }
+        if (stat_atlas_service_ready_fanout_total_) stat_atlas_service_ready_fanout_total_->addData(0u);
+        if (stat_atlas_service_ready_fanout_consumers_sum_) {
+            stat_atlas_service_ready_fanout_consumers_sum_->addData(0u);
+        }
+        if (stat_atlas_service_ready_fanout_consumers_peak_) {
+            stat_atlas_service_ready_fanout_consumers_peak_->addData(0u);
+        }
+        if (stat_atlas_service_released_total_) stat_atlas_service_released_total_->addData(0u);
+        if (stat_atlas_service_release_deferred_total_) {
+            stat_atlas_service_release_deferred_total_->addData(0u);
+        }
+        if (stat_atlas_service_ready_release_total_) {
+            stat_atlas_service_ready_release_total_->addData(0u);
+        }
+        if (stat_atlas_service_ready_lease_hit_total_) {
+            stat_atlas_service_ready_lease_hit_total_->addData(0u);
+        }
+        if (stat_atlas_service_ready_lease_expired_total_) {
+            stat_atlas_service_ready_lease_expired_total_->addData(0u);
+        }
+        if (stat_atlas_service_potential_private_service_elide_total_) {
+            stat_atlas_service_potential_private_service_elide_total_->addData(0u);
+        }
+        if (stat_atlas_service_active_entries_total_) {
+            stat_atlas_service_active_entries_total_->addData(0u);
+        }
+        if (stat_atlas_service_release_pending_active_total_) {
+            stat_atlas_service_release_pending_active_total_->addData(0u);
+        }
+        if (stat_atlas_service_atlas_obj_materialize_total_) {
+            stat_atlas_service_atlas_obj_materialize_total_->addData(0u);
+        }
+        if (stat_atlas_service_atlas_obj_publicize_total_) {
+            stat_atlas_service_atlas_obj_publicize_total_->addData(0u);
+        }
+        if (stat_atlas_service_atlas_obj_owner_form_total_) {
+            stat_atlas_service_atlas_obj_owner_form_total_->addData(0u);
+        }
+        if (stat_atlas_service_atlas_obj_ready_total_) {
+            stat_atlas_service_atlas_obj_ready_total_->addData(0u);
+        }
+        if (stat_atlas_service_atlas_obj_release_total_) {
+            stat_atlas_service_atlas_obj_release_total_->addData(0u);
+        }
+        if (stat_atlas_service_atlas_obj_private_only_total_) {
+            stat_atlas_service_atlas_obj_private_only_total_->addData(0u);
+        }
+    }
+    {
+        std::map<std::string, uint64_t> object_plane_stats;
+        if (pod_metadata_object_plane_) {
+            pod_metadata_object_plane_->exportStatsToMap(
+                object_plane_stats,
+                "atlas_pod_metadata_");
+        } else {
+            PodMetadataObjectPlane disabled_plane;
+            disabled_plane.exportStatsToMap(object_plane_stats, "atlas_pod_metadata_");
+        }
+        if (pod_owner_service_table_) {
+            pod_owner_service_table_->exportStatsToMap(
+                object_plane_stats,
+                "atlas_pod_owner_");
+        } else {
+            PodOwnerServiceTable disabled_table;
+            disabled_table.exportStatsToMap(object_plane_stats, "atlas_pod_owner_");
+        }
+        for (const auto& kv : object_plane_stats) {
+            auto it = atlas_object_plane_stats_.find(kv.first);
+            if (it == atlas_object_plane_stats_.end()) continue;
+            if (!it->second) continue;
+            it->second->addData(kv.second);
+        }
+    }
     // 报告总仿真周期（单实例）
     if (stat_sim_cycles_total_) stat_sim_cycles_total_->addData(current_cycle_);
 
@@ -904,6 +1469,474 @@ void MultiCorePE::finish() {
             fout2.close();
         }
     }
+    if (!core_stage_marks_.empty()) {
+        std::string dir = resolve_out_dir();
+        std::string pathCoreStage = dir + "/core_stage_events_db.csv";
+        std::ofstream fout(pathCoreStage);
+        if (fout.good()) {
+            fout << "core,seq,bg_ns,ga_ns,ea_ns,bs_ns,es_ns,gather_ns,apply_ns,scatter_ns,total_ns\n";
+            std::vector<CoreStepKey> keys;
+            keys.reserve(core_stage_marks_.size());
+            for (const auto& kv : core_stage_marks_) keys.push_back(kv.first);
+            std::sort(keys.begin(), keys.end(),
+                      [](const CoreStepKey& a, const CoreStepKey& b) {
+                          if (a.core != b.core) return a.core < b.core;
+                          return a.seq < b.seq;
+                      });
+            for (const auto& key : keys) {
+                const auto& m = core_stage_marks_[key];
+                uint64_t g = 0;
+                uint64_t a = 0;
+                uint64_t s = 0;
+                uint64_t t = 0;
+                if (m.bg && m.ga && m.ga >= m.bg) g = m.ga - m.bg;
+                if (m.ga && m.bs && m.bs >= m.ga) a = m.bs - m.ga;
+                if (m.bs && m.es && m.es >= m.bs) s = m.es - m.bs;
+                if (m.bg && m.es && m.es >= m.bg) t = m.es - m.bg;
+                fout << key.core << "," << key.seq << "," << m.bg << "," << m.ga << "," << m.ea << "," << m.bs << "," << m.es
+                     << "," << g << "," << a << "," << s << "," << t << "\n";
+            }
+            fout.close();
+        }
+    }
+    if (!step_perf_.empty()) {
+        std::string dir = resolve_out_dir();
+        std::string pathC = dir + "/pe_step_perf_db.csv";
+        std::ofstream fout3(pathC);
+        if (fout3.good()) {
+            fout3 << "seq,seed_pre_selected,seed_spike_attempts,seed_spikes_injected,seed_route_hits,seed_route_misses,seed_local_drops,"
+                  << "rx_packets_total,rx_spike_packets_total,rx_spikekey_packets_total,rx_spiketilekey_packets_total,rx_local_packets_total,rx_remote_packets_total,"
+                  << "rx_packets_before_bg_total,rx_local_packets_before_bg_total,rx_remote_packets_before_bg_total,"
+                  << "rx_packets_during_gather_total,rx_packets_during_apply_total,rx_packets_during_scatter_total,rx_gate_pending_peak,"
+                  << "rx_gate_accept_total,rx_gate_reject_refractory_total,rx_gate_direct_accept_total,rx_gate_direct_reject_refractory_total,"
+                  << "rx_gate_fastpath_accept_total,rx_gate_fastpath_reject_refractory_total,"
+                  << "acc_updates,posts_touched,spill_records,spilled_bytes,hwm_bytes_max,scatter_spikes_emitted,"
+                  << "unique_reads,unique_bytes,rowwin_triggers,rowwin_bytes,bursts,payload_bytes,window_inflight_peak,window_buffer_max_bytes,gap_absorbed_bytes,"
+                  << "frontend_staged_reads,frontend_staged_line_touches,frontend_granules_built,unique_line_count,covered_line_count,overfetch_bytes,apply_bank_credit_effective,cmd_cost_veto,cmd_cost_veto_fine_gap,cmd_cost_veto_row_window,"
+                  << "apply_issue_attempt_total,apply_issue_success_total,apply_issue_block_no_ready_total,apply_issue_block_inflight_cap_total,"
+                  << "apply_issue_block_bank_credit_total,apply_issue_block_downstream_busy_total,"
+                  << "apply_issue_block_retire_guard_total,apply_ready_queue_peak,apply_ready_queue_nonempty_cycles_total,"
+                  << "apply_first_issue_delay_ns,apply_first_down_resp_delay_ns,apply_first_granule_done_delay_ns,apply_first_up_resp_delay_ns,"
+                  << "apply_down_resp_total,apply_completed_granules_total,apply_emitted_subreads_total,"
+                  << "apply_backlog_granules_residual,apply_backlog_pending_up_reads_residual,apply_backlog_inflight_residual,"
+                  << "apply_backlog_granules_peak_after_due,apply_backlog_pending_up_reads_peak_after_due,apply_backlog_inflight_peak_after_due,"
+                  << "retire_global_hol_cycles_total,retire_ready_but_blocked_edges_total,retire_per_post_progress_total,"
+                  << "retire_wait_cycles_total,retire_wait_cycles_due_to_hol_total,retire_wait_cycles_due_to_barrier_total,"
+                  << "retire_samepost_blocked_edges_total,retire_crosspost_blocked_edges_total,"
+                  << "retire_policy_loss_cycles_total,retire_policy_loss_edges_total,"
+                  << "retire_shadow_per_post_recoverable_cycles_total,retire_shadow_per_post_recoverable_edges_total,"
+                  << "retire_shadow_per_post_ready_posts_peak,retire_shadow_per_post_committable_edges_peak,"
+                  << "retire_head_hol_cycles_dense_total,retire_head_hol_cycles_cache_total,retire_head_hol_cycles_miss_total,"
+                  << "retire_head_hol_cycles_bcsr_total,retire_head_hol_cycles_bcsr_file_total,retire_head_hol_cycles_gcss_total,"
+                  << "retire_head_blocked_edges_dense_total,retire_head_blocked_edges_cache_total,retire_head_blocked_edges_miss_total,"
+                  << "retire_head_blocked_edges_bcsr_total,retire_head_blocked_edges_bcsr_file_total,retire_head_blocked_edges_gcss_total,"
+                  << "retire_gcss_head_queued_not_issued_cycles_total,retire_gcss_qni_head_wait_episodes_total,retire_gcss_qni_head_wait_cycles_max,retire_gcss_head_queued_not_issued_blocked_edges_total,"
+                  << "retire_gcss_head_issued_wait_resp_cycles_total,retire_gcss_head_issued_wait_resp_blocked_edges_total,"
+                  << "retire_gcss_resp_ready_but_hol_cycles_total,retire_gcss_resp_ready_but_hol_blocked_edges_total,"
+                  << "retire_gcss_qni_loader_not_ready_cycles_total,retire_gcss_qni_loader_not_ready_blocked_edges_total,"
+                  << "retire_gcss_qni_weight_sram_stall_cycles_total,retire_gcss_qni_weight_sram_stall_blocked_edges_total,"
+                  << "retire_gcss_qni_vlf_younger_ahead_cycles_total,retire_gcss_qni_vlf_younger_ahead_blocked_edges_total,"
+                  << "retire_gcss_qni_vlf_younger_ahead_depth_total,retire_gcss_qni_vlf_younger_ahead_depth_samples_total,retire_gcss_qni_vlf_younger_ahead_depth_max,"
+                  << "retire_gcss_qni_issue_deferred_total,"
+                  << "retire_gcss_qni_pending_direct_queue_residency_cycles_total,retire_gcss_qni_pending_direct_queue_residency_samples_total,retire_gcss_qni_pending_direct_queue_residency_cycles_max,"
+                  << "retire_gcss_qni_vlf_front_inflight_full_cycles_total,retire_gcss_qni_vlf_front_inflight_full_blocked_edges_total,"
+                  << "retire_gcss_qni_vlf_front_waiting_issue_cycles_total,retire_gcss_qni_vlf_front_waiting_issue_blocked_edges_total,"
+                  << "retire_gcss_qni_pending_younger_ahead_cycles_total,retire_gcss_qni_pending_younger_ahead_blocked_edges_total,"
+                  << "retire_gcss_qni_pending_front_inflight_full_cycles_total,retire_gcss_qni_pending_front_inflight_full_blocked_edges_total,"
+                  << "retire_gcss_qni_pending_front_waiting_tick_cycles_total,retire_gcss_qni_pending_front_waiting_tick_blocked_edges_total,"
+                  << "retire_gcss_qni_unknown_cycles_total,retire_gcss_qni_unknown_blocked_edges_total,"
+                  << "retire_begin_apply_windows_total,retire_begin_apply_prev_edges_total,"
+                  << "retire_begin_apply_outstanding_carryin_total,retire_begin_apply_outstanding_carryin_windows_total,"
+                  << "retire_begin_apply_loader_not_ready_windows_total,"
+                  << "retire_edge_retire_registered_total,retire_edge_retire_retired_total,"
+                  << "retire_end_scatter_gcss_vlf_issue_queue_residual_total,retire_end_scatter_pending_direct_reads_residual_total,"
+                  << "retire_end_scatter_outstanding_residual_total,retire_end_scatter_residual_work_windows_total,"
+                  << "retire_gcss_vlf_issue_prepare_total,retire_gcss_vlf_issue_edges_total,"
+                  << "retire_gcss_vlf_issue_reorder_trigger_total,retire_gcss_vlf_issue_line_groups_total,"
+                  << "retire_wait_cycles_due_to_not_ready_total,retire_ready_queue_peak,retire_unblock_events_total,step_barrier_wait_ns\n";
+            std::vector<uint32_t> keys; keys.reserve(step_perf_.size());
+            for (auto &kv : step_perf_) keys.push_back(kv.first);
+            std::sort(keys.begin(), keys.end());
+            for (auto seq : keys) {
+                const auto& p = step_perf_[seq];
+                fout3 << seq
+                      << "," << p.seed_pre_selected
+                      << "," << p.seed_spike_attempts
+                      << "," << p.seed_spikes_injected
+                      << "," << p.seed_route_hits
+                      << "," << p.seed_route_misses
+                      << "," << p.seed_local_drops
+                      << "," << p.rx_packets_total
+                      << "," << p.rx_spike_packets_total
+                      << "," << p.rx_spikekey_packets_total
+                      << "," << p.rx_spiketilekey_packets_total
+                      << "," << p.rx_local_packets_total
+                      << "," << p.rx_remote_packets_total
+                      << "," << p.rx_packets_before_bg_total
+                      << "," << p.rx_local_packets_before_bg_total
+                      << "," << p.rx_remote_packets_before_bg_total
+                      << "," << p.rx_packets_during_gather_total
+                      << "," << p.rx_packets_during_apply_total
+                      << "," << p.rx_packets_during_scatter_total
+                      << "," << p.rx_gate_pending_peak
+                      << "," << p.rx_gate_accept_total
+                      << "," << p.rx_gate_reject_refractory_total
+                      << "," << p.rx_gate_direct_accept_total
+                      << "," << p.rx_gate_direct_reject_refractory_total
+                      << "," << p.rx_gate_fastpath_accept_total
+                      << "," << p.rx_gate_fastpath_reject_refractory_total
+                      << "," << p.acc_updates
+                      << "," << p.posts_touched
+                      << "," << p.spill_records
+                      << "," << p.spilled_bytes
+                      << "," << p.hwm_bytes_max
+                      << "," << p.scatter_spikes_emitted
+                      << "," << p.unique_reads
+                      << "," << p.unique_bytes
+                      << "," << p.rowwin_triggers
+                      << "," << p.rowwin_bytes
+                      << "," << p.bursts
+                      << "," << p.payload_bytes
+                      << "," << p.window_inflight_peak
+                      << "," << p.window_buffer_max_bytes
+                      << "," << p.gap_absorbed_bytes
+                      << "," << p.frontend_staged_reads
+                      << "," << p.frontend_staged_line_touches
+                      << "," << p.frontend_granules_built
+                      << "," << p.unique_line_count
+                      << "," << p.covered_line_count
+                      << "," << p.overfetch_bytes
+                      << "," << p.apply_bank_credit_effective
+                      << "," << p.cmd_cost_veto
+                      << "," << p.cmd_cost_veto_fine_gap
+                      << "," << p.cmd_cost_veto_row_window
+                      << "," << p.apply_issue_attempt_total
+                      << "," << p.apply_issue_success_total
+                      << "," << p.apply_issue_block_no_ready_total
+                      << "," << p.apply_issue_block_inflight_cap_total
+                      << "," << p.apply_issue_block_bank_credit_total
+                      << "," << p.apply_issue_block_downstream_busy_total
+                      << "," << p.apply_issue_block_retire_guard_total
+                      << "," << p.apply_ready_queue_peak
+                      << "," << p.apply_ready_queue_nonempty_cycles_total
+                      << "," << p.apply_first_issue_delay_ns
+                      << "," << p.apply_first_down_resp_delay_ns
+                      << "," << p.apply_first_granule_done_delay_ns
+                      << "," << p.apply_first_up_resp_delay_ns
+                      << "," << p.apply_down_resp_total
+                      << "," << p.apply_completed_granules_total
+                      << "," << p.apply_emitted_subreads_total
+                      << "," << p.apply_backlog_granules_residual
+                      << "," << p.apply_backlog_pending_up_reads_residual
+                      << "," << p.apply_backlog_inflight_residual
+                      << "," << p.apply_backlog_granules_peak_after_due
+                      << "," << p.apply_backlog_pending_up_reads_peak_after_due
+                      << "," << p.apply_backlog_inflight_peak_after_due
+                      << "," << p.retire_global_hol_cycles_total
+                      << "," << p.retire_ready_but_blocked_edges_total
+                      << "," << p.retire_per_post_progress_total
+                      << "," << p.retire_wait_cycles_total
+                      << "," << p.retire_wait_cycles_due_to_hol_total
+                      << "," << p.retire_wait_cycles_due_to_barrier_total
+                      << "," << p.retire_samepost_blocked_edges_total
+                      << "," << p.retire_crosspost_blocked_edges_total
+                      << "," << p.retire_policy_loss_cycles_total
+                      << "," << p.retire_policy_loss_edges_total
+                      << "," << p.retire_shadow_per_post_recoverable_cycles_total
+                      << "," << p.retire_shadow_per_post_recoverable_edges_total
+                      << "," << p.retire_shadow_per_post_ready_posts_peak
+                      << "," << p.retire_shadow_per_post_committable_edges_peak
+                      << "," << p.retire_head_hol_cycles_dense_total
+                      << "," << p.retire_head_hol_cycles_cache_total
+                      << "," << p.retire_head_hol_cycles_miss_total
+                      << "," << p.retire_head_hol_cycles_bcsr_total
+                      << "," << p.retire_head_hol_cycles_bcsr_file_total
+                      << "," << p.retire_head_hol_cycles_gcss_total
+                      << "," << p.retire_head_blocked_edges_dense_total
+                      << "," << p.retire_head_blocked_edges_cache_total
+                      << "," << p.retire_head_blocked_edges_miss_total
+                      << "," << p.retire_head_blocked_edges_bcsr_total
+                      << "," << p.retire_head_blocked_edges_bcsr_file_total
+                      << "," << p.retire_head_blocked_edges_gcss_total
+                      << "," << p.retire_gcss_head_queued_not_issued_cycles_total
+                      << "," << p.retire_gcss_qni_head_wait_episodes_total
+                      << "," << p.retire_gcss_qni_head_wait_cycles_max
+                      << "," << p.retire_gcss_head_queued_not_issued_blocked_edges_total
+                      << "," << p.retire_gcss_head_issued_wait_resp_cycles_total
+                      << "," << p.retire_gcss_head_issued_wait_resp_blocked_edges_total
+                      << "," << p.retire_gcss_resp_ready_but_hol_cycles_total
+                      << "," << p.retire_gcss_resp_ready_but_hol_blocked_edges_total
+                      << "," << p.retire_gcss_qni_loader_not_ready_cycles_total
+                      << "," << p.retire_gcss_qni_loader_not_ready_blocked_edges_total
+                      << "," << p.retire_gcss_qni_weight_sram_stall_cycles_total
+                      << "," << p.retire_gcss_qni_weight_sram_stall_blocked_edges_total
+                      << "," << p.retire_gcss_qni_vlf_younger_ahead_cycles_total
+                      << "," << p.retire_gcss_qni_vlf_younger_ahead_blocked_edges_total
+                      << "," << p.retire_gcss_qni_vlf_younger_ahead_depth_total
+                      << "," << p.retire_gcss_qni_vlf_younger_ahead_depth_samples_total
+                      << "," << p.retire_gcss_qni_vlf_younger_ahead_depth_max
+                      << "," << p.retire_gcss_qni_issue_deferred_total
+                      << "," << p.retire_gcss_qni_pending_direct_queue_residency_cycles_total
+                      << "," << p.retire_gcss_qni_pending_direct_queue_residency_samples_total
+                      << "," << p.retire_gcss_qni_pending_direct_queue_residency_cycles_max
+                      << "," << p.retire_gcss_qni_vlf_front_inflight_full_cycles_total
+                      << "," << p.retire_gcss_qni_vlf_front_inflight_full_blocked_edges_total
+                      << "," << p.retire_gcss_qni_vlf_front_waiting_issue_cycles_total
+                      << "," << p.retire_gcss_qni_vlf_front_waiting_issue_blocked_edges_total
+                      << "," << p.retire_gcss_qni_pending_younger_ahead_cycles_total
+                      << "," << p.retire_gcss_qni_pending_younger_ahead_blocked_edges_total
+                      << "," << p.retire_gcss_qni_pending_front_inflight_full_cycles_total
+                      << "," << p.retire_gcss_qni_pending_front_inflight_full_blocked_edges_total
+                      << "," << p.retire_gcss_qni_pending_front_waiting_tick_cycles_total
+                      << "," << p.retire_gcss_qni_pending_front_waiting_tick_blocked_edges_total
+                      << "," << p.retire_gcss_qni_unknown_cycles_total
+                      << "," << p.retire_gcss_qni_unknown_blocked_edges_total
+                      << "," << p.retire_begin_apply_windows_total
+                      << "," << p.retire_begin_apply_prev_edges_total
+                      << "," << p.retire_begin_apply_outstanding_carryin_total
+                      << "," << p.retire_begin_apply_outstanding_carryin_windows_total
+                      << "," << p.retire_begin_apply_loader_not_ready_windows_total
+                      << "," << p.retire_edge_retire_registered_total
+                      << "," << p.retire_edge_retire_retired_total
+                      << "," << p.retire_end_scatter_gcss_vlf_issue_queue_residual_total
+                      << "," << p.retire_end_scatter_pending_direct_reads_residual_total
+                      << "," << p.retire_end_scatter_outstanding_residual_total
+                      << "," << p.retire_end_scatter_residual_work_windows_total
+                      << "," << p.retire_gcss_vlf_issue_prepare_total
+                      << "," << p.retire_gcss_vlf_issue_edges_total
+                      << "," << p.retire_gcss_vlf_issue_reorder_trigger_total
+                      << "," << p.retire_gcss_vlf_issue_line_groups_total
+                      << "," << p.retire_wait_cycles_due_to_not_ready_total
+                      << "," << p.retire_ready_queue_peak
+                      << "," << p.retire_unblock_events_total
+                      << "," << p.step_barrier_wait_ns
+                      << "\n";
+            }
+            fout3.close();
+        }
+    }
+    if (!core_step_perf_.empty()) {
+        std::string dir = resolve_out_dir();
+        std::string pathCorePerf = dir + "/core_step_perf_db.csv";
+        std::ofstream fout4(pathCorePerf);
+        if (fout4.good()) {
+            fout4 << "core,seq,seed_pre_selected,seed_spike_attempts,seed_spikes_injected,seed_route_hits,seed_route_misses,seed_local_drops,"
+                  << "rx_packets_total,rx_spike_packets_total,rx_spikekey_packets_total,rx_spiketilekey_packets_total,rx_local_packets_total,rx_remote_packets_total,"
+                  << "rx_packets_before_bg_total,rx_local_packets_before_bg_total,rx_remote_packets_before_bg_total,"
+                  << "rx_packets_during_gather_total,rx_packets_during_apply_total,rx_packets_during_scatter_total,rx_gate_pending_peak,"
+                  << "rx_gate_accept_total,rx_gate_reject_refractory_total,rx_gate_direct_accept_total,rx_gate_direct_reject_refractory_total,"
+                  << "rx_gate_fastpath_accept_total,rx_gate_fastpath_reject_refractory_total,"
+                  << "acc_updates,posts_touched,spill_records,spilled_bytes,hwm_bytes_max,scatter_spikes_emitted,"
+                  << "unique_reads,unique_bytes,rowwin_triggers,rowwin_bytes,bursts,payload_bytes,window_inflight_peak,window_buffer_max_bytes,gap_absorbed_bytes,"
+                  << "frontend_staged_reads,frontend_staged_line_touches,frontend_granules_built,unique_line_count,covered_line_count,overfetch_bytes,apply_bank_credit_effective,cmd_cost_veto,cmd_cost_veto_fine_gap,cmd_cost_veto_row_window,"
+                  << "apply_issue_attempt_total,apply_issue_success_total,apply_issue_block_no_ready_total,apply_issue_block_inflight_cap_total,"
+                  << "apply_issue_block_bank_credit_total,apply_issue_block_downstream_busy_total,"
+                  << "apply_issue_block_retire_guard_total,apply_ready_queue_peak,apply_ready_queue_nonempty_cycles_total,"
+                  << "apply_first_issue_delay_ns,apply_first_down_resp_delay_ns,apply_first_granule_done_delay_ns,apply_first_up_resp_delay_ns,"
+                  << "apply_down_resp_total,apply_completed_granules_total,apply_emitted_subreads_total,"
+                  << "apply_backlog_granules_residual,apply_backlog_pending_up_reads_residual,apply_backlog_inflight_residual,"
+                  << "apply_backlog_granules_peak_after_due,apply_backlog_pending_up_reads_peak_after_due,apply_backlog_inflight_peak_after_due,"
+                  << "retire_global_hol_cycles_total,retire_ready_but_blocked_edges_total,retire_per_post_progress_total,"
+                  << "retire_wait_cycles_total,retire_wait_cycles_due_to_hol_total,retire_wait_cycles_due_to_barrier_total,"
+                  << "retire_samepost_blocked_edges_total,retire_crosspost_blocked_edges_total,"
+                  << "retire_policy_loss_cycles_total,retire_policy_loss_edges_total,"
+                  << "retire_shadow_per_post_recoverable_cycles_total,retire_shadow_per_post_recoverable_edges_total,"
+                  << "retire_shadow_per_post_ready_posts_peak,retire_shadow_per_post_committable_edges_peak,"
+                  << "retire_head_hol_cycles_dense_total,retire_head_hol_cycles_cache_total,retire_head_hol_cycles_miss_total,"
+                  << "retire_head_hol_cycles_bcsr_total,retire_head_hol_cycles_bcsr_file_total,retire_head_hol_cycles_gcss_total,"
+                  << "retire_head_blocked_edges_dense_total,retire_head_blocked_edges_cache_total,retire_head_blocked_edges_miss_total,"
+                  << "retire_head_blocked_edges_bcsr_total,retire_head_blocked_edges_bcsr_file_total,retire_head_blocked_edges_gcss_total,"
+                  << "retire_gcss_head_queued_not_issued_cycles_total,retire_gcss_qni_head_wait_episodes_total,retire_gcss_qni_head_wait_cycles_max,retire_gcss_head_queued_not_issued_blocked_edges_total,"
+                  << "retire_gcss_head_issued_wait_resp_cycles_total,retire_gcss_head_issued_wait_resp_blocked_edges_total,"
+                  << "retire_gcss_resp_ready_but_hol_cycles_total,retire_gcss_resp_ready_but_hol_blocked_edges_total,"
+                  << "retire_gcss_qni_loader_not_ready_cycles_total,retire_gcss_qni_loader_not_ready_blocked_edges_total,"
+                  << "retire_gcss_qni_weight_sram_stall_cycles_total,retire_gcss_qni_weight_sram_stall_blocked_edges_total,"
+                  << "retire_gcss_qni_vlf_younger_ahead_cycles_total,retire_gcss_qni_vlf_younger_ahead_blocked_edges_total,"
+                  << "retire_gcss_qni_vlf_younger_ahead_depth_total,retire_gcss_qni_vlf_younger_ahead_depth_samples_total,retire_gcss_qni_vlf_younger_ahead_depth_max,"
+                  << "retire_gcss_qni_issue_deferred_total,"
+                  << "retire_gcss_qni_pending_direct_queue_residency_cycles_total,retire_gcss_qni_pending_direct_queue_residency_samples_total,retire_gcss_qni_pending_direct_queue_residency_cycles_max,"
+                  << "retire_gcss_qni_vlf_front_inflight_full_cycles_total,retire_gcss_qni_vlf_front_inflight_full_blocked_edges_total,"
+                  << "retire_gcss_qni_vlf_front_waiting_issue_cycles_total,retire_gcss_qni_vlf_front_waiting_issue_blocked_edges_total,"
+                  << "retire_gcss_qni_pending_younger_ahead_cycles_total,retire_gcss_qni_pending_younger_ahead_blocked_edges_total,"
+                  << "retire_gcss_qni_pending_front_inflight_full_cycles_total,retire_gcss_qni_pending_front_inflight_full_blocked_edges_total,"
+                  << "retire_gcss_qni_pending_front_waiting_tick_cycles_total,retire_gcss_qni_pending_front_waiting_tick_blocked_edges_total,"
+                  << "retire_gcss_qni_unknown_cycles_total,retire_gcss_qni_unknown_blocked_edges_total,"
+                  << "retire_begin_apply_windows_total,retire_begin_apply_prev_edges_total,"
+                  << "retire_begin_apply_outstanding_carryin_total,retire_begin_apply_outstanding_carryin_windows_total,"
+                  << "retire_begin_apply_loader_not_ready_windows_total,"
+                  << "retire_edge_retire_registered_total,retire_edge_retire_retired_total,"
+                  << "retire_end_scatter_gcss_vlf_issue_queue_residual_total,retire_end_scatter_pending_direct_reads_residual_total,"
+                  << "retire_end_scatter_outstanding_residual_total,retire_end_scatter_residual_work_windows_total,"
+                  << "retire_gcss_vlf_issue_prepare_total,retire_gcss_vlf_issue_edges_total,"
+                  << "retire_gcss_vlf_issue_reorder_trigger_total,retire_gcss_vlf_issue_line_groups_total,"
+                  << "retire_wait_cycles_due_to_not_ready_total,retire_ready_queue_peak,retire_unblock_events_total,step_barrier_wait_ns\n";
+            std::vector<CoreStepKey> keys;
+            keys.reserve(core_step_perf_.size());
+            for (const auto& kv : core_step_perf_) keys.push_back(kv.first);
+            std::sort(keys.begin(), keys.end(),
+                      [](const CoreStepKey& a, const CoreStepKey& b) {
+                          if (a.core != b.core) return a.core < b.core;
+                          return a.seq < b.seq;
+                      });
+            for (const auto& key : keys) {
+                const auto& p = core_step_perf_[key];
+                fout4 << key.core
+                      << "," << key.seq
+                      << "," << p.seed_pre_selected
+                      << "," << p.seed_spike_attempts
+                      << "," << p.seed_spikes_injected
+                      << "," << p.seed_route_hits
+                      << "," << p.seed_route_misses
+                      << "," << p.seed_local_drops
+                      << "," << p.rx_packets_total
+                      << "," << p.rx_spike_packets_total
+                      << "," << p.rx_spikekey_packets_total
+                      << "," << p.rx_spiketilekey_packets_total
+                      << "," << p.rx_local_packets_total
+                      << "," << p.rx_remote_packets_total
+                      << "," << p.rx_packets_before_bg_total
+                      << "," << p.rx_local_packets_before_bg_total
+                      << "," << p.rx_remote_packets_before_bg_total
+                      << "," << p.rx_packets_during_gather_total
+                      << "," << p.rx_packets_during_apply_total
+                      << "," << p.rx_packets_during_scatter_total
+                      << "," << p.rx_gate_pending_peak
+                      << "," << p.rx_gate_accept_total
+                      << "," << p.rx_gate_reject_refractory_total
+                      << "," << p.rx_gate_direct_accept_total
+                      << "," << p.rx_gate_direct_reject_refractory_total
+                      << "," << p.rx_gate_fastpath_accept_total
+                      << "," << p.rx_gate_fastpath_reject_refractory_total
+                      << "," << p.acc_updates
+                      << "," << p.posts_touched
+                      << "," << p.spill_records
+                      << "," << p.spilled_bytes
+                      << "," << p.hwm_bytes_max
+                      << "," << p.scatter_spikes_emitted
+                      << "," << p.unique_reads
+                      << "," << p.unique_bytes
+                      << "," << p.rowwin_triggers
+                      << "," << p.rowwin_bytes
+                      << "," << p.bursts
+                      << "," << p.payload_bytes
+                      << "," << p.window_inflight_peak
+                      << "," << p.window_buffer_max_bytes
+                      << "," << p.gap_absorbed_bytes
+                      << "," << p.frontend_staged_reads
+                      << "," << p.frontend_staged_line_touches
+                      << "," << p.frontend_granules_built
+                      << "," << p.unique_line_count
+                      << "," << p.covered_line_count
+                      << "," << p.overfetch_bytes
+                      << "," << p.apply_bank_credit_effective
+                      << "," << p.cmd_cost_veto
+                      << "," << p.cmd_cost_veto_fine_gap
+                      << "," << p.cmd_cost_veto_row_window
+                      << "," << p.apply_issue_attempt_total
+                      << "," << p.apply_issue_success_total
+                      << "," << p.apply_issue_block_no_ready_total
+                      << "," << p.apply_issue_block_inflight_cap_total
+                      << "," << p.apply_issue_block_bank_credit_total
+                      << "," << p.apply_issue_block_downstream_busy_total
+                      << "," << p.apply_issue_block_retire_guard_total
+                      << "," << p.apply_ready_queue_peak
+                      << "," << p.apply_ready_queue_nonempty_cycles_total
+                      << "," << p.apply_first_issue_delay_ns
+                      << "," << p.apply_first_down_resp_delay_ns
+                      << "," << p.apply_first_granule_done_delay_ns
+                      << "," << p.apply_first_up_resp_delay_ns
+                      << "," << p.apply_down_resp_total
+                      << "," << p.apply_completed_granules_total
+                      << "," << p.apply_emitted_subreads_total
+                      << "," << p.apply_backlog_granules_residual
+                      << "," << p.apply_backlog_pending_up_reads_residual
+                      << "," << p.apply_backlog_inflight_residual
+                      << "," << p.apply_backlog_granules_peak_after_due
+                      << "," << p.apply_backlog_pending_up_reads_peak_after_due
+                      << "," << p.apply_backlog_inflight_peak_after_due
+                      << "," << p.retire_global_hol_cycles_total
+                      << "," << p.retire_ready_but_blocked_edges_total
+                      << "," << p.retire_per_post_progress_total
+                      << "," << p.retire_wait_cycles_total
+                      << "," << p.retire_wait_cycles_due_to_hol_total
+                      << "," << p.retire_wait_cycles_due_to_barrier_total
+                      << "," << p.retire_samepost_blocked_edges_total
+                      << "," << p.retire_crosspost_blocked_edges_total
+                      << "," << p.retire_policy_loss_cycles_total
+                      << "," << p.retire_policy_loss_edges_total
+                      << "," << p.retire_shadow_per_post_recoverable_cycles_total
+                      << "," << p.retire_shadow_per_post_recoverable_edges_total
+                      << "," << p.retire_shadow_per_post_ready_posts_peak
+                      << "," << p.retire_shadow_per_post_committable_edges_peak
+                      << "," << p.retire_head_hol_cycles_dense_total
+                      << "," << p.retire_head_hol_cycles_cache_total
+                      << "," << p.retire_head_hol_cycles_miss_total
+                      << "," << p.retire_head_hol_cycles_bcsr_total
+                      << "," << p.retire_head_hol_cycles_bcsr_file_total
+                      << "," << p.retire_head_hol_cycles_gcss_total
+                      << "," << p.retire_head_blocked_edges_dense_total
+                      << "," << p.retire_head_blocked_edges_cache_total
+                      << "," << p.retire_head_blocked_edges_miss_total
+                      << "," << p.retire_head_blocked_edges_bcsr_total
+                      << "," << p.retire_head_blocked_edges_bcsr_file_total
+                      << "," << p.retire_head_blocked_edges_gcss_total
+                      << "," << p.retire_gcss_head_queued_not_issued_cycles_total
+                      << "," << p.retire_gcss_qni_head_wait_episodes_total
+                      << "," << p.retire_gcss_qni_head_wait_cycles_max
+                      << "," << p.retire_gcss_head_queued_not_issued_blocked_edges_total
+                      << "," << p.retire_gcss_head_issued_wait_resp_cycles_total
+                      << "," << p.retire_gcss_head_issued_wait_resp_blocked_edges_total
+                      << "," << p.retire_gcss_resp_ready_but_hol_cycles_total
+                      << "," << p.retire_gcss_resp_ready_but_hol_blocked_edges_total
+                      << "," << p.retire_gcss_qni_loader_not_ready_cycles_total
+                      << "," << p.retire_gcss_qni_loader_not_ready_blocked_edges_total
+                      << "," << p.retire_gcss_qni_weight_sram_stall_cycles_total
+                      << "," << p.retire_gcss_qni_weight_sram_stall_blocked_edges_total
+                      << "," << p.retire_gcss_qni_vlf_younger_ahead_cycles_total
+                      << "," << p.retire_gcss_qni_vlf_younger_ahead_blocked_edges_total
+                      << "," << p.retire_gcss_qni_vlf_younger_ahead_depth_total
+                      << "," << p.retire_gcss_qni_vlf_younger_ahead_depth_samples_total
+                      << "," << p.retire_gcss_qni_vlf_younger_ahead_depth_max
+                      << "," << p.retire_gcss_qni_issue_deferred_total
+                      << "," << p.retire_gcss_qni_pending_direct_queue_residency_cycles_total
+                      << "," << p.retire_gcss_qni_pending_direct_queue_residency_samples_total
+                      << "," << p.retire_gcss_qni_pending_direct_queue_residency_cycles_max
+                      << "," << p.retire_gcss_qni_vlf_front_inflight_full_cycles_total
+                      << "," << p.retire_gcss_qni_vlf_front_inflight_full_blocked_edges_total
+                      << "," << p.retire_gcss_qni_vlf_front_waiting_issue_cycles_total
+                      << "," << p.retire_gcss_qni_vlf_front_waiting_issue_blocked_edges_total
+                      << "," << p.retire_gcss_qni_pending_younger_ahead_cycles_total
+                      << "," << p.retire_gcss_qni_pending_younger_ahead_blocked_edges_total
+                      << "," << p.retire_gcss_qni_pending_front_inflight_full_cycles_total
+                      << "," << p.retire_gcss_qni_pending_front_inflight_full_blocked_edges_total
+                      << "," << p.retire_gcss_qni_pending_front_waiting_tick_cycles_total
+                      << "," << p.retire_gcss_qni_pending_front_waiting_tick_blocked_edges_total
+                      << "," << p.retire_gcss_qni_unknown_cycles_total
+                      << "," << p.retire_gcss_qni_unknown_blocked_edges_total
+                      << "," << p.retire_begin_apply_windows_total
+                      << "," << p.retire_begin_apply_prev_edges_total
+                      << "," << p.retire_begin_apply_outstanding_carryin_total
+                      << "," << p.retire_begin_apply_outstanding_carryin_windows_total
+                      << "," << p.retire_begin_apply_loader_not_ready_windows_total
+                      << "," << p.retire_edge_retire_registered_total
+                      << "," << p.retire_edge_retire_retired_total
+                      << "," << p.retire_end_scatter_gcss_vlf_issue_queue_residual_total
+                      << "," << p.retire_end_scatter_pending_direct_reads_residual_total
+                      << "," << p.retire_end_scatter_outstanding_residual_total
+                      << "," << p.retire_end_scatter_residual_work_windows_total
+                      << "," << p.retire_gcss_vlf_issue_prepare_total
+                      << "," << p.retire_gcss_vlf_issue_edges_total
+                      << "," << p.retire_gcss_vlf_issue_reorder_trigger_total
+                      << "," << p.retire_gcss_vlf_issue_line_groups_total
+                      << "," << p.retire_wait_cycles_due_to_not_ready_total
+                      << "," << p.retire_ready_queue_peak
+                      << "," << p.retire_unblock_events_total
+                      << "," << p.step_barrier_wait_ns
+                      << "\n";
+            }
+            fout4.close();
+        }
+    }
 
     // 节点结果摘要（可选）
     if (print_node_summary_) {
@@ -974,6 +2007,419 @@ void MultiCorePE::finish() {
             noc_lat_hist_max_,
             spike_overflow,
             sk_overflow);
+    }
+
+    if (dma_scheduler_) {
+        const auto dma_stats = dma_scheduler_->snapshotStats();
+        if (stat_dma_issue_reqs_total_) stat_dma_issue_reqs_total_->addData(dma_stats.issue_reqs_total);
+        if (stat_dma_issue_bytes_total_) stat_dma_issue_bytes_total_->addData(dma_stats.issue_bytes_total);
+        if (stat_dma_queue_depth_max_p0_) stat_dma_queue_depth_max_p0_->addData(dma_stats.queue_depth_max[0]);
+        if (stat_dma_queue_depth_max_p1_) stat_dma_queue_depth_max_p1_->addData(dma_stats.queue_depth_max[1]);
+        if (stat_dma_queue_depth_max_p2_) stat_dma_queue_depth_max_p2_->addData(dma_stats.queue_depth_max[2]);
+        if (stat_dma_queue_depth_max_p3_) stat_dma_queue_depth_max_p3_->addData(dma_stats.queue_depth_max[3]);
+        if (stat_dma_inflight_max_) stat_dma_inflight_max_->addData(dma_stats.inflight_max);
+        if (stat_dma_stall_cycles_budget_) stat_dma_stall_cycles_budget_->addData(dma_stats.stall_cycles_budget);
+        if (stat_dma_stall_cycles_engine_) stat_dma_stall_cycles_engine_->addData(dma_stats.stall_cycles_engine);
+        if (stat_dma_stall_cycles_inflight_) stat_dma_stall_cycles_inflight_->addData(dma_stats.stall_cycles_inflight);
+        if (stat_dma_stall_cycles_stage_gate_) stat_dma_stall_cycles_stage_gate_->addData(dma_stats.stall_cycles_stage_gate);
+        if (stat_dma_stall_cycles_queue_full_) stat_dma_stall_cycles_queue_full_->addData(dma_stats.stall_cycles_queue_full);
+    }
+    if (local_storage_controller_) {
+        const auto ls_stats = local_storage_controller_->snapshotStats();
+        if (stat_ls_objects_registered_total_) {
+            stat_ls_objects_registered_total_->addData(static_cast<uint64_t>(ls_stats.objects_registered_total));
+        }
+        if (stat_ls_objects_enabled_total_) {
+            stat_ls_objects_enabled_total_->addData(static_cast<uint64_t>(ls_stats.objects_enabled_total));
+        }
+        if (stat_ls_capacity_bytes_total_) stat_ls_capacity_bytes_total_->addData(ls_stats.capacity_bytes_total);
+        if (stat_ls_queue_slots_total_) stat_ls_queue_slots_total_->addData(ls_stats.queue_slots_total);
+    }
+    {
+        std::map<std::string, uint64_t> atlas_activation_gate_stats;
+        appendAtlasActivationGateStats_(atlas_activation_gate_stats);
+        for (const auto& kv : atlas_activation_gate_stats) {
+            auto it = atlas_object_plane_stats_.find(kv.first);
+            if (it == atlas_object_plane_stats_.end() || it->second == nullptr) continue;
+            it->second->addData(kv.second);
+        }
+    }
+    {
+        std::map<std::string, uint64_t> atlas_shared_weight_census_stats;
+        appendAtlasSharedWeightCensusStats_(atlas_shared_weight_census_stats);
+        for (const auto& kv : atlas_shared_weight_census_stats) {
+            auto it = atlas_object_plane_stats_.find(kv.first);
+            if (it == atlas_object_plane_stats_.end() || it->second == nullptr) continue;
+            it->second->addData(kv.second);
+        }
+    }
+    {
+        std::map<std::string, uint64_t> atlas_control_runtime_class_stats;
+        appendAtlasControlRuntimeClassificationStats_(atlas_control_runtime_class_stats);
+        for (const auto& kv : atlas_control_runtime_class_stats) {
+            auto it = atlas_object_plane_stats_.find(kv.first);
+            if (it == atlas_object_plane_stats_.end() || it->second == nullptr) continue;
+            it->second->addData(kv.second);
+        }
+    }
+    if (pe_weight_object_plane_) {
+        const auto weight_plane_stats = pe_weight_object_plane_->snapshotStats();
+        const auto authority_total =
+            [](PeWeightObjectPlane::AuthorityClass observed,
+               PeWeightObjectPlane::AuthorityClass expected) -> uint64_t {
+            return observed == expected ? 1u : 0u;
+        };
+        const auto add_atlas_storage_stat = [this](const char* name, uint64_t value) {
+            auto it = atlas_object_plane_stats_.find(name);
+            if (it == atlas_object_plane_stats_.end() || it->second == nullptr) return;
+            it->second->addData(value);
+        };
+        add_atlas_storage_stat(
+            "atlas_storage_map_shared_owner_scope_enable",
+            weight_plane_stats.owner_scope_enable ? 1u : 0u);
+        add_atlas_storage_stat(
+            "atlas_storage_map_shared_actual_owner_enable",
+            weight_plane_stats.actual_owner_enable ? 1u : 0u);
+        add_atlas_storage_stat(
+            "atlas_storage_map_weight_idx_shared_enabled",
+            weight_plane_stats.idx_enabled ? 1u : 0u);
+        add_atlas_storage_stat(
+            "atlas_storage_map_weight_value_shared_enabled",
+            weight_plane_stats.l0_enabled ? 1u : 0u);
+        add_atlas_storage_stat(
+            "atlas_storage_map_weight_idx_private_authority_total",
+            authority_total(
+                weight_plane_stats.idx_authority,
+                PeWeightObjectPlane::AuthorityClass::PrivateAuthority));
+        add_atlas_storage_stat(
+            "atlas_storage_map_weight_idx_shared_mirror_only_total",
+            authority_total(
+                weight_plane_stats.idx_authority,
+                PeWeightObjectPlane::AuthorityClass::SharedMirrorOnly));
+        add_atlas_storage_stat(
+            "atlas_storage_map_weight_idx_shared_authority_active_total",
+            authority_total(
+                weight_plane_stats.idx_authority,
+                PeWeightObjectPlane::AuthorityClass::SharedAuthorityActive));
+        add_atlas_storage_stat(
+            "atlas_storage_map_weight_value_private_authority_total",
+            authority_total(
+                weight_plane_stats.l0_authority,
+                PeWeightObjectPlane::AuthorityClass::PrivateAuthority));
+        add_atlas_storage_stat(
+            "atlas_storage_map_weight_value_shared_mirror_only_total",
+            authority_total(
+                weight_plane_stats.l0_authority,
+                PeWeightObjectPlane::AuthorityClass::SharedMirrorOnly));
+        add_atlas_storage_stat(
+            "atlas_storage_map_weight_value_shared_authority_active_total",
+            authority_total(
+                weight_plane_stats.l0_authority,
+                PeWeightObjectPlane::AuthorityClass::SharedAuthorityActive));
+        add_atlas_storage_stat(
+            "atlas_storage_map_weight_idx_shared_reads_total",
+            weight_plane_stats.idx_sram.reads_total);
+        add_atlas_storage_stat(
+            "atlas_storage_map_weight_idx_shared_resident_bytes_peak",
+            weight_plane_stats.idx_sram.resident_bytes_peak);
+        add_atlas_storage_stat(
+            "atlas_storage_map_weight_value_shared_reads_total",
+            weight_plane_stats.l0_sram.reads_total);
+        add_atlas_storage_stat(
+            "atlas_storage_map_weight_value_shared_resident_bytes_peak",
+            weight_plane_stats.l0_sram.resident_bytes_peak);
+        if (stat_pulse_osa_shared_weight_enabled_) {
+            stat_pulse_osa_shared_weight_enabled_->addData(weight_plane_stats.enabled ? 1u : 0u);
+        }
+        if (stat_pulse_osa_shared_weight_owner_scope_enable_) {
+            stat_pulse_osa_shared_weight_owner_scope_enable_->addData(
+                weight_plane_stats.owner_scope_enable ? 1u : 0u);
+        }
+        if (stat_pulse_osa_shared_weight_actual_owner_enable_) {
+            stat_pulse_osa_shared_weight_actual_owner_enable_->addData(
+                weight_plane_stats.actual_owner_enable ? 1u : 0u);
+        }
+        if (stat_pulse_osa_shared_weight_idx_enabled_) {
+            stat_pulse_osa_shared_weight_idx_enabled_->addData(
+                weight_plane_stats.idx_enabled ? 1u : 0u);
+        }
+        if (stat_pulse_osa_shared_weight_idx_reads_total_) {
+            stat_pulse_osa_shared_weight_idx_reads_total_->addData(
+                weight_plane_stats.idx_sram.reads_total);
+        }
+        if (stat_pulse_osa_shared_weight_idx_writes_total_) {
+            stat_pulse_osa_shared_weight_idx_writes_total_->addData(
+                weight_plane_stats.idx_sram.writes_total);
+        }
+        if (stat_pulse_osa_shared_weight_idx_bank_conflict_ticks_total_) {
+            stat_pulse_osa_shared_weight_idx_bank_conflict_ticks_total_->addData(
+                weight_plane_stats.idx_sram.bank_conflict_ticks_total);
+        }
+        if (stat_pulse_osa_shared_weight_idx_predicted_extra_cycles_total_) {
+            stat_pulse_osa_shared_weight_idx_predicted_extra_cycles_total_->addData(
+                weight_plane_stats.idx_sram.predicted_extra_cycles_total);
+        }
+        if (stat_pulse_osa_shared_weight_idx_resident_bytes_peak_) {
+            stat_pulse_osa_shared_weight_idx_resident_bytes_peak_->addData(
+                weight_plane_stats.idx_sram.resident_bytes_peak);
+        }
+        if (stat_pulse_osa_shared_weight_l0_enabled_) {
+            stat_pulse_osa_shared_weight_l0_enabled_->addData(
+                weight_plane_stats.l0_enabled ? 1u : 0u);
+        }
+        if (stat_pulse_osa_shared_weight_l0_reads_total_) {
+            stat_pulse_osa_shared_weight_l0_reads_total_->addData(
+                weight_plane_stats.l0_sram.reads_total);
+        }
+        if (stat_pulse_osa_shared_weight_l0_writes_total_) {
+            stat_pulse_osa_shared_weight_l0_writes_total_->addData(
+                weight_plane_stats.l0_sram.writes_total);
+        }
+        if (stat_pulse_osa_shared_weight_l0_fill_total_) {
+            stat_pulse_osa_shared_weight_l0_fill_total_->addData(
+                weight_plane_stats.l0_fill_total);
+        }
+        if (stat_pulse_osa_shared_weight_l0_evict_total_) {
+            stat_pulse_osa_shared_weight_l0_evict_total_->addData(
+                weight_plane_stats.l0_evict_total);
+        }
+        if (stat_pulse_osa_shared_weight_l0_bank_conflict_ticks_total_) {
+            stat_pulse_osa_shared_weight_l0_bank_conflict_ticks_total_->addData(
+                weight_plane_stats.l0_sram.bank_conflict_ticks_total);
+        }
+        if (stat_pulse_osa_shared_weight_l0_predicted_extra_cycles_total_) {
+            stat_pulse_osa_shared_weight_l0_predicted_extra_cycles_total_->addData(
+                weight_plane_stats.l0_sram.predicted_extra_cycles_total);
+        }
+        if (stat_pulse_osa_shared_weight_l0_resident_bytes_peak_) {
+            stat_pulse_osa_shared_weight_l0_resident_bytes_peak_->addData(
+                weight_plane_stats.l0_sram.resident_bytes_peak);
+        }
+    } else {
+        const auto add_atlas_storage_stat = [this](const char* name, uint64_t value) {
+            auto it = atlas_object_plane_stats_.find(name);
+            if (it == atlas_object_plane_stats_.end() || it->second == nullptr) return;
+            it->second->addData(value);
+        };
+        add_atlas_storage_stat("atlas_storage_map_shared_owner_scope_enable", 0u);
+        add_atlas_storage_stat("atlas_storage_map_shared_actual_owner_enable", 0u);
+        add_atlas_storage_stat("atlas_storage_map_weight_idx_shared_enabled", 0u);
+        add_atlas_storage_stat("atlas_storage_map_weight_value_shared_enabled", 0u);
+        add_atlas_storage_stat("atlas_storage_map_weight_idx_private_authority_total", 1u);
+        add_atlas_storage_stat("atlas_storage_map_weight_idx_shared_mirror_only_total", 0u);
+        add_atlas_storage_stat("atlas_storage_map_weight_idx_shared_authority_active_total", 0u);
+        add_atlas_storage_stat("atlas_storage_map_weight_value_private_authority_total", 1u);
+        add_atlas_storage_stat("atlas_storage_map_weight_value_shared_mirror_only_total", 0u);
+        add_atlas_storage_stat("atlas_storage_map_weight_value_shared_authority_active_total", 0u);
+        add_atlas_storage_stat("atlas_storage_map_weight_idx_shared_reads_total", 0u);
+        add_atlas_storage_stat("atlas_storage_map_weight_idx_shared_resident_bytes_peak", 0u);
+        add_atlas_storage_stat("atlas_storage_map_weight_value_shared_reads_total", 0u);
+        add_atlas_storage_stat("atlas_storage_map_weight_value_shared_resident_bytes_peak", 0u);
+        if (stat_pulse_osa_shared_weight_enabled_) stat_pulse_osa_shared_weight_enabled_->addData(0u);
+        if (stat_pulse_osa_shared_weight_owner_scope_enable_) {
+            stat_pulse_osa_shared_weight_owner_scope_enable_->addData(0u);
+        }
+        if (stat_pulse_osa_shared_weight_actual_owner_enable_) {
+            stat_pulse_osa_shared_weight_actual_owner_enable_->addData(0u);
+        }
+        if (stat_pulse_osa_shared_weight_idx_enabled_) {
+            stat_pulse_osa_shared_weight_idx_enabled_->addData(0u);
+        }
+        if (stat_pulse_osa_shared_weight_l0_enabled_) {
+            stat_pulse_osa_shared_weight_l0_enabled_->addData(0u);
+        }
+        if (stat_pulse_osa_shared_weight_l0_fill_total_) {
+            stat_pulse_osa_shared_weight_l0_fill_total_->addData(0u);
+        }
+        if (stat_pulse_osa_shared_weight_l0_evict_total_) {
+            stat_pulse_osa_shared_weight_l0_evict_total_->addData(0u);
+        }
+    }
+    if (pulse_fabric_) {
+        const auto pulse_stats = pulse_fabric_->snapshotStats();
+        const auto add_atlas_control_runtime_stat = [this](const char* name, uint64_t value) {
+            auto it = atlas_object_plane_stats_.find(name);
+            if (it == atlas_object_plane_stats_.end() || it->second == nullptr) return;
+            it->second->addData(value);
+        };
+        if (stat_pulse_ingress_packets_total_) {
+            stat_pulse_ingress_packets_total_->addData(pulse_stats.ingress_packets_total);
+        }
+        if (stat_pulse_ingress_spike_packets_total_) {
+            stat_pulse_ingress_spike_packets_total_->addData(pulse_stats.ingress_spike_packets_total);
+        }
+        if (stat_pulse_ingress_spikekey_packets_total_) {
+            stat_pulse_ingress_spikekey_packets_total_->addData(pulse_stats.ingress_spikekey_packets_total);
+        }
+        if (stat_pulse_ingress_spiketilekey_packets_total_) {
+            stat_pulse_ingress_spiketilekey_packets_total_->addData(
+                pulse_stats.ingress_spiketilekey_packets_total);
+        }
+        if (stat_pulse_ingress_core_dispatch_total_) {
+            stat_pulse_ingress_core_dispatch_total_->addData(pulse_stats.ingress_core_dispatch_total);
+        }
+        if (stat_pulse_ingress_shared_buffered_total_) {
+            stat_pulse_ingress_shared_buffered_total_->addData(
+                pulse_stats.ingress_shared_buffered_total);
+        }
+        if (stat_pulse_ingress_shared_dispatch_total_) {
+            stat_pulse_ingress_shared_dispatch_total_->addData(
+                pulse_stats.ingress_shared_dispatch_total);
+        }
+        if (stat_pulse_ingress_direct_deliver_total_) {
+            stat_pulse_ingress_direct_deliver_total_->addData(
+                pulse_stats.ingress_direct_deliver_total);
+        }
+        if (stat_pulse_ingress_bypass_total_) {
+            stat_pulse_ingress_bypass_total_->addData(pulse_stats.ingress_bypass_total);
+        }
+        if (stat_pulse_ingress_pressure_bypass_total_) {
+            stat_pulse_ingress_pressure_bypass_total_->addData(
+                pulse_stats.ingress_pressure_bypass_total);
+        }
+        if (stat_pulse_ingress_singleton_bypass_total_) {
+            stat_pulse_ingress_singleton_bypass_total_->addData(
+                pulse_stats.ingress_singleton_bypass_total);
+        }
+        if (stat_pulse_ingress_deadline_bypass_total_) {
+            stat_pulse_ingress_deadline_bypass_total_->addData(
+                pulse_stats.ingress_deadline_bypass_total);
+        }
+        if (stat_pulse_ingress_pressure_cycles_total_) {
+            stat_pulse_ingress_pressure_cycles_total_->addData(
+                pulse_stats.ingress_pressure_cycles_total);
+        }
+        if (stat_pulse_ingress_entries_peak_) {
+            stat_pulse_ingress_entries_peak_->addData(pulse_stats.ingress_entries_peak);
+        }
+        if (stat_pulse_control_entries_current_) {
+            stat_pulse_control_entries_current_->addData(pulse_stats.control_entries_current);
+        }
+        if (stat_pulse_control_entries_peak_) {
+            stat_pulse_control_entries_peak_->addData(pulse_stats.control_entries_peak);
+        }
+        if (stat_pulse_control_backlog_cycles_total_) {
+            stat_pulse_control_backlog_cycles_total_->addData(
+                pulse_stats.control_backlog_cycles_total);
+        }
+        if (stat_pulse_control_messages_enqueued_total_) {
+            stat_pulse_control_messages_enqueued_total_->addData(
+                pulse_stats.control_messages_enqueued_total);
+        }
+        if (stat_pulse_control_messages_dequeued_total_) {
+            stat_pulse_control_messages_dequeued_total_->addData(
+                pulse_stats.control_messages_dequeued_total);
+        }
+        if (stat_pulse_control_frontier_export_total_) {
+            stat_pulse_control_frontier_export_total_->addData(
+                pulse_stats.control_frontier_export_total);
+        }
+        if (stat_pulse_control_owner_announce_total_) {
+            stat_pulse_control_owner_announce_total_->addData(
+                pulse_stats.control_owner_announce_total);
+        }
+        if (stat_pulse_control_join_request_total_) {
+            stat_pulse_control_join_request_total_->addData(
+                pulse_stats.control_join_request_total);
+        }
+        if (stat_pulse_control_ready_fanout_total_) {
+            stat_pulse_control_ready_fanout_total_->addData(
+                pulse_stats.control_ready_fanout_total);
+        }
+        if (stat_pulse_control_join_reject_total_) {
+            stat_pulse_control_join_reject_total_->addData(
+                pulse_stats.control_join_reject_total);
+        }
+        add_atlas_control_runtime_stat(
+            "atlas_control_runtime_queued_frontier_export_total",
+            pulse_stats.control_frontier_export_total);
+        add_atlas_control_runtime_stat(
+            "atlas_control_runtime_queued_owner_announce_total",
+            pulse_stats.control_owner_announce_total);
+        add_atlas_control_runtime_stat(
+            "atlas_control_runtime_queued_join_request_total",
+            pulse_stats.control_join_request_total);
+        add_atlas_control_runtime_stat(
+            "atlas_control_runtime_queued_ready_fanout_total",
+            pulse_stats.control_ready_fanout_total);
+        add_atlas_control_runtime_stat(
+            "atlas_control_runtime_queued_join_reject_total",
+            pulse_stats.control_join_reject_total);
+        add_atlas_control_runtime_stat(
+            "atlas_control_runtime_consumed_frontier_export_total",
+            pulse_stats.control_frontier_export_consumed_total);
+        add_atlas_control_runtime_stat(
+            "atlas_control_runtime_consumed_owner_announce_total",
+            pulse_stats.control_owner_announce_consumed_total);
+        add_atlas_control_runtime_stat(
+            "atlas_control_runtime_consumed_join_request_total",
+            pulse_stats.control_join_request_consumed_total);
+        add_atlas_control_runtime_stat(
+            "atlas_control_runtime_consumed_ready_fanout_total",
+            pulse_stats.control_ready_fanout_consumed_total);
+        add_atlas_control_runtime_stat(
+            "atlas_control_runtime_consumed_join_reject_total",
+            pulse_stats.control_join_reject_consumed_total);
+        add_atlas_control_runtime_stat(
+            "atlas_control_runtime_backlog_messages_current",
+            pulse_stats.control_entries_current);
+        add_atlas_control_runtime_stat(
+            "atlas_control_runtime_backlog_messages_peak",
+            pulse_stats.control_entries_peak);
+        add_atlas_control_runtime_stat(
+            "atlas_control_runtime_backlog_cycles_total",
+            pulse_stats.control_backlog_cycles_total);
+        if (stat_pulse_core_queue_entries_peak_) {
+            stat_pulse_core_queue_entries_peak_->addData(pulse_stats.core_queue_entries_peak);
+        }
+        if (stat_pulse_harbor_buckets_total_) {
+            stat_pulse_harbor_buckets_total_->addData(pulse_stats.harbor_buckets_total);
+        }
+        if (stat_pulse_harbor_packet_sum_) {
+            stat_pulse_harbor_packet_sum_->addData(pulse_stats.harbor_packet_sum);
+        }
+        if (stat_pulse_harbor_consumer_sum_) {
+            stat_pulse_harbor_consumer_sum_->addData(pulse_stats.harbor_consumer_sum);
+        }
+        if (stat_pulse_harbor_bucket_peak_) {
+            stat_pulse_harbor_bucket_peak_->addData(pulse_stats.harbor_bucket_peak);
+        }
+        if (stat_pulse_harbor_singleton_buckets_total_) {
+            stat_pulse_harbor_singleton_buckets_total_->addData(
+                pulse_stats.harbor_singleton_buckets_total);
+        }
+        if (stat_pulse_descriptor_total_) {
+            stat_pulse_descriptor_total_->addData(pulse_stats.descriptor_total);
+        }
+        if (stat_pulse_descriptor_packet_sum_) {
+            stat_pulse_descriptor_packet_sum_->addData(pulse_stats.descriptor_packet_sum);
+        }
+        if (stat_pulse_descriptor_consumer_sum_) {
+            stat_pulse_descriptor_consumer_sum_->addData(pulse_stats.descriptor_consumer_sum);
+        }
+        if (stat_pulse_descriptor_singleton_drop_total_) {
+            stat_pulse_descriptor_singleton_drop_total_->addData(
+                pulse_stats.descriptor_singleton_drop_total);
+        }
+    } else {
+        const auto add_atlas_control_runtime_stat = [this](const char* name, uint64_t value) {
+            auto it = atlas_object_plane_stats_.find(name);
+            if (it == atlas_object_plane_stats_.end() || it->second == nullptr) return;
+            it->second->addData(value);
+        };
+        add_atlas_control_runtime_stat("atlas_control_runtime_queued_frontier_export_total", 0u);
+        add_atlas_control_runtime_stat("atlas_control_runtime_queued_owner_announce_total", 0u);
+        add_atlas_control_runtime_stat("atlas_control_runtime_queued_join_request_total", 0u);
+        add_atlas_control_runtime_stat("atlas_control_runtime_queued_ready_fanout_total", 0u);
+        add_atlas_control_runtime_stat("atlas_control_runtime_queued_join_reject_total", 0u);
+        add_atlas_control_runtime_stat("atlas_control_runtime_consumed_frontier_export_total", 0u);
+        add_atlas_control_runtime_stat("atlas_control_runtime_consumed_owner_announce_total", 0u);
+        add_atlas_control_runtime_stat("atlas_control_runtime_consumed_join_request_total", 0u);
+        add_atlas_control_runtime_stat("atlas_control_runtime_consumed_ready_fanout_total", 0u);
+        add_atlas_control_runtime_stat("atlas_control_runtime_consumed_join_reject_total", 0u);
+        add_atlas_control_runtime_stat("atlas_control_runtime_backlog_messages_current", 0u);
+        add_atlas_control_runtime_stat("atlas_control_runtime_backlog_messages_peak", 0u);
+        add_atlas_control_runtime_stat("atlas_control_runtime_backlog_cycles_total", 0u);
     }
 
     // 输出时间窗口化统计CSV（如已启用并指定路径）
@@ -1071,6 +2517,10 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
             ok_to_end_sent_ = true;
         }
         return false;
+    }
+
+    if (pulse_fabric_) {
+        pulse_fabric_->observeControlBacklogCycle();
     }
     
     // 详细调试信息（仅在高详细度时输出）
@@ -1183,6 +2633,7 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
     
     // 1. 处理外部脉冲队列（Phase4-A1.1：下沉至 NoC 子系统）
     noc_subsys_.drainIncomingQueue(static_cast<uint64_t>(current_cycle_));
+    drainPulseIngress_();
     
     // 2. SubComponent时钟由SST自动管理，无需手动调用tick
     // 若子组件未被SST调度（某些环境组合下可能发生），则回退为手动驱动一拍，确保窗口推进与队列消费
@@ -1224,6 +2675,7 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
             const uint64_t now = static_cast<uint64_t>(current_cycle_);
             const uint64_t since_begin = (now >= global_step_begin_cycle_) ? (now - global_step_begin_cycle_) : 0;
             if (since_begin >= global_step_fixed_cycles_) {
+                noteStepBarrierWaitNs_(global_step_active_seq_, getCurrentSimTimeNano());
                 auto* ev = new GasStepBarrierEvent(GasStepBarrierOp::PeDone,
                                                    global_step_active_seq_,
                                                    static_cast<uint32_t>(node_id_));
@@ -1242,7 +2694,7 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
                 gas_step_ctrl_link_->send(ev);
                 global_step_done_sent_ = true;
                 if (stat_global_steps_done_total_) stat_global_steps_done_total_->addData(1);
-                if (sentinel_enabled_ && output_ && global_step_active_seq_ == 1) {
+                if (sentinel_enabled_ && output_ && global_step_active_seq_ <= 2) {
                     output_->verbose(CALL_INFO, 2, 0,
                         "[[sentinel-step-sync]] node=%d send PE_DONE(fixed_cycles) seq=%u since_begin=%" PRIu64 "\n",
                         node_id_, global_step_active_seq_, (uint64_t)since_begin);
@@ -1256,67 +2708,61 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
             // 2) 显式检查 NoC/NIC/片上 ring 是否仍有在途包/背压排队。
             const bool noc_idle = noc_subsys_.isIdle();
             if (!noc_idle) active = true;
+            if (!pulse_ingress_buffered_packets_.empty()) active = true;
 
             // 3) step 语义等价：
             // - 对已经进入 BeginApply/EndApply/BeginScatter/EndScatter 的 core，必须等待该 core 到达 EndScatter(seq)。
-            // - 对仅停在 BeginGather（或尚未产生阶段事件）的 core，回退为 hasWork()；否则“空 core 也必须 EndScatter”会把 step 永久卡住。
-            bool uses_stage_events = false;
-            bool all_end_scatter = false;
-            int stage_progress_cores = 0;
-            int stage_done_cores = 0;
-            int stage_bg_only_cores = 0;
-            int fallback_busy_cores = 0;
-            if (global_step_last_stage_code_.size() == static_cast<size_t>(num_cores_) &&
-                global_step_last_stage_seq_.size() == static_cast<size_t>(num_cores_)) {
+            // - 对仍停在 BeginGather 的 core，也必须继续 hold；否则会出现慢核还在旧 step Gather，
+            //   但 controller 已经广播下一步 START_STEP 的 closure 漏判。
+            GlobalStepDrainInputs drain_inputs{};
+            drain_inputs.injected = injected;
+            drain_inputs.noc_idle = noc_idle;
+            drain_inputs.stage_arrays_ready =
+                (global_step_last_stage_code_.size() == static_cast<size_t>(num_cores_) &&
+                 global_step_last_stage_seq_.size() == static_cast<size_t>(num_cores_));
+            drain_inputs.cores.reserve(static_cast<size_t>(num_cores_));
+            if (drain_inputs.stage_arrays_ready) {
                 for (int i = 0; i < num_cores_; ++i) {
                     const size_t idx = static_cast<size_t>(i);
                     const bool have_stage =
                         (global_step_last_stage_seq_[idx] == global_step_active_seq_) &&
                         (global_step_last_stage_code_[idx] != 0);
-                    const int stage_code = have_stage ? global_step_last_stage_code_[idx] : 0;
-
-                    if (stage_code >= 2 /*BeginApply and later*/) {
-                        uses_stage_events = true;
-                        stage_progress_cores += 1;
-                        if (stage_code == 5 /*EndScatter*/) {
-                            stage_done_cores += 1;
-                        } else {
-                            active = true;
-                        }
-                        continue;
-                    }
-
-                    if (stage_code == 1 /*BeginGather*/) {
-                        stage_bg_only_cores += 1;
-                    }
-                    if (cores_[i] && cores_[i]->hasWork()) {
-                        fallback_busy_cores += 1;
-                        active = true;
-                    }
+                    drain_inputs.cores.push_back(GlobalStepDrainCoreState{
+                        have_stage ? global_step_last_stage_code_[idx] : 0,
+                        cores_[i] && cores_[i]->hasWork(),
+                    });
                 }
-                all_end_scatter = uses_stage_events && (stage_done_cores == stage_progress_cores);
             } else {
-                // 非 window/GAS workload（或阶段镜像未初始化）：回退为 core 的 hasWork() 语义
                 for (int i = 0; i < num_cores_; ++i) {
-                    if (cores_[i] && cores_[i]->hasWork()) {
-                        fallback_busy_cores += 1;
-                        active = true;
-                    }
+                    drain_inputs.cores.push_back(GlobalStepDrainCoreState{
+                        0,
+                        cores_[i] && cores_[i]->hasWork(),
+                    });
                 }
             }
+            const GlobalStepDrainDecision drain_decision =
+                evaluateGlobalStepDrainDecision(drain_inputs);
+            active = active || drain_decision.active;
+            const bool uses_stage_events = drain_decision.uses_stage_events;
+            const bool all_end_scatter = drain_decision.all_end_scatter;
+            const int stage_progress_cores = drain_decision.stage_progress_cores;
+            const int stage_done_cores = drain_decision.stage_done_cores;
+            const int stage_bg_only_cores = drain_decision.stage_bg_only_cores;
+            const int stage_begin_apply_cores = drain_decision.stage_begin_apply_cores;
+            const int stage_end_apply_cores = drain_decision.stage_end_apply_cores;
+            const int stage_begin_scatter_cores = drain_decision.stage_begin_scatter_cores;
+            const int stage_end_scatter_cores = drain_decision.stage_end_scatter_cores;
+            const int fallback_busy_cores = drain_decision.fallback_busy_cores;
 
-            const bool hold_for_gather_completion =
-                (!uses_stage_events && stage_bg_only_cores > 0 &&
-                 global_step_last_stage_code_.size() == static_cast<size_t>(num_cores_) &&
-                 global_step_last_stage_seq_.size() == static_cast<size_t>(num_cores_));
+            const bool hold_for_gather_completion = drain_decision.hold_for_gather_completion;
             if (hold_for_gather_completion) {
                 // 仍停留在 Gather：必须等 workload 的 Gather->EndGather quiesce 规则自己推进，
                 // 不能让 PE 级 Drain 先于空窗口/慢窗口的 BeginApply 收尾。
                 active = true;
             }
 
-            // Drain 卡点探针（仅 node0 / seq1 / sentinel 模式限量打印）：用于定位“为什么 step 不推进”。
-            if (sentinel_enabled_ && output_ && node_id_ == 0 && global_step_active_seq_ == 1) {
+            // Drain 卡点探针（仅 node0 / seq<=2 / sentinel 模式限量打印）：用于定位“为什么 step 不推进”。
+            if (sentinel_enabled_ && output_ && node_id_ == 0 && global_step_active_seq_ <= 2) {
                 const uint64_t now = static_cast<uint64_t>(current_cycle_);
                 if ((now % 10000u) == 0u && global_step_drain_diag_count_ < 64u) {
                     const size_t inq = noc_subsys_.incomingQueueSize();
@@ -1326,7 +2772,7 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
                         ? (now - global_step_last_activity_cycle_)
                         : 0;
                     output_->verbose(CALL_INFO, 2, 0,
-                        "[[sentinel-step-drain]] node=%d seq=%u injected=%d stage=%d all_es=%d progressed=%d done=%d bg_only=%d bg_hold=%d fallback_busy=%d noc_idle=%d inq=%zu ring=%d nic_pending=%zu quiet=%" PRIu64 " min=%" PRIu64 "\n",
+                        "[[sentinel-step-drain]] node=%d seq=%u injected=%d stage=%d all_es=%d progressed=%d done=%d bg_only=%d ba=%d ea=%d bs=%d es=%d bg_hold=%d fallback_busy=%d noc_idle=%d inq=%zu ring=%d nic_pending=%zu quiet=%" PRIu64 " min=%" PRIu64 "\n",
                         node_id_,
                         global_step_active_seq_,
                         injected ? 1 : 0,
@@ -1335,6 +2781,10 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
                         stage_progress_cores,
                         stage_done_cores,
                         stage_bg_only_cores,
+                        stage_begin_apply_cores,
+                        stage_end_apply_cores,
+                        stage_begin_scatter_cores,
+                        stage_end_scatter_cores,
                         hold_for_gather_completion ? 1 : 0,
                         fallback_busy_cores,
                         noc_idle ? 1 : 0,
@@ -1354,6 +2804,7 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
                 const uint64_t last = global_step_last_activity_cycle_;
                 const uint64_t quiet = (now >= last) ? (now - last) : 0;
                 if (quiet >= global_step_drain_min_cycles_) {
+                    noteStepBarrierWaitNs_(global_step_active_seq_, getCurrentSimTimeNano());
                     auto* ev = new GasStepBarrierEvent(GasStepBarrierOp::PeDone,
                                                        global_step_active_seq_,
                                                        static_cast<uint32_t>(node_id_));
@@ -1370,7 +2821,7 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
                     gas_step_ctrl_link_->send(ev);
                     global_step_done_sent_ = true;
                     if (stat_global_steps_done_total_) stat_global_steps_done_total_->addData(1);
-                    if (sentinel_enabled_ && output_ && global_step_active_seq_ == 1) {
+                    if (sentinel_enabled_ && output_ && global_step_active_seq_ <= 2) {
                         output_->verbose(CALL_INFO, 2, 0,
                             "[[sentinel-step-sync]] node=%d send PE_DONE(drain) seq=%u quiet=%" PRIu64 " (min=%" PRIu64 ")\n",
                             node_id_, global_step_active_seq_, (uint64_t)quiet, (uint64_t)global_step_drain_min_cycles_);
@@ -1381,6 +2832,7 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
             bool active = false;
             if (!step_activation_subsys_.injectedForSeq(global_step_active_seq_)) active = true;
             if (!noc_subsys_.isIdle()) active = true;
+            if (!pulse_ingress_buffered_packets_.empty()) active = true;
             for (int i = 0; i < num_cores_; ++i) {
                 if (cores_[i] && cores_[i]->hasWork()) {
                     active = true;
@@ -1395,6 +2847,7 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
                 const uint64_t last = global_step_last_activity_cycle_;
                 const uint64_t quiet = (now >= last) ? (now - last) : 0;
                 if (quiet >= global_step_quiescent_min_cycles_) {
+                    noteStepBarrierWaitNs_(global_step_active_seq_, getCurrentSimTimeNano());
                     auto* ev = new GasStepBarrierEvent(GasStepBarrierOp::PeDone,
                                                        global_step_active_seq_,
                                                        static_cast<uint32_t>(node_id_));
@@ -1411,7 +2864,7 @@ bool MultiCorePE::clockTick(Cycle_t current_cycle) {
                     gas_step_ctrl_link_->send(ev);
                     global_step_done_sent_ = true;
                     if (stat_global_steps_done_total_) stat_global_steps_done_total_->addData(1);
-                    if (sentinel_enabled_ && output_ && global_step_active_seq_ == 1) {
+                    if (sentinel_enabled_ && output_ && global_step_active_seq_ <= 2) {
                         output_->verbose(CALL_INFO, 2, 0,
                             "[[sentinel-step-sync]] node=%d send PE_DONE(quiescent) seq=%u quiet=%" PRIu64 "\n",
                             node_id_, global_step_active_seq_, (uint64_t)quiet);
@@ -1464,276 +2917,21 @@ void MultiCorePE::handleLoaderDoneEvent(SST::Event* ev) {
     delete ev;
 }
 
-void MultiCorePE::submitTassLfP0WindowReport(const TassLfP0WindowReport& report) {
-    if (!tass_lf_p0_enable_) return;
-    if (stat_gas_tass_lf_p0_reports_submit_total_) stat_gas_tass_lf_p0_reports_submit_total_->addData(1);
-    uint32_t block_origin_node = 0;
-    uint32_t expected_contributors = 1;
-    computeTassBlockInfo_(report, block_origin_node, expected_contributors);
-    if (block_origin_node == static_cast<uint32_t>(node_id_)) {
-        reduceTassLfP0WindowReport_(report);
-        return;
-    }
-    if (tass_p0_out_link_) {
-        if (stat_gas_tass_lf_p0_reports_send_total_) stat_gas_tass_lf_p0_reports_send_total_->addData(1);
-        tass_p0_out_link_->send(new TassLfP0ReportEvent(report));
-    } else {
-        if (stat_gas_tass_lf_p0_reports_drop_no_link_total_) stat_gas_tass_lf_p0_reports_drop_no_link_total_->addData(1);
-    }
-}
-
-void MultiCorePE::submitTassNaiveWindowRequest(const TassNaiveWindowRequest& request) {
-    if (!naive_tass_enable_) {
-        if (!request.entries.empty()) {
-            output_->fatal(CALL_INFO, -1,
-                           "MultiCorePE fatal: received naive_tass window request while experimental_naive_tass_enable=0 "
-                           "(node=%d source_node=%u source_core=%u entries=%zu window=%u)\n",
-                           node_id_, request.source_node, request.source_core, request.entries.size(), request.window_seq);
-        }
-        return;
-    }
-    uint32_t block_origin_node = 0;
-    uint32_t expected_contributors = 1;
-    computeTassBlockInfo_(request, block_origin_node, expected_contributors);
-    if (block_origin_node == static_cast<uint32_t>(node_id_)) {
-        handleTassNaiveWindowRequest_(request);
-        return;
-    }
-    if (!tass_p0_out_link_) {
-        output_->fatal(CALL_INFO, -1,
-                       "MultiCorePE fatal: naive_tass request missing tass_p0_out link on node=%d source_core=%u\n",
-                       node_id_, request.source_core);
-    }
-    tass_p0_out_link_->send(new TassNaiveWindowRequestEvent(request));
-}
-
-void MultiCorePE::handleTassLfP0ReportEvent(SST::Event* ev) {
-    if (!ev) return;
-    if (auto* msg = dynamic_cast<TassLfP0ReportEvent*>(ev)) {
-        if (stat_gas_tass_lf_p0_reports_recv_total_) stat_gas_tass_lf_p0_reports_recv_total_->addData(1);
-        reduceTassLfP0WindowReport_(msg->report);
-        delete ev;
-        return;
-    }
-    if (auto* req = dynamic_cast<TassNaiveWindowRequestEvent*>(ev)) {
-        handleTassNaiveWindowRequest_(req->request);
-        delete ev;
-        return;
-    }
-    if (auto* rsp = dynamic_cast<TassNaiveResponseEvent*>(ev)) {
-        deliverTassNaiveResponsesLocal_(rsp->entries);
-        delete ev;
-        return;
-    }
-    delete ev;
-}
-
-void MultiCorePE::handleTassNaiveWindowRequest_(const TassNaiveWindowRequest& request) {
-    if (!naive_tass_enable_) {
-        if (!request.entries.empty()) {
-            output_->fatal(CALL_INFO, -1,
-                           "MultiCorePE fatal: TassNaiveWindowRequestEvent arrived on node with naive_tass disabled "
-                           "(node=%d source_node=%u source_core=%u entries=%zu window=%u)\n",
-                           node_id_, request.source_node, request.source_core, request.entries.size(), request.window_seq);
-        }
-        return;
-    }
-    if (request.entries.empty()) return;
-    if (!memory_interface_) {
-        output_->fatal(CALL_INFO, -1,
-                       "MultiCorePE fatal: naive_tass request arrived without memory_interface on node=%d\n",
-                       node_id_);
-    }
-    uint32_t block_origin_node = 0;
-    uint32_t expected_contributors = 1;
-    computeTassBlockInfo_(request, block_origin_node, expected_contributors);
-    if (block_origin_node != static_cast<uint32_t>(node_id_)) {
-        output_->fatal(CALL_INFO, -1,
-                       "MultiCorePE fatal: naive_tass request routed to non-origin node=%d expected_origin=%u src_node=%u\n",
-                       node_id_, block_origin_node, request.source_node);
-    }
-    const uint32_t line_size = std::max<uint32_t>(1u, request.line_size_bytes);
-    for (const auto& entry : request.entries) {
-        const uint64_t addr = base_addr_ + static_cast<uint64_t>(entry.widx) * sizeof(float);
-        const uint64_t line_addr = (addr / static_cast<uint64_t>(line_size)) * static_cast<uint64_t>(line_size);
-        const uint32_t byte_offset = static_cast<uint32_t>(addr - line_addr);
-        auto& state = tass_naive_lines_[line_addr];
-        if (state.window_seq != request.window_seq) {
-            state = TassNaiveLineState{};
-            state.window_seq = request.window_seq;
-            state.line_size_bytes = line_size;
-        }
-        if (!state.inflight && !state.data.empty()) {
-            TassNaiveResponseEntry rsp{};
-            rsp.dst_core = request.source_core;
-            rsp.window_seq = request.window_seq;
-            rsp.retire_seq = entry.retire_seq;
-            rsp.weight = loadTassNaiveWeight_(state.data, byte_offset);
-            std::vector<TassNaiveResponseEntry> local_entries{};
-            local_entries.push_back(rsp);
-            dispatchTassNaiveResponses_(request.source_node, local_entries);
-            continue;
-        }
-        TassNaiveLineWaiter waiter{};
-        waiter.dst_node = request.source_node;
-        waiter.dst_core = request.source_core;
-        waiter.window_seq = request.window_seq;
-        waiter.retire_seq = entry.retire_seq;
-        waiter.byte_offset = byte_offset;
-        state.waiters.push_back(waiter);
-        if (state.inflight) continue;
-        state.window_seq = request.window_seq;
-        state.line_size_bytes = line_size;
-        state.inflight = true;
-        auto* rd = new SST::Interfaces::StandardMem::Read(line_addr, line_size);
-        const auto req_id = rd->getID();
-        tass_naive_req_to_line_[req_id] = line_addr;
-        memory_interface_->send(rd);
-    }
-}
-
-void MultiCorePE::handleTassNaiveMemoryResponse_(SST::Interfaces::StandardMem::Request* req) {
-    if (!req) return;
-    auto* rr = dynamic_cast<SST::Interfaces::StandardMem::ReadResp*>(req);
-    if (!rr) {
-        delete req;
-        return;
-    }
-    const auto it = tass_naive_req_to_line_.find(req->getID());
-    if (it == tass_naive_req_to_line_.end()) {
-        output_->fatal(CALL_INFO, -1,
-                       "MultiCorePE fatal: naive_tass memory response with unknown request id "
-                       "(node=%d req_id=%" PRIu64 " inflight_req_count=%zu)\n",
-                       node_id_, static_cast<uint64_t>(req->getID()), tass_naive_req_to_line_.size());
-    }
-    const uint64_t line_addr = it->second;
-    tass_naive_req_to_line_.erase(it);
-    auto line_it = tass_naive_lines_.find(line_addr);
-    if (line_it == tass_naive_lines_.end()) {
-        output_->fatal(CALL_INFO, -1,
-                       "MultiCorePE fatal: naive_tass memory response line state missing "
-                       "(node=%d line_addr=0x%" PRIx64 " req_id=%" PRIu64 ")\n",
-                       node_id_, line_addr, static_cast<uint64_t>(req->getID()));
-    }
-    auto& state = line_it->second;
-    state.inflight = false;
-    state.data = rr->data;
-    std::unordered_map<uint32_t, std::vector<TassNaiveResponseEntry>> by_node{};
-    for (const auto& waiter : state.waiters) {
-        TassNaiveResponseEntry entry{};
-        entry.dst_core = waiter.dst_core;
-        entry.window_seq = waiter.window_seq;
-        entry.retire_seq = waiter.retire_seq;
-        entry.weight = loadTassNaiveWeight_(state.data, waiter.byte_offset);
-        by_node[waiter.dst_node].push_back(entry);
-    }
-    state.waiters.clear();
-    for (auto& kv : by_node) {
-        dispatchTassNaiveResponses_(kv.first, kv.second);
-    }
-    delete req;
-}
-
-void MultiCorePE::deliverTassNaiveResponsesLocal_(const std::vector<TassNaiveResponseEntry>& entries) {
-    if (entries.empty()) return;
-    std::unordered_map<uint32_t, std::vector<TassNaiveResponseEntry>> by_core{};
-    for (const auto& entry : entries) {
-        by_core[entry.dst_core].push_back(entry);
-    }
-    for (auto& kv : by_core) {
-        const uint32_t core_id = kv.first;
-        if (core_id >= static_cast<uint32_t>(cores_.size()) || !cores_[core_id]) {
-            output_->fatal(CALL_INFO, -1,
-                           "MultiCorePE fatal: naive_tass response target core out of range node=%d core=%u size=%zu\n",
-                           node_id_, core_id, cores_.size());
-        }
-        auto* sink = dynamic_cast<ITassNaiveResponseSink*>(cores_[core_id]);
-        if (!sink) {
-            output_->fatal(CALL_INFO, -1,
-                           "MultiCorePE fatal: core=%u on node=%d does not implement ITassNaiveResponseSink\n",
-                           core_id, node_id_);
-        }
-        sink->onTassNaiveResponses(kv.second);
-    }
-}
-
-void MultiCorePE::dispatchTassNaiveResponses_(uint32_t dst_node, std::vector<TassNaiveResponseEntry>& entries) {
-    if (entries.empty()) return;
-    if (dst_node == static_cast<uint32_t>(node_id_)) {
-        deliverTassNaiveResponsesLocal_(entries);
-        entries.clear();
-        return;
-    }
-    if (dst_node >= tass_p0_rsp_out_links_.size() || !tass_p0_rsp_out_links_[dst_node]) {
-        output_->fatal(CALL_INFO, -1,
-                       "MultiCorePE fatal: naive_tass response link missing node=%d dst_node=%u entries=%zu\n",
-                       node_id_, dst_node, entries.size());
-    }
-    tass_p0_rsp_out_links_[dst_node]->send(new TassNaiveResponseEvent(static_cast<uint32_t>(node_id_), std::move(entries)));
-    entries.clear();
-}
-
-void MultiCorePE::reduceTassLfP0WindowReport_(const TassLfP0WindowReport& report) {
-    if (!tass_lf_p0_enable_) return;
-    if (stat_gas_tass_lf_p0_reports_reduce_total_) stat_gas_tass_lf_p0_reports_reduce_total_->addData(1);
-    uint32_t block_origin_node = 0;
-    uint32_t expected_contributors = 1;
-    computeTassBlockInfo_(report, block_origin_node, expected_contributors);
-    if (block_origin_node != static_cast<uint32_t>(node_id_)) {
-        if (stat_gas_tass_lf_p0_reports_drop_non_origin_total_) stat_gas_tass_lf_p0_reports_drop_non_origin_total_->addData(1);
-        return;
-    }
-    const uint64_t epoch_key = packTassBlockEpochKey_(block_origin_node, report.window_seq);
-    const uint64_t contributor_key = packTassContributorKey_(report.node_id, report.core_id);
-    auto& epoch = tass_lf_p0_pending_epochs_[epoch_key];
-    if (epoch.expected_contributors == 0) {
-        epoch.expected_contributors = expected_contributors;
-        epoch.line_size_bytes = std::max<uint32_t>(1u, report.line_size_bytes);
-    }
-    const auto inserted = epoch.contributors.insert(contributor_key);
-    if (!inserted.second) {
-        return;
-    }
-    epoch.payload_bytes_total += report.payload_bytes_total;
-    epoch.current_vlf_line_groups_total += report.current_vlf_line_groups_total;
-    for (const auto& kv : report.pre_payload_entries) {
-        epoch.pre_payload_bytes[kv.pre_global] += kv.payload_bytes;
-        epoch.pre_contributors[kv.pre_global] += 1u;
-    }
-    if (epoch.contributors.size() < static_cast<size_t>(epoch.expected_contributors)) {
-        return;
-    }
-    const uint64_t line_size = std::max<uint64_t>(1ull, static_cast<uint64_t>(epoch.line_size_bytes));
-    uint64_t block_active_pres_total = static_cast<uint64_t>(epoch.pre_payload_bytes.size());
-    uint64_t block_shared_pres_total = 0;
-    uint64_t cross_core_joins_total = 0;
-    uint64_t block_naive_line_count_total = 0;
-    uint64_t response_fanout_total = 0;
-    for (const auto& kv : epoch.pre_payload_bytes) {
-        block_naive_line_count_total += ceilDivU64_(kv.second, line_size);
-    }
-    for (const auto& kv : epoch.pre_contributors) {
-        const uint64_t fanout = static_cast<uint64_t>(kv.second);
-        response_fanout_total += fanout;
-        if (fanout > 1) {
-            block_shared_pres_total += 1;
-            cross_core_joins_total += (fanout - 1);
-        }
-    }
-    if (stat_gas_tass_lf_p0_block_epochs_total_) stat_gas_tass_lf_p0_block_epochs_total_->addData(1);
-    if (stat_gas_tass_lf_p0_block_active_pres_total_) stat_gas_tass_lf_p0_block_active_pres_total_->addData(block_active_pres_total);
-    if (stat_gas_tass_lf_p0_block_shared_pres_total_) stat_gas_tass_lf_p0_block_shared_pres_total_->addData(block_shared_pres_total);
-    if (stat_gas_tass_lf_p0_cross_core_joins_total_) stat_gas_tass_lf_p0_cross_core_joins_total_->addData(cross_core_joins_total);
-    if (stat_gas_tass_lf_p0_payload_bytes_total_) stat_gas_tass_lf_p0_payload_bytes_total_->addData(epoch.payload_bytes_total);
-    if (stat_gas_tass_lf_p0_current_vlf_line_groups_total_) stat_gas_tass_lf_p0_current_vlf_line_groups_total_->addData(epoch.current_vlf_line_groups_total);
-    if (stat_gas_tass_lf_p0_block_naive_line_count_total_) stat_gas_tass_lf_p0_block_naive_line_count_total_->addData(block_naive_line_count_total);
-    if (stat_gas_tass_lf_p0_block_fused_lb_line_count_total_) stat_gas_tass_lf_p0_block_fused_lb_line_count_total_->addData(ceilDivU64_(epoch.payload_bytes_total, line_size));
-    if (stat_gas_tass_lf_p0_response_fanout_total_) stat_gas_tass_lf_p0_response_fanout_total_->addData(response_fanout_total);
-    tass_lf_p0_pending_epochs_.erase(epoch_key);
-}
-
 void MultiCorePE::handleGasStepCtrlEvent(SST::Event* ev) {
     if (!ev) return;
+    if (auto* gd = dynamic_cast<GatingDecisionEvent*>(ev)) {
+        const uint32_t src_global =
+            static_cast<uint32_t>(gd->src_pe) * static_cast<uint32_t>(total_neurons_) + gd->src_row;
+        std::vector<uint32_t> dpes = gd->dest_pes;
+        for (auto* core : cores_) {
+            if (!core) continue;
+            auto* hooks = dynamic_cast<ICoreControlHooks*>(core);
+            if (!hooks) continue;
+            hooks->applyGatingDecision(src_global, dpes, current_cycle_, gd->ttl_cycles);
+        }
+        delete gd;
+        return;
+    }
     auto* msg = dynamic_cast<GasStepBarrierEvent*>(ev);
     if (!msg) {
         delete ev;
@@ -1792,8 +2990,6 @@ void MultiCorePE::handleGasStepCtrlEvent(SST::Event* ev) {
 }
 
 void MultiCorePE::beginGlobalStep_(uint32_t seq) {
-    tass_naive_lines_.clear();
-    tass_naive_req_to_line_.clear();
     global_step_active_seq_ = seq;
     global_step_active_apply_bank_credit_target_ = global_step_pending_apply_bank_credit_target_;
     global_step_pending_apply_bank_credit_target_ = 0;
@@ -1836,10 +3032,16 @@ void MultiCorePE::beginGlobalStep_(uint32_t seq) {
             output_->fatal(CALL_INFO, -1, "GlobalStep fatal: core%d does not implement IGlobalStepHooks\n", i);
             return;
         }
-        if (sentinel_enabled_ && output_ && seq == 1) {
+        if (sentinel_enabled_ && output_ && seq <= 2) {
             output_->verbose(CALL_INFO, 2, 0, "[[sentinel-step-sync]] node=%d call onGlobalStepStart core=%d seq=%u\n", node_id_, i, seq);
         }
         hook->onGlobalStepStart(seq);
+        if (sentinel_enabled_ && output_ && node_id_ == 0 && seq <= 2 && i >= 15) {
+            output_->verbose(
+                CALL_INFO, 2, 0,
+                "[[sentinel-step-path]] node=%d core=%d seq=%u after_onGlobalStepStart\n",
+                node_id_, i, seq);
+        }
     }
 
     // naive_raw baseline：flush 上一 step 产生的“下一 step spike”，确保跨步传播但禁止步内级联。
@@ -1849,8 +3051,24 @@ void MultiCorePE::beginGlobalStep_(uint32_t seq) {
     // 注意：必须在 core 进入 step 后再注入，确保所有触发的 spike 归属到本 step 的 Gather。
     step_activation_subsys_.onGlobalStepStart(seq, getCurrentSimTimeNano());
 
-    if (sentinel_enabled_ && output_ && seq == 1) {
+    if (sentinel_enabled_ && output_ && seq <= 2) {
         output_->verbose(CALL_INFO, 2, 0, "[[sentinel-step-sync]] node=%d beginGlobalStep seq=%u cores=%d\n", node_id_, seq, num_cores_);
+    }
+}
+
+void MultiCorePE::noteStepBarrierWaitNs_(uint32_t seq, uint64_t now_ns) {
+    if (seq == 0) return;
+    uint64_t wait_ns = 0;
+    auto it = stage_marks_.find(seq);
+    if (it != stage_marks_.end()) {
+        const auto& m = it->second;
+        if (m.es != 0 && now_ns >= m.es) {
+            wait_ns = now_ns - m.es;
+        }
+    }
+    auto& perf = getOrCreateStepPerf_(seq);
+    if (wait_ns > perf.step_barrier_wait_ns) {
+        perf.step_barrier_wait_ns = wait_ns;
     }
 }
 
@@ -1876,6 +3094,313 @@ void MultiCorePE::clearAllDeferredPackets_() {
         }
     }
     deferred_packets_by_seq_.clear();
+}
+
+void MultiCorePE::clearAllPulseIngressPackets_() {
+    for (auto& kv : pulse_ingress_buffered_packets_) {
+        auto& entry = kv.second;
+        delete entry.pkt;
+        entry.pkt = nullptr;
+    }
+    pulse_ingress_buffered_packets_.clear();
+}
+
+bool MultiCorePE::pulseActualIngressEnabled_() const {
+    return pulse_fabric_ &&
+           !pulse_fabric_->config().observe_only &&
+           pulse_fabric_->config().ingress_enable &&
+           pulse_fabric_->config().ingress_entries > 0;
+}
+
+bool MultiCorePE::pulseActualIngressEligible_(NocPacketKind kind) const {
+    return kind == NocPacketKind::Spike ||
+           kind == NocPacketKind::SpikeKey ||
+           kind == NocPacketKind::SpikeTileKey;
+}
+
+void MultiCorePE::appendAtlasActivationGateStats_(
+    std::map<std::string, uint64_t>& stats) const {
+    const PeSharedCoreFabric::Config* pulse_cfg =
+        pulse_fabric_ ? &pulse_fabric_->config() : nullptr;
+    const bool pulse_osa_metadata_txn_effective =
+        pulse_osa_enable_ && pulse_osa_metadata_txn_enable_;
+    const bool rowindex_gate_pulse_osa =
+        pulse_osa_enable_;
+    const bool rowindex_gate_metadata_txn =
+        pulse_osa_metadata_txn_enable_;
+    const bool rowindex_gate_metadata_mask =
+        (pulse_osa_metadata_object_mask_bits_ &
+         PeLocalServiceObjectTable::kMetadataKindMaskRowIndex) != 0u;
+    const bool rowindex_gate_pod_enable =
+        pe_internal_pod_enable_cfg_;
+    const bool rowindex_gate_pod_metadata_enable =
+        pe_internal_pod_metadata_enable_cfg_;
+    const bool rowindex_gate_pod_owner_enable =
+        pe_internal_pod_owner_enable_cfg_;
+    const bool rowindex_gate_service_table_present =
+        pe_local_service_object_table_ != nullptr;
+    const bool pulse_osa_metadata_ready_lease_effective =
+        pulse_osa_metadata_txn_effective &&
+        pulse_osa_metadata_ready_lease_enable_ &&
+        pulse_osa_metadata_ready_lease_ttl_ > 0u &&
+        pulse_osa_metadata_object_mask_bits_ != 0u &&
+        pe_local_service_object_table_ != nullptr;
+    const bool control_runtime_produce_eligible =
+        pod_metadata_object_plane_ != nullptr &&
+        pod_owner_service_table_ != nullptr &&
+        pe_local_service_object_table_ != nullptr;
+    const bool control_runtime_end_to_end_eligible =
+        control_runtime_produce_eligible && pulse_fabric_ != nullptr;
+
+    stats["atlas_enable_state_local_storage_effective_total"] =
+        local_storage_enable_ ? 1u : 0u;
+    stats["atlas_enable_state_pe_internal_cpe_effective_total"] =
+        pe_internal_cpe_enable_cfg_ ? 1u : 0u;
+    stats["atlas_enable_state_pe_internal_pod_effective_total"] =
+        pe_internal_pod_enable_cfg_ ? 1u : 0u;
+    stats["atlas_enable_state_pe_internal_pod_metadata_effective_total"] =
+        pe_internal_pod_metadata_enable_cfg_ ? 1u : 0u;
+    stats["atlas_enable_state_pe_internal_pod_owner_effective_total"] =
+        pe_internal_pod_owner_enable_cfg_ ? 1u : 0u;
+    stats["atlas_enable_state_pe_local_service_table_present_total"] =
+        pe_local_service_object_table_ ? 1u : 0u;
+    stats["atlas_enable_state_rowindex_effective_total"] =
+        atlas_rowindex_effective_seen_ ? 1u : 0u;
+    stats["atlas_enable_state_rowindex_gate_pulse_osa_total"] =
+        rowindex_gate_pulse_osa ? 1u : 0u;
+    stats["atlas_enable_state_rowindex_gate_metadata_txn_total"] =
+        rowindex_gate_metadata_txn ? 1u : 0u;
+    stats["atlas_enable_state_rowindex_gate_metadata_mask_total"] =
+        rowindex_gate_metadata_mask ? 1u : 0u;
+    stats["atlas_enable_state_rowindex_gate_pod_enable_total"] =
+        rowindex_gate_pod_enable ? 1u : 0u;
+    stats["atlas_enable_state_rowindex_gate_pod_metadata_enable_total"] =
+        rowindex_gate_pod_metadata_enable ? 1u : 0u;
+    stats["atlas_enable_state_rowindex_gate_pod_owner_enable_total"] =
+        rowindex_gate_pod_owner_enable ? 1u : 0u;
+    stats["atlas_enable_state_rowindex_gate_service_table_present_total"] =
+        rowindex_gate_service_table_present ? 1u : 0u;
+    stats["atlas_enable_state_pulse_effective_total"] =
+        pulse_enable_ ? 1u : 0u;
+    stats["atlas_enable_state_pulse_fabric_present_total"] =
+        pulse_fabric_ ? 1u : 0u;
+    stats["atlas_enable_state_pulse_observe_only_total"] =
+        (pulse_cfg && pulse_cfg->observe_only) ? 1u : 0u;
+    stats["atlas_enable_state_pulse_actual_ingress_effective_total"] =
+        pulseActualIngressEnabled_() ? 1u : 0u;
+    stats["atlas_enable_state_pulse_harbor_effective_total"] =
+        (pulse_cfg && pulse_cfg->harbor_enable) ? 1u : 0u;
+    stats["atlas_enable_state_pulse_descriptor_effective_total"] =
+        (pulse_cfg && pulse_cfg->descriptor_enable) ? 1u : 0u;
+    stats["atlas_enable_state_pulse_descriptor_actual_effective_total"] =
+        (pulse_cfg && pulse_cfg->descriptor_actual_enable) ? 1u : 0u;
+    stats["atlas_enable_state_pulse_osa_effective_total"] =
+        pulse_osa_enable_ ? 1u : 0u;
+    stats["atlas_enable_state_pulse_osa_shared_weight_owner_effective_total"] =
+        pulse_osa_shared_weight_owner_enable_ ? 1u : 0u;
+    stats["atlas_enable_state_pulse_osa_shared_weight_actual_effective_total"] =
+        pulse_osa_shared_weight_owner_actual_enable_ ? 1u : 0u;
+    stats["atlas_enable_state_pe_weight_plane_present_total"] =
+        pe_weight_object_plane_ ? 1u : 0u;
+    stats["atlas_enable_state_pulse_osa_metadata_txn_effective_total"] =
+        pulse_osa_metadata_txn_effective ? 1u : 0u;
+    stats["atlas_enable_state_pulse_osa_metadata_ready_lease_effective_total"] =
+        pulse_osa_metadata_ready_lease_effective ? 1u : 0u;
+    stats["atlas_enable_state_pulse_osa_metadata_mask_nonzero_total"] =
+        pulse_osa_metadata_object_mask_bits_ != 0u ? 1u : 0u;
+    stats["atlas_enable_state_control_runtime_produce_eligible_total"] =
+        control_runtime_produce_eligible ? 1u : 0u;
+    stats["atlas_enable_state_control_runtime_end_to_end_eligible_total"] =
+        control_runtime_end_to_end_eligible ? 1u : 0u;
+
+    stats["atlas_activation_gate_workload_pure_snn_datapath_eligible"] =
+        pure_snn_datapath_workload_eligible_ ? 1u : 0u;
+    stats["atlas_activation_gate_local_storage_enable"] =
+        local_storage_enable_ ? 1u : 0u;
+    stats["atlas_activation_gate_pulse_requested"] =
+        pulse_enable_requested_ ? 1u : 0u;
+    stats["atlas_activation_gate_pulse_effective"] =
+        pulse_enable_ ? 1u : 0u;
+    stats["atlas_activation_gate_pulse_fabric_constructed"] =
+        pulse_fabric_ ? 1u : 0u;
+    stats["atlas_activation_gate_pulse_observe_only_effective"] =
+        (pulse_cfg && pulse_cfg->observe_only) ? 1u : 0u;
+    stats["atlas_activation_gate_pulse_actual_ingress_eligible"] =
+        pulseActualIngressEnabled_() ? 1u : 0u;
+    stats["atlas_activation_gate_pulse_harbor_enable_effective"] =
+        (pulse_cfg && pulse_cfg->harbor_enable) ? 1u : 0u;
+    stats["atlas_activation_gate_pulse_descriptor_enable_effective"] =
+        (pulse_cfg && pulse_cfg->descriptor_enable) ? 1u : 0u;
+    stats["atlas_activation_gate_pulse_descriptor_actual_requested"] =
+        pulse_descriptor_actual_requested_ ? 1u : 0u;
+    stats["atlas_activation_gate_pulse_descriptor_actual_effective"] =
+        (pulse_cfg && pulse_cfg->descriptor_actual_enable) ? 1u : 0u;
+    stats["atlas_activation_gate_pulse_osa_requested"] =
+        pulse_osa_requested_ ? 1u : 0u;
+    stats["atlas_activation_gate_pulse_osa_effective"] =
+        pulse_osa_enable_ ? 1u : 0u;
+    stats["atlas_activation_gate_shared_weight_owner_requested"] =
+        pulse_osa_shared_weight_owner_requested_ ? 1u : 0u;
+    stats["atlas_activation_gate_shared_weight_owner_effective"] =
+        pulse_osa_shared_weight_owner_enable_ ? 1u : 0u;
+    stats["atlas_activation_gate_shared_weight_plane_constructed"] =
+        pe_weight_object_plane_ ? 1u : 0u;
+    stats["atlas_activation_gate_shared_weight_actual_owner_requested"] =
+        pulse_osa_shared_weight_owner_actual_requested_ ? 1u : 0u;
+    stats["atlas_activation_gate_shared_weight_actual_owner_effective"] =
+        pulse_osa_shared_weight_owner_actual_enable_ ? 1u : 0u;
+    stats["atlas_activation_gate_pe_internal_pod_requested"] =
+        pe_internal_pod_requested_ ? 1u : 0u;
+    stats["atlas_activation_gate_rowindex_requested"] =
+        atlas_rowindex_requested_seen_ ? 1u : 0u;
+    stats["atlas_activation_gate_pe_internal_pod_metadata_requested"] =
+        pe_internal_pod_metadata_requested_ ? 1u : 0u;
+    stats["atlas_activation_gate_pe_internal_pod_owner_requested"] =
+        pe_internal_pod_owner_requested_ ? 1u : 0u;
+    stats["atlas_activation_gate_rowindex_constructed"] =
+        atlas_rowindex_constructed_seen_ ? 1u : 0u;
+    stats["atlas_activation_gate_pod_metadata_plane_constructed"] =
+        pod_metadata_object_plane_ ? 1u : 0u;
+    stats["atlas_activation_gate_pod_owner_table_constructed"] =
+        pod_owner_service_table_ ? 1u : 0u;
+    stats["atlas_activation_gate_service_table_constructed"] =
+        pe_local_service_object_table_ ? 1u : 0u;
+}
+
+void MultiCorePE::appendAtlasSharedWeightCensusStats_(
+    std::map<std::string, uint64_t>& stats) const {
+    bool state_absent = pe_weight_object_plane_ == nullptr;
+    bool state_owner_scope_off = false;
+    bool state_mirror_only = false;
+    bool state_actual_owner = false;
+
+    if (pe_weight_object_plane_) {
+        const auto weight_plane_stats = pe_weight_object_plane_->snapshotStats();
+        state_owner_scope_off = !weight_plane_stats.owner_scope_enable;
+        state_actual_owner =
+            weight_plane_stats.owner_scope_enable &&
+            weight_plane_stats.actual_owner_enable;
+        state_mirror_only =
+            weight_plane_stats.owner_scope_enable &&
+            !weight_plane_stats.actual_owner_enable;
+    }
+
+    const bool absent_reason_workload_ineligible =
+        state_absent && !pure_snn_datapath_workload_eligible_;
+    const bool absent_reason_local_storage_gate =
+        state_absent &&
+        pure_snn_datapath_workload_eligible_ &&
+        !local_storage_enable_;
+    const bool absent_reason_pulse_osa_gate =
+        state_absent &&
+        pure_snn_datapath_workload_eligible_ &&
+        local_storage_enable_ &&
+        !pulse_osa_enable_;
+    const bool absent_reason_owner_request_gate =
+        state_absent &&
+        pure_snn_datapath_workload_eligible_ &&
+        local_storage_enable_ &&
+        pulse_osa_enable_ &&
+        !pulse_osa_shared_weight_owner_requested_;
+
+    stats["atlas_shared_weight_census_state_absent_total"] =
+        state_absent ? 1u : 0u;
+    stats["atlas_shared_weight_census_state_owner_scope_off_total"] =
+        state_owner_scope_off ? 1u : 0u;
+    stats["atlas_shared_weight_census_state_mirror_only_total"] =
+        state_mirror_only ? 1u : 0u;
+    stats["atlas_shared_weight_census_state_actual_owner_total"] =
+        state_actual_owner ? 1u : 0u;
+    stats["atlas_shared_weight_census_absent_reason_workload_ineligible_total"] =
+        absent_reason_workload_ineligible ? 1u : 0u;
+    stats["atlas_shared_weight_census_absent_reason_local_storage_gate_total"] =
+        absent_reason_local_storage_gate ? 1u : 0u;
+    stats["atlas_shared_weight_census_absent_reason_pulse_osa_gate_total"] =
+        absent_reason_pulse_osa_gate ? 1u : 0u;
+    stats["atlas_shared_weight_census_absent_reason_owner_request_gate_total"] =
+        absent_reason_owner_request_gate ? 1u : 0u;
+}
+
+void MultiCorePE::appendAtlasControlRuntimeClassificationStats_(
+    std::map<std::string, uint64_t>& stats) const {
+    const bool fabric_present = pulse_fabric_ != nullptr;
+    bool queued_nonzero = false;
+    bool consumed_nonzero = false;
+    bool backlog_nonzero = false;
+    if (fabric_present) {
+        const auto pulse_stats = pulse_fabric_->snapshotStats();
+        queued_nonzero = pulse_stats.control_messages_enqueued_total > 0u;
+        consumed_nonzero = pulse_stats.control_messages_dequeued_total > 0u;
+        backlog_nonzero =
+            pulse_stats.control_entries_current > 0u ||
+            pulse_stats.control_entries_peak > 0u ||
+            pulse_stats.control_backlog_cycles_total > 0u;
+    }
+    const bool all_zero =
+        !atlas_control_runtime_produced_any_nonzero_last_ &&
+        !queued_nonzero &&
+        !consumed_nonzero &&
+        !backlog_nonzero;
+    const bool fabric_absent = !fabric_present;
+    const bool fabric_present_idle = fabric_present && all_zero;
+    const bool consumed_active = fabric_present && consumed_nonzero;
+    const bool queued_without_consume =
+        fabric_present &&
+        !consumed_nonzero &&
+        (queued_nonzero || backlog_nonzero);
+    const bool produced_without_queue =
+        fabric_present &&
+        !consumed_nonzero &&
+        !queued_nonzero &&
+        !backlog_nonzero &&
+        atlas_control_runtime_produced_any_nonzero_last_;
+
+    stats["atlas_control_runtime_produced_any_nonzero_total"] =
+        atlas_control_runtime_produced_any_nonzero_last_ ? 1u : 0u;
+    stats["atlas_control_runtime_queued_any_nonzero_total"] =
+        queued_nonzero ? 1u : 0u;
+    stats["atlas_control_runtime_consumed_any_nonzero_total"] =
+        consumed_nonzero ? 1u : 0u;
+    stats["atlas_control_runtime_backlog_any_nonzero_total"] =
+        backlog_nonzero ? 1u : 0u;
+    stats["atlas_control_runtime_all_zero_total"] =
+        all_zero ? 1u : 0u;
+    stats["atlas_control_runtime_state_fabric_absent_total"] =
+        fabric_absent ? 1u : 0u;
+    stats["atlas_control_runtime_state_fabric_present_idle_total"] =
+        fabric_present_idle ? 1u : 0u;
+    stats["atlas_control_runtime_state_produced_without_queue_total"] =
+        produced_without_queue ? 1u : 0u;
+    stats["atlas_control_runtime_state_queued_without_consume_total"] =
+        queued_without_consume ? 1u : 0u;
+    stats["atlas_control_runtime_state_consumed_active_total"] =
+        consumed_active ? 1u : 0u;
+}
+
+void MultiCorePE::drainPulseIngress_() {
+    if (!pulseActualIngressEnabled_()) return;
+    if (pulse_ingress_buffered_packets_.empty()) return;
+
+    std::vector<PeSharedCoreFabric::DispatchTicket> batch;
+    const size_t budget = static_cast<size_t>(std::max(1, num_cores_));
+    const size_t dispatched = pulse_fabric_->collectDispatchBatch(budget, batch);
+    if (dispatched == 0) return;
+
+    for (const auto& ticket : batch) {
+        auto it = pulse_ingress_buffered_packets_.find(ticket.token);
+        if (it == pulse_ingress_buffered_packets_.end()) {
+            pulse_fabric_->observeIngressDrain();
+            continue;
+        }
+        PulseIngressBufferedPacket entry = std::move(it->second);
+        pulse_ingress_buffered_packets_.erase(it);
+        if (!entry.pkt) {
+            pulse_fabric_->observeIngressDrain();
+            continue;
+        }
+        pulse_fabric_->observeSharedDispatch();
+        deliverPacketDirectToCore_(entry.endpoint_id, entry.pkt, /*pulse_account_delivery=*/true);
+    }
 }
 
 void MultiCorePE::handleExternalSpike(SpikeEvent* spike) {
@@ -1925,6 +3450,115 @@ void MultiCorePE::getStatistics(std::map<std::string, uint64_t>& stats) const {
     stats["external_spikes_sent"] = stat_external_spikes_sent_->getCollectionCount();
     stats["external_spikes_received"] = stat_external_spikes_received_->getCollectionCount();
     stats["current_cycle"] = current_cycle_;
+    if (local_storage_controller_) {
+        const auto ls_stats = local_storage_controller_->snapshotStats();
+        stats["ls_objects_registered_total"] = static_cast<uint64_t>(ls_stats.objects_registered_total);
+        stats["ls_objects_enabled_total"] = static_cast<uint64_t>(ls_stats.objects_enabled_total);
+        stats["ls_capacity_bytes_total"] = ls_stats.capacity_bytes_total;
+        stats["ls_queue_slots_total"] = ls_stats.queue_slots_total;
+    }
+    appendAtlasActivationGateStats_(stats);
+    appendAtlasSharedWeightCensusStats_(stats);
+    appendAtlasControlRuntimeClassificationStats_(stats);
+    if (pod_metadata_object_plane_) {
+        pod_metadata_object_plane_->exportStatsToMap(stats, "atlas_pod_metadata_");
+    } else {
+        PodMetadataObjectPlane disabled_plane;
+        disabled_plane.exportStatsToMap(stats, "atlas_pod_metadata_");
+    }
+    if (pod_owner_service_table_) {
+        pod_owner_service_table_->exportStatsToMap(stats, "atlas_pod_owner_");
+    } else {
+        PodOwnerServiceTable disabled_table;
+        disabled_table.exportStatsToMap(stats, "atlas_pod_owner_");
+    }
+    if (pe_local_service_object_table_) {
+        pe_local_service_object_table_->exportStatsToMap(stats, "atlas_service_");
+    } else {
+        stats["atlas_service_enabled"] = 0;
+        stats["atlas_service_owner_form_total"] = 0;
+        stats["atlas_service_join_live_total"] = 0;
+        stats["atlas_service_join_ready_total"] = 0;
+        stats["atlas_service_late_join_total"] = 0;
+        stats["atlas_service_duplicate_join_total"] = 0;
+        stats["atlas_service_ready_transition_total"] = 0;
+        stats["atlas_service_ready_fanout_total"] = 0;
+        stats["atlas_service_ready_fanout_consumers_sum"] = 0;
+        stats["atlas_service_ready_fanout_consumers_peak"] = 0;
+        stats["atlas_service_released_total"] = 0;
+        stats["atlas_service_release_deferred_total"] = 0;
+        stats["atlas_service_ready_release_total"] = 0;
+        stats["atlas_service_ready_lease_hit_total"] = 0;
+        stats["atlas_service_ready_lease_expired_total"] = 0;
+        stats["atlas_service_potential_private_service_elide_total"] = 0;
+        stats["atlas_service_active_entries_total"] = 0;
+        stats["atlas_service_release_pending_active_total"] = 0;
+        stats["atlas_service_atlas_obj_materialize_total"] = 0;
+        stats["atlas_service_atlas_obj_publicize_total"] = 0;
+        stats["atlas_service_atlas_obj_owner_form_total"] = 0;
+        stats["atlas_service_atlas_obj_ready_total"] = 0;
+        stats["atlas_service_atlas_obj_release_total"] = 0;
+        stats["atlas_service_atlas_obj_private_only_total"] = 0;
+    }
+    if (pe_weight_object_plane_) {
+        pe_weight_object_plane_->exportStatsToMap(stats, "pulse_osa_shared_weight_");
+    } else {
+        stats["pulse_osa_shared_weight_enabled"] = 0;
+        stats["pulse_osa_shared_weight_owner_scope_enable"] = 0;
+        stats["pulse_osa_shared_weight_actual_owner_enable"] = 0;
+        stats["pulse_osa_shared_weight_idx_enabled"] = 0;
+        stats["pulse_osa_shared_weight_l0_enabled"] = 0;
+        stats["pulse_osa_shared_weight_l0_fill_total"] = 0;
+        stats["pulse_osa_shared_weight_l0_evict_total"] = 0;
+    }
+    if (pulse_fabric_) {
+        const auto pulse_stats = pulse_fabric_->snapshotStats();
+        stats["pulse_ingress_packets_total"] = pulse_stats.ingress_packets_total;
+        stats["pulse_ingress_spike_packets_total"] = pulse_stats.ingress_spike_packets_total;
+        stats["pulse_ingress_spikekey_packets_total"] = pulse_stats.ingress_spikekey_packets_total;
+        stats["pulse_ingress_spiketilekey_packets_total"] =
+            pulse_stats.ingress_spiketilekey_packets_total;
+        stats["pulse_ingress_core_dispatch_total"] = pulse_stats.ingress_core_dispatch_total;
+        stats["pulse_ingress_shared_buffered_total"] = pulse_stats.ingress_shared_buffered_total;
+        stats["pulse_ingress_shared_dispatch_total"] = pulse_stats.ingress_shared_dispatch_total;
+        stats["pulse_ingress_direct_deliver_total"] = pulse_stats.ingress_direct_deliver_total;
+        stats["pulse_ingress_bypass_total"] = pulse_stats.ingress_bypass_total;
+        stats["pulse_ingress_pressure_bypass_total"] = pulse_stats.ingress_pressure_bypass_total;
+        stats["pulse_ingress_singleton_bypass_total"] = pulse_stats.ingress_singleton_bypass_total;
+        stats["pulse_ingress_deadline_bypass_total"] = pulse_stats.ingress_deadline_bypass_total;
+        stats["pulse_ingress_pressure_cycles_total"] = pulse_stats.ingress_pressure_cycles_total;
+        stats["pulse_ingress_entries_peak"] = pulse_stats.ingress_entries_peak;
+        stats["pulse_control_entries_current"] = pulse_stats.control_entries_current;
+        stats["pulse_control_entries_peak"] = pulse_stats.control_entries_peak;
+        stats["pulse_control_backlog_cycles_total"] =
+            pulse_stats.control_backlog_cycles_total;
+        stats["pulse_core_queue_entries_peak"] = pulse_stats.core_queue_entries_peak;
+        stats["pulse_harbor_buckets_total"] = pulse_stats.harbor_buckets_total;
+        stats["pulse_harbor_packet_sum"] = pulse_stats.harbor_packet_sum;
+        stats["pulse_harbor_consumer_sum"] = pulse_stats.harbor_consumer_sum;
+        stats["pulse_harbor_bucket_peak"] = pulse_stats.harbor_bucket_peak;
+        stats["pulse_harbor_singleton_buckets_total"] =
+            pulse_stats.harbor_singleton_buckets_total;
+        stats["pulse_descriptor_total"] = pulse_stats.descriptor_total;
+        stats["pulse_descriptor_packet_sum"] = pulse_stats.descriptor_packet_sum;
+        stats["pulse_descriptor_consumer_sum"] = pulse_stats.descriptor_consumer_sum;
+        stats["pulse_descriptor_singleton_drop_total"] =
+            pulse_stats.descriptor_singleton_drop_total;
+        stats["pulse_control_messages_enqueued_total"] =
+            pulse_stats.control_messages_enqueued_total;
+        stats["pulse_control_messages_dequeued_total"] =
+            pulse_stats.control_messages_dequeued_total;
+        stats["pulse_control_frontier_export_total"] =
+            pulse_stats.control_frontier_export_total;
+        stats["pulse_control_owner_announce_total"] =
+            pulse_stats.control_owner_announce_total;
+        stats["pulse_control_join_request_total"] =
+            pulse_stats.control_join_request_total;
+        stats["pulse_control_ready_fanout_total"] =
+            pulse_stats.control_ready_fanout_total;
+        stats["pulse_control_join_reject_total"] =
+            pulse_stats.control_join_reject_total;
+    }
 }
 
 void MultiCorePE::initializeStatistics() {
@@ -1944,6 +3578,873 @@ void MultiCorePE::initializeStatistics() {
     stat_compat_naive_gas_stage_events_total_ = registerStatistic<uint64_t>("compat_naive_gas_stage_events_total");
     stat_compat_finish_incomplete_total_ = registerStatistic<uint64_t>("compat_finish_incomplete_total");
     stat_loader_done_timeout_fallback_total_ = registerStatistic<uint64_t>("loader_done_timeout_fallback_total");
+    stat_dma_issue_reqs_total_ = registerStatistic<uint64_t>("dma_issue_reqs_total");
+    stat_dma_issue_bytes_total_ = registerStatistic<uint64_t>("dma_issue_bytes_total");
+    stat_dma_queue_depth_max_p0_ = registerStatistic<uint64_t>("dma_queue_depth_max_p0");
+    stat_dma_queue_depth_max_p1_ = registerStatistic<uint64_t>("dma_queue_depth_max_p1");
+    stat_dma_queue_depth_max_p2_ = registerStatistic<uint64_t>("dma_queue_depth_max_p2");
+    stat_dma_queue_depth_max_p3_ = registerStatistic<uint64_t>("dma_queue_depth_max_p3");
+    stat_dma_inflight_max_ = registerStatistic<uint64_t>("dma_inflight_max");
+    stat_dma_stall_cycles_budget_ = registerStatistic<uint64_t>("dma_stall_cycles_budget");
+    stat_dma_stall_cycles_engine_ = registerStatistic<uint64_t>("dma_stall_cycles_engine");
+    stat_dma_stall_cycles_inflight_ = registerStatistic<uint64_t>("dma_stall_cycles_inflight");
+    stat_dma_stall_cycles_stage_gate_ = registerStatistic<uint64_t>("dma_stall_cycles_stage_gate");
+    stat_dma_stall_cycles_queue_full_ = registerStatistic<uint64_t>("dma_stall_cycles_queue_full");
+    stat_ls_objects_registered_total_ = registerStatistic<uint64_t>("ls_objects_registered_total");
+    stat_ls_objects_enabled_total_ = registerStatistic<uint64_t>("ls_objects_enabled_total");
+    stat_ls_capacity_bytes_total_ = registerStatistic<uint64_t>("ls_capacity_bytes_total");
+    stat_ls_queue_slots_total_ = registerStatistic<uint64_t>("ls_queue_slots_total");
+    stat_atlas_service_enabled_ =
+        registerStatistic<uint64_t>("atlas_service_enabled");
+    stat_atlas_service_owner_form_total_ =
+        registerStatistic<uint64_t>("atlas_service_owner_form_total");
+    stat_atlas_service_join_live_total_ =
+        registerStatistic<uint64_t>("atlas_service_join_live_total");
+    stat_atlas_service_join_ready_total_ =
+        registerStatistic<uint64_t>("atlas_service_join_ready_total");
+    stat_atlas_service_late_join_total_ =
+        registerStatistic<uint64_t>("atlas_service_late_join_total");
+    stat_atlas_service_duplicate_join_total_ =
+        registerStatistic<uint64_t>("atlas_service_duplicate_join_total");
+    stat_atlas_service_ready_transition_total_ =
+        registerStatistic<uint64_t>("atlas_service_ready_transition_total");
+    stat_atlas_service_ready_fanout_total_ =
+        registerStatistic<uint64_t>("atlas_service_ready_fanout_total");
+    stat_atlas_service_ready_fanout_consumers_sum_ =
+        registerStatistic<uint64_t>("atlas_service_ready_fanout_consumers_sum");
+    stat_atlas_service_ready_fanout_consumers_peak_ =
+        registerStatistic<uint64_t>("atlas_service_ready_fanout_consumers_peak");
+    stat_atlas_service_released_total_ =
+        registerStatistic<uint64_t>("atlas_service_released_total");
+    stat_atlas_service_release_deferred_total_ =
+        registerStatistic<uint64_t>("atlas_service_release_deferred_total");
+    stat_atlas_service_ready_release_total_ =
+        registerStatistic<uint64_t>("atlas_service_ready_release_total");
+    stat_atlas_service_ready_lease_hit_total_ =
+        registerStatistic<uint64_t>("atlas_service_ready_lease_hit_total");
+    stat_atlas_service_ready_lease_expired_total_ =
+        registerStatistic<uint64_t>("atlas_service_ready_lease_expired_total");
+    stat_atlas_service_potential_private_service_elide_total_ =
+        registerStatistic<uint64_t>("atlas_service_potential_private_service_elide_total");
+    stat_atlas_service_active_entries_total_ =
+        registerStatistic<uint64_t>("atlas_service_active_entries_total");
+    stat_atlas_service_release_pending_active_total_ =
+        registerStatistic<uint64_t>("atlas_service_release_pending_active_total");
+    stat_atlas_service_atlas_obj_materialize_total_ =
+        registerStatistic<uint64_t>("atlas_service_atlas_obj_materialize_total");
+    stat_atlas_service_atlas_obj_publicize_total_ =
+        registerStatistic<uint64_t>("atlas_service_atlas_obj_publicize_total");
+    stat_atlas_service_atlas_obj_owner_form_total_ =
+        registerStatistic<uint64_t>("atlas_service_atlas_obj_owner_form_total");
+    stat_atlas_service_atlas_obj_ready_total_ =
+        registerStatistic<uint64_t>("atlas_service_atlas_obj_ready_total");
+    stat_atlas_service_atlas_obj_release_total_ =
+        registerStatistic<uint64_t>("atlas_service_atlas_obj_release_total");
+    stat_atlas_service_atlas_obj_private_only_total_ =
+        registerStatistic<uint64_t>("atlas_service_atlas_obj_private_only_total");
+    atlas_object_plane_stats_["atlas_pod_metadata_enabled"] =
+        registerStatistic<uint64_t>("atlas_pod_metadata_enabled");
+    atlas_object_plane_stats_["atlas_pod_metadata_observe_total"] =
+        registerStatistic<uint64_t>("atlas_pod_metadata_observe_total");
+    atlas_object_plane_stats_["atlas_pod_metadata_unique_object_total"] =
+        registerStatistic<uint64_t>("atlas_pod_metadata_unique_object_total");
+    atlas_object_plane_stats_["atlas_pod_metadata_overlap_hit_total"] =
+        registerStatistic<uint64_t>("atlas_pod_metadata_overlap_hit_total");
+    atlas_object_plane_stats_["atlas_pod_metadata_duplicate_consumer_total"] =
+        registerStatistic<uint64_t>("atlas_pod_metadata_duplicate_consumer_total");
+    atlas_object_plane_stats_["atlas_pod_metadata_evict_total"] =
+        registerStatistic<uint64_t>("atlas_pod_metadata_evict_total");
+    atlas_object_plane_stats_["atlas_pod_metadata_active_entries_total"] =
+        registerStatistic<uint64_t>("atlas_pod_metadata_active_entries_total");
+    atlas_object_plane_stats_["atlas_pod_metadata_active_entries_peak_total"] =
+        registerStatistic<uint64_t>("atlas_pod_metadata_active_entries_peak_total");
+    atlas_object_plane_stats_["atlas_pod_metadata_premphf_base_observe_total"] =
+        registerStatistic<uint64_t>("atlas_pod_metadata_premphf_base_observe_total");
+    atlas_object_plane_stats_["atlas_pod_metadata_premphf_base_unique_object_total"] =
+        registerStatistic<uint64_t>("atlas_pod_metadata_premphf_base_unique_object_total");
+    atlas_object_plane_stats_["atlas_pod_metadata_premphf_base_overlap_hit_total"] =
+        registerStatistic<uint64_t>("atlas_pod_metadata_premphf_base_overlap_hit_total");
+    atlas_object_plane_stats_["atlas_pod_metadata_premphf_base_duplicate_consumer_total"] =
+        registerStatistic<uint64_t>("atlas_pod_metadata_premphf_base_duplicate_consumer_total");
+    atlas_object_plane_stats_["atlas_pod_metadata_premphf_base_evict_total"] =
+        registerStatistic<uint64_t>("atlas_pod_metadata_premphf_base_evict_total");
+    atlas_object_plane_stats_["atlas_pod_metadata_premphf_base_active_entries_total"] =
+        registerStatistic<uint64_t>("atlas_pod_metadata_premphf_base_active_entries_total");
+    atlas_object_plane_stats_["atlas_pod_metadata_premphf_base_active_entries_peak_total"] =
+        registerStatistic<uint64_t>("atlas_pod_metadata_premphf_base_active_entries_peak_total");
+    atlas_object_plane_stats_["atlas_pod_metadata_premphf_band_observe_total"] =
+        registerStatistic<uint64_t>("atlas_pod_metadata_premphf_band_observe_total");
+    atlas_object_plane_stats_["atlas_pod_metadata_premphf_band_unique_object_total"] =
+        registerStatistic<uint64_t>("atlas_pod_metadata_premphf_band_unique_object_total");
+    atlas_object_plane_stats_["atlas_pod_metadata_premphf_band_overlap_hit_total"] =
+        registerStatistic<uint64_t>("atlas_pod_metadata_premphf_band_overlap_hit_total");
+    atlas_object_plane_stats_["atlas_pod_metadata_premphf_band_duplicate_consumer_total"] =
+        registerStatistic<uint64_t>("atlas_pod_metadata_premphf_band_duplicate_consumer_total");
+    atlas_object_plane_stats_["atlas_pod_metadata_premphf_band_evict_total"] =
+        registerStatistic<uint64_t>("atlas_pod_metadata_premphf_band_evict_total");
+    atlas_object_plane_stats_["atlas_pod_metadata_premphf_band_active_entries_total"] =
+        registerStatistic<uint64_t>("atlas_pod_metadata_premphf_band_active_entries_total");
+    atlas_object_plane_stats_["atlas_pod_metadata_premphf_band_active_entries_peak_total"] =
+        registerStatistic<uint64_t>("atlas_pod_metadata_premphf_band_active_entries_peak_total");
+    atlas_object_plane_stats_["atlas_pod_metadata_idx2row_observe_total"] =
+        registerStatistic<uint64_t>("atlas_pod_metadata_idx2row_observe_total");
+    atlas_object_plane_stats_["atlas_pod_metadata_idx2row_unique_object_total"] =
+        registerStatistic<uint64_t>("atlas_pod_metadata_idx2row_unique_object_total");
+    atlas_object_plane_stats_["atlas_pod_metadata_idx2row_overlap_hit_total"] =
+        registerStatistic<uint64_t>("atlas_pod_metadata_idx2row_overlap_hit_total");
+    atlas_object_plane_stats_["atlas_pod_metadata_idx2row_duplicate_consumer_total"] =
+        registerStatistic<uint64_t>("atlas_pod_metadata_idx2row_duplicate_consumer_total");
+    atlas_object_plane_stats_["atlas_pod_metadata_idx2row_evict_total"] =
+        registerStatistic<uint64_t>("atlas_pod_metadata_idx2row_evict_total");
+    atlas_object_plane_stats_["atlas_pod_metadata_idx2row_active_entries_total"] =
+        registerStatistic<uint64_t>("atlas_pod_metadata_idx2row_active_entries_total");
+    atlas_object_plane_stats_["atlas_pod_metadata_idx2row_active_entries_peak_total"] =
+        registerStatistic<uint64_t>("atlas_pod_metadata_idx2row_active_entries_peak_total");
+    atlas_object_plane_stats_["atlas_pod_metadata_rowindex_observe_total"] =
+        registerStatistic<uint64_t>("atlas_pod_metadata_rowindex_observe_total");
+    atlas_object_plane_stats_["atlas_pod_metadata_rowindex_unique_object_total"] =
+        registerStatistic<uint64_t>("atlas_pod_metadata_rowindex_unique_object_total");
+    atlas_object_plane_stats_["atlas_pod_metadata_rowindex_overlap_hit_total"] =
+        registerStatistic<uint64_t>("atlas_pod_metadata_rowindex_overlap_hit_total");
+    atlas_object_plane_stats_["atlas_pod_metadata_rowindex_duplicate_consumer_total"] =
+        registerStatistic<uint64_t>("atlas_pod_metadata_rowindex_duplicate_consumer_total");
+    atlas_object_plane_stats_["atlas_pod_metadata_rowindex_evict_total"] =
+        registerStatistic<uint64_t>("atlas_pod_metadata_rowindex_evict_total");
+    atlas_object_plane_stats_["atlas_pod_metadata_rowindex_active_entries_total"] =
+        registerStatistic<uint64_t>("atlas_pod_metadata_rowindex_active_entries_total");
+    atlas_object_plane_stats_["atlas_pod_metadata_rowindex_active_entries_peak_total"] =
+        registerStatistic<uint64_t>("atlas_pod_metadata_rowindex_active_entries_peak_total");
+    atlas_object_plane_stats_["atlas_pod_metadata_rowdescriptor_observe_total"] =
+        registerStatistic<uint64_t>("atlas_pod_metadata_rowdescriptor_observe_total");
+    atlas_object_plane_stats_["atlas_pod_metadata_rowdescriptor_unique_object_total"] =
+        registerStatistic<uint64_t>("atlas_pod_metadata_rowdescriptor_unique_object_total");
+    atlas_object_plane_stats_["atlas_pod_metadata_rowdescriptor_overlap_hit_total"] =
+        registerStatistic<uint64_t>("atlas_pod_metadata_rowdescriptor_overlap_hit_total");
+    atlas_object_plane_stats_["atlas_pod_metadata_rowdescriptor_duplicate_consumer_total"] =
+        registerStatistic<uint64_t>("atlas_pod_metadata_rowdescriptor_duplicate_consumer_total");
+    atlas_object_plane_stats_["atlas_pod_metadata_rowdescriptor_evict_total"] =
+        registerStatistic<uint64_t>("atlas_pod_metadata_rowdescriptor_evict_total");
+    atlas_object_plane_stats_["atlas_pod_metadata_rowdescriptor_active_entries_total"] =
+        registerStatistic<uint64_t>("atlas_pod_metadata_rowdescriptor_active_entries_total");
+    atlas_object_plane_stats_["atlas_pod_metadata_rowdescriptor_active_entries_peak_total"] =
+        registerStatistic<uint64_t>("atlas_pod_metadata_rowdescriptor_active_entries_peak_total");
+    atlas_object_plane_stats_["atlas_pod_owner_enabled"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_enabled");
+    atlas_object_plane_stats_["atlas_pod_owner_lookup_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_lookup_total");
+    atlas_object_plane_stats_["atlas_pod_owner_owner_alloc_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_owner_alloc_total");
+    atlas_object_plane_stats_["atlas_pod_owner_owner_hit_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_owner_hit_total");
+    atlas_object_plane_stats_["atlas_pod_owner_owner_reject_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_owner_reject_total");
+    atlas_object_plane_stats_["atlas_pod_owner_join_request_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_join_request_total");
+    atlas_object_plane_stats_["atlas_pod_owner_join_grant_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_join_grant_total");
+    atlas_object_plane_stats_["atlas_pod_owner_join_reject_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_join_reject_total");
+    atlas_object_plane_stats_["atlas_pod_owner_active_entries_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_active_entries_total");
+    atlas_object_plane_stats_["atlas_pod_owner_active_entries_peak_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_active_entries_peak_total");
+    atlas_object_plane_stats_["atlas_pod_owner_premphf_base_owner_alloc_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_premphf_base_owner_alloc_total");
+    atlas_object_plane_stats_["atlas_pod_owner_premphf_base_owner_hit_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_premphf_base_owner_hit_total");
+    atlas_object_plane_stats_["atlas_pod_owner_premphf_base_owner_reject_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_premphf_base_owner_reject_total");
+    atlas_object_plane_stats_["atlas_pod_owner_premphf_base_join_request_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_premphf_base_join_request_total");
+    atlas_object_plane_stats_["atlas_pod_owner_premphf_base_join_grant_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_premphf_base_join_grant_total");
+    atlas_object_plane_stats_["atlas_pod_owner_premphf_base_join_reject_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_premphf_base_join_reject_total");
+    atlas_object_plane_stats_["atlas_pod_owner_premphf_base_active_entries_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_premphf_base_active_entries_total");
+    atlas_object_plane_stats_["atlas_pod_owner_premphf_base_active_entries_peak_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_premphf_base_active_entries_peak_total");
+    atlas_object_plane_stats_["atlas_pod_owner_premphf_band_owner_alloc_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_premphf_band_owner_alloc_total");
+    atlas_object_plane_stats_["atlas_pod_owner_premphf_band_owner_hit_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_premphf_band_owner_hit_total");
+    atlas_object_plane_stats_["atlas_pod_owner_premphf_band_owner_reject_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_premphf_band_owner_reject_total");
+    atlas_object_plane_stats_["atlas_pod_owner_premphf_band_join_request_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_premphf_band_join_request_total");
+    atlas_object_plane_stats_["atlas_pod_owner_premphf_band_join_grant_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_premphf_band_join_grant_total");
+    atlas_object_plane_stats_["atlas_pod_owner_premphf_band_join_reject_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_premphf_band_join_reject_total");
+    atlas_object_plane_stats_["atlas_pod_owner_premphf_band_active_entries_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_premphf_band_active_entries_total");
+    atlas_object_plane_stats_["atlas_pod_owner_premphf_band_active_entries_peak_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_premphf_band_active_entries_peak_total");
+    atlas_object_plane_stats_["atlas_pod_owner_idx2row_owner_alloc_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_idx2row_owner_alloc_total");
+    atlas_object_plane_stats_["atlas_pod_owner_idx2row_owner_hit_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_idx2row_owner_hit_total");
+    atlas_object_plane_stats_["atlas_pod_owner_idx2row_owner_reject_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_idx2row_owner_reject_total");
+    atlas_object_plane_stats_["atlas_pod_owner_idx2row_join_request_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_idx2row_join_request_total");
+    atlas_object_plane_stats_["atlas_pod_owner_idx2row_join_grant_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_idx2row_join_grant_total");
+    atlas_object_plane_stats_["atlas_pod_owner_idx2row_join_reject_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_idx2row_join_reject_total");
+    atlas_object_plane_stats_["atlas_pod_owner_idx2row_active_entries_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_idx2row_active_entries_total");
+    atlas_object_plane_stats_["atlas_pod_owner_idx2row_active_entries_peak_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_idx2row_active_entries_peak_total");
+    atlas_object_plane_stats_["atlas_pod_owner_rowindex_owner_alloc_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_rowindex_owner_alloc_total");
+    atlas_object_plane_stats_["atlas_pod_owner_rowindex_owner_hit_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_rowindex_owner_hit_total");
+    atlas_object_plane_stats_["atlas_pod_owner_rowindex_owner_reject_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_rowindex_owner_reject_total");
+    atlas_object_plane_stats_["atlas_pod_owner_rowindex_join_request_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_rowindex_join_request_total");
+    atlas_object_plane_stats_["atlas_pod_owner_rowindex_join_grant_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_rowindex_join_grant_total");
+    atlas_object_plane_stats_["atlas_pod_owner_rowindex_join_reject_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_rowindex_join_reject_total");
+    atlas_object_plane_stats_["atlas_pod_owner_rowindex_active_entries_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_rowindex_active_entries_total");
+    atlas_object_plane_stats_["atlas_pod_owner_rowindex_active_entries_peak_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_rowindex_active_entries_peak_total");
+    atlas_object_plane_stats_["atlas_pod_owner_rowdescriptor_owner_alloc_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_rowdescriptor_owner_alloc_total");
+    atlas_object_plane_stats_["atlas_pod_owner_rowdescriptor_owner_hit_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_rowdescriptor_owner_hit_total");
+    atlas_object_plane_stats_["atlas_pod_owner_rowdescriptor_owner_reject_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_rowdescriptor_owner_reject_total");
+    atlas_object_plane_stats_["atlas_pod_owner_rowdescriptor_join_request_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_rowdescriptor_join_request_total");
+    atlas_object_plane_stats_["atlas_pod_owner_rowdescriptor_join_grant_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_rowdescriptor_join_grant_total");
+    atlas_object_plane_stats_["atlas_pod_owner_rowdescriptor_join_reject_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_rowdescriptor_join_reject_total");
+    atlas_object_plane_stats_["atlas_pod_owner_rowdescriptor_active_entries_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_rowdescriptor_active_entries_total");
+    atlas_object_plane_stats_["atlas_pod_owner_rowdescriptor_active_entries_peak_total"] =
+        registerStatistic<uint64_t>("atlas_pod_owner_rowdescriptor_active_entries_peak_total");
+    atlas_object_plane_stats_["atlas_census_premphf_base_frontier_events_total"] =
+        registerStatistic<uint64_t>("atlas_census_premphf_base_frontier_events_total");
+    atlas_object_plane_stats_["atlas_census_premphf_base_producer_events_total"] =
+        registerStatistic<uint64_t>("atlas_census_premphf_base_producer_events_total");
+    atlas_object_plane_stats_["atlas_census_premphf_base_gate_events_total"] =
+        registerStatistic<uint64_t>("atlas_census_premphf_base_gate_events_total");
+    atlas_object_plane_stats_["atlas_census_premphf_base_service_events_total"] =
+        registerStatistic<uint64_t>("atlas_census_premphf_base_service_events_total");
+    atlas_object_plane_stats_["atlas_census_premphf_band_frontier_events_total"] =
+        registerStatistic<uint64_t>("atlas_census_premphf_band_frontier_events_total");
+    atlas_object_plane_stats_["atlas_census_premphf_band_producer_events_total"] =
+        registerStatistic<uint64_t>("atlas_census_premphf_band_producer_events_total");
+    atlas_object_plane_stats_["atlas_census_premphf_band_gate_events_total"] =
+        registerStatistic<uint64_t>("atlas_census_premphf_band_gate_events_total");
+    atlas_object_plane_stats_["atlas_census_premphf_band_service_events_total"] =
+        registerStatistic<uint64_t>("atlas_census_premphf_band_service_events_total");
+    atlas_object_plane_stats_["atlas_census_idx2row_frontier_events_total"] =
+        registerStatistic<uint64_t>("atlas_census_idx2row_frontier_events_total");
+    atlas_object_plane_stats_["atlas_census_idx2row_producer_events_total"] =
+        registerStatistic<uint64_t>("atlas_census_idx2row_producer_events_total");
+    atlas_object_plane_stats_["atlas_census_idx2row_gate_events_total"] =
+        registerStatistic<uint64_t>("atlas_census_idx2row_gate_events_total");
+    atlas_object_plane_stats_["atlas_census_idx2row_service_events_total"] =
+        registerStatistic<uint64_t>("atlas_census_idx2row_service_events_total");
+    atlas_object_plane_stats_["atlas_census_rowindex_frontier_events_total"] =
+        registerStatistic<uint64_t>("atlas_census_rowindex_frontier_events_total");
+    atlas_object_plane_stats_["atlas_census_rowindex_producer_events_total"] =
+        registerStatistic<uint64_t>("atlas_census_rowindex_producer_events_total");
+    atlas_object_plane_stats_["atlas_census_rowindex_gate_events_total"] =
+        registerStatistic<uint64_t>("atlas_census_rowindex_gate_events_total");
+    atlas_object_plane_stats_["atlas_census_rowindex_service_events_total"] =
+        registerStatistic<uint64_t>("atlas_census_rowindex_service_events_total");
+    atlas_object_plane_stats_["atlas_census_rowdescriptor_frontier_events_total"] =
+        registerStatistic<uint64_t>("atlas_census_rowdescriptor_frontier_events_total");
+    atlas_object_plane_stats_["atlas_census_rowdescriptor_producer_events_total"] =
+        registerStatistic<uint64_t>("atlas_census_rowdescriptor_producer_events_total");
+    atlas_object_plane_stats_["atlas_census_rowdescriptor_gate_events_total"] =
+        registerStatistic<uint64_t>("atlas_census_rowdescriptor_gate_events_total");
+    atlas_object_plane_stats_["atlas_census_rowdescriptor_service_events_total"] =
+        registerStatistic<uint64_t>("atlas_census_rowdescriptor_service_events_total");
+    atlas_object_plane_stats_["atlas_proxy_idx2row_materialize_total"] =
+        registerStatistic<uint64_t>("atlas_proxy_idx2row_materialize_total");
+    atlas_object_plane_stats_["atlas_proxy_idx2row_publicize_total"] =
+        registerStatistic<uint64_t>("atlas_proxy_idx2row_publicize_total");
+    atlas_object_plane_stats_["atlas_proxy_idx2row_owner_form_total"] =
+        registerStatistic<uint64_t>("atlas_proxy_idx2row_owner_form_total");
+    atlas_object_plane_stats_["atlas_proxy_idx2row_join_live_total"] =
+        registerStatistic<uint64_t>("atlas_proxy_idx2row_join_live_total");
+    atlas_object_plane_stats_["atlas_proxy_idx2row_join_ready_total"] =
+        registerStatistic<uint64_t>("atlas_proxy_idx2row_join_ready_total");
+    atlas_object_plane_stats_["atlas_proxy_idx2row_ready_total"] =
+        registerStatistic<uint64_t>("atlas_proxy_idx2row_ready_total");
+    atlas_object_plane_stats_["atlas_proxy_idx2row_release_total"] =
+        registerStatistic<uint64_t>("atlas_proxy_idx2row_release_total");
+    atlas_object_plane_stats_["atlas_proxy_idx2row_release_missing_total"] =
+        registerStatistic<uint64_t>("atlas_proxy_idx2row_release_missing_total");
+    atlas_object_plane_stats_["atlas_proxy_idx2row_fallback_total"] =
+        registerStatistic<uint64_t>("atlas_proxy_idx2row_fallback_total");
+    atlas_object_plane_stats_["atlas_proxy_premphf_base_materialize_total"] =
+        registerStatistic<uint64_t>("atlas_proxy_premphf_base_materialize_total");
+    atlas_object_plane_stats_["atlas_proxy_premphf_base_publicize_total"] =
+        registerStatistic<uint64_t>("atlas_proxy_premphf_base_publicize_total");
+    atlas_object_plane_stats_["atlas_proxy_premphf_base_owner_form_total"] =
+        registerStatistic<uint64_t>("atlas_proxy_premphf_base_owner_form_total");
+    atlas_object_plane_stats_["atlas_proxy_premphf_base_shared_hit_total"] =
+        registerStatistic<uint64_t>("atlas_proxy_premphf_base_shared_hit_total");
+    atlas_object_plane_stats_["atlas_proxy_premphf_base_lookup_ready_total"] =
+        registerStatistic<uint64_t>("atlas_proxy_premphf_base_lookup_ready_total");
+    atlas_object_plane_stats_["atlas_proxy_premphf_base_proxy_only_gap_total"] =
+        registerStatistic<uint64_t>("atlas_proxy_premphf_base_proxy_only_gap_total");
+    atlas_object_plane_stats_["atlas_proxy_premphf_band_materialize_total"] =
+        registerStatistic<uint64_t>("atlas_proxy_premphf_band_materialize_total");
+    atlas_object_plane_stats_["atlas_proxy_premphf_band_publicize_total"] =
+        registerStatistic<uint64_t>("atlas_proxy_premphf_band_publicize_total");
+    atlas_object_plane_stats_["atlas_proxy_premphf_band_owner_form_candidate_total"] =
+        registerStatistic<uint64_t>("atlas_proxy_premphf_band_owner_form_candidate_total");
+    atlas_object_plane_stats_["atlas_proxy_premphf_band_join_ready_candidate_total"] =
+        registerStatistic<uint64_t>("atlas_proxy_premphf_band_join_ready_candidate_total");
+    atlas_object_plane_stats_["atlas_proxy_premphf_band_zero_service_total"] =
+        registerStatistic<uint64_t>("atlas_proxy_premphf_band_zero_service_total");
+    atlas_object_plane_stats_["atlas_proxy_rowindex_materialize_total"] =
+        registerStatistic<uint64_t>("atlas_proxy_rowindex_materialize_total");
+    atlas_object_plane_stats_["atlas_proxy_rowindex_publicize_total"] =
+        registerStatistic<uint64_t>("atlas_proxy_rowindex_publicize_total");
+    atlas_object_plane_stats_["atlas_proxy_rowindex_owner_form_total"] =
+        registerStatistic<uint64_t>("atlas_proxy_rowindex_owner_form_total");
+    atlas_object_plane_stats_["atlas_proxy_rowindex_join_live_total"] =
+        registerStatistic<uint64_t>("atlas_proxy_rowindex_join_live_total");
+    atlas_object_plane_stats_["atlas_proxy_rowindex_join_ready_total"] =
+        registerStatistic<uint64_t>("atlas_proxy_rowindex_join_ready_total");
+    atlas_object_plane_stats_["atlas_proxy_rowindex_ready_total"] =
+        registerStatistic<uint64_t>("atlas_proxy_rowindex_ready_total");
+    atlas_object_plane_stats_["atlas_proxy_rowindex_release_total"] =
+        registerStatistic<uint64_t>("atlas_proxy_rowindex_release_total");
+    atlas_object_plane_stats_["atlas_proxy_rowindex_release_missing_total"] =
+        registerStatistic<uint64_t>("atlas_proxy_rowindex_release_missing_total");
+    atlas_object_plane_stats_["atlas_proxy_rowindex_fallback_total"] =
+        registerStatistic<uint64_t>("atlas_proxy_rowindex_fallback_total");
+    atlas_object_plane_stats_["atlas_phase_local_begin_gather_total"] =
+        registerStatistic<uint64_t>("atlas_phase_local_begin_gather_total");
+    atlas_object_plane_stats_["atlas_phase_local_first_touch_after_gather_open_total"] =
+        registerStatistic<uint64_t>("atlas_phase_local_first_touch_after_gather_open_total");
+    atlas_object_plane_stats_["atlas_phase_local_touch_without_gather_open_total"] =
+        registerStatistic<uint64_t>("atlas_phase_local_touch_without_gather_open_total");
+    atlas_object_plane_stats_["atlas_phase_local_touch_during_apply_total"] =
+        registerStatistic<uint64_t>("atlas_phase_local_touch_during_apply_total");
+    atlas_object_plane_stats_["atlas_phase_local_begin_apply_total"] =
+        registerStatistic<uint64_t>("atlas_phase_local_begin_apply_total");
+    atlas_object_plane_stats_["atlas_phase_local_begin_apply_with_touch_total"] =
+        registerStatistic<uint64_t>("atlas_phase_local_begin_apply_with_touch_total");
+    atlas_object_plane_stats_["atlas_phase_local_begin_apply_with_pending_rowidx_total"] =
+        registerStatistic<uint64_t>("atlas_phase_local_begin_apply_with_pending_rowidx_total");
+    atlas_object_plane_stats_["atlas_phase_local_begin_apply_without_pending_rowidx_total"] =
+        registerStatistic<uint64_t>("atlas_phase_local_begin_apply_without_pending_rowidx_total");
+    atlas_object_plane_stats_["atlas_phase_local_end_scatter_total"] =
+        registerStatistic<uint64_t>("atlas_phase_local_end_scatter_total");
+    atlas_object_plane_stats_["atlas_storage_map_shared_owner_scope_enable"] =
+        registerStatistic<uint64_t>("atlas_storage_map_shared_owner_scope_enable");
+    atlas_object_plane_stats_["atlas_storage_map_shared_actual_owner_enable"] =
+        registerStatistic<uint64_t>("atlas_storage_map_shared_actual_owner_enable");
+    atlas_object_plane_stats_["atlas_storage_map_weight_idx_shared_enabled"] =
+        registerStatistic<uint64_t>("atlas_storage_map_weight_idx_shared_enabled");
+    atlas_object_plane_stats_["atlas_storage_map_weight_value_shared_enabled"] =
+        registerStatistic<uint64_t>("atlas_storage_map_weight_value_shared_enabled");
+    atlas_object_plane_stats_["atlas_storage_map_weight_idx_private_authority_total"] =
+        registerStatistic<uint64_t>("atlas_storage_map_weight_idx_private_authority_total");
+    atlas_object_plane_stats_["atlas_storage_map_weight_idx_shared_mirror_only_total"] =
+        registerStatistic<uint64_t>("atlas_storage_map_weight_idx_shared_mirror_only_total");
+    atlas_object_plane_stats_["atlas_storage_map_weight_idx_shared_authority_active_total"] =
+        registerStatistic<uint64_t>("atlas_storage_map_weight_idx_shared_authority_active_total");
+    atlas_object_plane_stats_["atlas_storage_map_weight_value_private_authority_total"] =
+        registerStatistic<uint64_t>("atlas_storage_map_weight_value_private_authority_total");
+    atlas_object_plane_stats_["atlas_storage_map_weight_value_shared_mirror_only_total"] =
+        registerStatistic<uint64_t>("atlas_storage_map_weight_value_shared_mirror_only_total");
+    atlas_object_plane_stats_["atlas_storage_map_weight_value_shared_authority_active_total"] =
+        registerStatistic<uint64_t>("atlas_storage_map_weight_value_shared_authority_active_total");
+    atlas_object_plane_stats_["atlas_storage_map_weight_idx_private_reads_total"] =
+        registerStatistic<uint64_t>("atlas_storage_map_weight_idx_private_reads_total");
+    atlas_object_plane_stats_["atlas_storage_map_weight_idx_shared_reads_total"] =
+        registerStatistic<uint64_t>("atlas_storage_map_weight_idx_shared_reads_total");
+    atlas_object_plane_stats_["atlas_storage_map_weight_idx_private_resident_bytes_peak"] =
+        registerStatistic<uint64_t>("atlas_storage_map_weight_idx_private_resident_bytes_peak");
+    atlas_object_plane_stats_["atlas_storage_map_weight_idx_shared_resident_bytes_peak"] =
+        registerStatistic<uint64_t>("atlas_storage_map_weight_idx_shared_resident_bytes_peak");
+    atlas_object_plane_stats_["atlas_storage_map_weight_value_private_reads_total"] =
+        registerStatistic<uint64_t>("atlas_storage_map_weight_value_private_reads_total");
+    atlas_object_plane_stats_["atlas_storage_map_weight_value_shared_reads_total"] =
+        registerStatistic<uint64_t>("atlas_storage_map_weight_value_shared_reads_total");
+    atlas_object_plane_stats_["atlas_storage_map_weight_value_private_resident_bytes_peak"] =
+        registerStatistic<uint64_t>("atlas_storage_map_weight_value_private_resident_bytes_peak");
+    atlas_object_plane_stats_["atlas_storage_map_weight_value_shared_resident_bytes_peak"] =
+        registerStatistic<uint64_t>("atlas_storage_map_weight_value_shared_resident_bytes_peak");
+    atlas_object_plane_stats_["atlas_shared_weight_census_state_absent_total"] =
+        registerStatistic<uint64_t>("atlas_shared_weight_census_state_absent_total");
+    atlas_object_plane_stats_["atlas_shared_weight_census_state_owner_scope_off_total"] =
+        registerStatistic<uint64_t>("atlas_shared_weight_census_state_owner_scope_off_total");
+    atlas_object_plane_stats_["atlas_shared_weight_census_state_mirror_only_total"] =
+        registerStatistic<uint64_t>("atlas_shared_weight_census_state_mirror_only_total");
+    atlas_object_plane_stats_["atlas_shared_weight_census_state_actual_owner_total"] =
+        registerStatistic<uint64_t>("atlas_shared_weight_census_state_actual_owner_total");
+    atlas_object_plane_stats_["atlas_shared_weight_census_absent_reason_workload_ineligible_total"] =
+        registerStatistic<uint64_t>("atlas_shared_weight_census_absent_reason_workload_ineligible_total");
+    atlas_object_plane_stats_["atlas_shared_weight_census_absent_reason_local_storage_gate_total"] =
+        registerStatistic<uint64_t>("atlas_shared_weight_census_absent_reason_local_storage_gate_total");
+    atlas_object_plane_stats_["atlas_shared_weight_census_absent_reason_pulse_osa_gate_total"] =
+        registerStatistic<uint64_t>("atlas_shared_weight_census_absent_reason_pulse_osa_gate_total");
+    atlas_object_plane_stats_["atlas_shared_weight_census_absent_reason_owner_request_gate_total"] =
+        registerStatistic<uint64_t>("atlas_shared_weight_census_absent_reason_owner_request_gate_total");
+    atlas_object_plane_stats_["atlas_control_runtime_produced_frontier_export_total"] =
+        registerStatistic<uint64_t>("atlas_control_runtime_produced_frontier_export_total");
+    atlas_object_plane_stats_["atlas_control_runtime_produced_owner_announce_total"] =
+        registerStatistic<uint64_t>("atlas_control_runtime_produced_owner_announce_total");
+    atlas_object_plane_stats_["atlas_control_runtime_produced_join_request_total"] =
+        registerStatistic<uint64_t>("atlas_control_runtime_produced_join_request_total");
+    atlas_object_plane_stats_["atlas_control_runtime_produced_ready_fanout_total"] =
+        registerStatistic<uint64_t>("atlas_control_runtime_produced_ready_fanout_total");
+    atlas_object_plane_stats_["atlas_control_runtime_produced_join_reject_total"] =
+        registerStatistic<uint64_t>("atlas_control_runtime_produced_join_reject_total");
+    atlas_object_plane_stats_["atlas_control_runtime_queued_frontier_export_total"] =
+        registerStatistic<uint64_t>("atlas_control_runtime_queued_frontier_export_total");
+    atlas_object_plane_stats_["atlas_control_runtime_queued_owner_announce_total"] =
+        registerStatistic<uint64_t>("atlas_control_runtime_queued_owner_announce_total");
+    atlas_object_plane_stats_["atlas_control_runtime_queued_join_request_total"] =
+        registerStatistic<uint64_t>("atlas_control_runtime_queued_join_request_total");
+    atlas_object_plane_stats_["atlas_control_runtime_queued_ready_fanout_total"] =
+        registerStatistic<uint64_t>("atlas_control_runtime_queued_ready_fanout_total");
+    atlas_object_plane_stats_["atlas_control_runtime_queued_join_reject_total"] =
+        registerStatistic<uint64_t>("atlas_control_runtime_queued_join_reject_total");
+    atlas_object_plane_stats_["atlas_control_runtime_consumed_frontier_export_total"] =
+        registerStatistic<uint64_t>("atlas_control_runtime_consumed_frontier_export_total");
+    atlas_object_plane_stats_["atlas_control_runtime_consumed_owner_announce_total"] =
+        registerStatistic<uint64_t>("atlas_control_runtime_consumed_owner_announce_total");
+    atlas_object_plane_stats_["atlas_control_runtime_consumed_join_request_total"] =
+        registerStatistic<uint64_t>("atlas_control_runtime_consumed_join_request_total");
+    atlas_object_plane_stats_["atlas_control_runtime_consumed_ready_fanout_total"] =
+        registerStatistic<uint64_t>("atlas_control_runtime_consumed_ready_fanout_total");
+    atlas_object_plane_stats_["atlas_control_runtime_consumed_join_reject_total"] =
+        registerStatistic<uint64_t>("atlas_control_runtime_consumed_join_reject_total");
+    atlas_object_plane_stats_["atlas_control_runtime_backlog_messages_current"] =
+        registerStatistic<uint64_t>("atlas_control_runtime_backlog_messages_current");
+    atlas_object_plane_stats_["atlas_control_runtime_backlog_messages_peak"] =
+        registerStatistic<uint64_t>("atlas_control_runtime_backlog_messages_peak");
+    atlas_object_plane_stats_["atlas_control_runtime_backlog_cycles_total"] =
+        registerStatistic<uint64_t>("atlas_control_runtime_backlog_cycles_total");
+    atlas_object_plane_stats_["atlas_control_runtime_produced_any_nonzero_total"] =
+        registerStatistic<uint64_t>("atlas_control_runtime_produced_any_nonzero_total");
+    atlas_object_plane_stats_["atlas_control_runtime_queued_any_nonzero_total"] =
+        registerStatistic<uint64_t>("atlas_control_runtime_queued_any_nonzero_total");
+    atlas_object_plane_stats_["atlas_control_runtime_consumed_any_nonzero_total"] =
+        registerStatistic<uint64_t>("atlas_control_runtime_consumed_any_nonzero_total");
+    atlas_object_plane_stats_["atlas_control_runtime_backlog_any_nonzero_total"] =
+        registerStatistic<uint64_t>("atlas_control_runtime_backlog_any_nonzero_total");
+    atlas_object_plane_stats_["atlas_control_runtime_all_zero_total"] =
+        registerStatistic<uint64_t>("atlas_control_runtime_all_zero_total");
+    atlas_object_plane_stats_["atlas_control_runtime_state_fabric_absent_total"] =
+        registerStatistic<uint64_t>("atlas_control_runtime_state_fabric_absent_total");
+    atlas_object_plane_stats_["atlas_control_runtime_state_fabric_present_idle_total"] =
+        registerStatistic<uint64_t>("atlas_control_runtime_state_fabric_present_idle_total");
+    atlas_object_plane_stats_["atlas_control_runtime_state_produced_without_queue_total"] =
+        registerStatistic<uint64_t>("atlas_control_runtime_state_produced_without_queue_total");
+    atlas_object_plane_stats_["atlas_control_runtime_state_queued_without_consume_total"] =
+        registerStatistic<uint64_t>("atlas_control_runtime_state_queued_without_consume_total");
+    atlas_object_plane_stats_["atlas_control_runtime_state_consumed_active_total"] =
+        registerStatistic<uint64_t>("atlas_control_runtime_state_consumed_active_total");
+    atlas_object_plane_stats_["atlas_enable_state_local_storage_effective_total"] =
+        registerStatistic<uint64_t>("atlas_enable_state_local_storage_effective_total");
+    atlas_object_plane_stats_["atlas_enable_state_pe_internal_cpe_effective_total"] =
+        registerStatistic<uint64_t>("atlas_enable_state_pe_internal_cpe_effective_total");
+    atlas_object_plane_stats_["atlas_enable_state_pe_internal_pod_effective_total"] =
+        registerStatistic<uint64_t>("atlas_enable_state_pe_internal_pod_effective_total");
+    atlas_object_plane_stats_["atlas_enable_state_pe_internal_pod_metadata_effective_total"] =
+        registerStatistic<uint64_t>("atlas_enable_state_pe_internal_pod_metadata_effective_total");
+    atlas_object_plane_stats_["atlas_enable_state_pe_internal_pod_owner_effective_total"] =
+        registerStatistic<uint64_t>("atlas_enable_state_pe_internal_pod_owner_effective_total");
+    atlas_object_plane_stats_["atlas_enable_state_pe_local_service_table_present_total"] =
+        registerStatistic<uint64_t>("atlas_enable_state_pe_local_service_table_present_total");
+    atlas_object_plane_stats_["atlas_enable_state_rowindex_effective_total"] =
+        registerStatistic<uint64_t>("atlas_enable_state_rowindex_effective_total");
+    atlas_object_plane_stats_["atlas_enable_state_rowindex_gate_pulse_osa_total"] =
+        registerStatistic<uint64_t>("atlas_enable_state_rowindex_gate_pulse_osa_total");
+    atlas_object_plane_stats_["atlas_enable_state_rowindex_gate_metadata_txn_total"] =
+        registerStatistic<uint64_t>("atlas_enable_state_rowindex_gate_metadata_txn_total");
+    atlas_object_plane_stats_["atlas_enable_state_rowindex_gate_metadata_mask_total"] =
+        registerStatistic<uint64_t>("atlas_enable_state_rowindex_gate_metadata_mask_total");
+    atlas_object_plane_stats_["atlas_enable_state_rowindex_gate_pod_enable_total"] =
+        registerStatistic<uint64_t>("atlas_enable_state_rowindex_gate_pod_enable_total");
+    atlas_object_plane_stats_["atlas_enable_state_rowindex_gate_pod_metadata_enable_total"] =
+        registerStatistic<uint64_t>("atlas_enable_state_rowindex_gate_pod_metadata_enable_total");
+    atlas_object_plane_stats_["atlas_enable_state_rowindex_gate_pod_owner_enable_total"] =
+        registerStatistic<uint64_t>("atlas_enable_state_rowindex_gate_pod_owner_enable_total");
+    atlas_object_plane_stats_["atlas_enable_state_rowindex_gate_service_table_present_total"] =
+        registerStatistic<uint64_t>("atlas_enable_state_rowindex_gate_service_table_present_total");
+    atlas_object_plane_stats_["atlas_enable_state_pulse_effective_total"] =
+        registerStatistic<uint64_t>("atlas_enable_state_pulse_effective_total");
+    atlas_object_plane_stats_["atlas_enable_state_pulse_fabric_present_total"] =
+        registerStatistic<uint64_t>("atlas_enable_state_pulse_fabric_present_total");
+    atlas_object_plane_stats_["atlas_enable_state_pulse_observe_only_total"] =
+        registerStatistic<uint64_t>("atlas_enable_state_pulse_observe_only_total");
+    atlas_object_plane_stats_["atlas_enable_state_pulse_actual_ingress_effective_total"] =
+        registerStatistic<uint64_t>("atlas_enable_state_pulse_actual_ingress_effective_total");
+    atlas_object_plane_stats_["atlas_enable_state_pulse_harbor_effective_total"] =
+        registerStatistic<uint64_t>("atlas_enable_state_pulse_harbor_effective_total");
+    atlas_object_plane_stats_["atlas_enable_state_pulse_descriptor_effective_total"] =
+        registerStatistic<uint64_t>("atlas_enable_state_pulse_descriptor_effective_total");
+    atlas_object_plane_stats_["atlas_enable_state_pulse_descriptor_actual_effective_total"] =
+        registerStatistic<uint64_t>("atlas_enable_state_pulse_descriptor_actual_effective_total");
+    atlas_object_plane_stats_["atlas_enable_state_pulse_osa_effective_total"] =
+        registerStatistic<uint64_t>("atlas_enable_state_pulse_osa_effective_total");
+    atlas_object_plane_stats_["atlas_enable_state_pulse_osa_shared_weight_owner_effective_total"] =
+        registerStatistic<uint64_t>("atlas_enable_state_pulse_osa_shared_weight_owner_effective_total");
+    atlas_object_plane_stats_["atlas_enable_state_pulse_osa_shared_weight_actual_effective_total"] =
+        registerStatistic<uint64_t>("atlas_enable_state_pulse_osa_shared_weight_actual_effective_total");
+    atlas_object_plane_stats_["atlas_enable_state_pe_weight_plane_present_total"] =
+        registerStatistic<uint64_t>("atlas_enable_state_pe_weight_plane_present_total");
+    atlas_object_plane_stats_["atlas_enable_state_pulse_osa_metadata_txn_effective_total"] =
+        registerStatistic<uint64_t>("atlas_enable_state_pulse_osa_metadata_txn_effective_total");
+    atlas_object_plane_stats_["atlas_enable_state_pulse_osa_metadata_ready_lease_effective_total"] =
+        registerStatistic<uint64_t>("atlas_enable_state_pulse_osa_metadata_ready_lease_effective_total");
+    atlas_object_plane_stats_["atlas_enable_state_pulse_osa_metadata_mask_nonzero_total"] =
+        registerStatistic<uint64_t>("atlas_enable_state_pulse_osa_metadata_mask_nonzero_total");
+    atlas_object_plane_stats_["atlas_enable_state_control_runtime_produce_eligible_total"] =
+        registerStatistic<uint64_t>("atlas_enable_state_control_runtime_produce_eligible_total");
+    atlas_object_plane_stats_["atlas_enable_state_control_runtime_end_to_end_eligible_total"] =
+        registerStatistic<uint64_t>("atlas_enable_state_control_runtime_end_to_end_eligible_total");
+    atlas_object_plane_stats_["atlas_activation_gate_workload_pure_snn_datapath_eligible"] =
+        registerStatistic<uint64_t>("atlas_activation_gate_workload_pure_snn_datapath_eligible");
+    atlas_object_plane_stats_["atlas_activation_gate_local_storage_enable"] =
+        registerStatistic<uint64_t>("atlas_activation_gate_local_storage_enable");
+    atlas_object_plane_stats_["atlas_activation_gate_pulse_requested"] =
+        registerStatistic<uint64_t>("atlas_activation_gate_pulse_requested");
+    atlas_object_plane_stats_["atlas_activation_gate_pulse_effective"] =
+        registerStatistic<uint64_t>("atlas_activation_gate_pulse_effective");
+    atlas_object_plane_stats_["atlas_activation_gate_pulse_fabric_constructed"] =
+        registerStatistic<uint64_t>("atlas_activation_gate_pulse_fabric_constructed");
+    atlas_object_plane_stats_["atlas_activation_gate_pulse_observe_only_effective"] =
+        registerStatistic<uint64_t>("atlas_activation_gate_pulse_observe_only_effective");
+    atlas_object_plane_stats_["atlas_activation_gate_pulse_actual_ingress_eligible"] =
+        registerStatistic<uint64_t>("atlas_activation_gate_pulse_actual_ingress_eligible");
+    atlas_object_plane_stats_["atlas_activation_gate_pulse_harbor_enable_effective"] =
+        registerStatistic<uint64_t>("atlas_activation_gate_pulse_harbor_enable_effective");
+    atlas_object_plane_stats_["atlas_activation_gate_pulse_descriptor_enable_effective"] =
+        registerStatistic<uint64_t>("atlas_activation_gate_pulse_descriptor_enable_effective");
+    atlas_object_plane_stats_["atlas_activation_gate_pulse_descriptor_actual_requested"] =
+        registerStatistic<uint64_t>("atlas_activation_gate_pulse_descriptor_actual_requested");
+    atlas_object_plane_stats_["atlas_activation_gate_pulse_descriptor_actual_effective"] =
+        registerStatistic<uint64_t>("atlas_activation_gate_pulse_descriptor_actual_effective");
+    atlas_object_plane_stats_["atlas_activation_gate_pulse_osa_requested"] =
+        registerStatistic<uint64_t>("atlas_activation_gate_pulse_osa_requested");
+    atlas_object_plane_stats_["atlas_activation_gate_pulse_osa_effective"] =
+        registerStatistic<uint64_t>("atlas_activation_gate_pulse_osa_effective");
+    atlas_object_plane_stats_["atlas_activation_gate_shared_weight_owner_requested"] =
+        registerStatistic<uint64_t>("atlas_activation_gate_shared_weight_owner_requested");
+    atlas_object_plane_stats_["atlas_activation_gate_shared_weight_owner_effective"] =
+        registerStatistic<uint64_t>("atlas_activation_gate_shared_weight_owner_effective");
+    atlas_object_plane_stats_["atlas_activation_gate_shared_weight_plane_constructed"] =
+        registerStatistic<uint64_t>("atlas_activation_gate_shared_weight_plane_constructed");
+    atlas_object_plane_stats_["atlas_activation_gate_shared_weight_actual_owner_requested"] =
+        registerStatistic<uint64_t>("atlas_activation_gate_shared_weight_actual_owner_requested");
+    atlas_object_plane_stats_["atlas_activation_gate_shared_weight_actual_owner_effective"] =
+        registerStatistic<uint64_t>("atlas_activation_gate_shared_weight_actual_owner_effective");
+    atlas_object_plane_stats_["atlas_activation_gate_pe_internal_pod_requested"] =
+        registerStatistic<uint64_t>("atlas_activation_gate_pe_internal_pod_requested");
+    atlas_object_plane_stats_["atlas_activation_gate_rowindex_requested"] =
+        registerStatistic<uint64_t>("atlas_activation_gate_rowindex_requested");
+    atlas_object_plane_stats_["atlas_activation_gate_pe_internal_pod_metadata_requested"] =
+        registerStatistic<uint64_t>("atlas_activation_gate_pe_internal_pod_metadata_requested");
+    atlas_object_plane_stats_["atlas_activation_gate_pe_internal_pod_owner_requested"] =
+        registerStatistic<uint64_t>("atlas_activation_gate_pe_internal_pod_owner_requested");
+    atlas_object_plane_stats_["atlas_activation_gate_rowindex_constructed"] =
+        registerStatistic<uint64_t>("atlas_activation_gate_rowindex_constructed");
+    atlas_object_plane_stats_["atlas_activation_gate_pod_metadata_plane_constructed"] =
+        registerStatistic<uint64_t>("atlas_activation_gate_pod_metadata_plane_constructed");
+    atlas_object_plane_stats_["atlas_activation_gate_pod_owner_table_constructed"] =
+        registerStatistic<uint64_t>("atlas_activation_gate_pod_owner_table_constructed");
+    atlas_object_plane_stats_["atlas_activation_gate_service_table_constructed"] =
+        registerStatistic<uint64_t>("atlas_activation_gate_service_table_constructed");
+    stat_pulse_osa_shared_weight_enabled_ =
+        registerStatistic<uint64_t>("pulse_osa_shared_weight_enabled");
+    stat_pulse_osa_shared_weight_owner_scope_enable_ =
+        registerStatistic<uint64_t>("pulse_osa_shared_weight_owner_scope_enable");
+    stat_pulse_osa_shared_weight_actual_owner_enable_ =
+        registerStatistic<uint64_t>("pulse_osa_shared_weight_actual_owner_enable");
+    stat_pulse_osa_shared_weight_idx_enabled_ =
+        registerStatistic<uint64_t>("pulse_osa_shared_weight_idx_enabled");
+    stat_pulse_osa_shared_weight_idx_reads_total_ =
+        registerStatistic<uint64_t>("pulse_osa_shared_weight_idx_reads_total");
+    stat_pulse_osa_shared_weight_idx_writes_total_ =
+        registerStatistic<uint64_t>("pulse_osa_shared_weight_idx_writes_total");
+    stat_pulse_osa_shared_weight_idx_bank_conflict_ticks_total_ =
+        registerStatistic<uint64_t>("pulse_osa_shared_weight_idx_bank_conflict_ticks_total");
+    stat_pulse_osa_shared_weight_idx_predicted_extra_cycles_total_ =
+        registerStatistic<uint64_t>("pulse_osa_shared_weight_idx_predicted_extra_cycles_total");
+    stat_pulse_osa_shared_weight_idx_resident_bytes_peak_ =
+        registerStatistic<uint64_t>("pulse_osa_shared_weight_idx_resident_bytes_peak");
+    stat_pulse_osa_shared_weight_l0_enabled_ =
+        registerStatistic<uint64_t>("pulse_osa_shared_weight_l0_enabled");
+    stat_pulse_osa_shared_weight_l0_reads_total_ =
+        registerStatistic<uint64_t>("pulse_osa_shared_weight_l0_reads_total");
+    stat_pulse_osa_shared_weight_l0_writes_total_ =
+        registerStatistic<uint64_t>("pulse_osa_shared_weight_l0_writes_total");
+    stat_pulse_osa_shared_weight_l0_fill_total_ =
+        registerStatistic<uint64_t>("pulse_osa_shared_weight_l0_fill_total");
+    stat_pulse_osa_shared_weight_l0_evict_total_ =
+        registerStatistic<uint64_t>("pulse_osa_shared_weight_l0_evict_total");
+    stat_pulse_osa_shared_weight_l0_bank_conflict_ticks_total_ =
+        registerStatistic<uint64_t>("pulse_osa_shared_weight_l0_bank_conflict_ticks_total");
+    stat_pulse_osa_shared_weight_l0_predicted_extra_cycles_total_ =
+        registerStatistic<uint64_t>("pulse_osa_shared_weight_l0_predicted_extra_cycles_total");
+    stat_pulse_osa_shared_weight_l0_resident_bytes_peak_ =
+        registerStatistic<uint64_t>("pulse_osa_shared_weight_l0_resident_bytes_peak");
+    stat_pulse_ingress_packets_total_ = registerStatistic<uint64_t>("pulse_ingress_packets_total");
+    stat_pulse_ingress_spike_packets_total_ =
+        registerStatistic<uint64_t>("pulse_ingress_spike_packets_total");
+    stat_pulse_ingress_spikekey_packets_total_ =
+        registerStatistic<uint64_t>("pulse_ingress_spikekey_packets_total");
+    stat_pulse_ingress_spiketilekey_packets_total_ =
+        registerStatistic<uint64_t>("pulse_ingress_spiketilekey_packets_total");
+    stat_pulse_ingress_core_dispatch_total_ =
+        registerStatistic<uint64_t>("pulse_ingress_core_dispatch_total");
+    stat_pulse_ingress_shared_buffered_total_ =
+        registerStatistic<uint64_t>("pulse_ingress_shared_buffered_total");
+    stat_pulse_ingress_shared_dispatch_total_ =
+        registerStatistic<uint64_t>("pulse_ingress_shared_dispatch_total");
+    stat_pulse_ingress_direct_deliver_total_ =
+        registerStatistic<uint64_t>("pulse_ingress_direct_deliver_total");
+    stat_pulse_ingress_bypass_total_ = registerStatistic<uint64_t>("pulse_ingress_bypass_total");
+    stat_pulse_ingress_pressure_bypass_total_ =
+        registerStatistic<uint64_t>("pulse_ingress_pressure_bypass_total");
+    stat_pulse_ingress_singleton_bypass_total_ =
+        registerStatistic<uint64_t>("pulse_ingress_singleton_bypass_total");
+    stat_pulse_ingress_deadline_bypass_total_ =
+        registerStatistic<uint64_t>("pulse_ingress_deadline_bypass_total");
+    stat_pulse_ingress_pressure_cycles_total_ =
+        registerStatistic<uint64_t>("pulse_ingress_pressure_cycles_total");
+    stat_pulse_ingress_entries_peak_ = registerStatistic<uint64_t>("pulse_ingress_entries_peak");
+    stat_pulse_control_entries_current_ =
+        registerStatistic<uint64_t>("pulse_control_entries_current");
+    stat_pulse_control_entries_peak_ =
+        registerStatistic<uint64_t>("pulse_control_entries_peak");
+    stat_pulse_control_backlog_cycles_total_ =
+        registerStatistic<uint64_t>("pulse_control_backlog_cycles_total");
+    stat_pulse_core_queue_entries_peak_ =
+        registerStatistic<uint64_t>("pulse_core_queue_entries_peak");
+    stat_pulse_harbor_buckets_total_ =
+        registerStatistic<uint64_t>("pulse_harbor_buckets_total");
+    stat_pulse_harbor_packet_sum_ =
+        registerStatistic<uint64_t>("pulse_harbor_packet_sum");
+    stat_pulse_harbor_consumer_sum_ =
+        registerStatistic<uint64_t>("pulse_harbor_consumer_sum");
+    stat_pulse_harbor_bucket_peak_ =
+        registerStatistic<uint64_t>("pulse_harbor_bucket_peak");
+    stat_pulse_harbor_singleton_buckets_total_ =
+        registerStatistic<uint64_t>("pulse_harbor_singleton_buckets_total");
+    stat_pulse_descriptor_total_ =
+        registerStatistic<uint64_t>("pulse_descriptor_total");
+    stat_pulse_descriptor_packet_sum_ =
+        registerStatistic<uint64_t>("pulse_descriptor_packet_sum");
+    stat_pulse_descriptor_consumer_sum_ =
+        registerStatistic<uint64_t>("pulse_descriptor_consumer_sum");
+    stat_pulse_descriptor_singleton_drop_total_ =
+        registerStatistic<uint64_t>("pulse_descriptor_singleton_drop_total");
+    stat_pulse_control_messages_enqueued_total_ =
+        registerStatistic<uint64_t>("pulse_control_messages_enqueued_total");
+    stat_pulse_control_messages_dequeued_total_ =
+        registerStatistic<uint64_t>("pulse_control_messages_dequeued_total");
+    stat_pulse_control_frontier_export_total_ =
+        registerStatistic<uint64_t>("pulse_control_frontier_export_total");
+    stat_pulse_control_owner_announce_total_ =
+        registerStatistic<uint64_t>("pulse_control_owner_announce_total");
+    stat_pulse_control_join_request_total_ =
+        registerStatistic<uint64_t>("pulse_control_join_request_total");
+    stat_pulse_control_ready_fanout_total_ =
+        registerStatistic<uint64_t>("pulse_control_ready_fanout_total");
+    stat_pulse_control_join_reject_total_ =
+        registerStatistic<uint64_t>("pulse_control_join_reject_total");
+    stat_pulse_agenda_candidates_total_ =
+        registerStatistic<uint64_t>("pulse_agenda_candidates_total");
+    stat_pulse_agenda_accepted_total_ =
+        registerStatistic<uint64_t>("pulse_agenda_accepted_total");
+    stat_pulse_agenda_rejected_total_ =
+        registerStatistic<uint64_t>("pulse_agenda_rejected_total");
+    stat_pulse_agenda_reject_gate_total_ =
+        registerStatistic<uint64_t>("pulse_agenda_reject_gate_total");
+    stat_pulse_correctness_ready_blocked_cycles_total_ =
+        registerStatistic<uint64_t>("pulse_correctness_ready_blocked_cycles_total");
+    stat_pulse_correctness_scoreboard_occupancy_peak_ =
+        registerStatistic<uint64_t>("pulse_correctness_scoreboard_occupancy_peak");
+    stat_pulse_shared_service_hits_total_ =
+        registerStatistic<uint64_t>("pulse_shared_service_hits_total");
+    stat_pulse_shared_service_misses_total_ =
+        registerStatistic<uint64_t>("pulse_shared_service_misses_total");
+    stat_pulse_region_service_entries_peak_ =
+        registerStatistic<uint64_t>("pulse_region_service_entries_peak");
+    stat_pulse_ready_fanout_total_ =
+        registerStatistic<uint64_t>("pulse_ready_fanout_total");
+    stat_pulse_rowdescriptor_ready_transition_total_ =
+        registerStatistic<uint64_t>("pulse_rowdescriptor_ready_transition_total");
+    stat_pulse_rowdescriptor_join_ready_total_ =
+        registerStatistic<uint64_t>("pulse_rowdescriptor_join_ready_total");
+    stat_pulse_rowdescriptor_ready_join_shortcut_candidates_total_ =
+        registerStatistic<uint64_t>("pulse_rowdescriptor_ready_join_shortcut_candidates_total");
+    stat_pulse_rowdescriptor_ready_join_shortcut_taken_total_ =
+        registerStatistic<uint64_t>("pulse_rowdescriptor_ready_join_shortcut_taken_total");
+    stat_pulse_rowdescriptor_ready_join_shortcut_late_release_taken_total_ =
+        registerStatistic<uint64_t>("pulse_rowdescriptor_ready_join_shortcut_late_release_taken_total");
+    stat_pulse_rowdescriptor_ready_join_shortcut_deferred_live_park_total_ =
+        registerStatistic<uint64_t>("pulse_rowdescriptor_ready_join_shortcut_deferred_live_park_total");
+    stat_pulse_rowdescriptor_ready_join_shortcut_deferred_live_apply_total_ =
+        registerStatistic<uint64_t>("pulse_rowdescriptor_ready_join_shortcut_deferred_live_apply_total");
+    stat_pulse_rowdescriptor_owner_form_deferred_park_total_ =
+        registerStatistic<uint64_t>("pulse_rowdescriptor_owner_form_deferred_park_total");
+    stat_pulse_rowdescriptor_owner_form_deferred_activate_total_ =
+        registerStatistic<uint64_t>("pulse_rowdescriptor_owner_form_deferred_activate_total");
+    stat_pulse_rowdescriptor_ready_join_shortcut_blocked_not_ready_total_ =
+        registerStatistic<uint64_t>("pulse_rowdescriptor_ready_join_shortcut_blocked_not_ready_total");
+    stat_pulse_rowdescriptor_ready_join_shortcut_blocked_owner_form_total_ =
+        registerStatistic<uint64_t>("pulse_rowdescriptor_ready_join_shortcut_blocked_owner_form_total");
+    stat_pulse_rowdescriptor_ready_join_shortcut_blocked_join_live_total_ =
+        registerStatistic<uint64_t>("pulse_rowdescriptor_ready_join_shortcut_blocked_join_live_total");
+    stat_pulse_rowdescriptor_ready_join_shortcut_blocked_other_total_ =
+        registerStatistic<uint64_t>("pulse_rowdescriptor_ready_join_shortcut_blocked_other_total");
+    stat_pulse_rowdescriptor_ready_join_shortcut_release_deferred_total_ =
+        registerStatistic<uint64_t>("pulse_rowdescriptor_ready_join_shortcut_release_deferred_total");
+    stat_pulse_rowdescriptor_ready_join_shortcut_apply_complete_total_ =
+        registerStatistic<uint64_t>("pulse_rowdescriptor_ready_join_shortcut_apply_complete_total");
+    stat_pulse_rowdescriptor_ready_join_shortcut_release_forwarded_total_ =
+        registerStatistic<uint64_t>("pulse_rowdescriptor_ready_join_shortcut_release_forwarded_total");
+    stat_pulse_rowdescriptor_ready_join_shortcut_release_missing_total_ =
+        registerStatistic<uint64_t>("pulse_rowdescriptor_ready_join_shortcut_release_missing_total");
+    stat_pulse_rowdescriptor_ready_join_descriptor_elide_total_ =
+        registerStatistic<uint64_t>("pulse_rowdescriptor_ready_join_descriptor_elide_total");
+    stat_pulse_rowdescriptor_ready_join_lines_elide_total_ =
+        registerStatistic<uint64_t>("pulse_rowdescriptor_ready_join_lines_elide_total");
+    stat_pulse_rowdescriptor_owner_first_service_elide_join_live_total_ =
+        registerStatistic<uint64_t>("pulse_rowdescriptor_owner_first_service_elide_join_live_total");
+    stat_pulse_rowdescriptor_owner_first_service_elide_join_ready_total_ =
+        registerStatistic<uint64_t>("pulse_rowdescriptor_owner_first_service_elide_join_ready_total");
+    stat_pulse_rowdescriptor_owner_first_service_elide_late_join_total_ =
+        registerStatistic<uint64_t>("pulse_rowdescriptor_owner_first_service_elide_late_join_total");
+    stat_pulse_pod_rowdescriptor_owner_form_total_ =
+        registerStatistic<uint64_t>("pulse_pod_rowdescriptor_owner_form_total");
+    stat_pulse_pod_rowdescriptor_owner_hit_total_ =
+        registerStatistic<uint64_t>("pulse_pod_rowdescriptor_owner_hit_total");
+    stat_pulse_pod_rowdescriptor_join_live_total_ =
+        registerStatistic<uint64_t>("pulse_pod_rowdescriptor_join_live_total");
+    stat_pulse_pod_rowdescriptor_join_ready_total_ =
+        registerStatistic<uint64_t>("pulse_pod_rowdescriptor_join_ready_total");
+    stat_pulse_pod_rowdescriptor_ready_transition_total_ =
+        registerStatistic<uint64_t>("pulse_pod_rowdescriptor_ready_transition_total");
+    stat_pulse_pod_rowdescriptor_late_join_total_ =
+        registerStatistic<uint64_t>("pulse_pod_rowdescriptor_late_join_total");
+    stat_pulse_pod_rowdescriptor_guard_total_ =
+        registerStatistic<uint64_t>("pulse_pod_rowdescriptor_guard_total");
+    stat_pulse_pod_rowdescriptor_guard_disabled_total_ =
+        registerStatistic<uint64_t>("pulse_pod_rowdescriptor_guard_disabled_total");
+    stat_pulse_pod_rowdescriptor_guard_missing_metadata_plane_total_ =
+        registerStatistic<uint64_t>("pulse_pod_rowdescriptor_guard_missing_metadata_plane_total");
+    stat_pulse_pod_rowdescriptor_guard_missing_owner_table_total_ =
+        registerStatistic<uint64_t>("pulse_pod_rowdescriptor_guard_missing_owner_table_total");
+    stat_pulse_pod_rowdescriptor_guard_zero_pod_count_total_ =
+        registerStatistic<uint64_t>("pulse_pod_rowdescriptor_guard_zero_pod_count_total");
+    stat_pulse_pod_rowdescriptor_guard_window_zero_total_ =
+        registerStatistic<uint64_t>("pulse_pod_rowdescriptor_guard_window_zero_total");
+    stat_pulse_pod_rowdescriptor_guard_invalid_cfg_pod_total_ =
+        registerStatistic<uint64_t>("pulse_pod_rowdescriptor_guard_invalid_cfg_pod_total");
+    stat_pulse_pod_rowdescriptor_reject_total_ =
+        registerStatistic<uint64_t>("pulse_pod_rowdescriptor_reject_total");
+    stat_pulse_pod_rowdescriptor_attempted_total_ =
+        registerStatistic<uint64_t>("pulse_pod_rowdescriptor_attempted_total");
+    stat_pulse_pod_rowdescriptor_potential_private_service_elide_total_ =
+        registerStatistic<uint64_t>("pulse_pod_rowdescriptor_potential_private_service_elide_total");
+    stat_pulse_pod_rowdescriptor_owner_first_issue_deferred_total_ =
+        registerStatistic<uint64_t>("pulse_pod_rowdescriptor_owner_first_issue_deferred_total");
+    stat_pulse_pod_rowdescriptor_owner_first_private_issue_avoided_total_ =
+        registerStatistic<uint64_t>("pulse_pod_rowdescriptor_owner_first_private_issue_avoided_total");
+    stat_pulse_pod_rowdescriptor_owner_first_service_elide_total_ =
+        registerStatistic<uint64_t>("pulse_pod_rowdescriptor_owner_first_service_elide_total");
+    stat_pulse_metadata_txn_export_total_ =
+        registerStatistic<uint64_t>("pulse_metadata_txn_export_total");
+    stat_pulse_metadata_txn_owner_launch_total_ =
+        registerStatistic<uint64_t>("pulse_metadata_txn_owner_launch_total");
+    stat_pulse_metadata_txn_join_live_total_ =
+        registerStatistic<uint64_t>("pulse_metadata_txn_join_live_total");
+    stat_pulse_metadata_txn_join_ready_total_ =
+        registerStatistic<uint64_t>("pulse_metadata_txn_join_ready_total");
+    stat_pulse_metadata_txn_late_join_total_ =
+        registerStatistic<uint64_t>("pulse_metadata_txn_late_join_total");
+    stat_pulse_metadata_txn_ready_lease_hit_total_ =
+        registerStatistic<uint64_t>("pulse_metadata_txn_ready_lease_hit_total");
+    stat_pulse_metadata_txn_ready_lease_expired_total_ =
+        registerStatistic<uint64_t>("pulse_metadata_txn_ready_lease_expired_total");
+    stat_pulse_metadata_txn_envelope_size_sum_total_ =
+        registerStatistic<uint64_t>("pulse_metadata_txn_envelope_size_sum_total");
+    stat_pulse_metadata_frontier_observed_total_ =
+        registerStatistic<uint64_t>("pulse_metadata_frontier_observed_total");
+    stat_pulse_metadata_frontier_same_window_reobserve_total_ =
+        registerStatistic<uint64_t>("pulse_metadata_frontier_same_window_reobserve_total");
+    stat_pulse_metadata_frontier_owner_form_candidate_total_ =
+        registerStatistic<uint64_t>("pulse_metadata_frontier_owner_form_candidate_total");
+    stat_pulse_metadata_frontier_join_ready_candidate_total_ =
+        registerStatistic<uint64_t>("pulse_metadata_frontier_join_ready_candidate_total");
+    stat_pulse_metadata_frontier_premphf_base_observed_total_ =
+        registerStatistic<uint64_t>("pulse_metadata_frontier_premphf_base_observed_total");
+    stat_pulse_metadata_frontier_premphf_base_same_window_reobserve_total_ =
+        registerStatistic<uint64_t>("pulse_metadata_frontier_premphf_base_same_window_reobserve_total");
+    stat_pulse_metadata_frontier_premphf_base_owner_form_candidate_total_ =
+        registerStatistic<uint64_t>("pulse_metadata_frontier_premphf_base_owner_form_candidate_total");
+    stat_pulse_metadata_frontier_premphf_base_join_ready_candidate_total_ =
+        registerStatistic<uint64_t>("pulse_metadata_frontier_premphf_base_join_ready_candidate_total");
+    stat_pulse_metadata_frontier_premphf_band_observed_total_ =
+        registerStatistic<uint64_t>("pulse_metadata_frontier_premphf_band_observed_total");
+    stat_pulse_metadata_frontier_premphf_band_same_window_reobserve_total_ =
+        registerStatistic<uint64_t>("pulse_metadata_frontier_premphf_band_same_window_reobserve_total");
+    stat_pulse_metadata_frontier_premphf_band_owner_form_candidate_total_ =
+        registerStatistic<uint64_t>("pulse_metadata_frontier_premphf_band_owner_form_candidate_total");
+    stat_pulse_metadata_frontier_premphf_band_join_ready_candidate_total_ =
+        registerStatistic<uint64_t>("pulse_metadata_frontier_premphf_band_join_ready_candidate_total");
+    stat_pulse_metadata_frontier_idx2row_observed_total_ =
+        registerStatistic<uint64_t>("pulse_metadata_frontier_idx2row_observed_total");
+    stat_pulse_metadata_frontier_idx2row_same_window_reobserve_total_ =
+        registerStatistic<uint64_t>("pulse_metadata_frontier_idx2row_same_window_reobserve_total");
+    stat_pulse_metadata_frontier_idx2row_owner_form_candidate_total_ =
+        registerStatistic<uint64_t>("pulse_metadata_frontier_idx2row_owner_form_candidate_total");
+    stat_pulse_metadata_frontier_idx2row_join_ready_candidate_total_ =
+        registerStatistic<uint64_t>("pulse_metadata_frontier_idx2row_join_ready_candidate_total");
+    stat_pulse_metadata_frontier_rowindex_observed_total_ =
+        registerStatistic<uint64_t>("pulse_metadata_frontier_rowindex_observed_total");
+    stat_pulse_metadata_frontier_rowindex_same_window_reobserve_total_ =
+        registerStatistic<uint64_t>("pulse_metadata_frontier_rowindex_same_window_reobserve_total");
+    stat_pulse_metadata_frontier_rowindex_owner_form_candidate_total_ =
+        registerStatistic<uint64_t>("pulse_metadata_frontier_rowindex_owner_form_candidate_total");
+    stat_pulse_metadata_frontier_rowindex_join_ready_candidate_total_ =
+        registerStatistic<uint64_t>("pulse_metadata_frontier_rowindex_join_ready_candidate_total");
+    stat_pulse_actual_gate_enable_false_total_ =
+        registerStatistic<uint64_t>("pulse_actual_gate_enable_false_total");
+    stat_pulse_actual_gate_window_zero_total_ =
+        registerStatistic<uint64_t>("pulse_actual_gate_window_zero_total");
+    stat_pulse_actual_gate_line_too_small_total_ =
+        registerStatistic<uint64_t>("pulse_actual_gate_line_too_small_total");
+    stat_pulse_actual_gate_taken_total_ =
+        registerStatistic<uint64_t>("pulse_actual_gate_taken_total");
+    stat_pulse_frontier_windows_total_ =
+        registerStatistic<uint64_t>("pulse_frontier_windows_total");
+    stat_pulse_frontier_lines_exported_total_ =
+        registerStatistic<uint64_t>("pulse_frontier_lines_exported_total");
+    stat_pulse_frontier_overlap_lines_total_ =
+        registerStatistic<uint64_t>("pulse_frontier_overlap_lines_total");
+    stat_pulse_frontier_overlap_peer_total_ =
+        registerStatistic<uint64_t>("pulse_frontier_overlap_peer_total");
+    stat_pulse_frontier_max_exported_per_window_ =
+        registerStatistic<uint64_t>("pulse_frontier_max_exported_per_window");
+    stat_pulse_prebase_lookup_owner_fill_total_ =
+        registerStatistic<uint64_t>("pulse_prebase_lookup_owner_fill_total");
+    stat_pulse_prebase_lookup_shared_hits_total_ =
+        registerStatistic<uint64_t>("pulse_prebase_lookup_shared_hits_total");
+    stat_pulse_prebase_lookup_entries_peak_ =
+        registerStatistic<uint64_t>("pulse_prebase_lookup_entries_peak");
     for (auto& mod : workload_stats_modules_) {
         if (!mod) continue;
         if (std::strcmp(mod->name(), "stream") == 0) {
@@ -1964,6 +4465,9 @@ void MultiCorePE::initializeStatistics() {
     stat_gas_rowwin_bytes_total_ = registerStatistic<uint64_t>("gas_row_window_bytes_total");
     stat_gas_total_bursts_ = registerStatistic<uint64_t>("gas_total_bursts");
     stat_gas_total_payload_bytes_ = registerStatistic<uint64_t>("gas_total_payload_bytes");
+    stat_gas_frontend_staged_reads_total_ = registerStatistic<uint64_t>("gas_frontend_staged_reads_total");
+    stat_gas_frontend_staged_line_touches_total_ = registerStatistic<uint64_t>("gas_frontend_staged_line_touches_total");
+    stat_gas_frontend_granules_built_total_ = registerStatistic<uint64_t>("gas_frontend_granules_built_total");
     stat_gas_unique_line_count_total_ = registerStatistic<uint64_t>("gas_unique_line_count_total");
     stat_gas_covered_line_count_total_ = registerStatistic<uint64_t>("gas_covered_line_count_total");
     stat_gas_overfetch_bytes_total_ = registerStatistic<uint64_t>("gas_overfetch_bytes_total");
@@ -1974,32 +4478,103 @@ void MultiCorePE::initializeStatistics() {
     stat_gas_apply_acc_updates_total_ = registerStatistic<uint64_t>("gas_apply_acc_updates_total");
     stat_gas_acc_posts_touched_total_ = registerStatistic<uint64_t>("gas_acc_posts_touched_total");
     stat_gas_scatter_spikes_emitted_total_ = registerStatistic<uint64_t>("gas_scatter_spikes_emitted_total");
+    stat_stall_on_step_gate_cycles_total_ = registerStatistic<uint64_t>("stall_on_step_gate_cycles_total");
     stat_gas_acc_hwm_bytes_total_ = registerStatistic<uint64_t>("gas_acc_high_watermark_bytes_total");
     stat_gas_acc_spill_records_total_ = registerStatistic<uint64_t>("gas_acc_spill_records_total");
     stat_gas_acc_spilled_bytes_total_ = registerStatistic<uint64_t>("gas_acc_spilled_bytes_total");
     stat_gas_retire_global_hol_cycles_total_ = registerStatistic<uint64_t>("gas_retire_global_hol_cycles_total");
     stat_gas_retire_ready_but_blocked_edges_total_ = registerStatistic<uint64_t>("gas_retire_ready_but_blocked_edges_total");
     stat_gas_retire_per_post_progress_total_ = registerStatistic<uint64_t>("gas_retire_per_post_progress_total");
-    stat_gas_tass_lf_p0_block_epochs_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_block_epochs_total");
-    stat_gas_tass_lf_p0_block_active_pres_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_block_active_pres_total");
-    stat_gas_tass_lf_p0_block_shared_pres_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_block_shared_pres_total");
-    stat_gas_tass_lf_p0_cross_core_joins_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_cross_core_joins_total");
-    stat_gas_tass_lf_p0_payload_bytes_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_payload_bytes_total");
-    stat_gas_tass_lf_p0_current_vlf_line_groups_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_current_vlf_line_groups_total");
-    stat_gas_tass_lf_p0_block_naive_line_count_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_block_naive_line_count_total");
-    stat_gas_tass_lf_p0_block_fused_lb_line_count_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_block_fused_lb_line_count_total");
-    stat_gas_tass_lf_p0_response_fanout_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_response_fanout_total");
-    stat_gas_tass_lf_p0_reports_submit_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_reports_submit_total");
-    stat_gas_tass_lf_p0_reports_send_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_reports_send_total");
-    stat_gas_tass_lf_p0_reports_recv_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_reports_recv_total");
-    stat_gas_tass_lf_p0_reports_reduce_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_reports_reduce_total");
-    stat_gas_tass_lf_p0_reports_drop_no_link_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_reports_drop_no_link_total");
-    stat_gas_tass_lf_p0_reports_drop_non_origin_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_reports_drop_non_origin_total");
-    stat_gas_tass_lf_p0_reports_flushed_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_reports_flushed_total");
-    stat_gas_tass_lf_p0_reports_nonzero_payload_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_reports_nonzero_payload_total");
-    stat_gas_tass_lf_p0_reports_pre_entries_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_reports_pre_entries_total");
-    stat_gas_tass_lf_p0_reports_via_callback_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_reports_via_callback_total");
-    stat_gas_tass_lf_p0_reports_via_fallback_total_ = registerStatistic<uint64_t>("gas_tass_lf_p0_reports_via_fallback_total");
+    stat_gas_retire_samepost_blocked_edges_total_ = registerStatistic<uint64_t>("gas_retire_samepost_blocked_edges_total");
+    stat_gas_retire_crosspost_blocked_edges_total_ = registerStatistic<uint64_t>("gas_retire_crosspost_blocked_edges_total");
+    stat_gas_retire_policy_loss_cycles_total_ = registerStatistic<uint64_t>("gas_retire_policy_loss_cycles_total");
+    stat_gas_retire_policy_loss_edges_total_ = registerStatistic<uint64_t>("gas_retire_policy_loss_edges_total");
+    stat_gas_retire_shadow_per_post_recoverable_cycles_total_ = registerStatistic<uint64_t>("gas_retire_shadow_per_post_recoverable_cycles_total");
+    stat_gas_retire_shadow_per_post_recoverable_edges_total_ = registerStatistic<uint64_t>("gas_retire_shadow_per_post_recoverable_edges_total");
+    stat_gas_retire_shadow_per_post_ready_posts_peak_ = registerStatistic<uint64_t>("gas_retire_shadow_per_post_ready_posts_peak");
+    stat_gas_retire_shadow_per_post_committable_edges_peak_ = registerStatistic<uint64_t>("gas_retire_shadow_per_post_committable_edges_peak");
+    stat_exp_noc_rowidx_prefetch_rows_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_prefetch_rows_total");
+    stat_exp_noc_rowidx_prefetch_bytes_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_prefetch_bytes_total");
+    stat_exp_noc_rowidx_prefetch_complete_inflight_miss_total_ =
+        registerStatistic<uint64_t>("exp_noc_rowidx_prefetch_complete_inflight_miss_total");
+    stat_exp_noc_rowidx_prefetch_complete_zero_waiters_total_ =
+        registerStatistic<uint64_t>("exp_noc_rowidx_prefetch_complete_zero_waiters_total");
+    stat_exp_noc_rowidx_prefetch_complete_waiters_total_ =
+        registerStatistic<uint64_t>("exp_noc_rowidx_prefetch_complete_waiters_total");
+    stat_exp_noc_rowidx_prefetch_rows_deferred_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_prefetch_rows_deferred_total");
+    stat_exp_noc_rowidx_prefetch_rows_failed_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_prefetch_rows_failed_total");
+    stat_exp_noc_rowidx_cache_hits_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_cache_hits_total");
+    stat_exp_noc_rowidx_cache_misses_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_cache_misses_total");
+    stat_exp_noc_rowidx_cache_fills_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_cache_fills_total");
+    stat_exp_noc_rowidx_cache_full_drop_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_cache_full_drop_total");
+    stat_exp_noc_rowidx_cache_entries_final_ = registerStatistic<uint64_t>("exp_noc_rowidx_cache_entries_final");
+    stat_exp_noc_rowidx_bulk_fill_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_bulk_fill_total");
+    stat_exp_noc_rowidx_bulk_rows_cached_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_bulk_rows_cached_total");
+    stat_exp_noc_rowidx_bulk_waiters_resolved_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_bulk_waiters_resolved_total");
+    stat_exp_noc_rowidx_touch_rows_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_touch_rows_total");
+    stat_exp_noc_rowidx_touch_events_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_touch_events_total");
+    stat_exp_noc_rowidx_rows_filtered_cold_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_rows_filtered_cold_total");
+    stat_exp_noc_rowidx_budget_ticks_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_budget_ticks_total");
+    stat_exp_noc_rowidx_budget_effective_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_budget_effective_total");
+    stat_exp_noc_rowidx_budget_adapt_ticks_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_budget_adapt_ticks_total");
+    stat_exp_noc_rowidx_ready_transition_apply_promote_cached_total_ =
+        registerStatistic<uint64_t>("exp_noc_rowidx_ready_transition_apply_promote_cached_total");
+    stat_exp_noc_rowidx_ready_signal_rowindex_response_total_ =
+        registerStatistic<uint64_t>("exp_noc_rowidx_ready_signal_rowindex_response_total");
+    stat_exp_noc_rowidx_ready_transition_rowindex_response_total_ =
+        registerStatistic<uint64_t>("exp_noc_rowidx_ready_transition_rowindex_response_total");
+    stat_exp_noc_rowidx_ready_signal_prefetch_response_total_ =
+        registerStatistic<uint64_t>("exp_noc_rowidx_ready_signal_prefetch_response_total");
+    stat_exp_noc_rowidx_ready_transition_prefetch_response_total_ =
+        registerStatistic<uint64_t>("exp_noc_rowidx_ready_transition_prefetch_response_total");
+    stat_exp_noc_rowidx_ready_signal_rowindex_response_inflight_waiters_total_ =
+        registerStatistic<uint64_t>("exp_noc_rowidx_ready_signal_rowindex_response_inflight_waiters_total");
+    stat_exp_noc_rowidx_ready_transition_rowindex_response_inflight_waiters_total_ =
+        registerStatistic<uint64_t>("exp_noc_rowidx_ready_transition_rowindex_response_inflight_waiters_total");
+    stat_exp_noc_rowidx_ready_signal_rowindex_response_inflight_zero_waiters_total_ =
+        registerStatistic<uint64_t>("exp_noc_rowidx_ready_signal_rowindex_response_inflight_zero_waiters_total");
+    stat_exp_noc_rowidx_ready_transition_rowindex_response_inflight_zero_waiters_total_ =
+        registerStatistic<uint64_t>("exp_noc_rowidx_ready_transition_rowindex_response_inflight_zero_waiters_total");
+    stat_exp_noc_rowidx_ready_signal_rowindex_response_noninflight_prefetch_only_total_ =
+        registerStatistic<uint64_t>("exp_noc_rowidx_ready_signal_rowindex_response_noninflight_prefetch_only_total");
+    stat_exp_noc_rowidx_ready_transition_rowindex_response_noninflight_prefetch_only_total_ =
+        registerStatistic<uint64_t>("exp_noc_rowidx_ready_transition_rowindex_response_noninflight_prefetch_only_total");
+    stat_exp_noc_rowidx_ready_signal_prefetch_response_inflight_waiters_total_ =
+        registerStatistic<uint64_t>("exp_noc_rowidx_ready_signal_prefetch_response_inflight_waiters_total");
+    stat_exp_noc_rowidx_ready_transition_prefetch_response_inflight_waiters_total_ =
+        registerStatistic<uint64_t>("exp_noc_rowidx_ready_transition_prefetch_response_inflight_waiters_total");
+    stat_exp_noc_rowidx_ready_signal_prefetch_response_inflight_zero_waiters_total_ =
+        registerStatistic<uint64_t>("exp_noc_rowidx_ready_signal_prefetch_response_inflight_zero_waiters_total");
+    stat_exp_noc_rowidx_ready_transition_prefetch_response_inflight_zero_waiters_total_ =
+        registerStatistic<uint64_t>("exp_noc_rowidx_ready_transition_prefetch_response_inflight_zero_waiters_total");
+    stat_exp_noc_rowidx_ready_signal_prefetch_response_noninflight_prefetch_only_total_ =
+        registerStatistic<uint64_t>("exp_noc_rowidx_ready_signal_prefetch_response_noninflight_prefetch_only_total");
+    stat_exp_noc_rowidx_ready_transition_prefetch_response_noninflight_prefetch_only_total_ =
+        registerStatistic<uint64_t>("exp_noc_rowidx_ready_transition_prefetch_response_noninflight_prefetch_only_total");
+    stat_exp_noc_rowidx_detached_demand_join_total_ =
+        registerStatistic<uint64_t>("exp_noc_rowidx_detached_demand_join_total");
+    stat_exp_noc_rowidx_detached_demand_waiters_resolved_total_ =
+        registerStatistic<uint64_t>("exp_noc_rowidx_detached_demand_waiters_resolved_total");
+    stat_exp_noc_rowidx_detached_demand_fallback_zero_total_ =
+        registerStatistic<uint64_t>("exp_noc_rowidx_detached_demand_fallback_zero_total");
+    stat_exp_noc_rowidx_detached_demand_ready_signal_total_ =
+        registerStatistic<uint64_t>("exp_noc_rowidx_detached_demand_ready_signal_total");
+    stat_exp_noc_rowidx_detached_demand_ready_transition_total_ =
+        registerStatistic<uint64_t>("exp_noc_rowidx_detached_demand_ready_transition_total");
+    stat_exp_noc_rowidx_ready_bypass_experimental_cache_hit_total_ =
+        registerStatistic<uint64_t>("exp_noc_rowidx_ready_bypass_experimental_cache_hit_total");
+    stat_exp_noc_rowidx_ready_bypass_rowindex_get_hit_total_ =
+        registerStatistic<uint64_t>("exp_noc_rowidx_ready_bypass_rowindex_get_hit_total");
+    stat_exp_noc_rowidx_close_attempt_total_ =
+        registerStatistic<uint64_t>("exp_noc_rowidx_close_attempt_total");
+    stat_exp_noc_rowidx_close_attempt_active_owner_total_ =
+        registerStatistic<uint64_t>("exp_noc_rowidx_close_attempt_active_owner_total");
+    stat_exp_noc_rowidx_close_attempt_already_pending_total_ =
+        registerStatistic<uint64_t>("exp_noc_rowidx_close_attempt_already_pending_total");
+    stat_exp_noc_rowidx_close_attempt_not_active_total_ =
+        registerStatistic<uint64_t>("exp_noc_rowidx_close_attempt_not_active_total");
+    stat_exp_noc_rowidx_close_attempt_not_owner_total_ =
+        registerStatistic<uint64_t>("exp_noc_rowidx_close_attempt_not_owner_total");
     stat_gcss_lookup_hit_total_ = registerStatistic<uint64_t>("gcss_lookup_hit_total");
     stat_gcss_lookup_miss_total_ = registerStatistic<uint64_t>("gcss_lookup_miss_total");
     stat_weight_read_dense_reqs_total_ = registerStatistic<uint64_t>("weight_read_dense_reqs_total");
@@ -2019,6 +4594,9 @@ void MultiCorePE::initializeStatistics() {
     stat_weight_idx_sram_bank_conflict_ticks_total_ = registerStatistic<uint64_t>("weight_idx_sram_bank_conflict_ticks_total");
     stat_weight_idx_sram_predicted_extra_cycles_total_ = registerStatistic<uint64_t>("weight_idx_sram_predicted_extra_cycles_total");
     stat_weight_idx_sram_resident_bytes_peak_ = registerStatistic<uint64_t>("weight_idx_sram_resident_bytes_peak");
+    stat_weight_idx_sram_bank_peak_accesses_per_tick_ = registerStatistic<uint64_t>("weight_idx_sram_bank_peak_accesses_per_tick");
+    stat_weight_idx_sram_energy_read_pj_total_ = registerStatistic<uint64_t>("weight_idx_sram_energy_read_pj_total");
+    stat_weight_idx_sram_energy_write_pj_total_ = registerStatistic<uint64_t>("weight_idx_sram_energy_write_pj_total");
     stat_weight_idx_lookup_total_ = registerStatistic<uint64_t>("weight_idx_lookup_total");
     stat_weight_idx_lookup_idx2_total_ = registerStatistic<uint64_t>("weight_idx_lookup_idx2_total");
     stat_weight_l0_sram_reads_total_ = registerStatistic<uint64_t>("weight_l0_sram_reads_total");
@@ -2028,6 +4606,10 @@ void MultiCorePE::initializeStatistics() {
     stat_weight_l0_sram_bank_conflict_ticks_total_ = registerStatistic<uint64_t>("weight_l0_sram_bank_conflict_ticks_total");
     stat_weight_l0_sram_predicted_extra_cycles_total_ = registerStatistic<uint64_t>("weight_l0_sram_predicted_extra_cycles_total");
     stat_weight_l0_sram_resident_bytes_peak_ = registerStatistic<uint64_t>("weight_l0_sram_resident_bytes_peak");
+    stat_weight_l0_sram_bank_peak_accesses_per_tick_ = registerStatistic<uint64_t>("weight_l0_sram_bank_peak_accesses_per_tick");
+    stat_weight_l0_sram_energy_read_pj_total_ = registerStatistic<uint64_t>("weight_l0_sram_energy_read_pj_total");
+    stat_weight_l0_sram_energy_write_pj_total_ = registerStatistic<uint64_t>("weight_l0_sram_energy_write_pj_total");
+    stat_weight_sram_enforced_stall_cycles_total_ = registerStatistic<uint64_t>("weight_sram_enforced_stall_cycles_total");
     stat_weight_l0_lookup_total_ = registerStatistic<uint64_t>("weight_l0_lookup_total");
     stat_weight_l0_hit_total_ = registerStatistic<uint64_t>("weight_l0_hit_total");
     stat_weight_l0_fill_total_ = registerStatistic<uint64_t>("weight_l0_fill_total");
@@ -2039,8 +4621,28 @@ void MultiCorePE::initializeStatistics() {
     stat_core_state_sram_bank_conflict_ticks_total_ = registerStatistic<uint64_t>("core_state_sram_bank_conflict_ticks_total");
     stat_core_state_sram_predicted_extra_cycles_total_ = registerStatistic<uint64_t>("core_state_sram_predicted_extra_cycles_total");
     stat_core_state_sram_resident_bytes_peak_ = registerStatistic<uint64_t>("core_state_sram_resident_bytes_peak");
+    stat_core_state_sram_bank_peak_accesses_per_tick_ = registerStatistic<uint64_t>("core_state_sram_bank_peak_accesses_per_tick");
+    stat_core_state_sram_energy_read_pj_total_ = registerStatistic<uint64_t>("core_state_sram_energy_read_pj_total");
+    stat_core_state_sram_energy_write_pj_total_ = registerStatistic<uint64_t>("core_state_sram_energy_write_pj_total");
+    stat_core_state_sram_stall_cycles_total_ = registerStatistic<uint64_t>("core_state_sram_stall_cycles_total");
+    stat_riscv_snn_workload_selected_ = registerStatistic<uint64_t>("riscv_snn_workload_selected");
+    stat_riscv_snn_firmware_elf_present_ = registerStatistic<uint64_t>("riscv_snn_firmware_elf_present");
+    stat_riscv_snn_firmware_loaded_ = registerStatistic<uint64_t>("riscv_snn_firmware_loaded");
+    stat_riscv_snn_backend_runtime_bridge_ = registerStatistic<uint64_t>("riscv_snn_backend_runtime_bridge");
+    stat_riscv_snn_firmware_started_count_ = registerStatistic<uint64_t>("riscv_snn_firmware_started_count");
+    stat_riscv_snn_submitted_commands_ = registerStatistic<uint64_t>("riscv_snn_submitted_commands");
+    stat_riscv_snn_accepted_commands_ = registerStatistic<uint64_t>("riscv_snn_accepted_commands");
+    stat_riscv_snn_completion_visible_count_ = registerStatistic<uint64_t>("riscv_snn_completion_visible_count");
+    stat_riscv_snn_completion_consumed_count_ = registerStatistic<uint64_t>("riscv_snn_completion_consumed_count");
+    stat_riscv_snn_fused_step_completion_count_ = registerStatistic<uint64_t>("riscv_snn_fused_step_completion_count");
+    stat_riscv_snn_fault_count_ = registerStatistic<uint64_t>("riscv_snn_fault_count");
+    stat_riscv_snn_last_completion_status_ = registerStatistic<uint64_t>("riscv_snn_last_completion_status");
+    stat_riscv_snn_last_fault_csr_ = registerStatistic<uint64_t>("riscv_snn_last_fault_csr");
+    stat_riscv_snn_backend_runtime_bridge_provider_bound_ =
+        registerStatistic<uint64_t>("riscv_snn_backend_runtime_bridge_provider_bound");
     stat_gas_activity_f_ = registerStatistic<double>("gas_activity_f");
     stat_sim_cycles_total_ = registerStatistic<uint64_t>("sim_cycles_total");
+    stat_compute_active_cycles_total_ = registerStatistic<uint64_t>("compute_active_cycles_total");
     stat_global_steps_done_total_ = registerStatistic<uint64_t>("global_steps_done_total");
     stat_step_activation_invocations_ = registerStatistic<uint64_t>("step_activation_invocations");
     stat_step_activation_pre_selected_ = registerStatistic<uint64_t>("step_activation_pre_selected");
@@ -2049,7 +4651,66 @@ void MultiCorePE::initializeStatistics() {
     stat_step_activation_route_hits_ = registerStatistic<uint64_t>("step_activation_route_hits");
     stat_step_activation_route_misses_ = registerStatistic<uint64_t>("step_activation_route_misses");
     stat_step_activation_local_drops_ = registerStatistic<uint64_t>("step_activation_local_drops");
-    
+
+}
+
+void MultiCorePE::accumulateRiscvSnnRuntimeStats(uint64_t workload_selected,
+                                                 uint64_t firmware_elf_present,
+                                                 uint64_t firmware_loaded,
+                                                 uint64_t backend_runtime_bridge,
+                                                 uint64_t firmware_started_count,
+                                                 uint64_t submitted_commands,
+                                                 uint64_t accepted_commands,
+                                                 uint64_t completion_visible_count,
+                                                 uint64_t completion_consumed_count,
+                                                 uint64_t fused_step_completion_count,
+                                                 uint64_t fault_count,
+                                                 uint64_t last_completion_status,
+                                                 uint64_t last_fault_csr,
+                                                 uint64_t backend_runtime_bridge_provider_bound) {
+    if (stat_riscv_snn_workload_selected_) {
+        stat_riscv_snn_workload_selected_->addData(workload_selected);
+    }
+    if (stat_riscv_snn_firmware_elf_present_) {
+        stat_riscv_snn_firmware_elf_present_->addData(firmware_elf_present);
+    }
+    if (stat_riscv_snn_firmware_loaded_) {
+        stat_riscv_snn_firmware_loaded_->addData(firmware_loaded);
+    }
+    if (stat_riscv_snn_backend_runtime_bridge_) {
+        stat_riscv_snn_backend_runtime_bridge_->addData(backend_runtime_bridge);
+    }
+    if (stat_riscv_snn_firmware_started_count_) {
+        stat_riscv_snn_firmware_started_count_->addData(firmware_started_count);
+    }
+    if (stat_riscv_snn_submitted_commands_) {
+        stat_riscv_snn_submitted_commands_->addData(submitted_commands);
+    }
+    if (stat_riscv_snn_accepted_commands_) {
+        stat_riscv_snn_accepted_commands_->addData(accepted_commands);
+    }
+    if (stat_riscv_snn_completion_visible_count_) {
+        stat_riscv_snn_completion_visible_count_->addData(completion_visible_count);
+    }
+    if (stat_riscv_snn_completion_consumed_count_) {
+        stat_riscv_snn_completion_consumed_count_->addData(completion_consumed_count);
+    }
+    if (stat_riscv_snn_fused_step_completion_count_) {
+        stat_riscv_snn_fused_step_completion_count_->addData(fused_step_completion_count);
+    }
+    if (stat_riscv_snn_fault_count_) {
+        stat_riscv_snn_fault_count_->addData(fault_count);
+    }
+    if (stat_riscv_snn_last_completion_status_) {
+        stat_riscv_snn_last_completion_status_->addData(last_completion_status);
+    }
+    if (stat_riscv_snn_last_fault_csr_) {
+        stat_riscv_snn_last_fault_csr_->addData(last_fault_csr);
+    }
+    if (stat_riscv_snn_backend_runtime_bridge_provider_bound_) {
+        stat_riscv_snn_backend_runtime_bridge_provider_bound_->addData(
+            backend_runtime_bridge_provider_bound);
+    }
 }
 
 void MultiCorePE::accumulateMemReadLatency(uint64_t latency_cycles, bool is_weight) {
@@ -2092,18 +4753,25 @@ void MultiCorePE::accumulateGasStatsExt(uint64_t unique_bytes, uint64_t unique_r
                                         uint64_t bursts, uint64_t payload_bytes,
                                         uint64_t window_inflight_peak,
                                         uint64_t window_buffer_max_bytes,
+                                        uint64_t frontend_staged_reads,
+                                        uint64_t frontend_staged_line_touches,
+                                        uint64_t frontend_granules_built,
                                         uint64_t unique_line_count,
                                         uint64_t covered_line_count,
                                         uint64_t overfetch_bytes,
                                         uint64_t apply_bank_credit_effective,
                                         uint64_t cmd_cost_veto,
                                         uint64_t cmd_cost_veto_fine_gap,
-                                        uint64_t cmd_cost_veto_row_window) {
+                                        uint64_t cmd_cost_veto_row_window,
+                                        uint64_t stall_on_step_gate_cycles) {
     accumulateGasStats(unique_bytes, unique_reads);
     if (rowwin_triggers && stat_gas_rowwin_triggers_total_) stat_gas_rowwin_triggers_total_->addData(rowwin_triggers);
     if (rowwin_bytes && stat_gas_rowwin_bytes_total_) stat_gas_rowwin_bytes_total_->addData(rowwin_bytes);
     if (bursts && stat_gas_total_bursts_) stat_gas_total_bursts_->addData(bursts);
     if (payload_bytes && stat_gas_total_payload_bytes_) stat_gas_total_payload_bytes_->addData(payload_bytes);
+    if (frontend_staged_reads && stat_gas_frontend_staged_reads_total_) stat_gas_frontend_staged_reads_total_->addData(frontend_staged_reads);
+    if (frontend_staged_line_touches && stat_gas_frontend_staged_line_touches_total_) stat_gas_frontend_staged_line_touches_total_->addData(frontend_staged_line_touches);
+    if (frontend_granules_built && stat_gas_frontend_granules_built_total_) stat_gas_frontend_granules_built_total_->addData(frontend_granules_built);
     if (unique_line_count && stat_gas_unique_line_count_total_) stat_gas_unique_line_count_total_->addData(unique_line_count);
     if (covered_line_count && stat_gas_covered_line_count_total_) stat_gas_covered_line_count_total_->addData(covered_line_count);
     if (overfetch_bytes && stat_gas_overfetch_bytes_total_) stat_gas_overfetch_bytes_total_->addData(overfetch_bytes);
@@ -2111,6 +4779,9 @@ void MultiCorePE::accumulateGasStatsExt(uint64_t unique_bytes, uint64_t unique_r
     if (cmd_cost_veto && stat_gas_cmd_cost_veto_total_) stat_gas_cmd_cost_veto_total_->addData(cmd_cost_veto);
     if (cmd_cost_veto_fine_gap && stat_gas_cmd_cost_veto_fine_gap_total_) stat_gas_cmd_cost_veto_fine_gap_total_->addData(cmd_cost_veto_fine_gap);
     if (cmd_cost_veto_row_window && stat_gas_cmd_cost_veto_row_window_total_) stat_gas_cmd_cost_veto_row_window_total_->addData(cmd_cost_veto_row_window);
+    if (stall_on_step_gate_cycles && stat_stall_on_step_gate_cycles_total_) {
+        stat_stall_on_step_gate_cycles_total_->addData(stall_on_step_gate_cycles);
+    }
 }
 
 void MultiCorePE::accumulateActivityF(double f) {
@@ -2134,6 +4805,1444 @@ void MultiCorePE::accumulateApplyScatterStats(uint64_t acc_updates, uint64_t pos
     if (spilled_bytes && stat_gas_acc_spilled_bytes_total_) stat_gas_acc_spilled_bytes_total_->addData(spilled_bytes);
 }
 
+MultiCorePE::StepPerfAgg& MultiCorePE::getOrCreateStepPerf_(uint32_t seq) {
+    return step_perf_[seq];
+}
+
+MultiCorePE::StepPerfAgg& MultiCorePE::getOrCreateCoreStepPerf_(int core_id, uint32_t seq) {
+    return core_step_perf_[CoreStepKey{core_id, seq}];
+}
+
+MultiCorePE::StageMarks& MultiCorePE::getOrCreateCoreStageMarks_(int core_id, uint32_t seq) {
+    return core_stage_marks_[CoreStepKey{core_id, seq}];
+}
+
+void MultiCorePE::recordStepActivationSummary(uint32_t seq,
+                                              uint64_t pre_selected,
+                                              uint64_t spike_attempts,
+                                              uint64_t spikes_injected,
+                                              uint64_t route_hits,
+                                              uint64_t route_misses,
+                                              uint64_t local_drops) {
+    if (seq == 0) return;
+    auto& perf = getOrCreateStepPerf_(seq);
+    perf.seed_pre_selected += pre_selected;
+    perf.seed_spike_attempts += spike_attempts;
+    perf.seed_spikes_injected += spikes_injected;
+    perf.seed_route_hits += route_hits;
+    perf.seed_route_misses += route_misses;
+    perf.seed_local_drops += local_drops;
+}
+
+void MultiCorePE::recordStepRxPacket(uint32_t seq, NocPacketKind kind, bool is_local, bool before_begin_gather) {
+    if (seq == 0) return;
+    auto& perf = getOrCreateStepPerf_(seq);
+    perf.rx_packets_total += 1;
+    if (is_local) perf.rx_local_packets_total += 1;
+    else perf.rx_remote_packets_total += 1;
+    if (before_begin_gather) {
+        perf.rx_packets_before_bg_total += 1;
+        if (is_local) perf.rx_local_packets_before_bg_total += 1;
+        else perf.rx_remote_packets_before_bg_total += 1;
+        if (perf.rx_packets_before_bg_total > perf.rx_gate_pending_peak) {
+            perf.rx_gate_pending_peak = perf.rx_packets_before_bg_total;
+        }
+    } else {
+        auto stage_it = stage_marks_.find(seq);
+        int stage_code = 0;
+        if (stage_it != stage_marks_.end()) {
+            const auto& m = stage_it->second;
+            if (m.bs != 0) stage_code = 3;
+            else if (m.ga != 0) stage_code = 2;
+            else if (m.bg != 0) stage_code = 1;
+        }
+        if (stage_code == 1) perf.rx_packets_during_gather_total += 1;
+        else if (stage_code == 2) perf.rx_packets_during_apply_total += 1;
+        else if (stage_code == 3) perf.rx_packets_during_scatter_total += 1;
+    }
+    switch (kind) {
+        case NocPacketKind::Spike:
+            perf.rx_spike_packets_total += 1;
+            break;
+        case NocPacketKind::SpikeKey:
+            perf.rx_spikekey_packets_total += 1;
+            break;
+        case NocPacketKind::SpikeTileKey:
+            perf.rx_spiketilekey_packets_total += 1;
+            break;
+        default:
+            break;
+    }
+}
+
+void MultiCorePE::recordStepRxGate(uint32_t seq,
+                                   uint64_t accept_total,
+                                   uint64_t reject_refractory_total,
+                                   uint64_t direct_accept_total,
+                                   uint64_t direct_reject_refractory_total,
+                                   uint64_t fastpath_accept_total,
+                                   uint64_t fastpath_reject_refractory_total) {
+    if (seq == 0) return;
+    auto& perf = getOrCreateStepPerf_(seq);
+    perf.rx_gate_accept_total += accept_total;
+    perf.rx_gate_reject_refractory_total += reject_refractory_total;
+    perf.rx_gate_direct_accept_total += direct_accept_total;
+    perf.rx_gate_direct_reject_refractory_total += direct_reject_refractory_total;
+    perf.rx_gate_fastpath_accept_total += fastpath_accept_total;
+    perf.rx_gate_fastpath_reject_refractory_total += fastpath_reject_refractory_total;
+}
+
+void MultiCorePE::recordStepGasStat(uint32_t seq, const GasStatEvent& st) {
+    if (seq == 0) return;
+    auto& perf = getOrCreateStepPerf_(seq);
+    perf.unique_reads += st.unique_reads;
+    perf.unique_bytes += st.unique_bytes;
+    perf.rowwin_triggers += st.rowwin_triggers;
+    perf.rowwin_bytes += st.rowwin_bytes;
+    perf.bursts += st.bursts;
+    perf.payload_bytes += st.payload_bytes;
+    perf.window_inflight_peak = std::max<uint64_t>(perf.window_inflight_peak, st.window_inflight_peak);
+    perf.window_buffer_max_bytes = std::max<uint64_t>(perf.window_buffer_max_bytes, st.window_buffer_max_bytes);
+    perf.gap_absorbed_bytes += st.gap_absorbed_bytes;
+    perf.frontend_staged_reads += st.frontend_staged_reads;
+    perf.frontend_staged_line_touches += st.frontend_staged_line_touches;
+    perf.frontend_granules_built += st.frontend_granules_built;
+    perf.unique_line_count += st.unique_line_count;
+    perf.covered_line_count += st.covered_line_count;
+    perf.overfetch_bytes += st.overfetch_bytes;
+    perf.apply_bank_credit_effective += st.apply_bank_credit_effective;
+    perf.cmd_cost_veto += st.cmd_cost_veto;
+    perf.cmd_cost_veto_fine_gap += st.cmd_cost_veto_fine_gap;
+    perf.cmd_cost_veto_row_window += st.cmd_cost_veto_row_window;
+    perf.apply_issue_attempt_total += st.apply_issue_attempt_total;
+    perf.apply_issue_success_total += st.apply_issue_success_total;
+    perf.apply_issue_block_no_ready_total += st.apply_issue_block_no_ready_total;
+    perf.apply_issue_block_inflight_cap_total += st.apply_issue_block_inflight_cap_total;
+    perf.apply_issue_block_bank_credit_total += st.apply_issue_block_bank_credit_total;
+    perf.apply_issue_block_downstream_busy_total += st.apply_issue_block_downstream_busy_total;
+    perf.apply_issue_block_retire_guard_total += st.apply_issue_block_retire_guard_total;
+    perf.apply_ready_queue_peak = std::max<uint64_t>(perf.apply_ready_queue_peak, st.apply_ready_queue_peak);
+    perf.apply_ready_queue_nonempty_cycles_total += st.apply_ready_queue_nonempty_cycles_total;
+    perf.apply_first_issue_delay_ns += st.apply_first_issue_delay_ns;
+    perf.apply_first_down_resp_delay_ns += st.apply_first_down_resp_delay_ns;
+    perf.apply_first_granule_done_delay_ns += st.apply_first_granule_done_delay_ns;
+    perf.apply_first_up_resp_delay_ns += st.apply_first_up_resp_delay_ns;
+    perf.apply_down_resp_total += st.apply_down_resp_total;
+    perf.apply_completed_granules_total += st.apply_completed_granules_total;
+    perf.apply_emitted_subreads_total += st.apply_emitted_subreads_total;
+    perf.apply_backlog_granules_residual =
+        std::max<uint64_t>(perf.apply_backlog_granules_residual, st.apply_backlog_granules_residual);
+    perf.apply_backlog_pending_up_reads_residual =
+        std::max<uint64_t>(perf.apply_backlog_pending_up_reads_residual,
+                           st.apply_backlog_pending_up_reads_residual);
+    perf.apply_backlog_inflight_residual =
+        std::max<uint64_t>(perf.apply_backlog_inflight_residual, st.apply_backlog_inflight_residual);
+    perf.apply_backlog_granules_peak_after_due =
+        std::max<uint64_t>(perf.apply_backlog_granules_peak_after_due,
+                           st.apply_backlog_granules_peak_after_due);
+    perf.apply_backlog_pending_up_reads_peak_after_due =
+        std::max<uint64_t>(perf.apply_backlog_pending_up_reads_peak_after_due,
+                           st.apply_backlog_pending_up_reads_peak_after_due);
+    perf.apply_backlog_inflight_peak_after_due =
+        std::max<uint64_t>(perf.apply_backlog_inflight_peak_after_due,
+                           st.apply_backlog_inflight_peak_after_due);
+}
+
+void MultiCorePE::recordCoreStepGasStat(int core_id, uint32_t seq, const GasStatEvent& st) {
+    if (seq == 0 || core_id < 0) return;
+    auto& perf = getOrCreateCoreStepPerf_(core_id, seq);
+    perf.unique_reads += st.unique_reads;
+    perf.unique_bytes += st.unique_bytes;
+    perf.rowwin_triggers += st.rowwin_triggers;
+    perf.rowwin_bytes += st.rowwin_bytes;
+    perf.bursts += st.bursts;
+    perf.payload_bytes += st.payload_bytes;
+    perf.window_inflight_peak = std::max<uint64_t>(perf.window_inflight_peak, st.window_inflight_peak);
+    perf.window_buffer_max_bytes = std::max<uint64_t>(perf.window_buffer_max_bytes, st.window_buffer_max_bytes);
+    perf.gap_absorbed_bytes += st.gap_absorbed_bytes;
+    perf.frontend_staged_reads += st.frontend_staged_reads;
+    perf.frontend_staged_line_touches += st.frontend_staged_line_touches;
+    perf.frontend_granules_built += st.frontend_granules_built;
+    perf.unique_line_count += st.unique_line_count;
+    perf.covered_line_count += st.covered_line_count;
+    perf.overfetch_bytes += st.overfetch_bytes;
+    perf.apply_bank_credit_effective += st.apply_bank_credit_effective;
+    perf.cmd_cost_veto += st.cmd_cost_veto;
+    perf.cmd_cost_veto_fine_gap += st.cmd_cost_veto_fine_gap;
+    perf.cmd_cost_veto_row_window += st.cmd_cost_veto_row_window;
+    perf.apply_issue_attempt_total += st.apply_issue_attempt_total;
+    perf.apply_issue_success_total += st.apply_issue_success_total;
+    perf.apply_issue_block_no_ready_total += st.apply_issue_block_no_ready_total;
+    perf.apply_issue_block_inflight_cap_total += st.apply_issue_block_inflight_cap_total;
+    perf.apply_issue_block_bank_credit_total += st.apply_issue_block_bank_credit_total;
+    perf.apply_issue_block_downstream_busy_total += st.apply_issue_block_downstream_busy_total;
+    perf.apply_issue_block_retire_guard_total += st.apply_issue_block_retire_guard_total;
+    perf.apply_ready_queue_peak = std::max<uint64_t>(perf.apply_ready_queue_peak, st.apply_ready_queue_peak);
+    perf.apply_ready_queue_nonempty_cycles_total += st.apply_ready_queue_nonempty_cycles_total;
+    perf.apply_first_issue_delay_ns += st.apply_first_issue_delay_ns;
+    perf.apply_first_down_resp_delay_ns += st.apply_first_down_resp_delay_ns;
+    perf.apply_first_granule_done_delay_ns += st.apply_first_granule_done_delay_ns;
+    perf.apply_first_up_resp_delay_ns += st.apply_first_up_resp_delay_ns;
+    perf.apply_down_resp_total += st.apply_down_resp_total;
+    perf.apply_completed_granules_total += st.apply_completed_granules_total;
+    perf.apply_emitted_subreads_total += st.apply_emitted_subreads_total;
+    perf.apply_backlog_granules_residual =
+        std::max<uint64_t>(perf.apply_backlog_granules_residual, st.apply_backlog_granules_residual);
+    perf.apply_backlog_pending_up_reads_residual =
+        std::max<uint64_t>(perf.apply_backlog_pending_up_reads_residual,
+                           st.apply_backlog_pending_up_reads_residual);
+    perf.apply_backlog_inflight_residual =
+        std::max<uint64_t>(perf.apply_backlog_inflight_residual, st.apply_backlog_inflight_residual);
+    perf.apply_backlog_granules_peak_after_due =
+        std::max<uint64_t>(perf.apply_backlog_granules_peak_after_due,
+                           st.apply_backlog_granules_peak_after_due);
+    perf.apply_backlog_pending_up_reads_peak_after_due =
+        std::max<uint64_t>(perf.apply_backlog_pending_up_reads_peak_after_due,
+                           st.apply_backlog_pending_up_reads_peak_after_due);
+    perf.apply_backlog_inflight_peak_after_due =
+        std::max<uint64_t>(perf.apply_backlog_inflight_peak_after_due,
+                           st.apply_backlog_inflight_peak_after_due);
+}
+
+void MultiCorePE::recordStepRetireStat(uint32_t seq,
+                                       uint64_t retire_global_hol_cycles_total,
+                                       uint64_t retire_ready_but_blocked_edges_total,
+                                       uint64_t retire_per_post_progress_total,
+                                       uint64_t retire_wait_cycles_total,
+                                       uint64_t retire_wait_cycles_due_to_hol_total,
+                                       uint64_t retire_wait_cycles_due_to_barrier_total,
+                                       uint64_t retire_wait_cycles_due_to_not_ready_total,
+                                       uint64_t retire_samepost_blocked_edges_total,
+                                       uint64_t retire_crosspost_blocked_edges_total,
+                                       uint64_t retire_policy_loss_cycles_total,
+                                       uint64_t retire_policy_loss_edges_total,
+                                       uint64_t retire_shadow_per_post_recoverable_cycles_total,
+                                       uint64_t retire_shadow_per_post_recoverable_edges_total,
+                                       uint64_t retire_shadow_per_post_ready_posts_peak,
+                                       uint64_t retire_shadow_per_post_committable_edges_peak,
+                                       uint64_t retire_head_hol_cycles_dense_total,
+                                       uint64_t retire_head_hol_cycles_cache_total,
+                                       uint64_t retire_head_hol_cycles_miss_total,
+                                       uint64_t retire_head_hol_cycles_bcsr_total,
+                                       uint64_t retire_head_hol_cycles_bcsr_file_total,
+                                       uint64_t retire_head_hol_cycles_gcss_total,
+                                       uint64_t retire_head_blocked_edges_dense_total,
+                                       uint64_t retire_head_blocked_edges_cache_total,
+                                       uint64_t retire_head_blocked_edges_miss_total,
+                                       uint64_t retire_head_blocked_edges_bcsr_total,
+                                       uint64_t retire_head_blocked_edges_bcsr_file_total,
+                                       uint64_t retire_head_blocked_edges_gcss_total,
+                                       uint64_t retire_gcss_head_queued_not_issued_cycles_total,
+                                       uint64_t retire_gcss_qni_head_wait_episodes_total,
+                                       uint64_t retire_gcss_qni_head_wait_cycles_max,
+                                       uint64_t retire_gcss_head_queued_not_issued_blocked_edges_total,
+                                       uint64_t retire_gcss_head_issued_wait_resp_cycles_total,
+                                       uint64_t retire_gcss_head_issued_wait_resp_blocked_edges_total,
+                                       uint64_t retire_gcss_resp_ready_but_hol_cycles_total,
+                                       uint64_t retire_gcss_resp_ready_but_hol_blocked_edges_total,
+                                       uint64_t retire_gcss_qni_loader_not_ready_cycles_total,
+                                       uint64_t retire_gcss_qni_loader_not_ready_blocked_edges_total,
+                                       uint64_t retire_gcss_qni_weight_sram_stall_cycles_total,
+                                       uint64_t retire_gcss_qni_weight_sram_stall_blocked_edges_total,
+                                       uint64_t retire_gcss_qni_vlf_younger_ahead_cycles_total,
+                                       uint64_t retire_gcss_qni_vlf_younger_ahead_blocked_edges_total,
+                                       uint64_t retire_gcss_qni_vlf_younger_ahead_depth_total,
+                                       uint64_t retire_gcss_qni_vlf_younger_ahead_depth_samples_total,
+                                       uint64_t retire_gcss_qni_vlf_younger_ahead_depth_max,
+                                       uint64_t retire_gcss_qni_issue_deferred_total,
+                                       uint64_t retire_gcss_qni_pending_direct_queue_residency_cycles_total,
+                                       uint64_t retire_gcss_qni_pending_direct_queue_residency_samples_total,
+                                       uint64_t retire_gcss_qni_pending_direct_queue_residency_cycles_max,
+                                       uint64_t retire_gcss_qni_vlf_front_inflight_full_cycles_total,
+                                       uint64_t retire_gcss_qni_vlf_front_inflight_full_blocked_edges_total,
+                                       uint64_t retire_gcss_qni_vlf_front_waiting_issue_cycles_total,
+                                       uint64_t retire_gcss_qni_vlf_front_waiting_issue_blocked_edges_total,
+                                       uint64_t retire_gcss_qni_pending_younger_ahead_cycles_total,
+                                       uint64_t retire_gcss_qni_pending_younger_ahead_blocked_edges_total,
+                                       uint64_t retire_gcss_qni_pending_front_inflight_full_cycles_total,
+                                       uint64_t retire_gcss_qni_pending_front_inflight_full_blocked_edges_total,
+                                       uint64_t retire_gcss_qni_pending_front_waiting_tick_cycles_total,
+                                       uint64_t retire_gcss_qni_pending_front_waiting_tick_blocked_edges_total,
+                                       uint64_t retire_gcss_qni_unknown_cycles_total,
+                                       uint64_t retire_gcss_qni_unknown_blocked_edges_total,
+                                       uint64_t retire_begin_apply_windows_total,
+                                       uint64_t retire_begin_apply_prev_edges_total,
+                                       uint64_t retire_begin_apply_outstanding_carryin_total,
+                                       uint64_t retire_begin_apply_outstanding_carryin_windows_total,
+                                       uint64_t retire_begin_apply_loader_not_ready_windows_total,
+                                       uint64_t retire_edge_retire_registered_total,
+                                       uint64_t retire_edge_retire_retired_total,
+                                       uint64_t retire_end_scatter_gcss_vlf_issue_queue_residual_total,
+                                       uint64_t retire_end_scatter_pending_direct_reads_residual_total,
+                                       uint64_t retire_end_scatter_outstanding_residual_total,
+                                       uint64_t retire_end_scatter_residual_work_windows_total,
+                                       uint64_t retire_gcss_vlf_issue_prepare_total,
+                                       uint64_t retire_gcss_vlf_issue_edges_total,
+                                       uint64_t retire_gcss_vlf_issue_reorder_trigger_total,
+                                       uint64_t retire_gcss_vlf_issue_line_groups_total,
+                                       uint64_t retire_ready_queue_peak,
+                                       uint64_t retire_unblock_events_total) {
+    if (seq == 0) return;
+    auto& perf = getOrCreateStepPerf_(seq);
+    perf.retire_global_hol_cycles_total += retire_global_hol_cycles_total;
+    perf.retire_ready_but_blocked_edges_total += retire_ready_but_blocked_edges_total;
+    perf.retire_per_post_progress_total += retire_per_post_progress_total;
+    perf.retire_wait_cycles_total += retire_wait_cycles_total;
+    perf.retire_wait_cycles_due_to_hol_total += retire_wait_cycles_due_to_hol_total;
+    perf.retire_wait_cycles_due_to_barrier_total += retire_wait_cycles_due_to_barrier_total;
+    perf.retire_wait_cycles_due_to_not_ready_total += retire_wait_cycles_due_to_not_ready_total;
+    perf.retire_samepost_blocked_edges_total += retire_samepost_blocked_edges_total;
+    perf.retire_crosspost_blocked_edges_total += retire_crosspost_blocked_edges_total;
+    perf.retire_policy_loss_cycles_total += retire_policy_loss_cycles_total;
+    perf.retire_policy_loss_edges_total += retire_policy_loss_edges_total;
+    perf.retire_shadow_per_post_recoverable_cycles_total += retire_shadow_per_post_recoverable_cycles_total;
+    perf.retire_shadow_per_post_recoverable_edges_total += retire_shadow_per_post_recoverable_edges_total;
+    perf.retire_shadow_per_post_ready_posts_peak =
+        std::max<uint64_t>(perf.retire_shadow_per_post_ready_posts_peak, retire_shadow_per_post_ready_posts_peak);
+    perf.retire_shadow_per_post_committable_edges_peak =
+        std::max<uint64_t>(perf.retire_shadow_per_post_committable_edges_peak, retire_shadow_per_post_committable_edges_peak);
+    perf.retire_head_hol_cycles_dense_total += retire_head_hol_cycles_dense_total;
+    perf.retire_head_hol_cycles_cache_total += retire_head_hol_cycles_cache_total;
+    perf.retire_head_hol_cycles_miss_total += retire_head_hol_cycles_miss_total;
+    perf.retire_head_hol_cycles_bcsr_total += retire_head_hol_cycles_bcsr_total;
+    perf.retire_head_hol_cycles_bcsr_file_total += retire_head_hol_cycles_bcsr_file_total;
+    perf.retire_head_hol_cycles_gcss_total += retire_head_hol_cycles_gcss_total;
+    perf.retire_head_blocked_edges_dense_total += retire_head_blocked_edges_dense_total;
+    perf.retire_head_blocked_edges_cache_total += retire_head_blocked_edges_cache_total;
+    perf.retire_head_blocked_edges_miss_total += retire_head_blocked_edges_miss_total;
+    perf.retire_head_blocked_edges_bcsr_total += retire_head_blocked_edges_bcsr_total;
+    perf.retire_head_blocked_edges_bcsr_file_total += retire_head_blocked_edges_bcsr_file_total;
+    perf.retire_head_blocked_edges_gcss_total += retire_head_blocked_edges_gcss_total;
+    perf.retire_gcss_head_queued_not_issued_cycles_total += retire_gcss_head_queued_not_issued_cycles_total;
+    perf.retire_gcss_qni_head_wait_episodes_total += retire_gcss_qni_head_wait_episodes_total;
+    perf.retire_gcss_qni_head_wait_cycles_max = std::max<uint64_t>(
+        perf.retire_gcss_qni_head_wait_cycles_max, retire_gcss_qni_head_wait_cycles_max);
+    perf.retire_gcss_head_queued_not_issued_blocked_edges_total += retire_gcss_head_queued_not_issued_blocked_edges_total;
+    perf.retire_gcss_head_issued_wait_resp_cycles_total += retire_gcss_head_issued_wait_resp_cycles_total;
+    perf.retire_gcss_head_issued_wait_resp_blocked_edges_total += retire_gcss_head_issued_wait_resp_blocked_edges_total;
+    perf.retire_gcss_resp_ready_but_hol_cycles_total += retire_gcss_resp_ready_but_hol_cycles_total;
+    perf.retire_gcss_resp_ready_but_hol_blocked_edges_total += retire_gcss_resp_ready_but_hol_blocked_edges_total;
+    perf.retire_gcss_qni_loader_not_ready_cycles_total += retire_gcss_qni_loader_not_ready_cycles_total;
+    perf.retire_gcss_qni_loader_not_ready_blocked_edges_total += retire_gcss_qni_loader_not_ready_blocked_edges_total;
+    perf.retire_gcss_qni_weight_sram_stall_cycles_total += retire_gcss_qni_weight_sram_stall_cycles_total;
+    perf.retire_gcss_qni_weight_sram_stall_blocked_edges_total += retire_gcss_qni_weight_sram_stall_blocked_edges_total;
+    perf.retire_gcss_qni_vlf_younger_ahead_cycles_total += retire_gcss_qni_vlf_younger_ahead_cycles_total;
+    perf.retire_gcss_qni_vlf_younger_ahead_blocked_edges_total += retire_gcss_qni_vlf_younger_ahead_blocked_edges_total;
+    perf.retire_gcss_qni_vlf_younger_ahead_depth_total += retire_gcss_qni_vlf_younger_ahead_depth_total;
+    perf.retire_gcss_qni_vlf_younger_ahead_depth_samples_total += retire_gcss_qni_vlf_younger_ahead_depth_samples_total;
+    perf.retire_gcss_qni_vlf_younger_ahead_depth_max = std::max<uint64_t>(
+        perf.retire_gcss_qni_vlf_younger_ahead_depth_max,
+        retire_gcss_qni_vlf_younger_ahead_depth_max);
+    perf.retire_gcss_qni_issue_deferred_total += retire_gcss_qni_issue_deferred_total;
+    perf.retire_gcss_qni_pending_direct_queue_residency_cycles_total +=
+        retire_gcss_qni_pending_direct_queue_residency_cycles_total;
+    perf.retire_gcss_qni_pending_direct_queue_residency_samples_total +=
+        retire_gcss_qni_pending_direct_queue_residency_samples_total;
+    perf.retire_gcss_qni_pending_direct_queue_residency_cycles_max = std::max<uint64_t>(
+        perf.retire_gcss_qni_pending_direct_queue_residency_cycles_max,
+        retire_gcss_qni_pending_direct_queue_residency_cycles_max);
+    perf.retire_gcss_qni_vlf_front_inflight_full_cycles_total += retire_gcss_qni_vlf_front_inflight_full_cycles_total;
+    perf.retire_gcss_qni_vlf_front_inflight_full_blocked_edges_total += retire_gcss_qni_vlf_front_inflight_full_blocked_edges_total;
+    perf.retire_gcss_qni_vlf_front_waiting_issue_cycles_total += retire_gcss_qni_vlf_front_waiting_issue_cycles_total;
+    perf.retire_gcss_qni_vlf_front_waiting_issue_blocked_edges_total += retire_gcss_qni_vlf_front_waiting_issue_blocked_edges_total;
+    perf.retire_gcss_qni_pending_younger_ahead_cycles_total += retire_gcss_qni_pending_younger_ahead_cycles_total;
+    perf.retire_gcss_qni_pending_younger_ahead_blocked_edges_total += retire_gcss_qni_pending_younger_ahead_blocked_edges_total;
+    perf.retire_gcss_qni_pending_front_inflight_full_cycles_total += retire_gcss_qni_pending_front_inflight_full_cycles_total;
+    perf.retire_gcss_qni_pending_front_inflight_full_blocked_edges_total += retire_gcss_qni_pending_front_inflight_full_blocked_edges_total;
+    perf.retire_gcss_qni_pending_front_waiting_tick_cycles_total += retire_gcss_qni_pending_front_waiting_tick_cycles_total;
+    perf.retire_gcss_qni_pending_front_waiting_tick_blocked_edges_total += retire_gcss_qni_pending_front_waiting_tick_blocked_edges_total;
+    perf.retire_gcss_qni_unknown_cycles_total += retire_gcss_qni_unknown_cycles_total;
+    perf.retire_gcss_qni_unknown_blocked_edges_total += retire_gcss_qni_unknown_blocked_edges_total;
+    perf.retire_begin_apply_windows_total += retire_begin_apply_windows_total;
+    perf.retire_begin_apply_prev_edges_total += retire_begin_apply_prev_edges_total;
+    perf.retire_begin_apply_outstanding_carryin_total += retire_begin_apply_outstanding_carryin_total;
+    perf.retire_begin_apply_outstanding_carryin_windows_total +=
+        retire_begin_apply_outstanding_carryin_windows_total;
+    perf.retire_begin_apply_loader_not_ready_windows_total +=
+        retire_begin_apply_loader_not_ready_windows_total;
+    perf.retire_edge_retire_registered_total += retire_edge_retire_registered_total;
+    perf.retire_edge_retire_retired_total += retire_edge_retire_retired_total;
+    perf.retire_end_scatter_gcss_vlf_issue_queue_residual_total +=
+        retire_end_scatter_gcss_vlf_issue_queue_residual_total;
+    perf.retire_end_scatter_pending_direct_reads_residual_total +=
+        retire_end_scatter_pending_direct_reads_residual_total;
+    perf.retire_end_scatter_outstanding_residual_total +=
+        retire_end_scatter_outstanding_residual_total;
+    perf.retire_end_scatter_residual_work_windows_total +=
+        retire_end_scatter_residual_work_windows_total;
+    perf.retire_gcss_vlf_issue_prepare_total += retire_gcss_vlf_issue_prepare_total;
+    perf.retire_gcss_vlf_issue_edges_total += retire_gcss_vlf_issue_edges_total;
+    perf.retire_gcss_vlf_issue_reorder_trigger_total += retire_gcss_vlf_issue_reorder_trigger_total;
+    perf.retire_gcss_vlf_issue_line_groups_total += retire_gcss_vlf_issue_line_groups_total;
+    perf.retire_ready_queue_peak = std::max<uint64_t>(perf.retire_ready_queue_peak, retire_ready_queue_peak);
+    perf.retire_unblock_events_total += retire_unblock_events_total;
+}
+
+void MultiCorePE::recordPulseAgendaObservability(
+    uint32_t seq,
+    uint64_t candidates_total,
+    uint64_t accepted_total,
+    uint64_t rejected_total,
+    uint64_t reject_gate_total,
+    uint64_t correctness_ready_blocked_cycles_total,
+    uint64_t correctness_scoreboard_occupancy_peak,
+    uint64_t shared_service_hits_total,
+    uint64_t shared_service_misses_total,
+    uint64_t region_service_entries_peak,
+    uint64_t ready_fanout_total,
+    uint64_t rowdescriptor_ready_transition_total,
+    uint64_t rowdescriptor_join_ready_total,
+    uint64_t rowdescriptor_ready_join_shortcut_candidates_total,
+    uint64_t rowdescriptor_ready_join_shortcut_taken_total,
+    uint64_t rowdescriptor_ready_join_shortcut_late_release_taken_total,
+    uint64_t rowdescriptor_ready_join_shortcut_deferred_live_park_total,
+    uint64_t rowdescriptor_ready_join_shortcut_deferred_live_apply_total,
+    uint64_t rowdescriptor_owner_form_deferred_park_total,
+    uint64_t rowdescriptor_owner_form_deferred_activate_total,
+    uint64_t rowdescriptor_ready_join_shortcut_blocked_not_ready_total,
+    uint64_t rowdescriptor_ready_join_shortcut_blocked_owner_form_total,
+    uint64_t rowdescriptor_ready_join_shortcut_blocked_join_live_total,
+    uint64_t rowdescriptor_ready_join_shortcut_blocked_other_total,
+    uint64_t rowdescriptor_ready_join_shortcut_release_deferred_total,
+    uint64_t rowdescriptor_ready_join_shortcut_apply_complete_total,
+    uint64_t rowdescriptor_ready_join_shortcut_release_forwarded_total,
+    uint64_t rowdescriptor_ready_join_shortcut_release_missing_total,
+    uint64_t rowdescriptor_ready_join_descriptor_elide_total,
+    uint64_t rowdescriptor_ready_join_lines_elide_total,
+    uint64_t rowdescriptor_owner_first_service_elide_join_live_total,
+    uint64_t rowdescriptor_owner_first_service_elide_join_ready_total,
+    uint64_t rowdescriptor_owner_first_service_elide_late_join_total,
+    uint64_t actual_gate_enable_false_total,
+    uint64_t actual_gate_window_zero_total,
+    uint64_t actual_gate_line_too_small_total,
+    uint64_t actual_gate_taken_total,
+    uint64_t frontier_windows_total,
+    uint64_t frontier_lines_exported_total,
+    uint64_t frontier_overlap_lines_total,
+    uint64_t frontier_overlap_peer_total,
+    uint64_t frontier_max_exported_per_window,
+    uint64_t prebase_lookup_owner_fill_total,
+    uint64_t prebase_lookup_shared_hits_total,
+    uint64_t prebase_lookup_entries_peak) {
+    (void)seq;
+    if (candidates_total && stat_pulse_agenda_candidates_total_) {
+        stat_pulse_agenda_candidates_total_->addData(candidates_total);
+    }
+    if (accepted_total && stat_pulse_agenda_accepted_total_) {
+        stat_pulse_agenda_accepted_total_->addData(accepted_total);
+    }
+    if (rejected_total && stat_pulse_agenda_rejected_total_) {
+        stat_pulse_agenda_rejected_total_->addData(rejected_total);
+    }
+    if (reject_gate_total && stat_pulse_agenda_reject_gate_total_) {
+        stat_pulse_agenda_reject_gate_total_->addData(reject_gate_total);
+    }
+    if (correctness_ready_blocked_cycles_total &&
+        stat_pulse_correctness_ready_blocked_cycles_total_) {
+        stat_pulse_correctness_ready_blocked_cycles_total_->addData(
+            correctness_ready_blocked_cycles_total);
+    }
+    if (correctness_scoreboard_occupancy_peak &&
+        stat_pulse_correctness_scoreboard_occupancy_peak_) {
+        stat_pulse_correctness_scoreboard_occupancy_peak_->addData(
+            correctness_scoreboard_occupancy_peak);
+    }
+    if (shared_service_hits_total && stat_pulse_shared_service_hits_total_) {
+        stat_pulse_shared_service_hits_total_->addData(shared_service_hits_total);
+    }
+    if (shared_service_misses_total && stat_pulse_shared_service_misses_total_) {
+        stat_pulse_shared_service_misses_total_->addData(shared_service_misses_total);
+    }
+    if (region_service_entries_peak && stat_pulse_region_service_entries_peak_) {
+        stat_pulse_region_service_entries_peak_->addData(region_service_entries_peak);
+    }
+    if (ready_fanout_total && stat_pulse_ready_fanout_total_) {
+        stat_pulse_ready_fanout_total_->addData(ready_fanout_total);
+    }
+    if (rowdescriptor_ready_transition_total &&
+        stat_pulse_rowdescriptor_ready_transition_total_) {
+        stat_pulse_rowdescriptor_ready_transition_total_->addData(
+            rowdescriptor_ready_transition_total);
+    }
+    if (rowdescriptor_join_ready_total &&
+        stat_pulse_rowdescriptor_join_ready_total_) {
+        stat_pulse_rowdescriptor_join_ready_total_->addData(
+            rowdescriptor_join_ready_total);
+    }
+    if (rowdescriptor_ready_join_shortcut_candidates_total &&
+        stat_pulse_rowdescriptor_ready_join_shortcut_candidates_total_) {
+        stat_pulse_rowdescriptor_ready_join_shortcut_candidates_total_->addData(
+            rowdescriptor_ready_join_shortcut_candidates_total);
+    }
+    if (rowdescriptor_ready_join_shortcut_taken_total &&
+        stat_pulse_rowdescriptor_ready_join_shortcut_taken_total_) {
+        stat_pulse_rowdescriptor_ready_join_shortcut_taken_total_->addData(
+            rowdescriptor_ready_join_shortcut_taken_total);
+    }
+    if (rowdescriptor_ready_join_shortcut_late_release_taken_total &&
+        stat_pulse_rowdescriptor_ready_join_shortcut_late_release_taken_total_) {
+        stat_pulse_rowdescriptor_ready_join_shortcut_late_release_taken_total_->addData(
+            rowdescriptor_ready_join_shortcut_late_release_taken_total);
+    }
+    if (rowdescriptor_ready_join_shortcut_deferred_live_park_total &&
+        stat_pulse_rowdescriptor_ready_join_shortcut_deferred_live_park_total_) {
+        stat_pulse_rowdescriptor_ready_join_shortcut_deferred_live_park_total_->addData(
+            rowdescriptor_ready_join_shortcut_deferred_live_park_total);
+    }
+    if (rowdescriptor_ready_join_shortcut_deferred_live_apply_total &&
+        stat_pulse_rowdescriptor_ready_join_shortcut_deferred_live_apply_total_) {
+        stat_pulse_rowdescriptor_ready_join_shortcut_deferred_live_apply_total_->addData(
+            rowdescriptor_ready_join_shortcut_deferred_live_apply_total);
+    }
+    if (rowdescriptor_owner_form_deferred_park_total &&
+        stat_pulse_rowdescriptor_owner_form_deferred_park_total_) {
+        stat_pulse_rowdescriptor_owner_form_deferred_park_total_->addData(
+            rowdescriptor_owner_form_deferred_park_total);
+    }
+    if (rowdescriptor_owner_form_deferred_activate_total &&
+        stat_pulse_rowdescriptor_owner_form_deferred_activate_total_) {
+        stat_pulse_rowdescriptor_owner_form_deferred_activate_total_->addData(
+            rowdescriptor_owner_form_deferred_activate_total);
+    }
+    if (rowdescriptor_ready_join_shortcut_blocked_not_ready_total &&
+        stat_pulse_rowdescriptor_ready_join_shortcut_blocked_not_ready_total_) {
+        stat_pulse_rowdescriptor_ready_join_shortcut_blocked_not_ready_total_->addData(
+            rowdescriptor_ready_join_shortcut_blocked_not_ready_total);
+    }
+    if (rowdescriptor_ready_join_shortcut_blocked_owner_form_total &&
+        stat_pulse_rowdescriptor_ready_join_shortcut_blocked_owner_form_total_) {
+        stat_pulse_rowdescriptor_ready_join_shortcut_blocked_owner_form_total_->addData(
+            rowdescriptor_ready_join_shortcut_blocked_owner_form_total);
+    }
+    if (rowdescriptor_ready_join_shortcut_blocked_join_live_total &&
+        stat_pulse_rowdescriptor_ready_join_shortcut_blocked_join_live_total_) {
+        stat_pulse_rowdescriptor_ready_join_shortcut_blocked_join_live_total_->addData(
+            rowdescriptor_ready_join_shortcut_blocked_join_live_total);
+    }
+    if (rowdescriptor_ready_join_shortcut_blocked_other_total &&
+        stat_pulse_rowdescriptor_ready_join_shortcut_blocked_other_total_) {
+        stat_pulse_rowdescriptor_ready_join_shortcut_blocked_other_total_->addData(
+            rowdescriptor_ready_join_shortcut_blocked_other_total);
+    }
+    if (rowdescriptor_ready_join_shortcut_release_deferred_total &&
+        stat_pulse_rowdescriptor_ready_join_shortcut_release_deferred_total_) {
+        stat_pulse_rowdescriptor_ready_join_shortcut_release_deferred_total_->addData(
+            rowdescriptor_ready_join_shortcut_release_deferred_total);
+    }
+    if (rowdescriptor_ready_join_shortcut_apply_complete_total &&
+        stat_pulse_rowdescriptor_ready_join_shortcut_apply_complete_total_) {
+        stat_pulse_rowdescriptor_ready_join_shortcut_apply_complete_total_->addData(
+            rowdescriptor_ready_join_shortcut_apply_complete_total);
+    }
+    if (rowdescriptor_ready_join_shortcut_release_forwarded_total &&
+        stat_pulse_rowdescriptor_ready_join_shortcut_release_forwarded_total_) {
+        stat_pulse_rowdescriptor_ready_join_shortcut_release_forwarded_total_->addData(
+            rowdescriptor_ready_join_shortcut_release_forwarded_total);
+    }
+    if (rowdescriptor_ready_join_shortcut_release_missing_total &&
+        stat_pulse_rowdescriptor_ready_join_shortcut_release_missing_total_) {
+        stat_pulse_rowdescriptor_ready_join_shortcut_release_missing_total_->addData(
+            rowdescriptor_ready_join_shortcut_release_missing_total);
+    }
+    if (rowdescriptor_ready_join_descriptor_elide_total &&
+        stat_pulse_rowdescriptor_ready_join_descriptor_elide_total_) {
+        stat_pulse_rowdescriptor_ready_join_descriptor_elide_total_->addData(
+            rowdescriptor_ready_join_descriptor_elide_total);
+    }
+    if (rowdescriptor_ready_join_lines_elide_total &&
+        stat_pulse_rowdescriptor_ready_join_lines_elide_total_) {
+        stat_pulse_rowdescriptor_ready_join_lines_elide_total_->addData(
+            rowdescriptor_ready_join_lines_elide_total);
+    }
+    if (rowdescriptor_owner_first_service_elide_join_live_total &&
+        stat_pulse_rowdescriptor_owner_first_service_elide_join_live_total_) {
+        stat_pulse_rowdescriptor_owner_first_service_elide_join_live_total_->addData(
+            rowdescriptor_owner_first_service_elide_join_live_total);
+    }
+    if (rowdescriptor_owner_first_service_elide_join_ready_total &&
+        stat_pulse_rowdescriptor_owner_first_service_elide_join_ready_total_) {
+        stat_pulse_rowdescriptor_owner_first_service_elide_join_ready_total_->addData(
+            rowdescriptor_owner_first_service_elide_join_ready_total);
+    }
+    if (rowdescriptor_owner_first_service_elide_late_join_total &&
+        stat_pulse_rowdescriptor_owner_first_service_elide_late_join_total_) {
+        stat_pulse_rowdescriptor_owner_first_service_elide_late_join_total_->addData(
+            rowdescriptor_owner_first_service_elide_late_join_total);
+    }
+    if (actual_gate_enable_false_total && stat_pulse_actual_gate_enable_false_total_) {
+        stat_pulse_actual_gate_enable_false_total_->addData(actual_gate_enable_false_total);
+    }
+    if (actual_gate_window_zero_total && stat_pulse_actual_gate_window_zero_total_) {
+        stat_pulse_actual_gate_window_zero_total_->addData(actual_gate_window_zero_total);
+    }
+    if (actual_gate_line_too_small_total && stat_pulse_actual_gate_line_too_small_total_) {
+        stat_pulse_actual_gate_line_too_small_total_->addData(actual_gate_line_too_small_total);
+    }
+    if (actual_gate_taken_total && stat_pulse_actual_gate_taken_total_) {
+        stat_pulse_actual_gate_taken_total_->addData(actual_gate_taken_total);
+    }
+    if (frontier_windows_total && stat_pulse_frontier_windows_total_) {
+        stat_pulse_frontier_windows_total_->addData(frontier_windows_total);
+    }
+    if (frontier_lines_exported_total && stat_pulse_frontier_lines_exported_total_) {
+        stat_pulse_frontier_lines_exported_total_->addData(frontier_lines_exported_total);
+    }
+    if (frontier_overlap_lines_total && stat_pulse_frontier_overlap_lines_total_) {
+        stat_pulse_frontier_overlap_lines_total_->addData(frontier_overlap_lines_total);
+    }
+    if (frontier_overlap_peer_total && stat_pulse_frontier_overlap_peer_total_) {
+        stat_pulse_frontier_overlap_peer_total_->addData(frontier_overlap_peer_total);
+    }
+    if (frontier_max_exported_per_window && stat_pulse_frontier_max_exported_per_window_) {
+        stat_pulse_frontier_max_exported_per_window_->addData(
+            frontier_max_exported_per_window);
+    }
+    if (prebase_lookup_owner_fill_total &&
+        stat_pulse_prebase_lookup_owner_fill_total_) {
+        stat_pulse_prebase_lookup_owner_fill_total_->addData(
+            prebase_lookup_owner_fill_total);
+    }
+    if (prebase_lookup_shared_hits_total &&
+        stat_pulse_prebase_lookup_shared_hits_total_) {
+        stat_pulse_prebase_lookup_shared_hits_total_->addData(
+            prebase_lookup_shared_hits_total);
+    }
+    if (prebase_lookup_entries_peak &&
+        stat_pulse_prebase_lookup_entries_peak_) {
+        stat_pulse_prebase_lookup_entries_peak_->addData(
+            prebase_lookup_entries_peak);
+    }
+}
+
+void MultiCorePE::recordPulsePodRowdescriptorObservability(
+    uint32_t seq,
+    uint64_t owner_form_total,
+    uint64_t owner_hit_total,
+    uint64_t join_live_total,
+    uint64_t join_ready_total,
+    uint64_t ready_transition_total,
+    uint64_t late_join_total,
+    uint64_t guard_total,
+    uint64_t guard_disabled_total,
+    uint64_t guard_missing_metadata_plane_total,
+    uint64_t guard_missing_owner_table_total,
+    uint64_t guard_zero_pod_count_total,
+    uint64_t guard_window_zero_total,
+    uint64_t guard_invalid_cfg_pod_total,
+    uint64_t reject_total,
+    uint64_t attempted_total,
+    uint64_t potential_private_service_elide_total,
+    uint64_t owner_first_issue_deferred_total,
+    uint64_t owner_first_private_issue_avoided_total,
+    uint64_t owner_first_service_elide_total) {
+    (void)seq;
+    if (owner_form_total && stat_pulse_pod_rowdescriptor_owner_form_total_) {
+        stat_pulse_pod_rowdescriptor_owner_form_total_->addData(owner_form_total);
+    }
+    if (owner_hit_total && stat_pulse_pod_rowdescriptor_owner_hit_total_) {
+        stat_pulse_pod_rowdescriptor_owner_hit_total_->addData(owner_hit_total);
+    }
+    if (join_live_total && stat_pulse_pod_rowdescriptor_join_live_total_) {
+        stat_pulse_pod_rowdescriptor_join_live_total_->addData(join_live_total);
+    }
+    if (join_ready_total && stat_pulse_pod_rowdescriptor_join_ready_total_) {
+        stat_pulse_pod_rowdescriptor_join_ready_total_->addData(join_ready_total);
+    }
+    if (ready_transition_total &&
+        stat_pulse_pod_rowdescriptor_ready_transition_total_) {
+        stat_pulse_pod_rowdescriptor_ready_transition_total_->addData(
+            ready_transition_total);
+    }
+    if (late_join_total && stat_pulse_pod_rowdescriptor_late_join_total_) {
+        stat_pulse_pod_rowdescriptor_late_join_total_->addData(late_join_total);
+    }
+    if (guard_total && stat_pulse_pod_rowdescriptor_guard_total_) {
+        stat_pulse_pod_rowdescriptor_guard_total_->addData(guard_total);
+    }
+    if (guard_disabled_total && stat_pulse_pod_rowdescriptor_guard_disabled_total_) {
+        stat_pulse_pod_rowdescriptor_guard_disabled_total_->addData(
+            guard_disabled_total);
+    }
+    if (guard_missing_metadata_plane_total &&
+        stat_pulse_pod_rowdescriptor_guard_missing_metadata_plane_total_) {
+        stat_pulse_pod_rowdescriptor_guard_missing_metadata_plane_total_->addData(
+            guard_missing_metadata_plane_total);
+    }
+    if (guard_missing_owner_table_total &&
+        stat_pulse_pod_rowdescriptor_guard_missing_owner_table_total_) {
+        stat_pulse_pod_rowdescriptor_guard_missing_owner_table_total_->addData(
+            guard_missing_owner_table_total);
+    }
+    if (guard_zero_pod_count_total &&
+        stat_pulse_pod_rowdescriptor_guard_zero_pod_count_total_) {
+        stat_pulse_pod_rowdescriptor_guard_zero_pod_count_total_->addData(
+            guard_zero_pod_count_total);
+    }
+    if (guard_window_zero_total &&
+        stat_pulse_pod_rowdescriptor_guard_window_zero_total_) {
+        stat_pulse_pod_rowdescriptor_guard_window_zero_total_->addData(
+            guard_window_zero_total);
+    }
+    if (guard_invalid_cfg_pod_total &&
+        stat_pulse_pod_rowdescriptor_guard_invalid_cfg_pod_total_) {
+        stat_pulse_pod_rowdescriptor_guard_invalid_cfg_pod_total_->addData(
+            guard_invalid_cfg_pod_total);
+    }
+    if (reject_total && stat_pulse_pod_rowdescriptor_reject_total_) {
+        stat_pulse_pod_rowdescriptor_reject_total_->addData(reject_total);
+    }
+    if (attempted_total && stat_pulse_pod_rowdescriptor_attempted_total_) {
+        stat_pulse_pod_rowdescriptor_attempted_total_->addData(attempted_total);
+    }
+    if (potential_private_service_elide_total &&
+        stat_pulse_pod_rowdescriptor_potential_private_service_elide_total_) {
+        stat_pulse_pod_rowdescriptor_potential_private_service_elide_total_->addData(
+            potential_private_service_elide_total);
+    }
+    if (owner_first_issue_deferred_total &&
+        stat_pulse_pod_rowdescriptor_owner_first_issue_deferred_total_) {
+        stat_pulse_pod_rowdescriptor_owner_first_issue_deferred_total_->addData(
+            owner_first_issue_deferred_total);
+    }
+    if (owner_first_private_issue_avoided_total &&
+        stat_pulse_pod_rowdescriptor_owner_first_private_issue_avoided_total_) {
+        stat_pulse_pod_rowdescriptor_owner_first_private_issue_avoided_total_->addData(
+            owner_first_private_issue_avoided_total);
+    }
+    if (owner_first_service_elide_total &&
+        stat_pulse_pod_rowdescriptor_owner_first_service_elide_total_) {
+        stat_pulse_pod_rowdescriptor_owner_first_service_elide_total_->addData(
+            owner_first_service_elide_total);
+    }
+}
+
+void MultiCorePE::recordPulseOsaMetadataTxnObservability(
+    const WeightMemorySubsystem::PulseOsaMetadataTxnStats& stats) {
+    if (stats.export_total && stat_pulse_metadata_txn_export_total_) {
+        stat_pulse_metadata_txn_export_total_->addData(stats.export_total);
+    }
+    if (stats.owner_launch_total && stat_pulse_metadata_txn_owner_launch_total_) {
+        stat_pulse_metadata_txn_owner_launch_total_->addData(stats.owner_launch_total);
+    }
+    if (stats.join_live_total && stat_pulse_metadata_txn_join_live_total_) {
+        stat_pulse_metadata_txn_join_live_total_->addData(stats.join_live_total);
+    }
+    if (stats.join_ready_total && stat_pulse_metadata_txn_join_ready_total_) {
+        stat_pulse_metadata_txn_join_ready_total_->addData(stats.join_ready_total);
+    }
+    if (stats.late_join_total && stat_pulse_metadata_txn_late_join_total_) {
+        stat_pulse_metadata_txn_late_join_total_->addData(stats.late_join_total);
+    }
+    if (stats.ready_lease_hit_total && stat_pulse_metadata_txn_ready_lease_hit_total_) {
+        stat_pulse_metadata_txn_ready_lease_hit_total_->addData(stats.ready_lease_hit_total);
+    }
+    if (stats.ready_lease_expired_total &&
+        stat_pulse_metadata_txn_ready_lease_expired_total_) {
+        stat_pulse_metadata_txn_ready_lease_expired_total_->addData(
+            stats.ready_lease_expired_total);
+    }
+    if (stats.envelope_size_sum_total &&
+        stat_pulse_metadata_txn_envelope_size_sum_total_) {
+        stat_pulse_metadata_txn_envelope_size_sum_total_->addData(
+            stats.envelope_size_sum_total);
+    }
+    if (stats.frontier_observed_total &&
+        stat_pulse_metadata_frontier_observed_total_) {
+        stat_pulse_metadata_frontier_observed_total_->addData(
+            stats.frontier_observed_total);
+    }
+    if (stats.frontier_same_window_reobserve_total &&
+        stat_pulse_metadata_frontier_same_window_reobserve_total_) {
+        stat_pulse_metadata_frontier_same_window_reobserve_total_->addData(
+            stats.frontier_same_window_reobserve_total);
+    }
+    if (stats.frontier_owner_form_candidate_total &&
+        stat_pulse_metadata_frontier_owner_form_candidate_total_) {
+        stat_pulse_metadata_frontier_owner_form_candidate_total_->addData(
+            stats.frontier_owner_form_candidate_total);
+    }
+    if (stats.frontier_join_ready_candidate_total &&
+        stat_pulse_metadata_frontier_join_ready_candidate_total_) {
+        stat_pulse_metadata_frontier_join_ready_candidate_total_->addData(
+            stats.frontier_join_ready_candidate_total);
+    }
+    if (stats.frontier_premphf_base_observed_total &&
+        stat_pulse_metadata_frontier_premphf_base_observed_total_) {
+        stat_pulse_metadata_frontier_premphf_base_observed_total_->addData(
+            stats.frontier_premphf_base_observed_total);
+    }
+    if (stats.frontier_premphf_base_same_window_reobserve_total &&
+        stat_pulse_metadata_frontier_premphf_base_same_window_reobserve_total_) {
+        stat_pulse_metadata_frontier_premphf_base_same_window_reobserve_total_->addData(
+            stats.frontier_premphf_base_same_window_reobserve_total);
+    }
+    if (stats.frontier_premphf_base_owner_form_candidate_total &&
+        stat_pulse_metadata_frontier_premphf_base_owner_form_candidate_total_) {
+        stat_pulse_metadata_frontier_premphf_base_owner_form_candidate_total_->addData(
+            stats.frontier_premphf_base_owner_form_candidate_total);
+    }
+    if (stats.frontier_premphf_base_join_ready_candidate_total &&
+        stat_pulse_metadata_frontier_premphf_base_join_ready_candidate_total_) {
+        stat_pulse_metadata_frontier_premphf_base_join_ready_candidate_total_->addData(
+            stats.frontier_premphf_base_join_ready_candidate_total);
+    }
+    if (stats.frontier_premphf_band_observed_total &&
+        stat_pulse_metadata_frontier_premphf_band_observed_total_) {
+        stat_pulse_metadata_frontier_premphf_band_observed_total_->addData(
+            stats.frontier_premphf_band_observed_total);
+    }
+    if (stats.frontier_premphf_band_same_window_reobserve_total &&
+        stat_pulse_metadata_frontier_premphf_band_same_window_reobserve_total_) {
+        stat_pulse_metadata_frontier_premphf_band_same_window_reobserve_total_->addData(
+            stats.frontier_premphf_band_same_window_reobserve_total);
+    }
+    if (stats.frontier_premphf_band_owner_form_candidate_total &&
+        stat_pulse_metadata_frontier_premphf_band_owner_form_candidate_total_) {
+        stat_pulse_metadata_frontier_premphf_band_owner_form_candidate_total_->addData(
+            stats.frontier_premphf_band_owner_form_candidate_total);
+    }
+    if (stats.frontier_premphf_band_join_ready_candidate_total &&
+        stat_pulse_metadata_frontier_premphf_band_join_ready_candidate_total_) {
+        stat_pulse_metadata_frontier_premphf_band_join_ready_candidate_total_->addData(
+            stats.frontier_premphf_band_join_ready_candidate_total);
+    }
+    if (stats.frontier_idx2row_observed_total &&
+        stat_pulse_metadata_frontier_idx2row_observed_total_) {
+        stat_pulse_metadata_frontier_idx2row_observed_total_->addData(
+            stats.frontier_idx2row_observed_total);
+    }
+    if (stats.frontier_idx2row_same_window_reobserve_total &&
+        stat_pulse_metadata_frontier_idx2row_same_window_reobserve_total_) {
+        stat_pulse_metadata_frontier_idx2row_same_window_reobserve_total_->addData(
+            stats.frontier_idx2row_same_window_reobserve_total);
+    }
+    if (stats.frontier_idx2row_owner_form_candidate_total &&
+        stat_pulse_metadata_frontier_idx2row_owner_form_candidate_total_) {
+        stat_pulse_metadata_frontier_idx2row_owner_form_candidate_total_->addData(
+            stats.frontier_idx2row_owner_form_candidate_total);
+    }
+    if (stats.frontier_idx2row_join_ready_candidate_total &&
+        stat_pulse_metadata_frontier_idx2row_join_ready_candidate_total_) {
+        stat_pulse_metadata_frontier_idx2row_join_ready_candidate_total_->addData(
+            stats.frontier_idx2row_join_ready_candidate_total);
+    }
+    if (stats.frontier_rowindex_observed_total &&
+        stat_pulse_metadata_frontier_rowindex_observed_total_) {
+        stat_pulse_metadata_frontier_rowindex_observed_total_->addData(
+            stats.frontier_rowindex_observed_total);
+    }
+    if (stats.frontier_rowindex_same_window_reobserve_total &&
+        stat_pulse_metadata_frontier_rowindex_same_window_reobserve_total_) {
+        stat_pulse_metadata_frontier_rowindex_same_window_reobserve_total_->addData(
+            stats.frontier_rowindex_same_window_reobserve_total);
+    }
+    if (stats.frontier_rowindex_owner_form_candidate_total &&
+        stat_pulse_metadata_frontier_rowindex_owner_form_candidate_total_) {
+        stat_pulse_metadata_frontier_rowindex_owner_form_candidate_total_->addData(
+            stats.frontier_rowindex_owner_form_candidate_total);
+    }
+    if (stats.frontier_rowindex_join_ready_candidate_total &&
+        stat_pulse_metadata_frontier_rowindex_join_ready_candidate_total_) {
+        stat_pulse_metadata_frontier_rowindex_join_ready_candidate_total_->addData(
+            stats.frontier_rowindex_join_ready_candidate_total);
+    }
+}
+
+void MultiCorePE::recordAtlasObjectObservability(
+    const WeightMemorySubsystem::ExperimentalPeAtlasObjectCensus& census,
+    const WeightMemorySubsystem::ExperimentalPeAtlasRowIndexLifecycleLedger& rowindex,
+    const WeightMemorySubsystem::ExperimentalPeAtlasIdx2RowLifecycleLedger& idx2row,
+    const WeightMemorySubsystem::ExperimentalPeAtlasPreMphfBaseProxyLedger& premphf_base,
+    const WeightMemorySubsystem::ExperimentalPeAtlasPreMphfBandProxyLedger& premphf_band,
+    const WeightMemorySubsystem::ExperimentalPeAtlasPhaseStats& phase,
+    const WeightMemorySubsystem::PeInternalPodStats& pod_runtime) {
+    const auto add_atlas_stat = [this](const char* name, uint64_t value) {
+        auto it = atlas_object_plane_stats_.find(name);
+        if (it == atlas_object_plane_stats_.end() || it->second == nullptr) return;
+        if (value == 0u) return;
+        it->second->addData(value);
+    };
+    const auto add_atlas_stat_sampled = [this](const char* name, uint64_t value) {
+        auto it = atlas_object_plane_stats_.find(name);
+        if (it == atlas_object_plane_stats_.end() || it->second == nullptr) return;
+        it->second->addData(value);
+    };
+
+    add_atlas_stat(
+        "atlas_census_premphf_base_frontier_events_total",
+        census.premphf_base.frontier_events_total);
+    add_atlas_stat(
+        "atlas_census_premphf_base_producer_events_total",
+        census.premphf_base.producer_events_total);
+    add_atlas_stat(
+        "atlas_census_premphf_base_gate_events_total",
+        census.premphf_base.gate_events_total);
+    add_atlas_stat(
+        "atlas_census_premphf_base_service_events_total",
+        census.premphf_base.service_events_total);
+    add_atlas_stat(
+        "atlas_census_premphf_band_frontier_events_total",
+        census.premphf_band.frontier_events_total);
+    add_atlas_stat(
+        "atlas_census_premphf_band_producer_events_total",
+        census.premphf_band.producer_events_total);
+    add_atlas_stat(
+        "atlas_census_premphf_band_gate_events_total",
+        census.premphf_band.gate_events_total);
+    add_atlas_stat(
+        "atlas_census_premphf_band_service_events_total",
+        census.premphf_band.service_events_total);
+    add_atlas_stat(
+        "atlas_census_idx2row_frontier_events_total",
+        census.idx2row.frontier_events_total);
+    add_atlas_stat(
+        "atlas_census_idx2row_producer_events_total",
+        census.idx2row.producer_events_total);
+    add_atlas_stat(
+        "atlas_census_idx2row_gate_events_total",
+        census.idx2row.gate_events_total);
+    add_atlas_stat(
+        "atlas_census_idx2row_service_events_total",
+        census.idx2row.service_events_total);
+    add_atlas_stat(
+        "atlas_census_rowindex_frontier_events_total",
+        census.rowindex.frontier_events_total);
+    add_atlas_stat(
+        "atlas_census_rowindex_producer_events_total",
+        census.rowindex.producer_events_total);
+    add_atlas_stat(
+        "atlas_census_rowindex_gate_events_total",
+        census.rowindex.gate_events_total);
+    add_atlas_stat(
+        "atlas_census_rowindex_service_events_total",
+        census.rowindex.service_events_total);
+    add_atlas_stat(
+        "atlas_census_rowdescriptor_frontier_events_total",
+        census.rowdescriptor.frontier_events_total);
+    add_atlas_stat(
+        "atlas_census_rowdescriptor_producer_events_total",
+        census.rowdescriptor.producer_events_total);
+    add_atlas_stat(
+        "atlas_census_rowdescriptor_gate_events_total",
+        census.rowdescriptor.gate_events_total);
+    add_atlas_stat(
+        "atlas_census_rowdescriptor_service_events_total",
+        census.rowdescriptor.service_events_total);
+
+    add_atlas_stat(
+        "atlas_proxy_idx2row_materialize_total",
+        idx2row.materialize_total);
+    add_atlas_stat(
+        "atlas_proxy_idx2row_publicize_total",
+        idx2row.publicize_total);
+    add_atlas_stat(
+        "atlas_proxy_idx2row_owner_form_total",
+        idx2row.owner_form_total);
+    add_atlas_stat(
+        "atlas_proxy_idx2row_join_live_total",
+        idx2row.join_live_total);
+    add_atlas_stat(
+        "atlas_proxy_idx2row_join_ready_total",
+        idx2row.join_ready_total);
+    add_atlas_stat(
+        "atlas_proxy_idx2row_ready_total",
+        idx2row.ready_total);
+    add_atlas_stat(
+        "atlas_proxy_idx2row_release_total",
+        idx2row.release_total);
+    add_atlas_stat(
+        "atlas_proxy_idx2row_release_missing_total",
+        idx2row.release_missing_total);
+    add_atlas_stat(
+        "atlas_proxy_idx2row_fallback_total",
+        idx2row.fallback_total);
+
+    add_atlas_stat(
+        "atlas_proxy_premphf_base_materialize_total",
+        premphf_base.materialize_total);
+    add_atlas_stat(
+        "atlas_proxy_premphf_base_publicize_total",
+        premphf_base.publicize_total);
+    add_atlas_stat(
+        "atlas_proxy_premphf_base_owner_form_total",
+        premphf_base.owner_form_total);
+    add_atlas_stat(
+        "atlas_proxy_premphf_base_shared_hit_total",
+        premphf_base.shared_hit_total);
+    add_atlas_stat(
+        "atlas_proxy_premphf_base_lookup_ready_total",
+        premphf_base.lookup_ready_total);
+    add_atlas_stat(
+        "atlas_proxy_premphf_base_proxy_only_gap_total",
+        premphf_base.proxy_only_gap_total);
+
+    add_atlas_stat(
+        "atlas_proxy_premphf_band_materialize_total",
+        premphf_band.materialize_total);
+    add_atlas_stat(
+        "atlas_proxy_premphf_band_publicize_total",
+        premphf_band.publicize_total);
+    add_atlas_stat(
+        "atlas_proxy_premphf_band_owner_form_candidate_total",
+        premphf_band.owner_form_candidate_total);
+    add_atlas_stat(
+        "atlas_proxy_premphf_band_join_ready_candidate_total",
+        premphf_band.join_ready_candidate_total);
+    add_atlas_stat(
+        "atlas_proxy_premphf_band_zero_service_total",
+        premphf_band.zero_service_total);
+
+    add_atlas_stat(
+        "atlas_proxy_rowindex_materialize_total",
+        rowindex.materialize_total);
+    add_atlas_stat(
+        "atlas_proxy_rowindex_publicize_total",
+        rowindex.publicize_total);
+    add_atlas_stat(
+        "atlas_proxy_rowindex_owner_form_total",
+        rowindex.owner_form_total);
+    add_atlas_stat(
+        "atlas_proxy_rowindex_join_live_total",
+        rowindex.join_live_total);
+    add_atlas_stat(
+        "atlas_proxy_rowindex_join_ready_total",
+        rowindex.join_ready_total);
+    add_atlas_stat(
+        "atlas_proxy_rowindex_ready_total",
+        rowindex.ready_total);
+    add_atlas_stat(
+        "atlas_proxy_rowindex_release_total",
+        rowindex.release_total);
+    add_atlas_stat(
+        "atlas_proxy_rowindex_release_missing_total",
+        rowindex.release_missing_total);
+    add_atlas_stat(
+        "atlas_proxy_rowindex_fallback_total",
+        rowindex.fallback_total);
+
+    const bool rowindex_requested =
+        (census.rowindex.frontier_events_total +
+         census.rowindex.producer_events_total +
+         census.rowindex.gate_events_total +
+         census.rowindex.service_events_total +
+         rowindex.materialize_total +
+         rowindex.publicize_total +
+         rowindex.owner_form_total +
+         rowindex.join_live_total +
+         rowindex.join_ready_total +
+         rowindex.ready_total +
+         rowindex.release_total +
+         rowindex.release_missing_total +
+         rowindex.fallback_total) > 0u;
+    const bool rowindex_effective =
+        rowindex_requested &&
+        pulse_osa_enable_ &&
+        pulse_osa_metadata_txn_enable_ &&
+        (pulse_osa_metadata_object_mask_bits_ &
+         PeLocalServiceObjectTable::kMetadataKindMaskRowIndex) != 0u &&
+        pe_internal_pod_enable_cfg_ &&
+        pe_internal_pod_metadata_enable_cfg_ &&
+        pe_internal_pod_owner_enable_cfg_ &&
+        pe_local_service_object_table_ != nullptr;
+    const bool rowindex_constructed =
+        rowindex.materialize_total > 0u ||
+        rowindex.publicize_total > 0u ||
+        rowindex.owner_form_total > 0u ||
+        rowindex.join_live_total > 0u ||
+        rowindex.join_ready_total > 0u ||
+        rowindex.ready_total > 0u;
+    atlas_rowindex_requested_seen_ =
+        atlas_rowindex_requested_seen_ || rowindex_requested;
+    atlas_rowindex_effective_seen_ =
+        atlas_rowindex_effective_seen_ || rowindex_effective;
+    atlas_rowindex_constructed_seen_ =
+        atlas_rowindex_constructed_seen_ || rowindex_constructed;
+
+    add_atlas_stat_sampled(
+        "atlas_control_runtime_produced_frontier_export_total",
+        pod_runtime.frontier_export_total);
+    add_atlas_stat_sampled(
+        "atlas_control_runtime_produced_owner_announce_total",
+        pod_runtime.owner_alloc_total);
+    add_atlas_stat_sampled(
+        "atlas_control_runtime_produced_join_request_total",
+        pod_runtime.join_request_total);
+    add_atlas_stat_sampled(
+        "atlas_control_runtime_produced_ready_fanout_total",
+        pod_runtime.service_ready_fanout_total);
+    add_atlas_stat_sampled(
+        "atlas_control_runtime_produced_join_reject_total",
+        pod_runtime.owner_reject_total + pod_runtime.join_reject_total);
+    atlas_control_runtime_produced_any_nonzero_last_ =
+        pod_runtime.frontier_export_total > 0u ||
+        pod_runtime.owner_alloc_total > 0u ||
+        pod_runtime.join_request_total > 0u ||
+        pod_runtime.service_ready_fanout_total > 0u ||
+        (pod_runtime.owner_reject_total + pod_runtime.join_reject_total) > 0u;
+
+    add_atlas_stat(
+        "atlas_phase_local_begin_gather_total",
+        phase.local_begin_gather_total);
+    add_atlas_stat(
+        "atlas_phase_local_first_touch_after_gather_open_total",
+        phase.local_first_touch_after_gather_open_total);
+    add_atlas_stat(
+        "atlas_phase_local_touch_without_gather_open_total",
+        phase.local_touch_without_gather_open_total);
+    add_atlas_stat(
+        "atlas_phase_local_touch_during_apply_total",
+        phase.local_touch_during_apply_total);
+    add_atlas_stat(
+        "atlas_phase_local_begin_apply_total",
+        phase.local_begin_apply_total);
+    add_atlas_stat(
+        "atlas_phase_local_begin_apply_with_touch_total",
+        phase.local_begin_apply_with_touch_total);
+    add_atlas_stat(
+        "atlas_phase_local_begin_apply_with_pending_rowidx_total",
+        phase.local_begin_apply_with_pending_rowidx_total);
+    add_atlas_stat(
+        "atlas_phase_local_begin_apply_without_pending_rowidx_total",
+        phase.local_begin_apply_without_pending_rowidx_total);
+    add_atlas_stat(
+        "atlas_phase_local_end_scatter_total",
+        phase.local_end_scatter_total);
+}
+
+void MultiCorePE::recordCoreStepRetireStat(int core_id,
+                                           uint32_t seq,
+                                           uint64_t retire_global_hol_cycles_total,
+                                           uint64_t retire_ready_but_blocked_edges_total,
+                                           uint64_t retire_per_post_progress_total,
+                                           uint64_t retire_wait_cycles_total,
+                                           uint64_t retire_wait_cycles_due_to_hol_total,
+                                           uint64_t retire_wait_cycles_due_to_barrier_total,
+                                           uint64_t retire_wait_cycles_due_to_not_ready_total,
+                                           uint64_t retire_samepost_blocked_edges_total,
+                                           uint64_t retire_crosspost_blocked_edges_total,
+                                           uint64_t retire_policy_loss_cycles_total,
+                                           uint64_t retire_policy_loss_edges_total,
+                                           uint64_t retire_shadow_per_post_recoverable_cycles_total,
+                                           uint64_t retire_shadow_per_post_recoverable_edges_total,
+                                           uint64_t retire_shadow_per_post_ready_posts_peak,
+                                           uint64_t retire_shadow_per_post_committable_edges_peak,
+                                           uint64_t retire_head_hol_cycles_dense_total,
+                                           uint64_t retire_head_hol_cycles_cache_total,
+                                           uint64_t retire_head_hol_cycles_miss_total,
+                                           uint64_t retire_head_hol_cycles_bcsr_total,
+                                           uint64_t retire_head_hol_cycles_bcsr_file_total,
+                                           uint64_t retire_head_hol_cycles_gcss_total,
+                                           uint64_t retire_head_blocked_edges_dense_total,
+                                           uint64_t retire_head_blocked_edges_cache_total,
+                                           uint64_t retire_head_blocked_edges_miss_total,
+                                           uint64_t retire_head_blocked_edges_bcsr_total,
+                                           uint64_t retire_head_blocked_edges_bcsr_file_total,
+                                           uint64_t retire_head_blocked_edges_gcss_total,
+                                           uint64_t retire_gcss_head_queued_not_issued_cycles_total,
+                                           uint64_t retire_gcss_qni_head_wait_episodes_total,
+                                           uint64_t retire_gcss_qni_head_wait_cycles_max,
+                                           uint64_t retire_gcss_head_queued_not_issued_blocked_edges_total,
+                                           uint64_t retire_gcss_head_issued_wait_resp_cycles_total,
+                                           uint64_t retire_gcss_head_issued_wait_resp_blocked_edges_total,
+                                           uint64_t retire_gcss_resp_ready_but_hol_cycles_total,
+                                           uint64_t retire_gcss_resp_ready_but_hol_blocked_edges_total,
+                                           uint64_t retire_gcss_qni_loader_not_ready_cycles_total,
+                                           uint64_t retire_gcss_qni_loader_not_ready_blocked_edges_total,
+                                           uint64_t retire_gcss_qni_weight_sram_stall_cycles_total,
+                                           uint64_t retire_gcss_qni_weight_sram_stall_blocked_edges_total,
+                                           uint64_t retire_gcss_qni_vlf_younger_ahead_cycles_total,
+                                           uint64_t retire_gcss_qni_vlf_younger_ahead_blocked_edges_total,
+                                           uint64_t retire_gcss_qni_vlf_younger_ahead_depth_total,
+                                           uint64_t retire_gcss_qni_vlf_younger_ahead_depth_samples_total,
+                                           uint64_t retire_gcss_qni_vlf_younger_ahead_depth_max,
+                                           uint64_t retire_gcss_qni_issue_deferred_total,
+                                           uint64_t retire_gcss_qni_pending_direct_queue_residency_cycles_total,
+                                           uint64_t retire_gcss_qni_pending_direct_queue_residency_samples_total,
+                                           uint64_t retire_gcss_qni_pending_direct_queue_residency_cycles_max,
+                                           uint64_t retire_gcss_qni_vlf_front_inflight_full_cycles_total,
+                                           uint64_t retire_gcss_qni_vlf_front_inflight_full_blocked_edges_total,
+                                           uint64_t retire_gcss_qni_vlf_front_waiting_issue_cycles_total,
+                                           uint64_t retire_gcss_qni_vlf_front_waiting_issue_blocked_edges_total,
+                                           uint64_t retire_gcss_qni_pending_younger_ahead_cycles_total,
+                                           uint64_t retire_gcss_qni_pending_younger_ahead_blocked_edges_total,
+                                           uint64_t retire_gcss_qni_pending_front_inflight_full_cycles_total,
+                                           uint64_t retire_gcss_qni_pending_front_inflight_full_blocked_edges_total,
+                                           uint64_t retire_gcss_qni_pending_front_waiting_tick_cycles_total,
+                                           uint64_t retire_gcss_qni_pending_front_waiting_tick_blocked_edges_total,
+                                           uint64_t retire_gcss_qni_unknown_cycles_total,
+                                           uint64_t retire_gcss_qni_unknown_blocked_edges_total,
+                                           uint64_t retire_begin_apply_windows_total,
+                                           uint64_t retire_begin_apply_prev_edges_total,
+                                           uint64_t retire_begin_apply_outstanding_carryin_total,
+                                           uint64_t retire_begin_apply_outstanding_carryin_windows_total,
+                                           uint64_t retire_begin_apply_loader_not_ready_windows_total,
+                                           uint64_t retire_edge_retire_registered_total,
+                                           uint64_t retire_edge_retire_retired_total,
+                                           uint64_t retire_end_scatter_gcss_vlf_issue_queue_residual_total,
+                                           uint64_t retire_end_scatter_pending_direct_reads_residual_total,
+                                           uint64_t retire_end_scatter_outstanding_residual_total,
+                                           uint64_t retire_end_scatter_residual_work_windows_total,
+                                           uint64_t retire_gcss_vlf_issue_prepare_total,
+                                           uint64_t retire_gcss_vlf_issue_edges_total,
+                                           uint64_t retire_gcss_vlf_issue_reorder_trigger_total,
+                                           uint64_t retire_gcss_vlf_issue_line_groups_total,
+                                           uint64_t retire_ready_queue_peak,
+                                           uint64_t retire_unblock_events_total) {
+    if (seq == 0 || core_id < 0) return;
+    auto& perf = getOrCreateCoreStepPerf_(core_id, seq);
+    perf.retire_global_hol_cycles_total += retire_global_hol_cycles_total;
+    perf.retire_ready_but_blocked_edges_total += retire_ready_but_blocked_edges_total;
+    perf.retire_per_post_progress_total += retire_per_post_progress_total;
+    perf.retire_wait_cycles_total += retire_wait_cycles_total;
+    perf.retire_wait_cycles_due_to_hol_total += retire_wait_cycles_due_to_hol_total;
+    perf.retire_wait_cycles_due_to_barrier_total += retire_wait_cycles_due_to_barrier_total;
+    perf.retire_wait_cycles_due_to_not_ready_total += retire_wait_cycles_due_to_not_ready_total;
+    perf.retire_samepost_blocked_edges_total += retire_samepost_blocked_edges_total;
+    perf.retire_crosspost_blocked_edges_total += retire_crosspost_blocked_edges_total;
+    perf.retire_policy_loss_cycles_total += retire_policy_loss_cycles_total;
+    perf.retire_policy_loss_edges_total += retire_policy_loss_edges_total;
+    perf.retire_shadow_per_post_recoverable_cycles_total += retire_shadow_per_post_recoverable_cycles_total;
+    perf.retire_shadow_per_post_recoverable_edges_total += retire_shadow_per_post_recoverable_edges_total;
+    perf.retire_shadow_per_post_ready_posts_peak =
+        std::max<uint64_t>(perf.retire_shadow_per_post_ready_posts_peak, retire_shadow_per_post_ready_posts_peak);
+    perf.retire_shadow_per_post_committable_edges_peak =
+        std::max<uint64_t>(perf.retire_shadow_per_post_committable_edges_peak, retire_shadow_per_post_committable_edges_peak);
+    perf.retire_head_hol_cycles_dense_total += retire_head_hol_cycles_dense_total;
+    perf.retire_head_hol_cycles_cache_total += retire_head_hol_cycles_cache_total;
+    perf.retire_head_hol_cycles_miss_total += retire_head_hol_cycles_miss_total;
+    perf.retire_head_hol_cycles_bcsr_total += retire_head_hol_cycles_bcsr_total;
+    perf.retire_head_hol_cycles_bcsr_file_total += retire_head_hol_cycles_bcsr_file_total;
+    perf.retire_head_hol_cycles_gcss_total += retire_head_hol_cycles_gcss_total;
+    perf.retire_head_blocked_edges_dense_total += retire_head_blocked_edges_dense_total;
+    perf.retire_head_blocked_edges_cache_total += retire_head_blocked_edges_cache_total;
+    perf.retire_head_blocked_edges_miss_total += retire_head_blocked_edges_miss_total;
+    perf.retire_head_blocked_edges_bcsr_total += retire_head_blocked_edges_bcsr_total;
+    perf.retire_head_blocked_edges_bcsr_file_total += retire_head_blocked_edges_bcsr_file_total;
+    perf.retire_head_blocked_edges_gcss_total += retire_head_blocked_edges_gcss_total;
+    perf.retire_gcss_head_queued_not_issued_cycles_total += retire_gcss_head_queued_not_issued_cycles_total;
+    perf.retire_gcss_qni_head_wait_episodes_total += retire_gcss_qni_head_wait_episodes_total;
+    perf.retire_gcss_qni_head_wait_cycles_max = std::max<uint64_t>(
+        perf.retire_gcss_qni_head_wait_cycles_max, retire_gcss_qni_head_wait_cycles_max);
+    perf.retire_gcss_head_queued_not_issued_blocked_edges_total += retire_gcss_head_queued_not_issued_blocked_edges_total;
+    perf.retire_gcss_head_issued_wait_resp_cycles_total += retire_gcss_head_issued_wait_resp_cycles_total;
+    perf.retire_gcss_head_issued_wait_resp_blocked_edges_total += retire_gcss_head_issued_wait_resp_blocked_edges_total;
+    perf.retire_gcss_resp_ready_but_hol_cycles_total += retire_gcss_resp_ready_but_hol_cycles_total;
+    perf.retire_gcss_resp_ready_but_hol_blocked_edges_total += retire_gcss_resp_ready_but_hol_blocked_edges_total;
+    perf.retire_gcss_qni_loader_not_ready_cycles_total += retire_gcss_qni_loader_not_ready_cycles_total;
+    perf.retire_gcss_qni_loader_not_ready_blocked_edges_total += retire_gcss_qni_loader_not_ready_blocked_edges_total;
+    perf.retire_gcss_qni_weight_sram_stall_cycles_total += retire_gcss_qni_weight_sram_stall_cycles_total;
+    perf.retire_gcss_qni_weight_sram_stall_blocked_edges_total += retire_gcss_qni_weight_sram_stall_blocked_edges_total;
+    perf.retire_gcss_qni_vlf_younger_ahead_cycles_total += retire_gcss_qni_vlf_younger_ahead_cycles_total;
+    perf.retire_gcss_qni_vlf_younger_ahead_blocked_edges_total += retire_gcss_qni_vlf_younger_ahead_blocked_edges_total;
+    perf.retire_gcss_qni_vlf_younger_ahead_depth_total += retire_gcss_qni_vlf_younger_ahead_depth_total;
+    perf.retire_gcss_qni_vlf_younger_ahead_depth_samples_total += retire_gcss_qni_vlf_younger_ahead_depth_samples_total;
+    perf.retire_gcss_qni_vlf_younger_ahead_depth_max = std::max<uint64_t>(
+        perf.retire_gcss_qni_vlf_younger_ahead_depth_max,
+        retire_gcss_qni_vlf_younger_ahead_depth_max);
+    perf.retire_gcss_qni_issue_deferred_total += retire_gcss_qni_issue_deferred_total;
+    perf.retire_gcss_qni_pending_direct_queue_residency_cycles_total +=
+        retire_gcss_qni_pending_direct_queue_residency_cycles_total;
+    perf.retire_gcss_qni_pending_direct_queue_residency_samples_total +=
+        retire_gcss_qni_pending_direct_queue_residency_samples_total;
+    perf.retire_gcss_qni_pending_direct_queue_residency_cycles_max = std::max<uint64_t>(
+        perf.retire_gcss_qni_pending_direct_queue_residency_cycles_max,
+        retire_gcss_qni_pending_direct_queue_residency_cycles_max);
+    perf.retire_gcss_qni_vlf_front_inflight_full_cycles_total += retire_gcss_qni_vlf_front_inflight_full_cycles_total;
+    perf.retire_gcss_qni_vlf_front_inflight_full_blocked_edges_total += retire_gcss_qni_vlf_front_inflight_full_blocked_edges_total;
+    perf.retire_gcss_qni_vlf_front_waiting_issue_cycles_total += retire_gcss_qni_vlf_front_waiting_issue_cycles_total;
+    perf.retire_gcss_qni_vlf_front_waiting_issue_blocked_edges_total += retire_gcss_qni_vlf_front_waiting_issue_blocked_edges_total;
+    perf.retire_gcss_qni_pending_younger_ahead_cycles_total += retire_gcss_qni_pending_younger_ahead_cycles_total;
+    perf.retire_gcss_qni_pending_younger_ahead_blocked_edges_total += retire_gcss_qni_pending_younger_ahead_blocked_edges_total;
+    perf.retire_gcss_qni_pending_front_inflight_full_cycles_total += retire_gcss_qni_pending_front_inflight_full_cycles_total;
+    perf.retire_gcss_qni_pending_front_inflight_full_blocked_edges_total += retire_gcss_qni_pending_front_inflight_full_blocked_edges_total;
+    perf.retire_gcss_qni_pending_front_waiting_tick_cycles_total += retire_gcss_qni_pending_front_waiting_tick_cycles_total;
+    perf.retire_gcss_qni_pending_front_waiting_tick_blocked_edges_total += retire_gcss_qni_pending_front_waiting_tick_blocked_edges_total;
+    perf.retire_gcss_qni_unknown_cycles_total += retire_gcss_qni_unknown_cycles_total;
+    perf.retire_gcss_qni_unknown_blocked_edges_total += retire_gcss_qni_unknown_blocked_edges_total;
+    perf.retire_begin_apply_windows_total += retire_begin_apply_windows_total;
+    perf.retire_begin_apply_prev_edges_total += retire_begin_apply_prev_edges_total;
+    perf.retire_begin_apply_outstanding_carryin_total += retire_begin_apply_outstanding_carryin_total;
+    perf.retire_begin_apply_outstanding_carryin_windows_total +=
+        retire_begin_apply_outstanding_carryin_windows_total;
+    perf.retire_begin_apply_loader_not_ready_windows_total +=
+        retire_begin_apply_loader_not_ready_windows_total;
+    perf.retire_edge_retire_registered_total += retire_edge_retire_registered_total;
+    perf.retire_edge_retire_retired_total += retire_edge_retire_retired_total;
+    perf.retire_end_scatter_gcss_vlf_issue_queue_residual_total +=
+        retire_end_scatter_gcss_vlf_issue_queue_residual_total;
+    perf.retire_end_scatter_pending_direct_reads_residual_total +=
+        retire_end_scatter_pending_direct_reads_residual_total;
+    perf.retire_end_scatter_outstanding_residual_total +=
+        retire_end_scatter_outstanding_residual_total;
+    perf.retire_end_scatter_residual_work_windows_total +=
+        retire_end_scatter_residual_work_windows_total;
+    perf.retire_gcss_vlf_issue_prepare_total += retire_gcss_vlf_issue_prepare_total;
+    perf.retire_gcss_vlf_issue_edges_total += retire_gcss_vlf_issue_edges_total;
+    perf.retire_gcss_vlf_issue_reorder_trigger_total += retire_gcss_vlf_issue_reorder_trigger_total;
+    perf.retire_gcss_vlf_issue_line_groups_total += retire_gcss_vlf_issue_line_groups_total;
+    perf.retire_ready_queue_peak = std::max<uint64_t>(perf.retire_ready_queue_peak, retire_ready_queue_peak);
+    perf.retire_unblock_events_total += retire_unblock_events_total;
+}
+
+void MultiCorePE::recordStepApplyScatter(uint32_t seq,
+                                         uint64_t acc_updates,
+                                         uint64_t posts_touched,
+                                         uint64_t spikes_emitted,
+                                         uint64_t hwm_bytes,
+                                         uint64_t spill_records,
+                                         uint64_t spilled_bytes) {
+    if (seq == 0) return;
+    auto& perf = getOrCreateStepPerf_(seq);
+    perf.acc_updates += acc_updates;
+    perf.posts_touched += posts_touched;
+    perf.spill_records += spill_records;
+    perf.spilled_bytes += spilled_bytes;
+    perf.hwm_bytes_max = std::max<uint64_t>(perf.hwm_bytes_max, hwm_bytes);
+    perf.scatter_spikes_emitted += spikes_emitted;
+}
+
+void MultiCorePE::recordCoreStepApplyScatter(int core_id,
+                                             uint32_t seq,
+                                             uint64_t acc_updates,
+                                             uint64_t posts_touched,
+                                             uint64_t spikes_emitted,
+                                             uint64_t hwm_bytes,
+                                             uint64_t spill_records,
+                                             uint64_t spilled_bytes) {
+    if (seq == 0 || core_id < 0) return;
+    auto& perf = getOrCreateCoreStepPerf_(core_id, seq);
+    perf.acc_updates += acc_updates;
+    perf.posts_touched += posts_touched;
+    perf.spill_records += spill_records;
+    perf.spilled_bytes += spilled_bytes;
+    perf.hwm_bytes_max = std::max<uint64_t>(perf.hwm_bytes_max, hwm_bytes);
+    perf.scatter_spikes_emitted += spikes_emitted;
+}
+
+void MultiCorePE::accumulateExperimentalNocPrefetchStats(const ExperimentalNocRowidxPeStats& rowidx) {
+#define ADD_STAT_VALUE(stat_ptr, value) \
+    do { \
+        if ((stat_ptr) != nullptr) (stat_ptr)->addData((value)); \
+    } while (0)
+
+    ADD_STAT_VALUE(stat_exp_noc_rowidx_prefetch_rows_total_, rowidx.prefetch_rows_total);
+    ADD_STAT_VALUE(stat_exp_noc_rowidx_prefetch_bytes_total_, rowidx.prefetch_bytes_total);
+    ADD_STAT_VALUE(
+        stat_exp_noc_rowidx_prefetch_complete_inflight_miss_total_,
+        rowidx.prefetch_complete_inflight_miss_total);
+    ADD_STAT_VALUE(
+        stat_exp_noc_rowidx_prefetch_complete_zero_waiters_total_,
+        rowidx.prefetch_complete_zero_waiters_total);
+    ADD_STAT_VALUE(
+        stat_exp_noc_rowidx_prefetch_complete_waiters_total_,
+        rowidx.prefetch_complete_waiters_total);
+    ADD_STAT_VALUE(stat_exp_noc_rowidx_prefetch_rows_deferred_total_, rowidx.prefetch_rows_deferred_total);
+    ADD_STAT_VALUE(stat_exp_noc_rowidx_prefetch_rows_failed_total_, rowidx.prefetch_rows_failed_total);
+    ADD_STAT_VALUE(stat_exp_noc_rowidx_cache_hits_total_, rowidx.cache_hits_total);
+    ADD_STAT_VALUE(stat_exp_noc_rowidx_cache_misses_total_, rowidx.cache_misses_total);
+    ADD_STAT_VALUE(stat_exp_noc_rowidx_cache_fills_total_, rowidx.cache_fills_total);
+    ADD_STAT_VALUE(stat_exp_noc_rowidx_cache_full_drop_total_, rowidx.cache_full_drop_total);
+    ADD_STAT_VALUE(stat_exp_noc_rowidx_cache_entries_final_, rowidx.cache_entries_final);
+    ADD_STAT_VALUE(stat_exp_noc_rowidx_bulk_fill_total_, rowidx.bulk_fill_total);
+    ADD_STAT_VALUE(stat_exp_noc_rowidx_bulk_rows_cached_total_, rowidx.bulk_rows_cached_total);
+    ADD_STAT_VALUE(stat_exp_noc_rowidx_bulk_waiters_resolved_total_, rowidx.bulk_waiters_resolved_total);
+    ADD_STAT_VALUE(stat_exp_noc_rowidx_touch_rows_total_, rowidx.touch_rows_total);
+    ADD_STAT_VALUE(stat_exp_noc_rowidx_touch_events_total_, rowidx.touch_events_total);
+    ADD_STAT_VALUE(stat_exp_noc_rowidx_rows_filtered_cold_total_, rowidx.rows_filtered_cold_total);
+    ADD_STAT_VALUE(stat_exp_noc_rowidx_budget_ticks_total_, rowidx.budget_ticks_total);
+    ADD_STAT_VALUE(stat_exp_noc_rowidx_budget_effective_total_, rowidx.budget_effective_total);
+    ADD_STAT_VALUE(stat_exp_noc_rowidx_budget_adapt_ticks_total_, rowidx.budget_adapt_ticks_total);
+    ADD_STAT_VALUE(
+        stat_exp_noc_rowidx_ready_transition_apply_promote_cached_total_,
+        rowidx.ready_transition_apply_promote_cached_total);
+    ADD_STAT_VALUE(
+        stat_exp_noc_rowidx_ready_signal_rowindex_response_total_,
+        rowidx.ready_signal_rowindex_response_total);
+    ADD_STAT_VALUE(
+        stat_exp_noc_rowidx_ready_transition_rowindex_response_total_,
+        rowidx.ready_transition_rowindex_response_total);
+    ADD_STAT_VALUE(
+        stat_exp_noc_rowidx_ready_signal_prefetch_response_total_,
+        rowidx.ready_signal_prefetch_response_total);
+    ADD_STAT_VALUE(
+        stat_exp_noc_rowidx_ready_transition_prefetch_response_total_,
+        rowidx.ready_transition_prefetch_response_total);
+    ADD_STAT_VALUE(
+        stat_exp_noc_rowidx_ready_signal_rowindex_response_inflight_waiters_total_,
+        rowidx.ready_signal_rowindex_response_inflight_waiters_total);
+    ADD_STAT_VALUE(
+        stat_exp_noc_rowidx_ready_transition_rowindex_response_inflight_waiters_total_,
+        rowidx.ready_transition_rowindex_response_inflight_waiters_total);
+    ADD_STAT_VALUE(
+        stat_exp_noc_rowidx_ready_signal_rowindex_response_inflight_zero_waiters_total_,
+        rowidx.ready_signal_rowindex_response_inflight_zero_waiters_total);
+    ADD_STAT_VALUE(
+        stat_exp_noc_rowidx_ready_transition_rowindex_response_inflight_zero_waiters_total_,
+        rowidx.ready_transition_rowindex_response_inflight_zero_waiters_total);
+    ADD_STAT_VALUE(
+        stat_exp_noc_rowidx_ready_signal_rowindex_response_noninflight_prefetch_only_total_,
+        rowidx.ready_signal_rowindex_response_noninflight_prefetch_only_total);
+    ADD_STAT_VALUE(
+        stat_exp_noc_rowidx_ready_transition_rowindex_response_noninflight_prefetch_only_total_,
+        rowidx.ready_transition_rowindex_response_noninflight_prefetch_only_total);
+    ADD_STAT_VALUE(
+        stat_exp_noc_rowidx_ready_signal_prefetch_response_inflight_waiters_total_,
+        rowidx.ready_signal_prefetch_response_inflight_waiters_total);
+    ADD_STAT_VALUE(
+        stat_exp_noc_rowidx_ready_transition_prefetch_response_inflight_waiters_total_,
+        rowidx.ready_transition_prefetch_response_inflight_waiters_total);
+    ADD_STAT_VALUE(
+        stat_exp_noc_rowidx_ready_signal_prefetch_response_inflight_zero_waiters_total_,
+        rowidx.ready_signal_prefetch_response_inflight_zero_waiters_total);
+    ADD_STAT_VALUE(
+        stat_exp_noc_rowidx_ready_transition_prefetch_response_inflight_zero_waiters_total_,
+        rowidx.ready_transition_prefetch_response_inflight_zero_waiters_total);
+    ADD_STAT_VALUE(
+        stat_exp_noc_rowidx_ready_signal_prefetch_response_noninflight_prefetch_only_total_,
+        rowidx.ready_signal_prefetch_response_noninflight_prefetch_only_total);
+    ADD_STAT_VALUE(
+        stat_exp_noc_rowidx_ready_transition_prefetch_response_noninflight_prefetch_only_total_,
+        rowidx.ready_transition_prefetch_response_noninflight_prefetch_only_total);
+    ADD_STAT_VALUE(
+        stat_exp_noc_rowidx_detached_demand_join_total_,
+        rowidx.detached_demand_join_total);
+    ADD_STAT_VALUE(
+        stat_exp_noc_rowidx_detached_demand_waiters_resolved_total_,
+        rowidx.detached_demand_waiters_resolved_total);
+    ADD_STAT_VALUE(
+        stat_exp_noc_rowidx_detached_demand_fallback_zero_total_,
+        rowidx.detached_demand_fallback_zero_total);
+    ADD_STAT_VALUE(
+        stat_exp_noc_rowidx_detached_demand_ready_signal_total_,
+        rowidx.detached_demand_ready_signal_total);
+    ADD_STAT_VALUE(
+        stat_exp_noc_rowidx_detached_demand_ready_transition_total_,
+        rowidx.detached_demand_ready_transition_total);
+    ADD_STAT_VALUE(
+        stat_exp_noc_rowidx_ready_bypass_experimental_cache_hit_total_,
+        rowidx.ready_bypass_experimental_cache_hit_total);
+    ADD_STAT_VALUE(
+        stat_exp_noc_rowidx_ready_bypass_rowindex_get_hit_total_,
+        rowidx.ready_bypass_rowindex_get_hit_total);
+    ADD_STAT_VALUE(
+        stat_exp_noc_rowidx_close_attempt_total_,
+        rowidx.close_attempt_total);
+    ADD_STAT_VALUE(
+        stat_exp_noc_rowidx_close_attempt_active_owner_total_,
+        rowidx.close_attempt_active_owner_total);
+    ADD_STAT_VALUE(
+        stat_exp_noc_rowidx_close_attempt_already_pending_total_,
+        rowidx.close_attempt_already_pending_total);
+    ADD_STAT_VALUE(
+        stat_exp_noc_rowidx_close_attempt_not_active_total_,
+        rowidx.close_attempt_not_active_total);
+    ADD_STAT_VALUE(
+        stat_exp_noc_rowidx_close_attempt_not_owner_total_,
+        rowidx.close_attempt_not_owner_total);
+
+#undef ADD_STAT_VALUE
+}
+
 void MultiCorePE::accumulateSynapseReadStats(uint64_t gcss_lookup_hit_total,
                                              uint64_t gcss_lookup_miss_total,
                                              uint64_t dense_reqs_total,
@@ -2153,6 +6262,9 @@ void MultiCorePE::accumulateSynapseReadStats(uint64_t gcss_lookup_hit_total,
                                              uint64_t weight_idx_sram_bank_conflict_ticks_total,
                                              uint64_t weight_idx_sram_predicted_extra_cycles_total,
                                              uint64_t weight_idx_sram_resident_bytes_peak,
+                                             uint64_t weight_idx_sram_bank_peak_accesses_per_tick,
+                                             uint64_t weight_idx_sram_energy_read_pj_total,
+                                             uint64_t weight_idx_sram_energy_write_pj_total,
                                              uint64_t weight_idx_lookup_total,
                                              uint64_t weight_idx_lookup_idx2_total,
                                              uint64_t weight_l0_sram_reads_total,
@@ -2162,6 +6274,10 @@ void MultiCorePE::accumulateSynapseReadStats(uint64_t gcss_lookup_hit_total,
                                              uint64_t weight_l0_sram_bank_conflict_ticks_total,
                                              uint64_t weight_l0_sram_predicted_extra_cycles_total,
                                              uint64_t weight_l0_sram_resident_bytes_peak,
+                                             uint64_t weight_l0_sram_bank_peak_accesses_per_tick,
+                                             uint64_t weight_l0_sram_energy_read_pj_total,
+                                             uint64_t weight_l0_sram_energy_write_pj_total,
+                                             uint64_t weight_sram_enforced_stall_cycles_total,
                                              uint64_t weight_l0_lookup_total,
                                              uint64_t weight_l0_hit_total,
                                              uint64_t weight_l0_fill_total,
@@ -2173,23 +6289,26 @@ void MultiCorePE::accumulateSynapseReadStats(uint64_t gcss_lookup_hit_total,
                                              uint64_t core_state_sram_bank_conflict_ticks_total,
                                              uint64_t core_state_sram_predicted_extra_cycles_total,
                                              uint64_t core_state_sram_resident_bytes_peak,
+                                             uint64_t core_state_sram_bank_peak_accesses_per_tick,
+                                             uint64_t core_state_sram_energy_read_pj_total,
+                                             uint64_t core_state_sram_energy_write_pj_total,
+                                             uint64_t core_state_sram_stall_cycles_total,
                                              uint64_t gas_retire_global_hol_cycles_total,
                                              uint64_t gas_retire_ready_but_blocked_edges_total,
                                              uint64_t gas_retire_per_post_progress_total,
-                                             uint64_t gas_tass_lf_p0_block_epochs_total,
-                                             uint64_t gas_tass_lf_p0_block_active_pres_total,
-                                             uint64_t gas_tass_lf_p0_block_shared_pres_total,
-                                             uint64_t gas_tass_lf_p0_cross_core_joins_total,
-                                             uint64_t gas_tass_lf_p0_payload_bytes_total,
-                                             uint64_t gas_tass_lf_p0_current_vlf_line_groups_total,
-                                             uint64_t gas_tass_lf_p0_block_naive_line_count_total,
-                                             uint64_t gas_tass_lf_p0_block_fused_lb_line_count_total,
-                                             uint64_t gas_tass_lf_p0_response_fanout_total,
-                                             uint64_t gas_tass_lf_p0_reports_flushed_total,
-                                             uint64_t gas_tass_lf_p0_reports_nonzero_payload_total,
-                                             uint64_t gas_tass_lf_p0_reports_pre_entries_total,
-                                             uint64_t gas_tass_lf_p0_reports_via_callback_total,
-                                             uint64_t gas_tass_lf_p0_reports_via_fallback_total) {
+                                             uint64_t gas_retire_samepost_blocked_edges_total,
+                                             uint64_t gas_retire_crosspost_blocked_edges_total,
+                                             uint64_t gas_retire_policy_loss_cycles_total,
+                                             uint64_t gas_retire_policy_loss_edges_total,
+                                             uint64_t gas_retire_shadow_per_post_recoverable_cycles_total,
+                                             uint64_t gas_retire_shadow_per_post_recoverable_edges_total,
+                                             uint64_t gas_retire_shadow_per_post_ready_posts_peak,
+                                             uint64_t gas_retire_shadow_per_post_committable_edges_peak) {
+    const auto add_atlas_storage_stat = [this](const char* name, uint64_t value) {
+        auto it = atlas_object_plane_stats_.find(name);
+        if (it == atlas_object_plane_stats_.end() || it->second == nullptr) return;
+        it->second->addData(value);
+    };
     if (stat_gcss_lookup_hit_total_) stat_gcss_lookup_hit_total_->addData(gcss_lookup_hit_total);
     if (stat_gcss_lookup_miss_total_) stat_gcss_lookup_miss_total_->addData(gcss_lookup_miss_total);
     if (stat_weight_read_dense_reqs_total_) stat_weight_read_dense_reqs_total_->addData(dense_reqs_total);
@@ -2209,8 +6328,17 @@ void MultiCorePE::accumulateSynapseReadStats(uint64_t gcss_lookup_hit_total,
     if (stat_weight_idx_sram_bank_conflict_ticks_total_) stat_weight_idx_sram_bank_conflict_ticks_total_->addData(weight_idx_sram_bank_conflict_ticks_total);
     if (stat_weight_idx_sram_predicted_extra_cycles_total_) stat_weight_idx_sram_predicted_extra_cycles_total_->addData(weight_idx_sram_predicted_extra_cycles_total);
     if (stat_weight_idx_sram_resident_bytes_peak_) stat_weight_idx_sram_resident_bytes_peak_->addData(weight_idx_sram_resident_bytes_peak);
+    if (stat_weight_idx_sram_bank_peak_accesses_per_tick_) stat_weight_idx_sram_bank_peak_accesses_per_tick_->addData(weight_idx_sram_bank_peak_accesses_per_tick);
+    if (stat_weight_idx_sram_energy_read_pj_total_) stat_weight_idx_sram_energy_read_pj_total_->addData(weight_idx_sram_energy_read_pj_total);
+    if (stat_weight_idx_sram_energy_write_pj_total_) stat_weight_idx_sram_energy_write_pj_total_->addData(weight_idx_sram_energy_write_pj_total);
     if (stat_weight_idx_lookup_total_) stat_weight_idx_lookup_total_->addData(weight_idx_lookup_total);
     if (stat_weight_idx_lookup_idx2_total_) stat_weight_idx_lookup_idx2_total_->addData(weight_idx_lookup_idx2_total);
+    add_atlas_storage_stat(
+        "atlas_storage_map_weight_idx_private_reads_total",
+        weight_idx_sram_reads_total);
+    add_atlas_storage_stat(
+        "atlas_storage_map_weight_idx_private_resident_bytes_peak",
+        weight_idx_sram_resident_bytes_peak);
     if (stat_weight_l0_sram_reads_total_) stat_weight_l0_sram_reads_total_->addData(weight_l0_sram_reads_total);
     if (stat_weight_l0_sram_writes_total_) stat_weight_l0_sram_writes_total_->addData(weight_l0_sram_writes_total);
     if (stat_weight_l0_sram_bytes_read_total_) stat_weight_l0_sram_bytes_read_total_->addData(weight_l0_sram_bytes_read_total);
@@ -2218,10 +6346,20 @@ void MultiCorePE::accumulateSynapseReadStats(uint64_t gcss_lookup_hit_total,
     if (stat_weight_l0_sram_bank_conflict_ticks_total_) stat_weight_l0_sram_bank_conflict_ticks_total_->addData(weight_l0_sram_bank_conflict_ticks_total);
     if (stat_weight_l0_sram_predicted_extra_cycles_total_) stat_weight_l0_sram_predicted_extra_cycles_total_->addData(weight_l0_sram_predicted_extra_cycles_total);
     if (stat_weight_l0_sram_resident_bytes_peak_) stat_weight_l0_sram_resident_bytes_peak_->addData(weight_l0_sram_resident_bytes_peak);
+    if (stat_weight_l0_sram_bank_peak_accesses_per_tick_) stat_weight_l0_sram_bank_peak_accesses_per_tick_->addData(weight_l0_sram_bank_peak_accesses_per_tick);
+    if (stat_weight_l0_sram_energy_read_pj_total_) stat_weight_l0_sram_energy_read_pj_total_->addData(weight_l0_sram_energy_read_pj_total);
+    if (stat_weight_l0_sram_energy_write_pj_total_) stat_weight_l0_sram_energy_write_pj_total_->addData(weight_l0_sram_energy_write_pj_total);
+    if (stat_weight_sram_enforced_stall_cycles_total_) stat_weight_sram_enforced_stall_cycles_total_->addData(weight_sram_enforced_stall_cycles_total);
     if (stat_weight_l0_lookup_total_) stat_weight_l0_lookup_total_->addData(weight_l0_lookup_total);
     if (stat_weight_l0_hit_total_) stat_weight_l0_hit_total_->addData(weight_l0_hit_total);
     if (stat_weight_l0_fill_total_) stat_weight_l0_fill_total_->addData(weight_l0_fill_total);
     if (stat_weight_l0_evict_total_) stat_weight_l0_evict_total_->addData(weight_l0_evict_total);
+    add_atlas_storage_stat(
+        "atlas_storage_map_weight_value_private_reads_total",
+        weight_l0_sram_reads_total);
+    add_atlas_storage_stat(
+        "atlas_storage_map_weight_value_private_resident_bytes_peak",
+        weight_l0_sram_resident_bytes_peak);
     if (stat_core_state_sram_reads_total_) stat_core_state_sram_reads_total_->addData(core_state_sram_reads_total);
     if (stat_core_state_sram_writes_total_) stat_core_state_sram_writes_total_->addData(core_state_sram_writes_total);
     if (stat_core_state_sram_bytes_read_total_) stat_core_state_sram_bytes_read_total_->addData(core_state_sram_bytes_read_total);
@@ -2229,40 +6367,46 @@ void MultiCorePE::accumulateSynapseReadStats(uint64_t gcss_lookup_hit_total,
     if (stat_core_state_sram_bank_conflict_ticks_total_) stat_core_state_sram_bank_conflict_ticks_total_->addData(core_state_sram_bank_conflict_ticks_total);
     if (stat_core_state_sram_predicted_extra_cycles_total_) stat_core_state_sram_predicted_extra_cycles_total_->addData(core_state_sram_predicted_extra_cycles_total);
     if (stat_core_state_sram_resident_bytes_peak_) stat_core_state_sram_resident_bytes_peak_->addData(core_state_sram_resident_bytes_peak);
+    if (stat_core_state_sram_bank_peak_accesses_per_tick_) stat_core_state_sram_bank_peak_accesses_per_tick_->addData(core_state_sram_bank_peak_accesses_per_tick);
+    if (stat_core_state_sram_energy_read_pj_total_) stat_core_state_sram_energy_read_pj_total_->addData(core_state_sram_energy_read_pj_total);
+    if (stat_core_state_sram_energy_write_pj_total_) stat_core_state_sram_energy_write_pj_total_->addData(core_state_sram_energy_write_pj_total);
+    if (stat_core_state_sram_stall_cycles_total_) stat_core_state_sram_stall_cycles_total_->addData(core_state_sram_stall_cycles_total);
     if (stat_gas_retire_global_hol_cycles_total_) stat_gas_retire_global_hol_cycles_total_->addData(gas_retire_global_hol_cycles_total);
     if (stat_gas_retire_ready_but_blocked_edges_total_) stat_gas_retire_ready_but_blocked_edges_total_->addData(gas_retire_ready_but_blocked_edges_total);
     if (stat_gas_retire_per_post_progress_total_) stat_gas_retire_per_post_progress_total_->addData(gas_retire_per_post_progress_total);
-    if (stat_gas_tass_lf_p0_block_epochs_total_) stat_gas_tass_lf_p0_block_epochs_total_->addData(gas_tass_lf_p0_block_epochs_total);
-    if (stat_gas_tass_lf_p0_block_active_pres_total_) stat_gas_tass_lf_p0_block_active_pres_total_->addData(gas_tass_lf_p0_block_active_pres_total);
-    if (stat_gas_tass_lf_p0_block_shared_pres_total_) stat_gas_tass_lf_p0_block_shared_pres_total_->addData(gas_tass_lf_p0_block_shared_pres_total);
-    if (stat_gas_tass_lf_p0_cross_core_joins_total_) stat_gas_tass_lf_p0_cross_core_joins_total_->addData(gas_tass_lf_p0_cross_core_joins_total);
-    if (stat_gas_tass_lf_p0_payload_bytes_total_) stat_gas_tass_lf_p0_payload_bytes_total_->addData(gas_tass_lf_p0_payload_bytes_total);
-    if (stat_gas_tass_lf_p0_current_vlf_line_groups_total_) stat_gas_tass_lf_p0_current_vlf_line_groups_total_->addData(gas_tass_lf_p0_current_vlf_line_groups_total);
-    if (stat_gas_tass_lf_p0_block_naive_line_count_total_) stat_gas_tass_lf_p0_block_naive_line_count_total_->addData(gas_tass_lf_p0_block_naive_line_count_total);
-    if (stat_gas_tass_lf_p0_block_fused_lb_line_count_total_) stat_gas_tass_lf_p0_block_fused_lb_line_count_total_->addData(gas_tass_lf_p0_block_fused_lb_line_count_total);
-    if (stat_gas_tass_lf_p0_response_fanout_total_) stat_gas_tass_lf_p0_response_fanout_total_->addData(gas_tass_lf_p0_response_fanout_total);
-    if (stat_gas_tass_lf_p0_reports_flushed_total_) stat_gas_tass_lf_p0_reports_flushed_total_->addData(gas_tass_lf_p0_reports_flushed_total);
-    if (stat_gas_tass_lf_p0_reports_nonzero_payload_total_) stat_gas_tass_lf_p0_reports_nonzero_payload_total_->addData(gas_tass_lf_p0_reports_nonzero_payload_total);
-    if (stat_gas_tass_lf_p0_reports_pre_entries_total_) stat_gas_tass_lf_p0_reports_pre_entries_total_->addData(gas_tass_lf_p0_reports_pre_entries_total);
-    if (stat_gas_tass_lf_p0_reports_via_callback_total_) stat_gas_tass_lf_p0_reports_via_callback_total_->addData(gas_tass_lf_p0_reports_via_callback_total);
-    if (stat_gas_tass_lf_p0_reports_via_fallback_total_) stat_gas_tass_lf_p0_reports_via_fallback_total_->addData(gas_tass_lf_p0_reports_via_fallback_total);
+    if (stat_gas_retire_samepost_blocked_edges_total_) stat_gas_retire_samepost_blocked_edges_total_->addData(gas_retire_samepost_blocked_edges_total);
+    if (stat_gas_retire_crosspost_blocked_edges_total_) stat_gas_retire_crosspost_blocked_edges_total_->addData(gas_retire_crosspost_blocked_edges_total);
+    if (stat_gas_retire_policy_loss_cycles_total_) stat_gas_retire_policy_loss_cycles_total_->addData(gas_retire_policy_loss_cycles_total);
+    if (stat_gas_retire_policy_loss_edges_total_) stat_gas_retire_policy_loss_edges_total_->addData(gas_retire_policy_loss_edges_total);
+    if (stat_gas_retire_shadow_per_post_recoverable_cycles_total_) stat_gas_retire_shadow_per_post_recoverable_cycles_total_->addData(gas_retire_shadow_per_post_recoverable_cycles_total);
+    if (stat_gas_retire_shadow_per_post_recoverable_edges_total_) stat_gas_retire_shadow_per_post_recoverable_edges_total_->addData(gas_retire_shadow_per_post_recoverable_edges_total);
+    if (stat_gas_retire_shadow_per_post_ready_posts_peak_) stat_gas_retire_shadow_per_post_ready_posts_peak_->addData(gas_retire_shadow_per_post_ready_posts_peak);
+    if (stat_gas_retire_shadow_per_post_committable_edges_peak_) stat_gas_retire_shadow_per_post_committable_edges_peak_->addData(gas_retire_shadow_per_post_committable_edges_peak);
 }
 
 void MultiCorePE::notifyStageEvent(uint32_t seq, const std::string& event, uint64_t ts_ns,
                                    uint64_t spikes_emitted, int core_id) {
     auto &m = stage_marks_[seq];
-    if (event == "BeginGather") {
-        if (m.bg == 0 || ts_ns < m.bg) m.bg = ts_ns;
-    } else if (event == "BeginApply") {
-        // 多核窗口阶段并非严格同步：我们希望 PE 级阶段边界代表“所有核心都进入该阶段”的时刻。
-        // 因此 BeginApply/BeginScatter 取 max（最慢核心），BeginGather 取 min（最早起点）。
-        if (m.ga == 0 || ts_ns > m.ga) m.ga = ts_ns;
-    } else if (event == "EndApply") {
-        if (m.ea == 0 || ts_ns > m.ea) m.ea = ts_ns;
-    } else if (event == "BeginScatter") {
-        if (m.bs == 0 || ts_ns > m.bs) m.bs = ts_ns;
-    } else if (event == "EndScatter") {
-        if (m.es == 0 || ts_ns > m.es) m.es = ts_ns;
+    StageMarks* core_marks = nullptr;
+    if (core_id >= 0) {
+        core_marks = &getOrCreateCoreStageMarks_(core_id, seq);
+    }
+    auto apply_stage_event = [&](StageMarks& marks) {
+        if (event == "BeginGather") {
+            if (marks.bg == 0 || ts_ns < marks.bg) marks.bg = ts_ns;
+        } else if (event == "BeginApply") {
+            if (marks.ga == 0 || ts_ns > marks.ga) marks.ga = ts_ns;
+        } else if (event == "EndApply") {
+            if (marks.ea == 0 || ts_ns > marks.ea) marks.ea = ts_ns;
+        } else if (event == "BeginScatter") {
+            if (marks.bs == 0 || ts_ns > marks.bs) marks.bs = ts_ns;
+        } else if (event == "EndScatter") {
+            if (marks.es == 0 || ts_ns > marks.es) marks.es = ts_ns;
+        }
+    };
+    apply_stage_event(m);
+    if (core_marks) {
+        apply_stage_event(*core_marks);
     }
 
     // Experiment observability: naive_raw must not execute GAS Apply/Scatter stages.
@@ -2286,10 +6430,11 @@ void MultiCorePE::notifyStageEvent(uint32_t seq, const std::string& event, uint6
         global_step_last_stage_spikes_[idx] = spikes_emitted;
     }
 
-    if (sentinel_enabled_ && output_ && seq == 1 &&
+    if (sentinel_enabled_ && output_ && seq <= 2 &&
         global_step_sync_enable_ &&
         seq == global_step_active_seq_ &&
-        (event == "BeginGather" || event == "BeginApply" || event == "EndScatter")) {
+        (event == "BeginGather" || event == "BeginApply" || event == "EndApply" ||
+         event == "BeginScatter" || event == "EndScatter")) {
         output_->verbose(CALL_INFO, 2, 0,
             "[[sentinel-step-sync]] node=%d stage=%s core=%d seq=%u ts_ns=%" PRIu64 " spikes=%" PRIu64 "\n",
             node_id_, event.c_str(), core_id, seq, (uint64_t)ts_ns, (uint64_t)spikes_emitted);
@@ -2297,9 +6442,44 @@ void MultiCorePE::notifyStageEvent(uint32_t seq, const std::string& event, uint6
 
     // Step 注入事件转发（Phase3-B 下沉为 StepActivationSubsystem）
     if (event == "BeginGather") {
+        if (sentinel_enabled_ && output_ && node_id_ == 0 && seq <= 2 && core_id >= 15) {
+            output_->verbose(
+                CALL_INFO, 2, 0,
+                "[[sentinel-step-path]] node=%d core=%d seq=%u notifyStageEvent before_step_activation ts_ns=%" PRIu64 "\n",
+                node_id_, core_id, seq, static_cast<uint64_t>(ts_ns));
+        }
         step_activation_subsys_.onBeginGather(seq, ts_ns, core_id);
+        if (sentinel_enabled_ && output_ && node_id_ == 0 && seq <= 2 && core_id >= 15) {
+            output_->verbose(
+                CALL_INFO, 2, 0,
+                "[[sentinel-step-path]] node=%d core=%d seq=%u notifyStageEvent after_step_activation\n",
+                node_id_, core_id, seq);
+        }
+    } else if (event == "BeginApply") {
+        if (pulse_fabric_) {
+            pulse_fabric_->closeGatherHarborStep(seq);
+        }
     } else if (event == "EndScatter") {
-        step_activation_subsys_.onEndScatter(seq);
+        if (core_id >= 0 && core_id < num_cores_) {
+            auto& reset_state = step_endscatter_reset_state_[seq];
+            if (reset_state.cores_seen.size() != static_cast<size_t>(num_cores_)) {
+                reset_state.cores_seen.assign(static_cast<size_t>(num_cores_), 0);
+                reset_state.done_count = 0;
+                reset_state.reset_fired = false;
+            }
+            const size_t idx = static_cast<size_t>(core_id);
+            if (reset_state.cores_seen[idx] == 0) {
+                reset_state.cores_seen[idx] = 1;
+                reset_state.done_count += 1;
+            }
+            // reset_mem_each_step 必须等本 PE 的所有 core 都真正结束该 step 的 Scatter 之后再触发，
+            // 否则早到 core 会提前清掉状态，晚到 core 又会把旧 step 的 refractory/last_spike 写回。
+            if (!reset_state.reset_fired &&
+                reset_state.done_count >= static_cast<uint32_t>(num_cores_)) {
+                step_activation_subsys_.onEndScatter(seq);
+                reset_state.reset_fired = true;
+            }
+        }
     }
 
     // Global Step barrier: 当本 PE 的所有 core 都完成 EndScatter(seq) 后，上报给控制器（EndScatter policy）
@@ -2311,7 +6491,7 @@ void MultiCorePE::notifyStageEvent(uint32_t seq, const std::string& event, uint6
         seq == global_step_active_seq_) {
         if (core_id >= 0 && core_id < num_cores_) {
             global_step_done_cores_[static_cast<size_t>(core_id)] = 1;
-            if (sentinel_enabled_ && output_ && seq == 1) {
+            if (sentinel_enabled_ && output_ && seq <= 2) {
                 size_t done_cnt = 0;
                 for (auto v : global_step_done_cores_) if (v) ++done_cnt;
                 output_->verbose(CALL_INFO, 2, 0,
@@ -2323,6 +6503,7 @@ void MultiCorePE::notifyStageEvent(uint32_t seq, const std::string& event, uint6
                 if (!v) { all_done = false; break; }
             }
             if (all_done) {
+                noteStepBarrierWaitNs_(seq, getCurrentSimTimeNano());
                 auto* ev = new GasStepBarrierEvent(GasStepBarrierOp::PeDone, seq, static_cast<uint32_t>(node_id_));
                 // Step-level telemetry: reuse PE-level stage marks aggregated in notifyStageEvent().
                 // This is used by GlobalGasStepController for criticality-aware global credit control.
@@ -2335,7 +6516,7 @@ void MultiCorePE::notifyStageEvent(uint32_t seq, const std::string& event, uint6
                 gas_step_ctrl_link_->send(ev);
                 global_step_done_sent_ = true;
                 if (stat_global_steps_done_total_) stat_global_steps_done_total_->addData(1);
-                if (sentinel_enabled_ && output_ && seq == 1) {
+                if (sentinel_enabled_ && output_ && seq <= 2) {
                     output_->verbose(CALL_INFO, 2, 0, "[[sentinel-step-sync]] node=%d send PE_DONE seq=%u\n", node_id_, seq);
                 }
             }
@@ -2405,6 +6586,13 @@ void MultiCorePE::initializeProcessingUnits() {
     
     cores_.reserve(num_cores_);
     
+    const bool core_pe_internal_cpe_enable =
+        pe_internal_cpe_enable_cfg_;
+    const bool core_pe_internal_pod_enable =
+        pe_internal_pod_enable_cfg_;
+    const uint32_t core_pe_internal_pod_count = pe_internal_pod_count_cfg_;
+    const uint32_t core_pe_internal_pod_size = pe_internal_pod_size_cfg_;
+
     for (int i = 0; i < num_cores_; i++) {
         int neuron_id_start = node_id_ * total_neurons_ + i * neurons_per_core_;
         
@@ -2425,6 +6613,7 @@ void MultiCorePE::initializeProcessingUnits() {
         core_params.insert("tau_mem", std::to_string(tau_mem_));
         core_params.insert("t_ref", std::to_string(t_ref_));
         core_params.insert("node_id", std::to_string(node_id_));
+        core_params.insert("step_seed_only_mode", std::to_string(step_seed_only_mode_ ? 1 : 0));
         // 若 Python 侧未提供 base_addr，则退回旧的简单映射；否则尊重传入值
         if (!core_params.contains("base_addr")) {
             core_params.insert("base_addr", std::to_string(neuron_id_start * 1000)); // 简单地址映射（仅兜底）
@@ -2441,12 +6630,31 @@ void MultiCorePE::initializeProcessingUnits() {
         core_params.insert("weight_verify_samples", std::to_string(weight_verify_samples_));
         core_params.insert("expected_weight_value", std::to_string(expected_weight_value_));
         core_params.insert("verify_log_each_sample", std::to_string(verify_log_each_sample_ ? 1 : 0));
-        
+
         // 传递权重回退参数 - 关键修复！
         core_params.insert("use_event_weight_fallback", std::to_string(use_event_weight_fallback_ ? 1 : 0));
         core_params.insert("enable_memory_weights", std::to_string(enable_memory_weights_ ? 1 : 0));
         core_params.insert("write_weights_on_init", std::to_string(write_weights_on_init_ ? 1 : 0));
-        
+        core_params.insert(
+            "pe_internal_cpe_enable",
+            std::to_string(core_pe_internal_cpe_enable ? 1 : 0));
+        core_params.insert(
+            "pe_internal_pod_enable",
+            std::to_string(core_pe_internal_pod_enable ? 1 : 0));
+        core_params.insert(
+            "pe_internal_pod_metadata_enable",
+            std::to_string(
+                pe_internal_pod_metadata_enable_cfg_ ? 1 : 0));
+        core_params.insert(
+            "pe_internal_pod_owner_enable",
+            std::to_string(
+                pe_internal_pod_owner_enable_cfg_ ? 1 : 0));
+        core_params.insert(
+            "pe_internal_pod_count",
+            std::to_string(core_pe_internal_pod_count));
+        core_params.insert(
+            "pe_internal_pod_size",
+            std::to_string(core_pe_internal_pod_size));
         // 记录槽位可用性（Phase9：核心槽位 API 改为 CoreShellAPI）
         bool slot_api_ok = isSubComponentLoadableUsingAPI<CoreShellAPI>("core" + std::to_string(i));
 
@@ -2616,19 +6824,68 @@ void MultiCorePE::generateTestTraffic() {
         if (spikes_to_send > 0) {
             PE_LOG(4, "🔥 生成测试流量: %d个脉冲 (已发送%d/%d)\n", 
                             spikes_to_send, test_spikes_sent_, test_max_spikes_);
-            
-            for (int i = 0; i < spikes_to_send; i++) {
-                // 创建测试脉冲
-                int src_neuron = node_id_ * total_neurons_ + (i % total_neurons_);
-                int dst_neuron = test_target_node_ * total_neurons_ + (i % total_neurons_);
 
-                // 使用配置的目标节点，避免被错误地回送到自身
-                SpikeEvent* test_spike = new SpikeEvent(src_neuron, dst_neuron, static_cast<uint32_t>(test_target_node_),
-                                                        test_weight_, current_cycle_);
-                
-                // 发送外部脉冲
-                sendExternalSpike(test_spike);
-                test_spikes_sent_++;
+            if (test_traffic_packet_kind_ == "spikekey_direct_v4") {
+                // 走下面的逐条 per-core synthetic emit 路径，复用 workload=snn 的真实 3D route/spike-comm。
+            } else if (test_traffic_packet_kind_ == "spiketile_bundle_v3") {
+                std::unordered_map<int, std::vector<uint32_t>> batch_by_endpoint;
+                batch_by_endpoint.reserve(static_cast<size_t>(std::max(spikes_to_send, 1)));
+                for (int i = 0; i < spikes_to_send; i++) {
+                    const int local_pre = (i % total_neurons_);
+                    const int src_endpoint = local_pre / std::max(neurons_per_core_, 1);
+                    batch_by_endpoint[src_endpoint].push_back(static_cast<uint32_t>(local_pre));
+                }
+                for (const auto& kv : batch_by_endpoint) {
+                    const int src_endpoint = kv.first;
+                    if (src_endpoint < 0 || src_endpoint >= static_cast<int>(cores_.size()) ||
+                        cores_[src_endpoint] == nullptr) {
+                        continue;
+                    }
+                    const uint64_t emitted =
+                        cores_[src_endpoint]->syntheticEmitNeuronFireBatch(kv.second, current_cycle_);
+                    test_spikes_sent_ += static_cast<int>(emitted);
+                }
+                return;
+            }
+
+            for (int i = 0; i < spikes_to_send; i++) {
+                const int local_pre = (i % total_neurons_);
+                const int src_neuron = node_id_ * total_neurons_ + local_pre;
+                const int dst_neuron = test_target_node_ * total_neurons_ + local_pre;
+                const int src_endpoint = local_pre / std::max(neurons_per_core_, 1);
+                const uint16_t dst_endpoint = static_cast<uint16_t>(src_endpoint);
+                bool emitted = false;
+
+                if (test_traffic_packet_kind_ == "spikekey_direct_v4") {
+                    if (src_endpoint >= 0 && src_endpoint < static_cast<int>(cores_.size()) &&
+                        cores_[src_endpoint] != nullptr) {
+                        emitted = cores_[src_endpoint]->syntheticEmitNeuronFire(
+                            static_cast<uint32_t>(local_pre),
+                            current_cycle_);
+                    }
+                } else if (test_traffic_packet_kind_ == "spikekey") {
+                    auto* pkt = buildSyntheticSpikeKeyPacket_(
+                        static_cast<uint32_t>(node_id_),
+                        static_cast<uint16_t>(src_endpoint),
+                        static_cast<uint32_t>(test_target_node_),
+                        dst_endpoint,
+                        static_cast<uint32_t>(src_neuron),
+                        current_cycle_);
+                    noc_subsys_.sendFromCore(src_endpoint, pkt);
+                    emitted = true;
+                } else {
+                    // 使用配置的目标节点，避免被错误地回送到自身
+                    auto* test_spike = new SpikeEvent(src_neuron,
+                                                      dst_neuron,
+                                                      static_cast<uint32_t>(test_target_node_),
+                                                      test_weight_,
+                                                      current_cycle_);
+                    sendExternalSpike(test_spike);
+                    emitted = true;
+                }
+                if (emitted) {
+                    test_spikes_sent_++;
+                }
             }
         }
     }
@@ -2807,6 +7064,43 @@ void MultiCorePE::requestMemoryAccess(uint64_t address, size_t size,
         static_cast<uint64_t>(address), size);
 }
 
+void MultiCorePE::deliverPacketDirectToCore_(int endpoint_id,
+                                             NocPacketEvent* pkt,
+                                             bool pulse_account_delivery) {
+    if (!pkt) return;
+
+    if (pkt->packetKind() == NocPacketKind::Spike) {
+        if (pulse_account_delivery && pulse_fabric_) {
+            pulse_fabric_->observeIngressDrain();
+            pulse_fabric_->observeCoreQueueEnqueue(endpoint_id);
+        }
+        const bool taken = cores_[endpoint_id]->deliverPacket(pkt);
+        if (pulse_account_delivery && pulse_fabric_) {
+            pulse_fabric_->observeCoreQueueDequeue(endpoint_id);
+        }
+        if (!taken) {
+            output_->fatal(CALL_INFO, -1,
+                           "Phase8(strict): core=%d refused Spike packet (kind=%u); legacy deliverSpike fallback is disabled\n",
+                           endpoint_id, static_cast<unsigned>(pkt->kind));
+        }
+        return;
+    }
+
+    if (pulse_account_delivery && pulse_fabric_) {
+        pulse_fabric_->observeIngressDrain();
+        pulse_fabric_->observeCoreQueueEnqueue(endpoint_id);
+    }
+    const bool taken = cores_[endpoint_id]->deliverPacket(pkt);
+    if (pulse_account_delivery && pulse_fabric_) {
+        pulse_fabric_->observeCoreQueueDequeue(endpoint_id);
+    }
+    if (!taken) {
+        PE_LOG(2, "⚠️ core=%d 未处理 packet(kind=%u)，已回收\n",
+               endpoint_id, static_cast<unsigned>(pkt->kind));
+        delete pkt;
+    }
+}
+
 void MultiCorePE::deliverPacketToEndpoint_(int endpoint_id, NocPacketEvent* pkt) {
     if (!pkt) return;
 
@@ -2843,6 +7137,23 @@ void MultiCorePE::deliverPacketToEndpoint_(int endpoint_id, NocPacketEvent* pkt)
             if (bin < noc_lat_spikekey_hist_.size()) noc_lat_spikekey_hist_[static_cast<size_t>(bin)] += 1;
         }
     }
+    {
+        uint32_t step_seq = pkt->step_seq;
+        if (step_seq == 0 && global_step_active_seq_ != 0) step_seq = global_step_active_seq_;
+        if (step_seq != 0 &&
+            (pkt->packetKind() == NocPacketKind::Spike ||
+             pkt->packetKind() == NocPacketKind::SpikeKey ||
+             pkt->packetKind() == NocPacketKind::SpikeTileKey)) {
+            const bool is_local = (pkt->src_node == static_cast<uint32_t>(node_id_));
+            bool before_begin_gather = true;
+            auto stage_it = stage_marks_.find(step_seq);
+            if (stage_it != stage_marks_.end() && stage_it->second.bg != 0) {
+                before_begin_gather = false;
+            }
+            recordStepRxPacket(step_seq, pkt->packetKind(), is_local, before_begin_gather);
+        }
+    }
+
     if (pkt->packetKind() == NocPacketKind::Spike) {
         // Phase8 (strict): 平台层不再对 Spike packet 做任何 SpikeEvent 语义处理。
         // Spike 的编解码/处理必须由 core/workload 通过 deliverPacket() 完成；
@@ -2857,34 +7168,77 @@ void MultiCorePE::deliverPacketToEndpoint_(int endpoint_id, NocPacketEvent* pkt)
                            "Phase8(strict): endpoint(core)=%d not configured for Spike packet (kind=%u) on node=%d\n",
                            endpoint_id, static_cast<unsigned>(pkt->kind), node_id_);
         }
-        const bool taken = cores_[endpoint_id]->deliverPacket(pkt);
-        if (!taken) {
-            output_->fatal(CALL_INFO, -1,
-                           "Phase8(strict): core=%d refused Spike packet (kind=%u); legacy deliverSpike fallback is disabled\n",
-                           endpoint_id, static_cast<unsigned>(pkt->kind));
+    } else {
+        if (endpoint_id < 0 || endpoint_id >= num_cores_) {
+            PE_LOG(2, "⚠️ 无效 endpoint_id=%d，丢弃 packet(kind=%u)\n",
+                   endpoint_id, static_cast<unsigned>(pkt->kind));
+            delete pkt;
+            return;
         }
-        return; // packet owned by core
+        if (!cores_[endpoint_id]) {
+            PE_LOG(2, "⚠️ endpoint(core)=%d 未配置，丢弃 packet(kind=%u)\n",
+                   endpoint_id, static_cast<unsigned>(pkt->kind));
+            delete pkt;
+            return;
+        }
     }
 
-    if (endpoint_id < 0 || endpoint_id >= num_cores_) {
-        PE_LOG(2, "⚠️ 无效 endpoint_id=%d，丢弃 packet(kind=%u)\n",
-               endpoint_id, static_cast<unsigned>(pkt->kind));
-        delete pkt;
-        return;
-    }
-    if (!cores_[endpoint_id]) {
-        PE_LOG(2, "⚠️ endpoint(core)=%d 未配置，丢弃 packet(kind=%u)\n",
-               endpoint_id, static_cast<unsigned>(pkt->kind));
-        delete pkt;
-        return;
+    PeSharedCoreFabric::IngressDecision pulse_decision =
+        PeSharedCoreFabric::IngressDecision::ForwardToCore;
+    bool pulse_account_delivery = false;
+    if (pulse_fabric_) {
+        PeSharedCoreFabric::IngressObservation pulse_obs{};
+        pulse_obs.kind = pulsePacketKindFromNoc_(pkt->packetKind());
+        pulse_obs.endpoint_id = endpoint_id;
+        pulse_obs.bytes = static_cast<uint32_t>(pkt->payload.size());
+        pulse_obs.step_seq = pkt->step_seq;
+        const PulseDescriptorSurrogate_ pulse_descriptor =
+            buildPulseDescriptorSurrogate_(*pkt, global_layout_);
+        pulse_obs.descriptor_surrogate_valid = pulse_descriptor.valid;
+        pulse_obs.descriptor_post_block_id = pulse_descriptor.post_block_id;
+        pulse_obs.descriptor_weight_region_id = pulse_descriptor.weight_region_id;
+        pulse_obs.descriptor_retire_domain_id = pulse_descriptor.retire_domain_id;
+        pulse_obs.descriptor_region_safe = pulse_descriptor.region_safe;
+        pulse_decision = pulse_fabric_->observeIngress(pulse_obs);
+        pulse_account_delivery = true;
+        if (pulse_fabric_->config().harbor_enable &&
+            pulseActualIngressEligible_(pkt->packetKind())) {
+            uint32_t harbor_step_seq = pkt->step_seq;
+            if (harbor_step_seq == 0 && global_step_active_seq_ != 0) {
+                harbor_step_seq = global_step_active_seq_;
+            }
+            bool gather_open = (harbor_step_seq != 0);
+            if (gather_open) {
+                auto stage_it = stage_marks_.find(harbor_step_seq);
+                if (stage_it != stage_marks_.end() && stage_it->second.ga != 0) {
+                    gather_open = false;
+                }
+            }
+            if (gather_open) {
+                pulse_obs.step_seq = harbor_step_seq;
+                pulse_fabric_->observeGatherHarbor(pulse_obs);
+            }
+        }
     }
 
-    const bool taken = cores_[endpoint_id]->deliverPacket(pkt);
-    if (!taken) {
-        PE_LOG(2, "⚠️ core=%d 未处理 packet(kind=%u)，已回收\n",
-               endpoint_id, static_cast<unsigned>(pkt->kind));
-        delete pkt;
+    if (pulseActualIngressEnabled_() &&
+        pulse_decision == PeSharedCoreFabric::IngressDecision::ForwardToCore &&
+        pulseActualIngressEligible_(pkt->packetKind())) {
+        const uint64_t token = pulse_next_dispatch_token_++;
+        if (pulse_next_dispatch_token_ == 0) pulse_next_dispatch_token_ = 1;
+        if (pulse_fabric_->enqueueDispatchToken(token, endpoint_id)) {
+            pulse_fabric_->observeSharedIngressBuffered();
+            pulse_ingress_buffered_packets_.emplace(
+                token,
+                PulseIngressBufferedPacket{token, endpoint_id, pkt});
+            return;
+        }
     }
+
+    if (pulse_account_delivery && pulse_fabric_) {
+        pulse_fabric_->observeDirectDeliver();
+    }
+    deliverPacketDirectToCore_(endpoint_id, pkt, pulse_account_delivery);
 }
 
 void MultiCorePE::resetAllCoreMembranes() {

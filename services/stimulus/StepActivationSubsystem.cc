@@ -133,20 +133,54 @@ void StepActivationSubsystem::onBeginGather(uint32_t seq, uint64_t ts_ns, int co
     if (!cfg_.enable) return;
     if (cfg_.period_cycles != 0) return;
 
+    const bool trace_step_path =
+        rt_.log &&
+        rt_.node_id == 0 &&
+        seq <= 2 &&
+        core_id >= 15;
+    if (trace_step_path) {
+        STEP_LOG(2,
+                 "[[sentinel-step-path]] node=%d core=%d seq=%u step_activation onBeginGather enter ready=%d last=%u pending=%d trigger_core=%d\n",
+                 rt_.node_id, core_id, seq, injection_ready_ ? 1 : 0,
+                 last_injection_seq_, pending_step_inject_ ? 1 : 0, cfg_.trigger_core);
+    }
+
     const bool core_ok = (cfg_.trigger_core < 0) ||
                          (core_id < 0) ||
                          (core_id == cfg_.trigger_core);
-    if (!core_ok) return;
+    if (!core_ok) {
+        if (trace_step_path) {
+            STEP_LOG(2,
+                     "[[sentinel-step-path]] node=%d core=%d seq=%u step_activation onBeginGather filtered_by_trigger\n",
+                     rt_.node_id, core_id, seq);
+        }
+        return;
+    }
 
     const bool first_inject = (last_injection_seq_ == std::numeric_limits<uint32_t>::max());
     if (first_inject || seq > last_injection_seq_) {
         if (injection_ready_) {
+            if (trace_step_path) {
+                STEP_LOG(2,
+                         "[[sentinel-step-path]] node=%d core=%d seq=%u step_activation before_inject\n",
+                         rt_.node_id, core_id, seq);
+            }
             injectStepActivations_(seq, ts_ns);
             last_injection_seq_ = seq;
+            if (trace_step_path) {
+                STEP_LOG(2,
+                         "[[sentinel-step-path]] node=%d core=%d seq=%u step_activation after_inject\n",
+                         rt_.node_id, core_id, seq);
+            }
         } else {
             pending_step_inject_ = true;
             pending_step_seq_ = seq;
             pending_step_ts_ns_ = ts_ns;
+            if (trace_step_path) {
+                STEP_LOG(2,
+                         "[[sentinel-step-path]] node=%d core=%d seq=%u step_activation deferred_pending\n",
+                         rt_.node_id, core_id, seq);
+            }
         }
     } else {
         // 多核/全局 step 同步场景下，同一个 seq 可能会重复触发 BeginGather（属于正常现象，静默忽略）。
@@ -158,6 +192,11 @@ void StepActivationSubsystem::onBeginGather(uint32_t seq, uint64_t ts_ns, int co
                 ++seq_warn_count_;
             }
         }
+    }
+    if (trace_step_path) {
+        STEP_LOG(2,
+                 "[[sentinel-step-path]] node=%d core=%d seq=%u step_activation onBeginGather exit\n",
+                 rt_.node_id, core_id, seq);
     }
 }
 
@@ -476,6 +515,9 @@ void StepActivationSubsystem::injectStepActivations_(uint32_t seq, uint64_t sim_
     if (st_.route_hits && route_hits) st_.route_hits->addData(route_hits);
     if (st_.route_misses && route_misses) st_.route_misses->addData(route_misses);
     if (st_.local_drops && local_drops) st_.local_drops->addData(local_drops);
+    if (rt_.report_injection_summary) {
+        rt_.report_injection_summary(seq, sources_selected, spike_attempts, spikes_injected, route_hits, route_misses, local_drops);
+    }
 
     if (rt_.log && rt_.log->getVerboseLevel() >= 1) {
         STEP_LOG(1,

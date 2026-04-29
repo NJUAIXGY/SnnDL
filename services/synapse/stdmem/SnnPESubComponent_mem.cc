@@ -55,10 +55,10 @@ void SnnPESubComponent::initStdMemPhase0_() {
                                                    &SnnPESubComponent::handleMemoryResponse<SST::Interfaces::StandardMem::Request>>(this));
 
     // bind endpoint for control-plane sends (Begin/EndGather etc.)
-    // Phase6：stream workload 需要“纯内存语义”，强制设置 non-cacheable（同时保留 env fallback 兼容路径）。
+    // Phase6：stream/traffic_mem workload 需要“纯内存语义”，强制设置 non-cacheable（同时保留 env fallback 兼容路径）。
     {
         StdMemEndpoint::Config cfg{};
-        cfg.force_noncacheable = isStreamWorkload_();
+        cfg.force_noncacheable = isStreamLikeWorkload_();
         stdmem_ep_->configure(cfg);
     }
     StdMemEndpoint::Runtime rt{};

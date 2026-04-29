@@ -208,11 +208,17 @@ am_libSnnDL_la_OBJECTS = events/SimpleTestEvent.lo \
 	services/synapse/weights/SnnWeightDiagnostics.lo \
 	components/noc/SnnNetworkAdapter.lo \
 	components/noc/MulticastRouter.lo \
+	components/noc3d/MulticastRouter3DNative.lo \
+	components/noc3d/Noc3DSmokeSource.lo \
+	components/noc3d/Noc3DSmokeSink.lo \
+	components/noc3d/HBMStackStub.lo \
 	components/noc/MulticastNIC.lo \
 	services/synapse/route/SnnRouteProvider.lo \
+	services/synapse/route/SpikeNocCodec.lo \
 	services/synapse/route/BcsrRouteBuilder.lo \
 	services/synapse/route/StepBcsrReachability.lo \
 	services/synapse/route/SynapseRouteSubsystem.lo \
+	services/synapse/route3d/SynapseRouteSubsystem3D.lo \
 	services/stimulus/StepActivationSubsystem.lo \
 	services/stimulus/ExternalSpikeInputSubsystem.lo \
 	services/noc/NocSubsystem.lo \
@@ -222,12 +228,28 @@ am_libSnnDL_la_OBJECTS = events/SimpleTestEvent.lo \
 	services/synapse/route/SpikeCommSubsystem.lo \
 	services/synapse/route/SpikePacketBridge.lo \
 	services/workload/CoreWorkloadFactory.lo \
+	services/workload/common/SnnAccelBackend.lo \
 	services/workload/layout/NormalizedNeuronLayout.lo \
+	services/workload/riscv_snn/RiscvSnnBootDriver.lo \
+	services/workload/riscv_snn/RiscvSnnFirmwareLoader.lo \
+	services/workload/riscv_snn/RiscvSnnHart.lo \
+	services/workload/riscv_snn/RiscvSnnIss.lo \
+	services/workload/riscv_snn/RiscvSnnRuntimeBridgeBackend.lo \
+	services/workload/riscv_snn/RiscvSnnShadowTransportExport.lo \
+	services/workload/riscv_snn/RiscvSnnShadowRuntimeServices.lo \
+	services/workload/riscv_snn/RiscvSnnWorkload.lo \
 	services/workload/snn/SnnWorkload.lo \
 	services/workload/stream/StreamWorkload.lo \
 	services/workload/traffic/TrafficWorkload.lo \
+	services/workload/traffic_mem/TrafficMemWorkload.lo \
 	services/workload/tensor/TensorWorkload.lo \
 	services/memory/sram_sim/model/BankedSramModel.lo \
+	services/local_storage/LocalStorageHierarchyController.lo \
+	services/local_storage/PeWeightObjectPlane.lo \
+	services/memory/DmaMemAccessProxy.lo \
+	services/pe_fabric/PulseAgendaScorer.lo \
+	services/pe_fabric/PeSharedCoreFabric.lo \
+	services/memory/PeDmaScheduler.lo \
 	services/memory/StandardMemAccess.lo
 libSnnDL_la_OBJECTS = $(am_libSnnDL_la_OBJECTS)
 AM_V_lt = $(am__v_lt_$(V))
@@ -267,6 +289,10 @@ am__depfiles_remade = components/$(DEPDIR)/CachelineFragmentMemIF.Plo \
 	components/noc/$(DEPDIR)/MulticastRouter.Plo \
 	components/noc/$(DEPDIR)/SimpleNetworkWrapper.Plo \
 	components/noc/$(DEPDIR)/SnnNetworkAdapter.Plo \
+	components/noc3d/$(DEPDIR)/HBMStackStub.Plo \
+	components/noc3d/$(DEPDIR)/MulticastRouter3DNative.Plo \
+	components/noc3d/$(DEPDIR)/Noc3DSmokeSink.Plo \
+	components/noc3d/$(DEPDIR)/Noc3DSmokeSource.Plo \
 	components/stimulus/$(DEPDIR)/SpikeSource.Plo \
 	components/workload_stats/$(DEPDIR)/WorkloadStatsRegistry.Plo \
 	compute/$(DEPDIR)/SnnComputeCore.Plo \
@@ -281,10 +307,16 @@ am__depfiles_remade = components/$(DEPDIR)/CachelineFragmentMemIF.Plo \
 	control/$(DEPDIR)/SnnPESubComponent_spike.Plo \
 	events/$(DEPDIR)/SimpleTestEvent.Plo \
 	events/$(DEPDIR)/SpikeEventWrapper.Plo \
+	services/local_storage/$(DEPDIR)/LocalStorageHierarchyController.Plo \
+	services/local_storage/$(DEPDIR)/PeWeightObjectPlane.Plo \
+	services/memory/$(DEPDIR)/DmaMemAccessProxy.Plo \
+	services/memory/$(DEPDIR)/PeDmaScheduler.Plo \
 	services/memory/$(DEPDIR)/StandardMemAccess.Plo \
 	services/memory/sram_sim/model/$(DEPDIR)/BankedSramModel.Plo \
 	services/noc/$(DEPDIR)/NocSubsystem.Plo \
 	services/noc/$(DEPDIR)/OptimizedInternalRing.Plo \
+	services/pe_fabric/$(DEPDIR)/PeSharedCoreFabric.Plo \
+	services/pe_fabric/$(DEPDIR)/PulseAgendaScorer.Plo \
 	services/stimulus/$(DEPDIR)/ExternalSpikeInputSubsystem.Plo \
 	services/stimulus/$(DEPDIR)/StepActivationSubsystem.Plo \
 	services/synapse/gas/$(DEPDIR)/AccumulatorOps.Plo \
@@ -293,9 +325,11 @@ am__depfiles_remade = components/$(DEPDIR)/CachelineFragmentMemIF.Plo \
 	services/synapse/route/$(DEPDIR)/BcsrRouteBuilder.Plo \
 	services/synapse/route/$(DEPDIR)/SnnRouteProvider.Plo \
 	services/synapse/route/$(DEPDIR)/SpikeCommSubsystem.Plo \
+	services/synapse/route/$(DEPDIR)/SpikeNocCodec.Plo \
 	services/synapse/route/$(DEPDIR)/SpikePacketBridge.Plo \
 	services/synapse/route/$(DEPDIR)/StepBcsrReachability.Plo \
 	services/synapse/route/$(DEPDIR)/SynapseRouteSubsystem.Plo \
+	services/synapse/route3d/$(DEPDIR)/SynapseRouteSubsystem3D.Plo \
 	services/synapse/stdmem/$(DEPDIR)/SnnPESubComponent_mem.Plo \
 	services/synapse/stdmem/$(DEPDIR)/StdMemEndpoint.Plo \
 	services/synapse/weights/$(DEPDIR)/SnnBcsrWeightManager.Plo \
@@ -304,11 +338,21 @@ am__depfiles_remade = components/$(DEPDIR)/CachelineFragmentMemIF.Plo \
 	services/synapse/weights/$(DEPDIR)/WeightCacheOps.Plo \
 	services/synapse/weights/$(DEPDIR)/WeightMemorySubsystem.Plo \
 	services/workload/$(DEPDIR)/CoreWorkloadFactory.Plo \
+	services/workload/common/$(DEPDIR)/SnnAccelBackend.Plo \
 	services/workload/layout/$(DEPDIR)/NormalizedNeuronLayout.Plo \
+	services/workload/riscv_snn/$(DEPDIR)/RiscvSnnBootDriver.Plo \
+	services/workload/riscv_snn/$(DEPDIR)/RiscvSnnFirmwareLoader.Plo \
+	services/workload/riscv_snn/$(DEPDIR)/RiscvSnnHart.Plo \
+	services/workload/riscv_snn/$(DEPDIR)/RiscvSnnIss.Plo \
+	services/workload/riscv_snn/$(DEPDIR)/RiscvSnnRuntimeBridgeBackend.Plo \
+	services/workload/riscv_snn/$(DEPDIR)/RiscvSnnShadowRuntimeServices.Plo \
+	services/workload/riscv_snn/$(DEPDIR)/RiscvSnnShadowTransportExport.Plo \
+	services/workload/riscv_snn/$(DEPDIR)/RiscvSnnWorkload.Plo \
 	services/workload/snn/$(DEPDIR)/SnnWorkload.Plo \
 	services/workload/stream/$(DEPDIR)/StreamWorkload.Plo \
 	services/workload/tensor/$(DEPDIR)/TensorWorkload.Plo \
-	services/workload/traffic/$(DEPDIR)/TrafficWorkload.Plo
+	services/workload/traffic/$(DEPDIR)/TrafficWorkload.Plo \
+	services/workload/traffic_mem/$(DEPDIR)/TrafficMemWorkload.Plo
 am__mv = mv -f
 CXXCOMPILE = $(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) \
 	$(AM_CPPFLAGS) $(CPPFLAGS) $(AM_CXXFLAGS) $(CXXFLAGS)
@@ -645,10 +689,14 @@ libSnnDL_la_SOURCES = \
 	api/IGasStageSink.h \
 	api/IGasStepGate.h \
 	api/IGlobalStepHooks.h \
-	api/ITassLfP0Hooks.h \
 	api/ICoreMemoryLink.h \
 	api/IMemoryAccess.h \
+	api/IDmaTaggedAccess.h \
+	api/IDmaSchedulerProvider.h \
+	api/IPeSharedCoreFabricProvider.h \
+	api/ILocalStorageProvider.h \
 	api/ICoreWorkload.h \
+	api/ISnnAccelRuntimeServices.h \
 	api/ISpikeWorkload.h \
 	api/WorkloadConfig.h \
 	api/CoreWorkloadFactory.h \
@@ -737,17 +785,31 @@ libSnnDL_la_SOURCES = \
 	components/noc/SnnNetworkAdapter.h \
 	components/noc/MulticastRouter.cc \
 	components/noc/MulticastRouter.h \
+	components/noc3d/MulticastRouter3DNative.cc \
+	components/noc3d/MulticastRouter3DNative.h \
+	components/noc3d/MulticastRouter3DNativeConfig.h \
+	components/noc3d/Noc3DSmokeSource.cc \
+	components/noc3d/Noc3DSmokeSource.h \
+	components/noc3d/Noc3DSmokeSink.cc \
+	components/noc3d/Noc3DSmokeSink.h \
+	components/noc3d/HBMStackStub.cc \
+	components/noc3d/HBMStackStub.h \
 	components/noc/MulticastNIC.cc \
 	components/noc/MulticastNIC.h \
 	services/SnnProfiler.h \
 	services/synapse/route/SnnRouteProvider.cc \
 	services/synapse/route/SnnRouteProvider.h \
+	services/synapse/route/SpikeNocCodec.cc \
+	services/synapse/route/SpikeNocCodec.h \
 	services/synapse/route/BcsrRouteBuilder.cc \
 	services/synapse/route/BcsrRouteBuilder.h \
 	services/synapse/route/StepBcsrReachability.cc \
 	services/synapse/route/StepBcsrReachability.h \
 	services/synapse/route/SynapseRouteSubsystem.cc \
 	services/synapse/route/SynapseRouteSubsystem.h \
+	services/synapse/route3d/Route3DNodeMapper.h \
+	services/synapse/route3d/SynapseRouteSubsystem3D.cc \
+	services/synapse/route3d/SynapseRouteSubsystem3D.h \
 	services/stimulus/StepActivationSubsystem.cc \
 	services/stimulus/StepActivationSubsystem.h \
 	services/stimulus/ExternalSpikeInputSubsystem.cc \
@@ -766,19 +828,60 @@ libSnnDL_la_SOURCES = \
 	services/synapse/route/SpikePacketBridge.cc \
 	services/synapse/route/SpikePacketBridge.h \
 	services/workload/CoreWorkloadFactory.cc \
+	services/workload/common/SnnAccelBackend.cc \
+	services/workload/common/SnnAccelBackend.h \
+	services/workload/common/SnnAccelBackendContract.h \
 	services/workload/layout/NormalizedNeuronLayout.cc \
 	services/workload/layout/NormalizedNeuronLayout.h \
+	services/workload/riscv_snn/RiscvSnnAbi.h \
+	services/workload/riscv_snn/RiscvSnnAsm.h \
+	services/workload/riscv_snn/RiscvSnnBootDriver.cc \
+	services/workload/riscv_snn/RiscvSnnBootDriver.h \
+	services/workload/riscv_snn/RiscvSnnElfWriter.h \
+	services/workload/riscv_snn/RiscvSnnFirmwareLoader.cc \
+	services/workload/riscv_snn/RiscvSnnFirmwareLoader.h \
+	services/workload/riscv_snn/RiscvSnnHart.cc \
+	services/workload/riscv_snn/RiscvSnnHart.h \
+	services/workload/riscv_snn/RiscvSnnIss.cc \
+	services/workload/riscv_snn/RiscvSnnIss.h \
+	services/workload/riscv_snn/RiscvSnnMemoryImage.h \
+	services/workload/riscv_snn/RiscvSnnQueueContract.h \
+	services/workload/riscv_snn/RiscvSnnRuntimeBridgeBackend.cc \
+	services/workload/riscv_snn/RiscvSnnRuntimeBridgeBackend.h \
+	services/workload/riscv_snn/RiscvSnnSampleFirmware.h \
+	services/workload/riscv_snn/RiscvSnnShadowTransportExport.cc \
+	services/workload/riscv_snn/RiscvSnnShadowTransportExport.h \
+	services/workload/riscv_snn/RiscvSnnShadowRuntimeServices.cc \
+	services/workload/riscv_snn/RiscvSnnShadowRuntimeServices.h \
+	services/workload/riscv_snn/RiscvSnnWorkload.cc \
+	services/workload/riscv_snn/RiscvSnnWorkload.h \
 	services/workload/snn/SnnWorkload.cc \
 	services/workload/snn/SnnWorkload.h \
 	services/workload/stream/StreamWorkload.cc \
 	services/workload/stream/StreamWorkload.h \
 	services/workload/traffic/TrafficWorkload.cc \
 	services/workload/traffic/TrafficWorkload.h \
+	services/workload/traffic_mem/TrafficMemWorkload.cc \
+	services/workload/traffic_mem/TrafficMemWorkload.h \
 	services/workload/tensor/TensorWorkload.cc \
 	services/workload/tensor/TensorWorkload.h \
 	services/memory/sram_sim/layout/VirtualSramLayout.h \
 	services/memory/sram_sim/model/BankedSramModel.cc \
 	services/memory/sram_sim/model/BankedSramModel.h \
+	services/local_storage/LocalStorageTypes.h \
+	services/local_storage/LocalStorageHierarchyController.cc \
+	services/local_storage/LocalStorageHierarchyController.h \
+	services/local_storage/PeWeightObjectPlane.cc \
+	services/local_storage/PeWeightObjectPlane.h \
+	services/memory/DmaMemAccessProxy.cc \
+	services/memory/DmaMemAccessProxy.h \
+	services/pe_fabric/PulseAgendaScorer.cc \
+	services/pe_fabric/PulseAgendaScorer.h \
+	services/pe_fabric/PulseDescriptor.h \
+	services/pe_fabric/PeSharedCoreFabric.cc \
+	services/pe_fabric/PeSharedCoreFabric.h \
+	services/memory/PeDmaScheduler.cc \
+	services/memory/PeDmaScheduler.h \
 	services/memory/StandardMemAccess.cc \
 	services/memory/StandardMemAccess.h
 
@@ -787,6 +890,7 @@ libSnnDL_la_SOURCES = \
 # Note: sources above already include GatherBufferIF / MemKCalBench / MPI files.
 #
 libSnnDL_la_LDFLAGS = -module -avoid-version
+RISCV_SNN_TEST_LINK = $(CXXLD) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(CXXFLAGS)
 all: all-am
 
 .SUFFIXES:
@@ -1033,6 +1137,22 @@ components/noc/SnnNetworkAdapter.lo: components/noc/$(am__dirstamp) \
 	components/noc/$(DEPDIR)/$(am__dirstamp)
 components/noc/MulticastRouter.lo: components/noc/$(am__dirstamp) \
 	components/noc/$(DEPDIR)/$(am__dirstamp)
+components/noc3d/$(am__dirstamp):
+	@$(MKDIR_P) components/noc3d
+	@: > components/noc3d/$(am__dirstamp)
+components/noc3d/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) components/noc3d/$(DEPDIR)
+	@: > components/noc3d/$(DEPDIR)/$(am__dirstamp)
+components/noc3d/MulticastRouter3DNative.lo:  \
+	components/noc3d/$(am__dirstamp) \
+	components/noc3d/$(DEPDIR)/$(am__dirstamp)
+components/noc3d/Noc3DSmokeSource.lo:  \
+	components/noc3d/$(am__dirstamp) \
+	components/noc3d/$(DEPDIR)/$(am__dirstamp)
+components/noc3d/Noc3DSmokeSink.lo: components/noc3d/$(am__dirstamp) \
+	components/noc3d/$(DEPDIR)/$(am__dirstamp)
+components/noc3d/HBMStackStub.lo: components/noc3d/$(am__dirstamp) \
+	components/noc3d/$(DEPDIR)/$(am__dirstamp)
 components/noc/MulticastNIC.lo: components/noc/$(am__dirstamp) \
 	components/noc/$(DEPDIR)/$(am__dirstamp)
 services/synapse/route/$(am__dirstamp):
@@ -1044,6 +1164,9 @@ services/synapse/route/$(DEPDIR)/$(am__dirstamp):
 services/synapse/route/SnnRouteProvider.lo:  \
 	services/synapse/route/$(am__dirstamp) \
 	services/synapse/route/$(DEPDIR)/$(am__dirstamp)
+services/synapse/route/SpikeNocCodec.lo:  \
+	services/synapse/route/$(am__dirstamp) \
+	services/synapse/route/$(DEPDIR)/$(am__dirstamp)
 services/synapse/route/BcsrRouteBuilder.lo:  \
 	services/synapse/route/$(am__dirstamp) \
 	services/synapse/route/$(DEPDIR)/$(am__dirstamp)
@@ -1053,6 +1176,15 @@ services/synapse/route/StepBcsrReachability.lo:  \
 services/synapse/route/SynapseRouteSubsystem.lo:  \
 	services/synapse/route/$(am__dirstamp) \
 	services/synapse/route/$(DEPDIR)/$(am__dirstamp)
+services/synapse/route3d/$(am__dirstamp):
+	@$(MKDIR_P) services/synapse/route3d
+	@: > services/synapse/route3d/$(am__dirstamp)
+services/synapse/route3d/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) services/synapse/route3d/$(DEPDIR)
+	@: > services/synapse/route3d/$(DEPDIR)/$(am__dirstamp)
+services/synapse/route3d/SynapseRouteSubsystem3D.lo:  \
+	services/synapse/route3d/$(am__dirstamp) \
+	services/synapse/route3d/$(DEPDIR)/$(am__dirstamp)
 services/stimulus/$(am__dirstamp):
 	@$(MKDIR_P) services/stimulus
 	@: > services/stimulus/$(am__dirstamp)
@@ -1091,6 +1223,15 @@ services/workload/$(DEPDIR)/$(am__dirstamp):
 services/workload/CoreWorkloadFactory.lo:  \
 	services/workload/$(am__dirstamp) \
 	services/workload/$(DEPDIR)/$(am__dirstamp)
+services/workload/common/$(am__dirstamp):
+	@$(MKDIR_P) services/workload/common
+	@: > services/workload/common/$(am__dirstamp)
+services/workload/common/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) services/workload/common/$(DEPDIR)
+	@: > services/workload/common/$(DEPDIR)/$(am__dirstamp)
+services/workload/common/SnnAccelBackend.lo:  \
+	services/workload/common/$(am__dirstamp) \
+	services/workload/common/$(DEPDIR)/$(am__dirstamp)
 services/workload/layout/$(am__dirstamp):
 	@$(MKDIR_P) services/workload/layout
 	@: > services/workload/layout/$(am__dirstamp)
@@ -1100,6 +1241,36 @@ services/workload/layout/$(DEPDIR)/$(am__dirstamp):
 services/workload/layout/NormalizedNeuronLayout.lo:  \
 	services/workload/layout/$(am__dirstamp) \
 	services/workload/layout/$(DEPDIR)/$(am__dirstamp)
+services/workload/riscv_snn/$(am__dirstamp):
+	@$(MKDIR_P) services/workload/riscv_snn
+	@: > services/workload/riscv_snn/$(am__dirstamp)
+services/workload/riscv_snn/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) services/workload/riscv_snn/$(DEPDIR)
+	@: > services/workload/riscv_snn/$(DEPDIR)/$(am__dirstamp)
+services/workload/riscv_snn/RiscvSnnBootDriver.lo:  \
+	services/workload/riscv_snn/$(am__dirstamp) \
+	services/workload/riscv_snn/$(DEPDIR)/$(am__dirstamp)
+services/workload/riscv_snn/RiscvSnnFirmwareLoader.lo:  \
+	services/workload/riscv_snn/$(am__dirstamp) \
+	services/workload/riscv_snn/$(DEPDIR)/$(am__dirstamp)
+services/workload/riscv_snn/RiscvSnnHart.lo:  \
+	services/workload/riscv_snn/$(am__dirstamp) \
+	services/workload/riscv_snn/$(DEPDIR)/$(am__dirstamp)
+services/workload/riscv_snn/RiscvSnnIss.lo:  \
+	services/workload/riscv_snn/$(am__dirstamp) \
+	services/workload/riscv_snn/$(DEPDIR)/$(am__dirstamp)
+services/workload/riscv_snn/RiscvSnnRuntimeBridgeBackend.lo:  \
+	services/workload/riscv_snn/$(am__dirstamp) \
+	services/workload/riscv_snn/$(DEPDIR)/$(am__dirstamp)
+services/workload/riscv_snn/RiscvSnnShadowTransportExport.lo:  \
+	services/workload/riscv_snn/$(am__dirstamp) \
+	services/workload/riscv_snn/$(DEPDIR)/$(am__dirstamp)
+services/workload/riscv_snn/RiscvSnnShadowRuntimeServices.lo:  \
+	services/workload/riscv_snn/$(am__dirstamp) \
+	services/workload/riscv_snn/$(DEPDIR)/$(am__dirstamp)
+services/workload/riscv_snn/RiscvSnnWorkload.lo:  \
+	services/workload/riscv_snn/$(am__dirstamp) \
+	services/workload/riscv_snn/$(DEPDIR)/$(am__dirstamp)
 services/workload/snn/$(am__dirstamp):
 	@$(MKDIR_P) services/workload/snn
 	@: > services/workload/snn/$(am__dirstamp)
@@ -1127,6 +1298,15 @@ services/workload/traffic/$(DEPDIR)/$(am__dirstamp):
 services/workload/traffic/TrafficWorkload.lo:  \
 	services/workload/traffic/$(am__dirstamp) \
 	services/workload/traffic/$(DEPDIR)/$(am__dirstamp)
+services/workload/traffic_mem/$(am__dirstamp):
+	@$(MKDIR_P) services/workload/traffic_mem
+	@: > services/workload/traffic_mem/$(am__dirstamp)
+services/workload/traffic_mem/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) services/workload/traffic_mem/$(DEPDIR)
+	@: > services/workload/traffic_mem/$(DEPDIR)/$(am__dirstamp)
+services/workload/traffic_mem/TrafficMemWorkload.lo:  \
+	services/workload/traffic_mem/$(am__dirstamp) \
+	services/workload/traffic_mem/$(DEPDIR)/$(am__dirstamp)
 services/workload/tensor/$(am__dirstamp):
 	@$(MKDIR_P) services/workload/tensor
 	@: > services/workload/tensor/$(am__dirstamp)
@@ -1145,12 +1325,40 @@ services/memory/sram_sim/model/$(DEPDIR)/$(am__dirstamp):
 services/memory/sram_sim/model/BankedSramModel.lo:  \
 	services/memory/sram_sim/model/$(am__dirstamp) \
 	services/memory/sram_sim/model/$(DEPDIR)/$(am__dirstamp)
+services/local_storage/$(am__dirstamp):
+	@$(MKDIR_P) services/local_storage
+	@: > services/local_storage/$(am__dirstamp)
+services/local_storage/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) services/local_storage/$(DEPDIR)
+	@: > services/local_storage/$(DEPDIR)/$(am__dirstamp)
+services/local_storage/LocalStorageHierarchyController.lo:  \
+	services/local_storage/$(am__dirstamp) \
+	services/local_storage/$(DEPDIR)/$(am__dirstamp)
+services/local_storage/PeWeightObjectPlane.lo:  \
+	services/local_storage/$(am__dirstamp) \
+	services/local_storage/$(DEPDIR)/$(am__dirstamp)
 services/memory/$(am__dirstamp):
 	@$(MKDIR_P) services/memory
 	@: > services/memory/$(am__dirstamp)
 services/memory/$(DEPDIR)/$(am__dirstamp):
 	@$(MKDIR_P) services/memory/$(DEPDIR)
 	@: > services/memory/$(DEPDIR)/$(am__dirstamp)
+services/memory/DmaMemAccessProxy.lo: services/memory/$(am__dirstamp) \
+	services/memory/$(DEPDIR)/$(am__dirstamp)
+services/pe_fabric/$(am__dirstamp):
+	@$(MKDIR_P) services/pe_fabric
+	@: > services/pe_fabric/$(am__dirstamp)
+services/pe_fabric/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) services/pe_fabric/$(DEPDIR)
+	@: > services/pe_fabric/$(DEPDIR)/$(am__dirstamp)
+services/pe_fabric/PulseAgendaScorer.lo:  \
+	services/pe_fabric/$(am__dirstamp) \
+	services/pe_fabric/$(DEPDIR)/$(am__dirstamp)
+services/pe_fabric/PeSharedCoreFabric.lo:  \
+	services/pe_fabric/$(am__dirstamp) \
+	services/pe_fabric/$(DEPDIR)/$(am__dirstamp)
+services/memory/PeDmaScheduler.lo: services/memory/$(am__dirstamp) \
+	services/memory/$(DEPDIR)/$(am__dirstamp)
 services/memory/StandardMemAccess.lo: services/memory/$(am__dirstamp) \
 	services/memory/$(DEPDIR)/$(am__dirstamp)
 
@@ -1171,6 +1379,8 @@ mostlyclean-compile:
 	-rm -f components/multicore/*.lo
 	-rm -f components/noc/*.$(OBJEXT)
 	-rm -f components/noc/*.lo
+	-rm -f components/noc3d/*.$(OBJEXT)
+	-rm -f components/noc3d/*.lo
 	-rm -f components/stimulus/*.$(OBJEXT)
 	-rm -f components/stimulus/*.lo
 	-rm -f components/workload_stats/*.$(OBJEXT)
@@ -1181,26 +1391,36 @@ mostlyclean-compile:
 	-rm -f control/*.lo
 	-rm -f events/*.$(OBJEXT)
 	-rm -f events/*.lo
+	-rm -f services/local_storage/*.$(OBJEXT)
+	-rm -f services/local_storage/*.lo
 	-rm -f services/memory/*.$(OBJEXT)
 	-rm -f services/memory/*.lo
 	-rm -f services/memory/sram_sim/model/*.$(OBJEXT)
 	-rm -f services/memory/sram_sim/model/*.lo
 	-rm -f services/noc/*.$(OBJEXT)
 	-rm -f services/noc/*.lo
+	-rm -f services/pe_fabric/*.$(OBJEXT)
+	-rm -f services/pe_fabric/*.lo
 	-rm -f services/stimulus/*.$(OBJEXT)
 	-rm -f services/stimulus/*.lo
 	-rm -f services/synapse/gas/*.$(OBJEXT)
 	-rm -f services/synapse/gas/*.lo
 	-rm -f services/synapse/route/*.$(OBJEXT)
 	-rm -f services/synapse/route/*.lo
+	-rm -f services/synapse/route3d/*.$(OBJEXT)
+	-rm -f services/synapse/route3d/*.lo
 	-rm -f services/synapse/stdmem/*.$(OBJEXT)
 	-rm -f services/synapse/stdmem/*.lo
 	-rm -f services/synapse/weights/*.$(OBJEXT)
 	-rm -f services/synapse/weights/*.lo
 	-rm -f services/workload/*.$(OBJEXT)
 	-rm -f services/workload/*.lo
+	-rm -f services/workload/common/*.$(OBJEXT)
+	-rm -f services/workload/common/*.lo
 	-rm -f services/workload/layout/*.$(OBJEXT)
 	-rm -f services/workload/layout/*.lo
+	-rm -f services/workload/riscv_snn/*.$(OBJEXT)
+	-rm -f services/workload/riscv_snn/*.lo
 	-rm -f services/workload/snn/*.$(OBJEXT)
 	-rm -f services/workload/snn/*.lo
 	-rm -f services/workload/stream/*.$(OBJEXT)
@@ -1209,6 +1429,8 @@ mostlyclean-compile:
 	-rm -f services/workload/tensor/*.lo
 	-rm -f services/workload/traffic/*.$(OBJEXT)
 	-rm -f services/workload/traffic/*.lo
+	-rm -f services/workload/traffic_mem/*.$(OBJEXT)
+	-rm -f services/workload/traffic_mem/*.lo
 
 distclean-compile:
 	-rm -f *.tab.c
@@ -1229,6 +1451,10 @@ include components/noc/$(DEPDIR)/MulticastNIC.Plo # am--include-marker
 include components/noc/$(DEPDIR)/MulticastRouter.Plo # am--include-marker
 include components/noc/$(DEPDIR)/SimpleNetworkWrapper.Plo # am--include-marker
 include components/noc/$(DEPDIR)/SnnNetworkAdapter.Plo # am--include-marker
+include components/noc3d/$(DEPDIR)/HBMStackStub.Plo # am--include-marker
+include components/noc3d/$(DEPDIR)/MulticastRouter3DNative.Plo # am--include-marker
+include components/noc3d/$(DEPDIR)/Noc3DSmokeSink.Plo # am--include-marker
+include components/noc3d/$(DEPDIR)/Noc3DSmokeSource.Plo # am--include-marker
 include components/stimulus/$(DEPDIR)/SpikeSource.Plo # am--include-marker
 include components/workload_stats/$(DEPDIR)/WorkloadStatsRegistry.Plo # am--include-marker
 include compute/$(DEPDIR)/SnnComputeCore.Plo # am--include-marker
@@ -1243,10 +1469,16 @@ include control/$(DEPDIR)/SnnPESubComponent_scheme1.Plo # am--include-marker
 include control/$(DEPDIR)/SnnPESubComponent_spike.Plo # am--include-marker
 include events/$(DEPDIR)/SimpleTestEvent.Plo # am--include-marker
 include events/$(DEPDIR)/SpikeEventWrapper.Plo # am--include-marker
+include services/local_storage/$(DEPDIR)/LocalStorageHierarchyController.Plo # am--include-marker
+include services/local_storage/$(DEPDIR)/PeWeightObjectPlane.Plo # am--include-marker
+include services/memory/$(DEPDIR)/DmaMemAccessProxy.Plo # am--include-marker
+include services/memory/$(DEPDIR)/PeDmaScheduler.Plo # am--include-marker
 include services/memory/$(DEPDIR)/StandardMemAccess.Plo # am--include-marker
 include services/memory/sram_sim/model/$(DEPDIR)/BankedSramModel.Plo # am--include-marker
 include services/noc/$(DEPDIR)/NocSubsystem.Plo # am--include-marker
 include services/noc/$(DEPDIR)/OptimizedInternalRing.Plo # am--include-marker
+include services/pe_fabric/$(DEPDIR)/PeSharedCoreFabric.Plo # am--include-marker
+include services/pe_fabric/$(DEPDIR)/PulseAgendaScorer.Plo # am--include-marker
 include services/stimulus/$(DEPDIR)/ExternalSpikeInputSubsystem.Plo # am--include-marker
 include services/stimulus/$(DEPDIR)/StepActivationSubsystem.Plo # am--include-marker
 include services/synapse/gas/$(DEPDIR)/AccumulatorOps.Plo # am--include-marker
@@ -1255,9 +1487,11 @@ include services/synapse/gas/$(DEPDIR)/GasPhaseController.Plo # am--include-mark
 include services/synapse/route/$(DEPDIR)/BcsrRouteBuilder.Plo # am--include-marker
 include services/synapse/route/$(DEPDIR)/SnnRouteProvider.Plo # am--include-marker
 include services/synapse/route/$(DEPDIR)/SpikeCommSubsystem.Plo # am--include-marker
+include services/synapse/route/$(DEPDIR)/SpikeNocCodec.Plo # am--include-marker
 include services/synapse/route/$(DEPDIR)/SpikePacketBridge.Plo # am--include-marker
 include services/synapse/route/$(DEPDIR)/StepBcsrReachability.Plo # am--include-marker
 include services/synapse/route/$(DEPDIR)/SynapseRouteSubsystem.Plo # am--include-marker
+include services/synapse/route3d/$(DEPDIR)/SynapseRouteSubsystem3D.Plo # am--include-marker
 include services/synapse/stdmem/$(DEPDIR)/SnnPESubComponent_mem.Plo # am--include-marker
 include services/synapse/stdmem/$(DEPDIR)/StdMemEndpoint.Plo # am--include-marker
 include services/synapse/weights/$(DEPDIR)/SnnBcsrWeightManager.Plo # am--include-marker
@@ -1266,11 +1500,21 @@ include services/synapse/weights/$(DEPDIR)/WeightAccessor.Plo # am--include-mark
 include services/synapse/weights/$(DEPDIR)/WeightCacheOps.Plo # am--include-marker
 include services/synapse/weights/$(DEPDIR)/WeightMemorySubsystem.Plo # am--include-marker
 include services/workload/$(DEPDIR)/CoreWorkloadFactory.Plo # am--include-marker
+include services/workload/common/$(DEPDIR)/SnnAccelBackend.Plo # am--include-marker
 include services/workload/layout/$(DEPDIR)/NormalizedNeuronLayout.Plo # am--include-marker
+include services/workload/riscv_snn/$(DEPDIR)/RiscvSnnBootDriver.Plo # am--include-marker
+include services/workload/riscv_snn/$(DEPDIR)/RiscvSnnFirmwareLoader.Plo # am--include-marker
+include services/workload/riscv_snn/$(DEPDIR)/RiscvSnnHart.Plo # am--include-marker
+include services/workload/riscv_snn/$(DEPDIR)/RiscvSnnIss.Plo # am--include-marker
+include services/workload/riscv_snn/$(DEPDIR)/RiscvSnnRuntimeBridgeBackend.Plo # am--include-marker
+include services/workload/riscv_snn/$(DEPDIR)/RiscvSnnShadowRuntimeServices.Plo # am--include-marker
+include services/workload/riscv_snn/$(DEPDIR)/RiscvSnnShadowTransportExport.Plo # am--include-marker
+include services/workload/riscv_snn/$(DEPDIR)/RiscvSnnWorkload.Plo # am--include-marker
 include services/workload/snn/$(DEPDIR)/SnnWorkload.Plo # am--include-marker
 include services/workload/stream/$(DEPDIR)/StreamWorkload.Plo # am--include-marker
 include services/workload/tensor/$(DEPDIR)/TensorWorkload.Plo # am--include-marker
 include services/workload/traffic/$(DEPDIR)/TrafficWorkload.Plo # am--include-marker
+include services/workload/traffic_mem/$(DEPDIR)/TrafficMemWorkload.Plo # am--include-marker
 
 $(am__depfiles_remade):
 	@$(MKDIR_P) $(@D)
@@ -1313,25 +1557,32 @@ clean-libtool:
 	-rm -rf components/gather/apply/.libs components/gather/apply/_libs
 	-rm -rf components/multicore/.libs components/multicore/_libs
 	-rm -rf components/noc/.libs components/noc/_libs
+	-rm -rf components/noc3d/.libs components/noc3d/_libs
 	-rm -rf components/stimulus/.libs components/stimulus/_libs
 	-rm -rf components/workload_stats/.libs components/workload_stats/_libs
 	-rm -rf compute/.libs compute/_libs
 	-rm -rf control/.libs control/_libs
 	-rm -rf events/.libs events/_libs
+	-rm -rf services/local_storage/.libs services/local_storage/_libs
 	-rm -rf services/memory/.libs services/memory/_libs
 	-rm -rf services/memory/sram_sim/model/.libs services/memory/sram_sim/model/_libs
 	-rm -rf services/noc/.libs services/noc/_libs
+	-rm -rf services/pe_fabric/.libs services/pe_fabric/_libs
 	-rm -rf services/stimulus/.libs services/stimulus/_libs
 	-rm -rf services/synapse/gas/.libs services/synapse/gas/_libs
 	-rm -rf services/synapse/route/.libs services/synapse/route/_libs
+	-rm -rf services/synapse/route3d/.libs services/synapse/route3d/_libs
 	-rm -rf services/synapse/stdmem/.libs services/synapse/stdmem/_libs
 	-rm -rf services/synapse/weights/.libs services/synapse/weights/_libs
 	-rm -rf services/workload/.libs services/workload/_libs
+	-rm -rf services/workload/common/.libs services/workload/common/_libs
 	-rm -rf services/workload/layout/.libs services/workload/layout/_libs
+	-rm -rf services/workload/riscv_snn/.libs services/workload/riscv_snn/_libs
 	-rm -rf services/workload/snn/.libs services/workload/snn/_libs
 	-rm -rf services/workload/stream/.libs services/workload/stream/_libs
 	-rm -rf services/workload/tensor/.libs services/workload/tensor/_libs
 	-rm -rf services/workload/traffic/.libs services/workload/traffic/_libs
+	-rm -rf services/workload/traffic_mem/.libs services/workload/traffic_mem/_libs
 snippets-local: 
 
 ID: $(am__tagged_files)
@@ -1463,6 +1714,8 @@ distclean-generic:
 	-rm -f components/multicore/$(am__dirstamp)
 	-rm -f components/noc/$(DEPDIR)/$(am__dirstamp)
 	-rm -f components/noc/$(am__dirstamp)
+	-rm -f components/noc3d/$(DEPDIR)/$(am__dirstamp)
+	-rm -f components/noc3d/$(am__dirstamp)
 	-rm -f components/stimulus/$(DEPDIR)/$(am__dirstamp)
 	-rm -f components/stimulus/$(am__dirstamp)
 	-rm -f components/workload_stats/$(DEPDIR)/$(am__dirstamp)
@@ -1473,26 +1726,36 @@ distclean-generic:
 	-rm -f control/$(am__dirstamp)
 	-rm -f events/$(DEPDIR)/$(am__dirstamp)
 	-rm -f events/$(am__dirstamp)
+	-rm -f services/local_storage/$(DEPDIR)/$(am__dirstamp)
+	-rm -f services/local_storage/$(am__dirstamp)
 	-rm -f services/memory/$(DEPDIR)/$(am__dirstamp)
 	-rm -f services/memory/$(am__dirstamp)
 	-rm -f services/memory/sram_sim/model/$(DEPDIR)/$(am__dirstamp)
 	-rm -f services/memory/sram_sim/model/$(am__dirstamp)
 	-rm -f services/noc/$(DEPDIR)/$(am__dirstamp)
 	-rm -f services/noc/$(am__dirstamp)
+	-rm -f services/pe_fabric/$(DEPDIR)/$(am__dirstamp)
+	-rm -f services/pe_fabric/$(am__dirstamp)
 	-rm -f services/stimulus/$(DEPDIR)/$(am__dirstamp)
 	-rm -f services/stimulus/$(am__dirstamp)
 	-rm -f services/synapse/gas/$(DEPDIR)/$(am__dirstamp)
 	-rm -f services/synapse/gas/$(am__dirstamp)
 	-rm -f services/synapse/route/$(DEPDIR)/$(am__dirstamp)
 	-rm -f services/synapse/route/$(am__dirstamp)
+	-rm -f services/synapse/route3d/$(DEPDIR)/$(am__dirstamp)
+	-rm -f services/synapse/route3d/$(am__dirstamp)
 	-rm -f services/synapse/stdmem/$(DEPDIR)/$(am__dirstamp)
 	-rm -f services/synapse/stdmem/$(am__dirstamp)
 	-rm -f services/synapse/weights/$(DEPDIR)/$(am__dirstamp)
 	-rm -f services/synapse/weights/$(am__dirstamp)
 	-rm -f services/workload/$(DEPDIR)/$(am__dirstamp)
 	-rm -f services/workload/$(am__dirstamp)
+	-rm -f services/workload/common/$(DEPDIR)/$(am__dirstamp)
+	-rm -f services/workload/common/$(am__dirstamp)
 	-rm -f services/workload/layout/$(DEPDIR)/$(am__dirstamp)
 	-rm -f services/workload/layout/$(am__dirstamp)
+	-rm -f services/workload/riscv_snn/$(DEPDIR)/$(am__dirstamp)
+	-rm -f services/workload/riscv_snn/$(am__dirstamp)
 	-rm -f services/workload/snn/$(DEPDIR)/$(am__dirstamp)
 	-rm -f services/workload/snn/$(am__dirstamp)
 	-rm -f services/workload/stream/$(DEPDIR)/$(am__dirstamp)
@@ -1501,6 +1764,8 @@ distclean-generic:
 	-rm -f services/workload/tensor/$(am__dirstamp)
 	-rm -f services/workload/traffic/$(DEPDIR)/$(am__dirstamp)
 	-rm -f services/workload/traffic/$(am__dirstamp)
+	-rm -f services/workload/traffic_mem/$(DEPDIR)/$(am__dirstamp)
+	-rm -f services/workload/traffic_mem/$(am__dirstamp)
 
 maintainer-clean-generic:
 	@echo "This command is intended for maintainers to use"
@@ -1527,6 +1792,10 @@ distclean: distclean-am
 	-rm -f components/noc/$(DEPDIR)/MulticastRouter.Plo
 	-rm -f components/noc/$(DEPDIR)/SimpleNetworkWrapper.Plo
 	-rm -f components/noc/$(DEPDIR)/SnnNetworkAdapter.Plo
+	-rm -f components/noc3d/$(DEPDIR)/HBMStackStub.Plo
+	-rm -f components/noc3d/$(DEPDIR)/MulticastRouter3DNative.Plo
+	-rm -f components/noc3d/$(DEPDIR)/Noc3DSmokeSink.Plo
+	-rm -f components/noc3d/$(DEPDIR)/Noc3DSmokeSource.Plo
 	-rm -f components/stimulus/$(DEPDIR)/SpikeSource.Plo
 	-rm -f components/workload_stats/$(DEPDIR)/WorkloadStatsRegistry.Plo
 	-rm -f compute/$(DEPDIR)/SnnComputeCore.Plo
@@ -1541,10 +1810,16 @@ distclean: distclean-am
 	-rm -f control/$(DEPDIR)/SnnPESubComponent_spike.Plo
 	-rm -f events/$(DEPDIR)/SimpleTestEvent.Plo
 	-rm -f events/$(DEPDIR)/SpikeEventWrapper.Plo
+	-rm -f services/local_storage/$(DEPDIR)/LocalStorageHierarchyController.Plo
+	-rm -f services/local_storage/$(DEPDIR)/PeWeightObjectPlane.Plo
+	-rm -f services/memory/$(DEPDIR)/DmaMemAccessProxy.Plo
+	-rm -f services/memory/$(DEPDIR)/PeDmaScheduler.Plo
 	-rm -f services/memory/$(DEPDIR)/StandardMemAccess.Plo
 	-rm -f services/memory/sram_sim/model/$(DEPDIR)/BankedSramModel.Plo
 	-rm -f services/noc/$(DEPDIR)/NocSubsystem.Plo
 	-rm -f services/noc/$(DEPDIR)/OptimizedInternalRing.Plo
+	-rm -f services/pe_fabric/$(DEPDIR)/PeSharedCoreFabric.Plo
+	-rm -f services/pe_fabric/$(DEPDIR)/PulseAgendaScorer.Plo
 	-rm -f services/stimulus/$(DEPDIR)/ExternalSpikeInputSubsystem.Plo
 	-rm -f services/stimulus/$(DEPDIR)/StepActivationSubsystem.Plo
 	-rm -f services/synapse/gas/$(DEPDIR)/AccumulatorOps.Plo
@@ -1553,9 +1828,11 @@ distclean: distclean-am
 	-rm -f services/synapse/route/$(DEPDIR)/BcsrRouteBuilder.Plo
 	-rm -f services/synapse/route/$(DEPDIR)/SnnRouteProvider.Plo
 	-rm -f services/synapse/route/$(DEPDIR)/SpikeCommSubsystem.Plo
+	-rm -f services/synapse/route/$(DEPDIR)/SpikeNocCodec.Plo
 	-rm -f services/synapse/route/$(DEPDIR)/SpikePacketBridge.Plo
 	-rm -f services/synapse/route/$(DEPDIR)/StepBcsrReachability.Plo
 	-rm -f services/synapse/route/$(DEPDIR)/SynapseRouteSubsystem.Plo
+	-rm -f services/synapse/route3d/$(DEPDIR)/SynapseRouteSubsystem3D.Plo
 	-rm -f services/synapse/stdmem/$(DEPDIR)/SnnPESubComponent_mem.Plo
 	-rm -f services/synapse/stdmem/$(DEPDIR)/StdMemEndpoint.Plo
 	-rm -f services/synapse/weights/$(DEPDIR)/SnnBcsrWeightManager.Plo
@@ -1564,11 +1841,21 @@ distclean: distclean-am
 	-rm -f services/synapse/weights/$(DEPDIR)/WeightCacheOps.Plo
 	-rm -f services/synapse/weights/$(DEPDIR)/WeightMemorySubsystem.Plo
 	-rm -f services/workload/$(DEPDIR)/CoreWorkloadFactory.Plo
+	-rm -f services/workload/common/$(DEPDIR)/SnnAccelBackend.Plo
 	-rm -f services/workload/layout/$(DEPDIR)/NormalizedNeuronLayout.Plo
+	-rm -f services/workload/riscv_snn/$(DEPDIR)/RiscvSnnBootDriver.Plo
+	-rm -f services/workload/riscv_snn/$(DEPDIR)/RiscvSnnFirmwareLoader.Plo
+	-rm -f services/workload/riscv_snn/$(DEPDIR)/RiscvSnnHart.Plo
+	-rm -f services/workload/riscv_snn/$(DEPDIR)/RiscvSnnIss.Plo
+	-rm -f services/workload/riscv_snn/$(DEPDIR)/RiscvSnnRuntimeBridgeBackend.Plo
+	-rm -f services/workload/riscv_snn/$(DEPDIR)/RiscvSnnShadowRuntimeServices.Plo
+	-rm -f services/workload/riscv_snn/$(DEPDIR)/RiscvSnnShadowTransportExport.Plo
+	-rm -f services/workload/riscv_snn/$(DEPDIR)/RiscvSnnWorkload.Plo
 	-rm -f services/workload/snn/$(DEPDIR)/SnnWorkload.Plo
 	-rm -f services/workload/stream/$(DEPDIR)/StreamWorkload.Plo
 	-rm -f services/workload/tensor/$(DEPDIR)/TensorWorkload.Plo
 	-rm -f services/workload/traffic/$(DEPDIR)/TrafficWorkload.Plo
+	-rm -f services/workload/traffic_mem/$(DEPDIR)/TrafficMemWorkload.Plo
 	-rm -f Makefile
 distclean-am: clean-am distclean-compile distclean-generic \
 	distclean-tags
@@ -1630,6 +1917,10 @@ maintainer-clean: maintainer-clean-am
 	-rm -f components/noc/$(DEPDIR)/MulticastRouter.Plo
 	-rm -f components/noc/$(DEPDIR)/SimpleNetworkWrapper.Plo
 	-rm -f components/noc/$(DEPDIR)/SnnNetworkAdapter.Plo
+	-rm -f components/noc3d/$(DEPDIR)/HBMStackStub.Plo
+	-rm -f components/noc3d/$(DEPDIR)/MulticastRouter3DNative.Plo
+	-rm -f components/noc3d/$(DEPDIR)/Noc3DSmokeSink.Plo
+	-rm -f components/noc3d/$(DEPDIR)/Noc3DSmokeSource.Plo
 	-rm -f components/stimulus/$(DEPDIR)/SpikeSource.Plo
 	-rm -f components/workload_stats/$(DEPDIR)/WorkloadStatsRegistry.Plo
 	-rm -f compute/$(DEPDIR)/SnnComputeCore.Plo
@@ -1644,10 +1935,16 @@ maintainer-clean: maintainer-clean-am
 	-rm -f control/$(DEPDIR)/SnnPESubComponent_spike.Plo
 	-rm -f events/$(DEPDIR)/SimpleTestEvent.Plo
 	-rm -f events/$(DEPDIR)/SpikeEventWrapper.Plo
+	-rm -f services/local_storage/$(DEPDIR)/LocalStorageHierarchyController.Plo
+	-rm -f services/local_storage/$(DEPDIR)/PeWeightObjectPlane.Plo
+	-rm -f services/memory/$(DEPDIR)/DmaMemAccessProxy.Plo
+	-rm -f services/memory/$(DEPDIR)/PeDmaScheduler.Plo
 	-rm -f services/memory/$(DEPDIR)/StandardMemAccess.Plo
 	-rm -f services/memory/sram_sim/model/$(DEPDIR)/BankedSramModel.Plo
 	-rm -f services/noc/$(DEPDIR)/NocSubsystem.Plo
 	-rm -f services/noc/$(DEPDIR)/OptimizedInternalRing.Plo
+	-rm -f services/pe_fabric/$(DEPDIR)/PeSharedCoreFabric.Plo
+	-rm -f services/pe_fabric/$(DEPDIR)/PulseAgendaScorer.Plo
 	-rm -f services/stimulus/$(DEPDIR)/ExternalSpikeInputSubsystem.Plo
 	-rm -f services/stimulus/$(DEPDIR)/StepActivationSubsystem.Plo
 	-rm -f services/synapse/gas/$(DEPDIR)/AccumulatorOps.Plo
@@ -1656,9 +1953,11 @@ maintainer-clean: maintainer-clean-am
 	-rm -f services/synapse/route/$(DEPDIR)/BcsrRouteBuilder.Plo
 	-rm -f services/synapse/route/$(DEPDIR)/SnnRouteProvider.Plo
 	-rm -f services/synapse/route/$(DEPDIR)/SpikeCommSubsystem.Plo
+	-rm -f services/synapse/route/$(DEPDIR)/SpikeNocCodec.Plo
 	-rm -f services/synapse/route/$(DEPDIR)/SpikePacketBridge.Plo
 	-rm -f services/synapse/route/$(DEPDIR)/StepBcsrReachability.Plo
 	-rm -f services/synapse/route/$(DEPDIR)/SynapseRouteSubsystem.Plo
+	-rm -f services/synapse/route3d/$(DEPDIR)/SynapseRouteSubsystem3D.Plo
 	-rm -f services/synapse/stdmem/$(DEPDIR)/SnnPESubComponent_mem.Plo
 	-rm -f services/synapse/stdmem/$(DEPDIR)/StdMemEndpoint.Plo
 	-rm -f services/synapse/weights/$(DEPDIR)/SnnBcsrWeightManager.Plo
@@ -1667,11 +1966,21 @@ maintainer-clean: maintainer-clean-am
 	-rm -f services/synapse/weights/$(DEPDIR)/WeightCacheOps.Plo
 	-rm -f services/synapse/weights/$(DEPDIR)/WeightMemorySubsystem.Plo
 	-rm -f services/workload/$(DEPDIR)/CoreWorkloadFactory.Plo
+	-rm -f services/workload/common/$(DEPDIR)/SnnAccelBackend.Plo
 	-rm -f services/workload/layout/$(DEPDIR)/NormalizedNeuronLayout.Plo
+	-rm -f services/workload/riscv_snn/$(DEPDIR)/RiscvSnnBootDriver.Plo
+	-rm -f services/workload/riscv_snn/$(DEPDIR)/RiscvSnnFirmwareLoader.Plo
+	-rm -f services/workload/riscv_snn/$(DEPDIR)/RiscvSnnHart.Plo
+	-rm -f services/workload/riscv_snn/$(DEPDIR)/RiscvSnnIss.Plo
+	-rm -f services/workload/riscv_snn/$(DEPDIR)/RiscvSnnRuntimeBridgeBackend.Plo
+	-rm -f services/workload/riscv_snn/$(DEPDIR)/RiscvSnnShadowRuntimeServices.Plo
+	-rm -f services/workload/riscv_snn/$(DEPDIR)/RiscvSnnShadowTransportExport.Plo
+	-rm -f services/workload/riscv_snn/$(DEPDIR)/RiscvSnnWorkload.Plo
 	-rm -f services/workload/snn/$(DEPDIR)/SnnWorkload.Plo
 	-rm -f services/workload/stream/$(DEPDIR)/StreamWorkload.Plo
 	-rm -f services/workload/tensor/$(DEPDIR)/TensorWorkload.Plo
 	-rm -f services/workload/traffic/$(DEPDIR)/TrafficWorkload.Plo
+	-rm -f services/workload/traffic_mem/$(DEPDIR)/TrafficMemWorkload.Plo
 	-rm -f Makefile
 maintainer-clean-am: distclean-am maintainer-clean-generic
 
@@ -1721,9 +2030,75 @@ uninstall-am: uninstall-compLTLIBRARIES
 # libSnnDL_la_LIBADD = $(MPI_LIBS)
 # endif
 
-.PHONY: test-compile
+.PHONY: test-compile test-riscv-snn-protocols test-riscv-snn-backend-timing-contract test-riscv-snn-runtime-service-provider test-riscv-snn-runtime-bridge-backend test-riscv-snn-firmware-protocol test-riscv-snn-toolchain-firmware-protocol test-riscv-snn-stimulus-gating
+test-riscv-snn-protocols: test-riscv-snn-backend-timing-contract test-riscv-snn-runtime-service-provider test-riscv-snn-runtime-bridge-backend test-riscv-snn-firmware-protocol test-riscv-snn-toolchain-firmware-protocol test-riscv-snn-stimulus-gating
+
+test-riscv-snn-stimulus-gating:
+	$(RISCV_SNN_TEST_LINK) $(srcdir)/tests/test_riscv_snn_stimulus_gating.cc \
+		-o $(builddir)/test_riscv_snn_stimulus_gating$(EXEEXT) && \
+		$(builddir)/test_riscv_snn_stimulus_gating$(EXEEXT) && \
+		rg -q "ex_rt\\.enabled = workloadAllowsSnnStimulus\\(cfg\\.workload_kind\\);" $(srcdir)/components/MultiCorePE.cc && \
+		rg -q "if \\(!rt_\\.enabled\\)" $(srcdir)/services/stimulus/ExternalSpikeInputSubsystem.cc
+
+test-riscv-snn-backend-timing-contract:
+	$(RISCV_SNN_TEST_LINK) $(srcdir)/tests/test_riscv_snn_backend_timing_contract.cc \
+		$(srcdir)/services/workload/common/SnnAccelBackend.cc \
+		$(srcdir)/services/workload/riscv_snn/RiscvSnnRuntimeBridgeBackend.cc \
+		$(srcdir)/services/workload/riscv_snn/RiscvSnnHart.cc \
+		$(srcdir)/services/workload/riscv_snn/RiscvSnnIss.cc \
+		-o $(builddir)/test_riscv_snn_backend_timing_contract$(EXEEXT) && \
+		$(builddir)/test_riscv_snn_backend_timing_contract$(EXEEXT)
+
+test-riscv-snn-runtime-service-provider:
+	$(RISCV_SNN_TEST_LINK) $(srcdir)/tests/test_riscv_snn_runtime_service_provider.cc \
+		$(srcdir)/services/workload/common/SnnAccelBackend.cc \
+		$(srcdir)/services/workload/riscv_snn/RiscvSnnRuntimeBridgeBackend.cc \
+		$(srcdir)/services/workload/riscv_snn/RiscvSnnShadowTransportExport.cc \
+		-o $(builddir)/test_riscv_snn_runtime_service_provider$(EXEEXT) && \
+		$(builddir)/test_riscv_snn_runtime_service_provider$(EXEEXT)
+
+test-riscv-snn-runtime-bridge-backend:
+	$(RISCV_SNN_TEST_LINK) $(srcdir)/tests/test_riscv_snn_runtime_bridge_backend.cc \
+		$(srcdir)/services/workload/common/SnnAccelBackend.cc \
+		$(srcdir)/services/workload/riscv_snn/RiscvSnnRuntimeBridgeBackend.cc \
+		-o $(builddir)/test_riscv_snn_runtime_bridge_backend$(EXEEXT) && \
+		$(builddir)/test_riscv_snn_runtime_bridge_backend$(EXEEXT)
+
+test-riscv-snn-firmware-protocol:
+	$(RISCV_SNN_TEST_LINK) $(srcdir)/tests/test_riscv_snn_firmware_protocol.cc \
+		$(srcdir)/services/workload/common/SnnAccelBackend.cc \
+		$(srcdir)/services/workload/riscv_snn/RiscvSnnRuntimeBridgeBackend.cc \
+		$(srcdir)/services/workload/riscv_snn/RiscvSnnHart.cc \
+		$(srcdir)/services/workload/riscv_snn/RiscvSnnIss.cc \
+		-o $(builddir)/test_riscv_snn_firmware_protocol$(EXEEXT) && \
+		$(builddir)/test_riscv_snn_firmware_protocol$(EXEEXT)
+
+test-riscv-snn-toolchain-firmware-protocol:
+	$(RISCV_SNN_TEST_LINK) $(srcdir)/tests/test_riscv_snn_toolchain_firmware_protocol.cc \
+		$(srcdir)/services/workload/common/SnnAccelBackend.cc \
+		$(srcdir)/services/workload/riscv_snn/RiscvSnnRuntimeBridgeBackend.cc \
+		$(srcdir)/services/workload/riscv_snn/RiscvSnnHart.cc \
+		$(srcdir)/services/workload/riscv_snn/RiscvSnnIss.cc \
+		$(srcdir)/services/workload/riscv_snn/RiscvSnnFirmwareLoader.cc \
+		-o $(builddir)/test_riscv_snn_toolchain_firmware_protocol$(EXEEXT) && \
+		$(builddir)/test_riscv_snn_toolchain_firmware_protocol$(EXEEXT)
+
 test-compile:
 	$(CXXCOMPILE) -c $(srcdir)/tests/test_includes.cc -o $(builddir)/test_includes.o
+	$(CXXCOMPILE) -c $(srcdir)/tests/test_pe_internal_pod_shadow_gate.cc -o $(builddir)/test_pe_internal_pod_shadow_gate.o
+	$(CXXCOMPILE) -c $(srcdir)/tests/test_pe_internal_pod_shadow_wms_seam.cc -o $(builddir)/test_pe_internal_pod_shadow_wms_seam.o
+	$(CXXCOMPILE) -c $(srcdir)/tests/test_riscv_snn_abi.cc -o $(builddir)/test_riscv_snn_abi.o
+	$(CXXCOMPILE) -c $(srcdir)/tests/test_riscv_snn_backend_timing_contract.cc -o $(builddir)/test_riscv_snn_backend_timing_contract.o
+	$(CXXCOMPILE) -c $(srcdir)/tests/test_riscv_snn_boot_driver.cc -o $(builddir)/test_riscv_snn_boot_driver.o
+	$(CXXCOMPILE) -c $(srcdir)/tests/test_riscv_snn_firmware_loader.cc -o $(builddir)/test_riscv_snn_firmware_loader.o
+	$(CXXCOMPILE) -c $(srcdir)/tests/test_riscv_snn_firmware_tools.cc -o $(builddir)/test_riscv_snn_firmware_tools.o
+	$(CXXCOMPILE) -c $(srcdir)/tests/test_riscv_snn_firmware_protocol.cc -o $(builddir)/test_riscv_snn_firmware_protocol.o
+	$(CXXCOMPILE) -c $(srcdir)/tests/test_riscv_snn_toolchain_firmware_protocol.cc -o $(builddir)/test_riscv_snn_toolchain_firmware_protocol.o
+	$(CXXCOMPILE) -c $(srcdir)/tests/test_riscv_snn_iss.cc -o $(builddir)/test_riscv_snn_iss.o
+	$(CXXCOMPILE) -c $(srcdir)/tests/test_riscv_snn_queue_contract.cc -o $(builddir)/test_riscv_snn_queue_contract.o
+	$(CXXCOMPILE) -c $(srcdir)/tests/test_riscv_snn_runtime_bridge_backend.cc -o $(builddir)/test_riscv_snn_runtime_bridge_backend.o
+	$(CXXCOMPILE) -c $(srcdir)/tests/test_riscv_snn_runtime_service_provider.cc -o $(builddir)/test_riscv_snn_runtime_service_provider.o
+	$(CXXCOMPILE) -c $(srcdir)/tests/test_riscv_snn_stimulus_gating.cc -o $(builddir)/test_riscv_snn_stimulus_gating.o
 
 # Tell versions [3.59,3.63) of GNU make to not export all variables.
 # Otherwise a system limit (for SysV at least) may be exceeded.

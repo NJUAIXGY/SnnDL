@@ -61,6 +61,20 @@ bool parseIngressPolicy_(const std::string& s, IngressPolicy& out) {
     return false;
 }
 
+std::string sourcePrimaryKindFromCfg_(const SynapseRouteBuildConfig& cfg) {
+    const bool edges_csv_bootstrap =
+        cfg.mapping_mode == "edges_csv" && !cfg.mapping_edges_file.empty();
+    const bool legacy_route_tables_bootstrap =
+        !edges_csv_bootstrap && (!cfg.weights_template.empty() || cfg.real_synapse_inputs_available);
+    if (edges_csv_bootstrap) return "edges_csv_bootstrap";
+    if (legacy_route_tables_bootstrap && cfg.real_synapse_inputs_available) {
+        return "legacy_route_tables_with_real_synapse_inputs";
+    }
+    if (legacy_route_tables_bootstrap) return "legacy_route_tables_bootstrap";
+    if (cfg.real_synapse_inputs_available) return "real_synapse_inputs_only";
+    return "legacy_only";
+}
+
 inline bool parseU32CsvField_(std::string tok, uint32_t& out) {
     size_t b = 0;
     while (b < tok.size() && std::isspace(static_cast<unsigned char>(tok[b]))) ++b;
@@ -635,6 +649,10 @@ void SynapseRouteSubsystem::bindFanoutStat(SST::Statistics::Statistic<uint64_t>*
     if (stat_fanout_per_spike) stat_fanout_per_spike_ = stat_fanout_per_spike;
 }
 
+void SynapseRouteSubsystem::bindRouteRuntimeStats(const RouteRuntimeStatSinks& stats) {
+    route_runtime_stats_ = stats;
+}
+
 bool SynapseRouteSubsystem::initRoutes() {
     routes_shared_.reset();
     routes_local_fallback_.clear();
@@ -782,6 +800,31 @@ void SynapseRouteSubsystem::applyGatingDecision(uint32_t src_global,
             "📥 应用门控: src_g=%u, k=%zu, expire=%" PRIu64 "\n",
             src_global, dest_pes.size(), gating_cache_[src_global].expire_cycle);
     }
+}
+
+SynapseRouteSubsystem::RouteSemanticDescriptor SynapseRouteSubsystem::describeRouteSemantics() const {
+    RouteSemanticDescriptor descriptor{};
+    descriptor.source_semantics_authority = "legacy_provider";
+    descriptor.source_primary_kind = sourcePrimaryKindFromCfg_(cfg_);
+    descriptor.route_topology = "mesh_2d";
+    descriptor.target_semantics_authority = "legacy_multicast_fallback";
+    descriptor.real_synapse_inputs_available = cfg_.real_synapse_inputs_available;
+    descriptor.native_synapse_source_candidate = false;
+    descriptor.native_source_fanout_active = false;
+    descriptor.native_target_synthesis_active = false;
+    descriptor.bootstrap_dependency_active = false;
+    descriptor.native_bootstrap_source.clear();
+    if (descriptor.source_primary_kind == "edges_csv_bootstrap") {
+        descriptor.bootstrap_dependency_active = true;
+        descriptor.native_bootstrap_source = "edges_csv";
+    } else if (
+        descriptor.source_primary_kind == "legacy_route_tables_bootstrap"
+        || descriptor.source_primary_kind == "legacy_route_tables_with_real_synapse_inputs"
+    ) {
+        descriptor.bootstrap_dependency_active = true;
+        descriptor.native_bootstrap_source = "legacy_route_tables";
+    }
+    return descriptor;
 }
 
 bool SynapseRouteSubsystem::multicastEnabled() const {
@@ -960,7 +1003,11 @@ void SynapseRouteSubsystem::initMulticastTargets_() {
         if (!per_block.empty()) {
             std::vector<BlockTarget> vec;
             vec.reserve(per_block.size());
-            for (auto& itb : per_block) vec.push_back(itb.second);
+            for (auto& itb : per_block) {
+                itb.second.cohort_id = 0;
+                itb.second.band_color = 0;
+                vec.push_back(itb.second);
+            }
             std::sort(vec.begin(), vec.end(),
                       [](const BlockTarget& a, const BlockTarget& b) { return a.block_id < b.block_id; });
             built.emplace(pre_global, std::move(vec));

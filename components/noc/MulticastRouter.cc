@@ -82,7 +82,7 @@ MulticastRouter::MulticastRouter(SST::ComponentId_t id, SST::Params& params)
     }
 
     const std::string mesh_shape = cfg.mesh_shape;
-    if (!parseMeshShape_(mesh_shape, mesh_w_, mesh_h_) || mesh_w_ == 0 || mesh_h_ == 0) {
+    if (!parseMeshShape_(mesh_shape, mesh_w_, mesh_h_, mesh_z_) || mesh_w_ == 0 || mesh_h_ == 0 || mesh_z_ == 0) {
         out_.fatal(CALL_INFO, -1, "Invalid mesh_shape='%s'\n", mesh_shape.c_str());
     }
 
@@ -209,11 +209,21 @@ void MulticastRouter::routeUnicastXY_(NocPacketEvent* pkt) {
     }
 
     if (mesh_w_ == 0) { delete pkt; return; }
-    const uint32_t x = node_id_ % mesh_w_;
-    const uint32_t y = node_id_ / mesh_w_;
-
-    const uint32_t dest_x = pkt->dst_node % mesh_w_;
-    const uint32_t dest_y = pkt->dst_node / mesh_w_;
+    uint32_t x = 0, y = 0, z = 0;
+    uint32_t dest_x = 0, dest_y = 0, dest_z = 0;
+    if (!nodeIdToCoord2DLayered_(node_id_, mesh_w_, mesh_h_, mesh_z_, x, y, z) ||
+        !nodeIdToCoord2DLayered_(pkt->dst_node, mesh_w_, mesh_h_, mesh_z_, dest_x, dest_y, dest_z)) {
+        delete pkt;
+        return;
+    }
+    if (z != dest_z) {
+        // layered-2d router cannot forward across z; each die remains an independent 2D plane.
+        out_.verbose(CALL_INFO, 2, 0,
+                     "[mcast-router] drop cross-z unicast self=%u dst=%u self_z=%u dst_z=%u\n",
+                     node_id_, pkt->dst_node, z, dest_z);
+        delete pkt;
+        return;
+    }
 
     if (x < dest_x) { sendToEast_(pkt); return; }
     if (x > dest_x) { sendToWest_(pkt); return; }
@@ -231,11 +241,21 @@ void MulticastRouter::routeUnicastYX_(NocPacketEvent* pkt) {
     }
 
     if (mesh_w_ == 0) { delete pkt; return; }
-    const uint32_t x = node_id_ % mesh_w_;
-    const uint32_t y = node_id_ / mesh_w_;
-
-    const uint32_t dest_x = pkt->dst_node % mesh_w_;
-    const uint32_t dest_y = pkt->dst_node / mesh_w_;
+    uint32_t x = 0, y = 0, z = 0;
+    uint32_t dest_x = 0, dest_y = 0, dest_z = 0;
+    if (!nodeIdToCoord2DLayered_(node_id_, mesh_w_, mesh_h_, mesh_z_, x, y, z) ||
+        !nodeIdToCoord2DLayered_(pkt->dst_node, mesh_w_, mesh_h_, mesh_z_, dest_x, dest_y, dest_z)) {
+        delete pkt;
+        return;
+    }
+    if (z != dest_z) {
+        // layered-2d router cannot forward across z; each die remains an independent 2D plane.
+        out_.verbose(CALL_INFO, 2, 0,
+                     "[mcast-router] drop cross-z unicast self=%u dst=%u self_z=%u dst_z=%u\n",
+                     node_id_, pkt->dst_node, z, dest_z);
+        delete pkt;
+        return;
+    }
 
     if (y < dest_y) { sendToSouth_(pkt); return; }
     if (y > dest_y) { sendToNorth_(pkt); return; }
@@ -287,10 +307,21 @@ void MulticastRouter::routeSpikeKey_(NocPacketEvent* pkt) {
             }
             pkt->dst_node = ws.ingress_node;
 
-            const uint32_t self_x_inter = node_id_ % mesh_w_;
-            const uint32_t self_y_inter = node_id_ / mesh_w_;
-            const uint32_t dest_x_inter = ws.ingress_node % mesh_w_;
-            const uint32_t dest_y_inter = ws.ingress_node / mesh_w_;
+            uint32_t self_x_inter = 0, self_y_inter = 0, self_z_inter = 0;
+            uint32_t dest_x_inter = 0, dest_y_inter = 0, dest_z_inter = 0;
+            if (!nodeIdToCoord2DLayered_(node_id_, mesh_w_, mesh_h_, mesh_z_, self_x_inter, self_y_inter, self_z_inter) ||
+                !nodeIdToCoord2DLayered_(ws.ingress_node, mesh_w_, mesh_h_, mesh_z_, dest_x_inter, dest_y_inter, dest_z_inter)) {
+                delete pkt;
+                return;
+            }
+            if (self_z_inter != dest_z_inter) {
+                // layered-2d router cannot forward across z; each die remains an independent 2D plane.
+                out_.verbose(CALL_INFO, 2, 0,
+                             "[mcast-router] drop cross-z inter self=%u ingress=%u self_z=%u dst_z=%u\n",
+                             node_id_, ws.ingress_node, self_z_inter, dest_z_inter);
+                delete pkt;
+                return;
+            }
 
             auto estimateInterDirCost = [&](uint8_t dir, uint64_t payload_bytes, uint64_t len_bias) -> uint64_t {
                 uint32_t port_idx = 0;
@@ -395,8 +426,11 @@ void MulticastRouter::routeSpikeKey_(NocPacketEvent* pkt) {
 
     // INTRA: blocked multicast tree (arbitrary block_w x block_h, rooted at ingress_node).
     if (mesh_w_ == 0) { delete pkt; return; }
-    const uint32_t self_x = node_id_ % mesh_w_;
-    const uint32_t self_y = node_id_ / mesh_w_;
+    uint32_t self_x = 0, self_y = 0, self_z = 0;
+    if (!nodeIdToCoord2DLayered_(node_id_, mesh_w_, mesh_h_, mesh_z_, self_x, self_y, self_z)) {
+        delete pkt;
+        return;
+    }
 
     // block origin derived from block_id (core_mask indices are always in block-top-left order)
     const uint32_t blocks_w = mesh_w_ / block_w;
@@ -414,8 +448,19 @@ void MulticastRouter::routeSpikeKey_(NocPacketEvent* pkt) {
     const uint32_t idx_self = idxOfLocal_(local_x, local_y, block_w); // block-relative
     if (idx_self >= block_cells || idx_self >= kMaxMulticastBlockCells) { delete pkt; return; }
 
-    const uint32_t ingress_x = ws.ingress_node % mesh_w_;
-    const uint32_t ingress_y = ws.ingress_node / mesh_w_;
+    uint32_t ingress_x = 0, ingress_y = 0, ingress_z = 0;
+    if (!nodeIdToCoord2DLayered_(ws.ingress_node, mesh_w_, mesh_h_, mesh_z_, ingress_x, ingress_y, ingress_z)) {
+        delete pkt;
+        return;
+    }
+    if (self_z != ingress_z) {
+        // layered-2d router cannot forward across z; each die remains an independent 2D plane.
+        out_.verbose(CALL_INFO, 2, 0,
+                     "[mcast-router] drop cross-z intra self=%u ingress=%u self_z=%u ingress_z=%u\n",
+                     node_id_, ws.ingress_node, self_z, ingress_z);
+        delete pkt;
+        return;
+    }
     if (ingress_x < block_x0 || ingress_y < block_y0) { delete pkt; return; }
     if (ingress_x >= block_x0 + block_w || ingress_y >= block_y0 + block_h) { delete pkt; return; }
     const uint32_t ingress_lx = ingress_x - block_x0;
@@ -693,15 +738,24 @@ void MulticastRouter::routeSpikeInterBundle_(NocPacketEvent* pkt) {
 
     constexpr uint16_t kStageInter = 0;
     constexpr uint16_t kStageIntra = 1;
-    const uint32_t self_x = node_id_ % mesh_w_;
-    const uint32_t self_y = node_id_ / mesh_w_;
+    uint32_t self_x = 0, self_y = 0, self_z = 0;
+    if (!nodeIdToCoord2DLayered_(node_id_, mesh_w_, mesh_h_, mesh_z_, self_x, self_y, self_z)) {
+        delete pkt;
+        return;
+    }
     auto pick_inter_dir = [&](uint32_t ingress_node,
                               uint64_t group_id,
                               uint32_t pre_global,
                               uint32_t block_id,
                               uint64_t payload_bytes) -> uint8_t {
-        const uint32_t dest_x = ingress_node % mesh_w_;
-        const uint32_t dest_y = ingress_node / mesh_w_;
+        uint32_t dest_x = 0, dest_y = 0, dest_z = 0;
+        if (!nodeIdToCoord2DLayered_(ingress_node, mesh_w_, mesh_h_, mesh_z_, dest_x, dest_y, dest_z)) {
+            return 0xffu;
+        }
+        if (dest_z != self_z) {
+            // layered-2d router cannot forward across z; each die remains an independent 2D plane.
+            return 0xffu;
+        }
         if (dest_x == self_x && dest_y == self_y) return 0;
 
         auto estimateInterDirCost = [&](uint8_t dir, uint64_t len_bias) -> uint64_t {
@@ -1109,18 +1163,21 @@ uint64_t MulticastRouter::packetBytes_(const NocPacketEvent* pkt) const {
     return serialize_header_bytes_ + static_cast<uint64_t>(pkt->payload.size());
 }
 
-bool MulticastRouter::parseMeshShape_(const std::string& shape, uint32_t& out_w, uint32_t& out_h) {
+bool MulticastRouter::parseMeshShape_(const std::string& shape, uint32_t& out_w, uint32_t& out_h, uint32_t& out_z) {
     out_w = 0;
     out_h = 0;
+    out_z = 1;
     if (shape.empty()) return false;
 
     const std::string s = toLowerCopy(shape);
 
-    const auto pos = s.find('x');
-    if (pos == std::string::npos) return false;
-    const std::string a = s.substr(0, pos);
-    const std::string b = s.substr(pos + 1);
-    if (a.empty() || b.empty()) return false;
+    const auto pos0 = s.find('x');
+    if (pos0 == std::string::npos) return false;
+    const auto pos1 = s.find('x', pos0 + 1);
+    const std::string a = s.substr(0, pos0);
+    const std::string b = (pos1 == std::string::npos) ? s.substr(pos0 + 1) : s.substr(pos0 + 1, pos1 - pos0 - 1);
+    const std::string c = (pos1 == std::string::npos) ? "1" : s.substr(pos1 + 1);
+    if (a.empty() || b.empty() || c.empty()) return false;
 
     char* endp = nullptr;
     const long w = std::strtol(a.c_str(), &endp, 10);
@@ -1128,9 +1185,34 @@ bool MulticastRouter::parseMeshShape_(const std::string& shape, uint32_t& out_w,
     endp = nullptr;
     const long h = std::strtol(b.c_str(), &endp, 10);
     if (!endp || *endp != '\0' || h <= 0) return false;
+    endp = nullptr;
+    const long z = std::strtol(c.c_str(), &endp, 10);
+    if (!endp || *endp != '\0' || z <= 0) return false;
 
     out_w = static_cast<uint32_t>(w);
     out_h = static_cast<uint32_t>(h);
+    out_z = static_cast<uint32_t>(z);
+    return true;
+}
+
+bool MulticastRouter::nodeIdToCoord2DLayered_(uint32_t node_id,
+                                              uint32_t mesh_w,
+                                              uint32_t mesh_h,
+                                              uint32_t mesh_z,
+                                              uint32_t& out_x,
+                                              uint32_t& out_y,
+                                              uint32_t& out_z) {
+    out_x = 0;
+    out_y = 0;
+    out_z = 0;
+    if (mesh_w == 0 || mesh_h == 0 || mesh_z == 0) return false;
+    const uint64_t layer_nodes = static_cast<uint64_t>(mesh_w) * static_cast<uint64_t>(mesh_h);
+    const uint64_t total_nodes = layer_nodes * static_cast<uint64_t>(mesh_z);
+    if (layer_nodes == 0 || static_cast<uint64_t>(node_id) >= total_nodes) return false;
+    out_x = node_id % mesh_w;
+    const uint32_t yz = node_id / mesh_w;
+    out_y = yz % mesh_h;
+    out_z = yz / mesh_h;
     return true;
 }
 

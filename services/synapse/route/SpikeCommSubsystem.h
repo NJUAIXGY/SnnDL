@@ -27,6 +27,7 @@ struct SpikeCommRuntimeConfig {
     INocTransport* noc = nullptr;  // optional (native multicast path uses packet injection)
     int src_core = 0;
     uint32_t node_id = 0;
+    const uint32_t* active_step_seq = nullptr;
     ISynapseRoute* synapse_route = nullptr;
     uint64_t global_neuron_base = 0;
     bool experimental_spiketile_enable = false;
@@ -64,6 +65,17 @@ public:
     uint64_t txSpikePacketsTotal() const { return tx_spike_packets_total_; }
     uint64_t txSpikeKeyPacketsTotal() const { return tx_spikekey_packets_total_; }
     uint64_t txSpikeTileKeyPacketsTotal() const { return tx_spiketilekey_packets_total_; }
+    uint64_t txSpikeKeyV4PacketsTotal() const { return tx_spikekey_v4_packets_total_; }
+    uint64_t txSpikeTileKeyV4PacketsTotal() const { return tx_spiketilekey_v4_packets_total_; }
+    uint64_t txBundleV1PacketsTotal() const { return tx_bundle_v1_packets_total_; }
+    uint64_t txBundleV2PacketsTotal() const { return tx_bundle_v2_packets_total_; }
+    uint64_t txBundleV3PacketsTotal() const { return tx_bundle_v3_packets_total_; }
+    uint64_t txCohortPacketsTotal() const { return tx_cohort_packets_total_; }
+    uint64_t txCohortPresTotal() const { return tx_cohort_pres_total_; }
+    uint64_t txCohortBandcolorSwitchTotal() const { return tx_cohort_bandcolor_switch_total_; }
+    uint64_t stormCohortPacketsTotal() const { return tx_cohort_packets_total_; }
+    uint64_t stormCohortPresTotal() const { return tx_cohort_pres_total_; }
+    uint64_t stormCohortBandcolorSwitchTotal() const { return tx_cohort_bandcolor_switch_total_; }
 
 private:
     void emitCommon_(uint32_t source_global, uint32_t source_local, uint64_t now_cycle);
@@ -74,6 +86,7 @@ private:
     INocTransport* noc_ = nullptr;            // 非拥有；由外部管理生命周期
     int src_core_ = 0;
     uint32_t node_id_ = 0;
+    const uint32_t* active_step_seq_ = nullptr;
     uint64_t global_neuron_base_ = 0;
     uint64_t emit_seq_ = 0; // monotonic per run; used to ensure group_id uniqueness under high-rate injection
 
@@ -89,6 +102,20 @@ private:
     uint64_t tx_spike_packets_total_ = 0;
     uint64_t tx_spikekey_packets_total_ = 0;
     uint64_t tx_spiketilekey_packets_total_ = 0;
+    uint64_t tx_spikekey_v4_packets_total_ = 0;
+    uint64_t tx_spiketilekey_v4_packets_total_ = 0;
+    uint64_t tx_bundle_v1_packets_total_ = 0;
+    uint64_t tx_bundle_v2_packets_total_ = 0;
+    uint64_t tx_bundle_v3_packets_total_ = 0;
+    uint64_t tx_cohort_packets_total_ = 0;
+    uint64_t tx_cohort_pres_total_ = 0;
+    uint64_t tx_cohort_bandcolor_switch_total_ = 0;
+    uint64_t bundle_v3_diag_attempt_total_ = 0;
+    uint64_t bundle_v3_diag_success_total_ = 0;
+    uint64_t bundle_v3_diag_fallback_total_ = 0;
+    uint64_t bundle_v3_diag_emitted_packets_total_ = 0;
+    uint32_t bundle_v3_diag_logs_emitted_ = 0;
+    uint32_t bundle_v3_diag_log_cap_ = 64;
 
 };
 
