@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <list>
@@ -22,9 +23,11 @@ struct WeightCacheOps {
 
     WeightCacheOps() = default;
 
-    void configure(const Config& cfg, std::function<void()> on_evict = {});
+    void configure(const Config& cfg, std::function<void(uint64_t)> on_evict = {});
     void reserve(size_t hint_entries);
 
+    bool contains(uint64_t key) const;
+    size_t entryCount() const;
     bool tryGet(uint64_t key, float& out);
     void store(uint64_t key, float value);
 
@@ -40,7 +43,7 @@ private:
     void clockPut_(uint64_t key, float value);
 
     Config cfg_{};
-    std::function<void()> on_evict_;
+    std::function<void(uint64_t)> on_evict_;
 
     // LRU cache
     std::list<uint64_t> lru_list_;

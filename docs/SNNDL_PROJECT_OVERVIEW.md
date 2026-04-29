@@ -387,7 +387,7 @@ make install
 | `control/SnnPEApplyScatter.cc` | `source` | include:"SnnPESubComponent.h" |
 | `control/SnnPEOrchestrators.cc` | `source` | include:"SnnPESubComponent.h" |
 | `control/SnnPESubComponent.cc` | `source` | include:"SnnPESubComponent.h" |
-| `control/SnnPESubComponent.h` | `header` | include:"SnnCoreAPI.h"; types:SpikeEvent, NocSpikeTransport, BcsrWeightManager, StdMemEndpoint, ISnnSpikeCommWorkload, IGasStageSink, IWeightReader, IPeAggregation, IManualWindowDrive, AccumulatorOps, WeightCacheOps, WeightAccessor; ns:SST |
+| `control/SnnPESubComponent.h` | `header` | include:"SnnCoreAPI.h"; types:SpikeEvent, NocSpikeTransport, BcsrWeightManager, StdMemEndpoint, ISnnSpikeCommWorkload, IGasStageSink, IWeightReader, IPeAggregation, AccumulatorOps, WeightCacheOps, WeightAccessor; ns:SST |
 | `control/SnnPESubComponent_bcsr.cc` | `source` | include:"SnnPESubComponent.h" |
 | `control/SnnPESubComponent_impl.h` | `header` | include:"SnnPESubComponent.h"; types:GasPhaseController, SnnPESubComponent; ns:SST |
 | `control/SnnPESubComponent_routing.cc` | `source` | include:"SnnPESubComponent.h" |
@@ -531,7 +531,7 @@ make install
 | `services/synapse/stdmem/README.md` | `doc` | services/synapse/stdmem/（StandardMem 胶水层：隔离 StandardMem 类型） |
 | `services/synapse/stdmem/SnnPESubComponent_mem.cc` | `source` | include:"SnnPESubComponent.h" |
 | `services/synapse/stdmem/StdMemEndpoint.cc` | `source` | include:"synapse/stdmem/StdMemEndpoint.h"; types:StdMemEndpoint; ns:SST |
-| `services/synapse/stdmem/StdMemEndpoint.h` | `header` | include:"IGasCmdSender.h"; types:IGasStageSink, IGasStepGate, IMemoryAccess, IManualWindowDrive, StdMemEndpoint, Config, Runtime, Impl; ns:SST |
+| `services/synapse/stdmem/StdMemEndpoint.h` | `header` | include:"IGasCmdSender.h"; types:IGasStageSink, IGasStepGate, IMemoryAccess, StdMemEndpoint, Config, Runtime, Impl; ns:SST |
 
 </details>
 

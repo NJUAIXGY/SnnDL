@@ -124,11 +124,17 @@ void AccumulatorOps::update(uint32_t post, float dv) {
 
 void AccumulatorOps::mergeSpill_() {
     if (acc_spill_log_.empty()) return;
-    std::sort(acc_spill_log_.begin(), acc_spill_log_.end(),
+    std::vector<std::pair<uint32_t, float>> spill = std::move(acc_spill_log_);
+    acc_spill_log_.clear();
+
+    const bool prev_spill_enable = spill_enable_;
+    spill_enable_ = false;
+
+    std::sort(spill.begin(), spill.end(),
               [](const auto& a, const auto& b){ return a.first < b.first; });
     uint32_t curp = UINT32_MAX;
     float sum = 0.0f;
-    for (auto& pr : acc_spill_log_) {
+    for (auto& pr : spill) {
         if (pr.first != curp) {
             if (curp != UINT32_MAX) update(curp, sum);
             curp = pr.first;
@@ -138,7 +144,8 @@ void AccumulatorOps::mergeSpill_() {
         }
     }
     if (curp != UINT32_MAX) update(curp, sum);
-    acc_spill_log_.clear();
+
+    spill_enable_ = prev_spill_enable;
 }
 
 void AccumulatorOps::collectSortedPairs(std::vector<std::pair<uint32_t, float>>& out) {
@@ -196,7 +203,6 @@ void AccumulatorOps::verifyDense(uint32_t seq) {
         log_once("unused", kv.first, 0.0, kv.second);
         acc_shadow_map_.clear();
     }
-    acc_shadow_map_.clear();
     shadow_mismatch_logged_ = false;
 }
 

@@ -9,6 +9,7 @@
 #include "synapse/weights/WeightMemorySubsystem.h"
 #include "synapse/weights/SnnBcsrWeightManager.h"
 #include "SnnDLLogging.h"
+#include "synapse/common/BcsrMeta.h"
 
 #include <fstream>
 #include <sstream>
@@ -29,31 +30,27 @@ using namespace SST::SnnDL;
 // BCSR remains a storage format/addressing scheme only.
 static constexpr bool kEnableLegacyBcsrOptimizations = false;
 
-namespace {
-bool extractUnsigned(const std::string& text, const char* key, uint64_t& value) {
-    auto pos = text.find(key);
-    if (pos == std::string::npos) return false;
-    pos = text.find(':', pos);
-    if (pos == std::string::npos) return false;
-    ++pos;
-    while (pos < text.size() && (std::isspace(static_cast<unsigned char>(text[pos])) || text[pos] == '"')) ++pos;
-    size_t end = pos;
-    while (end < text.size() && (std::isdigit(static_cast<unsigned char>(text[end])) || text[end] == 'x' || text[end] == 'X')) ++end;
-    if (end <= pos) return false;
-    value = std::strtoull(text.substr(pos, end - pos).c_str(), nullptr, 0);
-    return true;
-}
-} // namespace
-
 bool SnnPESubComponent::BcsrLayout::validate(uint64_t base, Output* out, bool debug, uint32_t core_id, uint32_t node_id) const {
+    std::string mode = layout_mode;
+    std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (mode.empty()) mode = "flat";
     const bool monotonic = (colidx_offset >= rowptr_offset) && (blockdata_offset >= colidx_offset);
     const bool aligned64 = ((rowptr_offset | colidx_offset | blockdata_offset | blockids_offset) & 0x3FULL) == 0;
+    const size_t block_row_bytes =
+        static_cast<size_t>(block_cols ? block_cols : 0) * static_cast<size_t>(val_bytes ? val_bytes : 0);
+    const bool rowpack_stride_ok =
+        (mode != "rowpack_v1") ||
+        ((colidx_row_stride_bytes >= (idx_bytes ? idx_bytes : 2)) &&
+         (blockdata_row_stride_bytes >= block_row_bytes));
     const uint64_t stride = per_core_stride;
     const uint64_t max_off = maxOffset();
     const bool stride_ok = (stride == 0) ? true : (max_off < stride);
     if (debug && out) {
         out->verbose(CALL_INFO, 2, 0,
-            "[diag-bcsr-base] node=%u core=%u base=0x%lx rp=0x%lx ci=0x%lx bd=0x%lx ids=0x%lx stride=%" PRIu64 " stride_ok=%d align64=%d mono=%d br=%u bc=%u idx=%u val=%u\n",
+            "[diag-bcsr-base] node=%u core=%u base=0x%lx rp=0x%lx ci=0x%lx bd=0x%lx ids=0x%lx stride=%" PRIu64
+            " stride_ok=%d align64=%d mono=%d mode=%s ci_row_stride=%u bd_row_stride=%u ids_row_stride=%u rowpack_ok=%d br=%u bc=%u idx=%u val=%u\n",
             node_id, core_id,
             (unsigned long)base,
             (unsigned long)(base + rowptr_offset),
@@ -63,18 +60,23 @@ bool SnnPESubComponent::BcsrLayout::validate(uint64_t base, Output* out, bool de
             stride, stride_ok ? 1 : 0,
             aligned64 ? 1 : 0,
             monotonic ? 1 : 0,
+            mode.c_str(),
+            colidx_row_stride_bytes,
+            blockdata_row_stride_bytes,
+            blockids_row_stride_bytes,
+            rowpack_stride_ok ? 1 : 0,
             block_rows ? block_rows : 0,
             block_cols ? block_cols : 0,
             idx_bytes ? idx_bytes : 0,
             val_bytes ? val_bytes : 0);
-        if (!aligned64 || !monotonic || !stride_ok) {
+        if (!aligned64 || !monotonic || !stride_ok || !rowpack_stride_ok) {
             out->verbose(CALL_INFO, 2, 0,
-                "[diag-bcsr-base] offsets suspect (aligned64=%d monotonic=%d stride_ok=%d max_off=0x%llx stride=0x%llx)\n",
-                aligned64 ? 1 : 0, monotonic ? 1 : 0, stride_ok ? 1 : 0,
+                "[diag-bcsr-base] offsets/layout suspect (aligned64=%d monotonic=%d stride_ok=%d rowpack_ok=%d max_off=0x%llx stride=0x%llx)\n",
+                aligned64 ? 1 : 0, monotonic ? 1 : 0, stride_ok ? 1 : 0, rowpack_stride_ok ? 1 : 0,
                 (unsigned long long)max_off, (unsigned long long)stride);
         }
     }
-    return monotonic && aligned64;
+    return monotonic && aligned64 && rowpack_stride_ok;
 }
 
 bool SnnPESubComponent::parseBcsrMeta(const std::string& meta_path, uint32_t& rows_out, uint32_t& cols_out,
@@ -83,23 +85,24 @@ bool SnnPESubComponent::parseBcsrMeta(const std::string& meta_path, uint32_t& ro
                                       uint64_t& rowptr_off_out, uint64_t& colidx_off_out,
                                       uint64_t& blockdata_off_out, uint64_t& blockids_off_out,
                                       uint32_t& total_blocks_out) const {
-    std::ifstream meta(meta_path);
-    if (!meta.good()) return false;
-    std::string text((std::istreambuf_iterator<char>(meta)), std::istreambuf_iterator<char>());
-    uint64_t value = 0;
-    bool ok = false;
-    if (extractUnsigned(text, "\"rows\"", value)) { rows_out = static_cast<uint32_t>(value); ok = true; }
-    if (extractUnsigned(text, "\"cols\"", value)) { cols_out = static_cast<uint32_t>(value); ok = true; }
-    if (extractUnsigned(text, "\"br\"", value)) { br_out = static_cast<uint32_t>(value); ok = true; }
-    if (extractUnsigned(text, "\"bc\"", value)) { bc_out = static_cast<uint32_t>(value); ok = true; }
-    if (extractUnsigned(text, "\"idx_bytes\"", value)) { idx_bytes_out = static_cast<uint32_t>(value); ok = true; }
-    if (extractUnsigned(text, "\"val_bytes\"", value)) { val_bytes_out = static_cast<uint32_t>(value); ok = true; }
-    if (extractUnsigned(text, "\"rowptr_offset\"", value)) { rowptr_off_out = value; ok = true; }
-    if (extractUnsigned(text, "\"colidx_offset\"", value)) { colidx_off_out = value; ok = true; }
-    if (extractUnsigned(text, "\"blockdata_offset\"", value)) { blockdata_off_out = value; ok = true; }
-    if (extractUnsigned(text, "\"blockids_offset\"", value)) { blockids_off_out = value; ok = true; }
-    if (extractUnsigned(text, "\"total_blocks\"", value)) { total_blocks_out = static_cast<uint32_t>(value); ok = true; }
-    return ok;
+    BcsrMeta meta{};
+    if (!parseBcsrMetaJsonFile(meta_path, meta)) return false;
+
+    if (meta.rows == 0 || meta.cols == 0) return false;
+    if (meta.rowptr_offset == 0 && meta.colidx_offset == 0 && meta.blockdata_offset == 0) return false;
+
+    rows_out = meta.rows;
+    cols_out = meta.cols;
+    br_out = meta.br;
+    bc_out = meta.bc;
+    idx_bytes_out = meta.idx_bytes;
+    val_bytes_out = meta.val_bytes;
+    rowptr_off_out = meta.rowptr_offset;
+    colidx_off_out = meta.colidx_offset;
+    blockdata_off_out = meta.blockdata_offset;
+    blockids_off_out = meta.blockids_offset;
+    total_blocks_out = meta.total_blocks;
+    return true;
 }
 
 float SnnPESubComponent::readBcsrWeightFromFile_(uint32_t post_local, uint32_t pre_global) const {
@@ -115,6 +118,16 @@ float SnnPESubComponent::readBcsrWeightFromFile_(uint32_t post_local, uint32_t p
     uint64_t rp_off=0, ci_off=0, bd_off=0, id_off=0;
     std::string meta_path = bin_path + ".meta.json";
     if (!parseBcsrMeta(meta_path, rows, colsN, brM, bcM, idxB, valB, rp_off, ci_off, bd_off, id_off, totalB)) return 0.0f;
+    if (idxB != 2 && idxB != 4) idxB = (bcsr_idx_bytes_ == 4) ? 4 : 2;
+    if (valB == 0) valB = (bcsr_val_bytes_ ? bcsr_val_bytes_ : 4);
+    std::string layout_mode = bcsr_layout_.layout_mode;
+    std::transform(layout_mode.begin(), layout_mode.end(), layout_mode.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    const bool rowpack_v1 =
+        (layout_mode == "rowpack_v1") &&
+        (bcsr_layout_.colidx_row_stride_bytes >= (idxB ? idxB : 2)) &&
+        (bcsr_layout_.blockdata_row_stride_bytes > 0);
     std::ifstream fin(bin_path, std::ios::binary);
     if (!fin.good()) return 0.0f;
     uint32_t start = 0, end = 0;
@@ -124,7 +137,16 @@ float SnnPESubComponent::readBcsrWeightFromFile_(uint32_t post_local, uint32_t p
     if (!fin.good() || end <= start) return 0.0f;
     int idx_in_row = -1;
     for (uint32_t j=0; j < (end - start); ++j) {
-        fin.seekg(static_cast<std::streamoff>(ci_off + (size_t)(start + j) * idxB), std::ios::beg);
+        uint64_t colidx_off = 0;
+        if (rowpack_v1) {
+            colidx_off =
+                ci_off +
+                static_cast<uint64_t>(block_row) * static_cast<uint64_t>(bcsr_layout_.colidx_row_stride_bytes) +
+                static_cast<uint64_t>(j) * static_cast<uint64_t>(idxB);
+        } else {
+            colidx_off = ci_off + static_cast<uint64_t>(start + j) * static_cast<uint64_t>(idxB);
+        }
+        fin.seekg(static_cast<std::streamoff>(colidx_off), std::ios::beg);
         uint32_t colv = 0;
         if (idxB == 2) { uint16_t v=0; fin.read(reinterpret_cast<char*>(&v), 2); colv = v; }
         else { fin.read(reinterpret_cast<char*>(&colv), 4); }
@@ -134,8 +156,18 @@ float SnnPESubComponent::readBcsrWeightFromFile_(uint32_t post_local, uint32_t p
     if (idx_in_row < 0) return 0.0f;
     uint32_t brEff = (brM? brM : br);
     uint32_t bcEff = (bcM? bcM : bc);
+    if (valB != 4) return 0.0f;
     size_t blk_bytes = (size_t)brEff * (size_t)bcEff * (size_t)valB;
-    fin.seekg(static_cast<std::streamoff>(bd_off + (uint64_t)(start + (uint32_t)idx_in_row) * blk_bytes), std::ios::beg);
+    uint64_t blockdata_off = 0;
+    if (rowpack_v1) {
+        blockdata_off =
+            bd_off +
+            static_cast<uint64_t>(block_row) * static_cast<uint64_t>(bcsr_layout_.blockdata_row_stride_bytes) +
+            static_cast<uint64_t>(idx_in_row) * static_cast<uint64_t>(blk_bytes);
+    } else {
+        blockdata_off = bd_off + static_cast<uint64_t>(start + static_cast<uint32_t>(idx_in_row)) * static_cast<uint64_t>(blk_bytes);
+    }
+    fin.seekg(static_cast<std::streamoff>(blockdata_off), std::ios::beg);
     std::vector<float> blk((size_t)brEff * (size_t)bcEff, 0.0f);
     if (valB == 4) fin.read(reinterpret_cast<char*>(blk.data()), blk_bytes);
     if (!fin.good()) return 0.0f;

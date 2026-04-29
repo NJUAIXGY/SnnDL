@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <unordered_map>
 
 #include "ISynapseRoute.h"
 #include "SynapseRouteBuildConfig.h"
@@ -22,6 +23,8 @@ struct BcsrAppendOptions {
     uint32_t pre_begin = 0;
     uint32_t pre_end = std::numeric_limits<uint32_t>::max();
 };
+
+using RouteWeightMap = std::unordered_map<uint64_t, float>;
 
 bool parseBcsrMetaJson(const std::string& meta_path,
                        uint32_t& rows_out, uint32_t& cols_out,
@@ -40,7 +43,7 @@ bool appendRoutesFromBcsrFile(const SynapseRouteBuildConfig& cfg,
                               int core_index,
                               uint32_t rows_hint,
                               ISynapseRoute::RouteMap& routes_out,
-                              const BcsrAppendOptions& opt);
+                              const BcsrAppendOptions& opt,
+                              RouteWeightMap* route_weights_out = nullptr);
 
 }} // namespace SST::SnnDL
-

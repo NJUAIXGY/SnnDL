@@ -43,6 +43,12 @@ public:
         OptimizedInternalRing* optimized_ring = nullptr;
         SST::Link* external_spike_output_link = nullptr;  // legacy fallback
 
+        // Optional: step tagging for step-limited experiments (naive_raw "no within-step cascade").
+        // When active_step_seq != nullptr and *active_step_seq != 0, and packet.step_seq==0:
+        //   packet.step_seq = *active_step_seq + step_seq_offset
+        const uint32_t* active_step_seq = nullptr;  // 非拥有
+        uint32_t step_seq_offset = 0;
+
         // 投递回调（由 MultiCorePE 提供实现）：NoC 只负责把 packet 投递到目标 endpoint
         std::function<void(int /*endpoint_id*/, NocPacketEvent*)> deliver_to_endpoint;
     };

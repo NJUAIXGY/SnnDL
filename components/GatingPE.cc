@@ -1,29 +1,72 @@
 // -*- c++ -*-
 #include "GatingPE.h"
+#include <cctype>
+#include <limits>
 #include <sstream>
+#include <stdexcept>
 #include <random>
 #include "SnnNIC.h"
 #include "SnnInterface.h"
 #include "GatingDecisionEvent.h"
+#include "GatingPEConfig.h"
 
 using namespace SST;
 using namespace SST::SnnDL;
 
+namespace {
+
+static inline void trimAsciiInplace_(std::string& s) {
+    size_t b = 0;
+    while (b < s.size() && std::isspace(static_cast<unsigned char>(s[b]))) ++b;
+    size_t e = s.size();
+    while (e > b && std::isspace(static_cast<unsigned char>(s[e - 1]))) --e;
+    if (b == 0 && e == s.size()) return;
+    s = s.substr(b, e - b);
+}
+
+static inline bool parseU32Strict_(const std::string& in, uint32_t& out) {
+    std::string s = in;
+    trimAsciiInplace_(s);
+    if (s.empty()) return false;
+    try {
+        size_t pos = 0;
+        const unsigned long long v = std::stoull(s, &pos, 10);
+        if (pos != s.size()) return false;
+        if (v > static_cast<unsigned long long>(std::numeric_limits<uint32_t>::max())) return false;
+        out = static_cast<uint32_t>(v);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+} // namespace
+
 GatingPE::GatingPE(ComponentId_t id, Params& params)
     : Component(id)
 {
-    total_nodes_  = params.find<uint32_t>("total_nodes", 16);
-    rows_per_pe_  = params.find<uint32_t>("rows_per_pe", 16);
-    top_k_        = params.find<uint32_t>("top_k", 4);
-    weight_value_ = params.find<float>("weight_value", 1.0f);
-    transitions_  = params.find<std::string>("transitions", "0-3:4-7,4-7:8-11,8-11:12-15");
-    edges_path_   = params.find<std::string>("edges_output_file", "");
-    csv_header_   = params.find<int>("csv_header", 1) != 0;
-    selection_    = params.find<std::string>("selection", "round_robin");
-    seed_         = params.find<uint32_t>("seed", 42);
+    const GatingPEConfig cfg = parseGatingPEConfig(params);
+    total_nodes_  = cfg.total_nodes;
+    rows_per_pe_  = cfg.rows_per_pe;
+    top_k_        = cfg.top_k;
+    weight_value_ = cfg.weight_value;
+    transitions_  = cfg.transitions;
+    edges_path_   = cfg.edges_output_file;
+    csv_header_   = cfg.csv_header;
+    selection_    = cfg.selection;
+    seed_         = cfg.seed;
 
-    int verbose = params.find<int>("verbose", 0);
-    out_ = new Output("GatingPE[@p:@l]: ", verbose, 0, Output::STDOUT);
+    gate_targets_ = cfg.gate_targets;
+    emit_period_ns_ = cfg.emit_period_ns;
+    emit_count_ = cfg.emit_count;
+    nic_node_id_ = cfg.node_id;
+    nic_vns_ = cfg.virtual_channels;
+    nic_vn_control_ = cfg.vn_control;
+    nic_link_bw_ = cfg.link_bw;
+    nic_in_buf_ = cfg.input_buf_size;
+    nic_out_buf_ = cfg.output_buf_size;
+
+    out_ = new Output("GatingPE[@p:@l]: ", cfg.verbose, 0, Output::STDOUT);
 
     // stats
     stat_tokens_ = registerStatistic<uint64_t>("gating_tokens");
@@ -71,22 +114,48 @@ void GatingPE::finish() { /* no-op */ }
 
 bool GatingPE::parseTransitions(const std::string& s, std::vector<Transition>& out) {
     // format: a-b:c-d, e-f:g-h, ... (inclusive bounds)
+    out.clear();
     std::istringstream ss(s);
     std::string tok;
     while (std::getline(ss, tok, ',')) {
+        trimAsciiInplace_(tok);
         if (tok.empty()) continue;
         size_t colon = tok.find(':');
-        if (colon == std::string::npos) return false;
+        if (colon == std::string::npos) {
+            if (out_) out_->verbose(CALL_INFO, 1, 0, "⚠️ transitions token缺少':'分隔符: '%s'\n", tok.c_str());
+            return false;
+        }
         std::string left = tok.substr(0, colon);
         std::string right = tok.substr(colon+1);
-        auto parseRange = [](const std::string& r)->Range{
+        trimAsciiInplace_(left);
+        trimAsciiInplace_(right);
+        auto parseRange = [](const std::string& r, Range& out_range)->bool{
             size_t dash = r.find('-');
-            Range R{};
-            if (dash == std::string::npos) { R.a = R.b = (uint32_t) std::stoul(r); }
-            else { R.a = (uint32_t) std::stoul(r.substr(0,dash)); R.b = (uint32_t) std::stoul(r.substr(dash+1)); }
-            return R;
+            if (dash == std::string::npos) {
+                uint32_t v = 0;
+                if (!parseU32Strict_(r, v)) return false;
+                out_range.a = v;
+                out_range.b = v;
+                return true;
+            }
+
+            uint32_t a = 0, b = 0;
+            if (!parseU32Strict_(r.substr(0, dash), a)) return false;
+            if (!parseU32Strict_(r.substr(dash + 1), b)) return false;
+            if (b < a) return false;
+            out_range.a = a;
+            out_range.b = b;
+            return true;
         };
-        Transition tr; tr.src = parseRange(left); tr.dst = parseRange(right);
+        Transition tr;
+        if (!parseRange(left, tr.src)) {
+            if (out_) out_->verbose(CALL_INFO, 1, 0, "⚠️ transitions源范围解析失败: '%s'\n", left.c_str());
+            return false;
+        }
+        if (!parseRange(right, tr.dst)) {
+            if (out_) out_->verbose(CALL_INFO, 1, 0, "⚠️ transitions目标范围解析失败: '%s'\n", right.c_str());
+            return false;
+        }
         out.push_back(tr);
     }
     return !out.empty();
@@ -138,16 +207,31 @@ void GatingPE::writeCSV() {
 
 bool GatingPE::parseTargets(const std::string& s, std::vector<uint32_t>& out) {
     // format: a-b,c,d-e
+    out.clear();
     std::istringstream ss(s);
     std::string tok;
     while (std::getline(ss, tok, ',')) {
+        trimAsciiInplace_(tok);
         if (tok.empty()) continue;
         size_t dash = tok.find('-');
         if (dash == std::string::npos) {
-            out.push_back((uint32_t)std::stoul(tok));
+            uint32_t v = 0;
+            if (!parseU32Strict_(tok, v)) {
+                if (out_) out_->verbose(CALL_INFO, 1, 0, "⚠️ gate_targets项解析失败: '%s'\n", tok.c_str());
+                return false;
+            }
+            out.push_back(v);
         } else {
-            uint32_t a = (uint32_t)std::stoul(tok.substr(0,dash));
-            uint32_t b = (uint32_t)std::stoul(tok.substr(dash+1));
+            uint32_t a = 0, b = 0;
+            if (!parseU32Strict_(tok.substr(0, dash), a) ||
+                !parseU32Strict_(tok.substr(dash + 1), b)) {
+                if (out_) out_->verbose(CALL_INFO, 1, 0, "⚠️ gate_targets范围解析失败: '%s'\n", tok.c_str());
+                return false;
+            }
+            if (b < a) {
+                if (out_) out_->verbose(CALL_INFO, 1, 0, "⚠️ gate_targets范围无效(右端小于左端): '%s'\n", tok.c_str());
+                return false;
+            }
             for (uint32_t x=a; x<=b; ++x) out.push_back(x);
         }
     }
@@ -157,17 +241,17 @@ bool GatingPE::parseTargets(const std::string& s, std::vector<uint32_t>& out) {
 bool GatingPE::onEmitTick(SST::Cycle_t) {
     if (!nic_) return false;
     // 解析一次targets
-    static std::vector<uint32_t> targets; if (targets.empty()) parseTargets(gate_targets_, targets);
+    if (parsed_targets_.empty()) parseTargets(gate_targets_, parsed_targets_);
     // 解析一次transitions
-    static std::vector<Transition> trs; if (trs.empty()) parseTransitions(transitions_, trs);
-    if (targets.empty() || trs.empty()) return false;
+    if (parsed_transitions_.empty()) parseTransitions(transitions_, parsed_transitions_);
+    if (parsed_targets_.empty() || parsed_transitions_.empty()) return false;
 
     // 简单轮转：每个目标源PE发一个决策（src_row按emit_sent_轮转）
     uint32_t row = (rows_per_pe_ == 0) ? 0u : (uint32_t)(emit_sent_ % rows_per_pe_);
-    for (uint32_t src_pe : targets) {
+    for (uint32_t src_pe : parsed_targets_) {
         // 找到对应的dst范围
         std::vector<uint32_t> dst_pes;
-        for (auto &tr : trs) if (src_pe >= tr.src.a && src_pe <= tr.src.b) {
+        for (auto &tr : parsed_transitions_) if (src_pe >= tr.src.a && src_pe <= tr.src.b) {
             for (uint32_t p=tr.dst.a; p<=tr.dst.b; ++p) dst_pes.push_back(p);
         }
         if (dst_pes.empty()) continue;

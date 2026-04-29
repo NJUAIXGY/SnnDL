@@ -9,7 +9,6 @@
 #include "SnnPESubComponent.h"
 #include "SnnPESubComponent_impl.h"
 #include "IPeAggregation.h"
-#include "IManualWindowDrive.h"
 #include "synapse/stdmem/StdMemEndpoint.h"
 #include "synapse/weights/SnnBcsrWeightManager.h"
 #include "synapse/weights/WeightMemorySubsystem.h"
@@ -30,6 +29,22 @@ template <>
 void SnnPESubComponent::handleMemoryResponse<SST::Interfaces::StandardMem::Request>(
     SST::Interfaces::StandardMem::Request* req);
 
+uint64_t SnnPESubComponent::denseWeightAddr_(uint32_t row, uint32_t col, uint32_t width) const {
+    const uint64_t bpf = sizeof(float);
+    if (!dense_phys_enable_ || dense_phys_group_stride_bytes_ == 0 || dense_phys_row_stride_bytes_ == 0 ||
+        dense_phys_rows_per_dram_row_ == 0) {
+        return base_addr_ +
+               (static_cast<uint64_t>(row) * static_cast<uint64_t>(width) + static_cast<uint64_t>(col)) * bpf;
+    }
+    const uint64_t group = static_cast<uint64_t>(row) / static_cast<uint64_t>(dense_phys_rows_per_dram_row_);
+    const uint64_t within = static_cast<uint64_t>(row) % static_cast<uint64_t>(dense_phys_rows_per_dram_row_);
+    const uint64_t off =
+        group * static_cast<uint64_t>(dense_phys_group_stride_bytes_) +
+        within * static_cast<uint64_t>(dense_phys_row_stride_bytes_) +
+        static_cast<uint64_t>(col) * bpf;
+    return base_addr_ + off;
+}
+
 void SnnPESubComponent::initStdMemPhase0_() {
     // 加载 StandardMem 接口（Python 可通过槽位提供）。
     // 注意：该逻辑放在 synapse/stdmem 域，避免 control/*.cc 出现 StandardMem::。
@@ -40,10 +55,10 @@ void SnnPESubComponent::initStdMemPhase0_() {
                                                    &SnnPESubComponent::handleMemoryResponse<SST::Interfaces::StandardMem::Request>>(this));
 
     // bind endpoint for control-plane sends (Begin/EndGather etc.)
-    // Phase6：stream workload 需要“纯内存语义”，强制设置 non-cacheable（同时保留 env fallback 兼容路径）。
+    // Phase6：stream/traffic_mem workload 需要“纯内存语义”，强制设置 non-cacheable（同时保留 env fallback 兼容路径）。
     {
         StdMemEndpoint::Config cfg{};
-        cfg.force_noncacheable = isStreamWorkload_();
+        cfg.force_noncacheable = isStreamLikeWorkload_();
         stdmem_ep_->configure(cfg);
     }
     StdMemEndpoint::Runtime rt{};
@@ -62,23 +77,6 @@ void SnnPESubComponent::initStdMemPhase0_() {
     if (stdmem_ep_ && stdmem_ep_->available()) {
         // 若已成功加载 StandardMem 子组件，则认为内存就绪（即使未显式提供 memory_link_）
         memory_ready_ = true;
-        if (gas_manual_window_drive_) {
-            auto* drive = stdmem_ep_->manualWindowDrive();
-                if (!drive) {
-                    if (output_) {
-                    output_->verbose(CALL_INFO, 1, 0,
-                        "⚠️ 核心%d启用gas_manual_window_drive但memory不支持IManualWindowDrive，降级为自动窗口\n",
-                        core_id_);
-                    }
-                    gas_manual_window_drive_ = false;
-                } else {
-                    if (output_) {
-                    output_->verbose(CALL_INFO, 2, 0,
-                        "[diag-gas] 核心%d启用manual窗口驱动 (IManualWindowDrive) gather_cycles=%" PRIu64 "\n",
-                        core_id_, manual_gas_gather_cycles_cfg_);
-                    }
-                }
-        }
     } else {
         memory_ready_ = false;
     }
@@ -108,7 +106,9 @@ bool SnnPESubComponent::applyLocalWeightUpdates_(const std::unordered_map<uint64
         if (weight_decay != 0.0f) {
             new_w -= weight_decay * old_w;
         }
-	        uint64_t addr = base_addr_ + key * bytes_per_float;
+	        const uint32_t row = (width != 0) ? static_cast<uint32_t>(key / static_cast<uint64_t>(width)) : 0u;
+	        const uint32_t col = (width != 0) ? static_cast<uint32_t>(key % static_cast<uint64_t>(width)) : 0u;
+	        uint64_t addr = denseWeightAddr_(row, col, width);
 	        std::vector<uint8_t> data(bytes_per_float);
 	        std::memcpy(data.data(), &new_w, bytes_per_float);
 	        if (impl_) impl_->reportMemoryIssue(data.size(), false);
@@ -144,8 +144,7 @@ void SnnPESubComponent::requestWeight(uint32_t pre_neuron, uint32_t post_neuron,
         return;
     }
 
-    const uint64_t req_addr =
-        base_addr_ + (static_cast<uint64_t>(row) * static_cast<uint64_t>(width) + static_cast<uint64_t>(col)) * sizeof(float);
+    const uint64_t req_addr = denseWeightAddr_(row, col, width);
     const uint64_t issue_cycle = static_cast<uint64_t>(total_cycles_);
 
     if (window_read_debug_ && output_) {
@@ -209,7 +208,7 @@ void SnnPESubComponent::scheme1PrefetchSlice_(uint32_t slice_idx) {
     for (uint32_t row = 0; row < num_neurons_; ++row) {
         // 按 cacheline 对齐扫描该区间
         for (uint32_t c = (beg / fpl) * fpl; c < end; c += fpl) {
-            uint64_t req_addr = base_addr_ + (static_cast<uint64_t>(row) * width + c) * sizeof(float);
+            uint64_t req_addr = denseWeightAddr_(row, c, width);
             size_t req_size = std::min<uint32_t>(fpl, end - c) * (uint32_t)sizeof(float);
             if (stat_s1_bytes_read_) stat_s1_bytes_read_->addData(static_cast<uint64_t>(req_size));
             const uint32_t count_floats = static_cast<uint32_t>(req_size / sizeof(float));

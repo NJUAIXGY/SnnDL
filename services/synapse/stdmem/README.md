@@ -6,9 +6,10 @@
 - 纯内存访问走 `api/IMemoryAccess.h`（实现：`services/memory/StandardMemAccess`）
 - GAS 控制面的 stage/stat 事件走 `api/IGasStageSink.h` / `api/IGasCmdSender.h`
 
-## 默认内存语义（cacheline）
+## 默认内存语义（memHierarchy / cacheline 对齐）
 
-`StdMemEndpoint`/`StandardMemAccess` 处于“对下游 memHierarchy 发起事务”的边界：默认以 **cacheline** 作为外部搬运与统计对齐的基本粒度（`memHierarchy GetS/GetX`）。
+`StdMemEndpoint`/`StandardMemAccess` 处于“对下游 memHierarchy 发起事务”的边界：只负责把上游的 `addr+size` 请求转为 StandardMem 事务并分发回包，**请求粒度由上游决定**。
+系统层 traffic/带宽口径仍以 memHierarchy 的 cacheline 事务为准（例如 `MemController requests_received_*`）。
 如上层（例如 GAS）显式形成大 granule/row-streaming 读，其 overfetch 必须通过上层 granule 统计与 `effective_config.json` 闭环解释，禁止把大粒度当成默认。
 
 ---
@@ -22,7 +23,8 @@
   - 同时对接两类回包：
     1) **数据面**：分发到 `services/memory/StandardMemAccess`（纯 `addr→bytes`）
     2) **控制面**：分发到 `api/IGasStageSink`（BeginGather/BeginApply/... 的 stage/stat 载体）
-  - 实现 `api/IGasCmdSender`：用于向 GatherBufferIF 发送 GAS stage custom cmd
+  - 实现 `api/IGasCmdSender`：用于向 StandardMem 前端（GatherBufferIF）发送 GAS stage custom cmd
+  - 已弃用：`api/IManualWindowDrive.h` 仅保留兼容入口；StdMemEndpoint 不再暴露手动窗口驱动，窗口推进由 GatherBufferIF 的 clock 驱动
   - **fail-fast**：遇到 `stdmem-untracked`（回包无法匹配任何 pending）直接 `fatal`，用于尽早暴露重复回包/错配等严重问题。
 
 ### `SnnPESubComponent_mem.cc`

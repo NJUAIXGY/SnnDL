@@ -20,13 +20,18 @@
 
 ### CoreShell / Workload（平台面主干）
 - `CoreShellAPI.h`
-  - CoreShell 暴露给上层（MultiCorePE）的最小能力面：`onClockTick/deliverPacket/hasWork/getStatistics` 等。
+  - CoreShell 暴露给上层（MultiCorePE）的最小能力面：`setParentInterface/deliverPacket/hasWork/getUtilization/getStatistics` 等。
   - **推荐主路径**（packet-first + 可插拔 workload）。
 - `ICoreWorkload.h` / `WorkloadConfig.h` / `CoreWorkloadFactory.h`
   - Workload 插件契约与工厂：`workload_impl=snn|stream|...`。
   - CoreShell 只持有 `ICoreWorkload`，不持有业务状态机。
 - `ISpikeWorkload.h` / `ISnnSpikeCommWorkload.h`
   - Spike 相关的 workload 可选接口（例如 SNN workload 暴露“本地注入/统计/通信”协作点）。
+
+### Utils（轻量工具，避免重复造轮子）
+- `SnnDLStringUtil.h`
+  - ASCII 小写归一化：`toLowerCopy()`（保持可复现、无 locale 依赖）。
+  - 模板占位符替换：`replaceAll()/replaceAllIndexed()/resolvePeCoreTemplate()`（用于 `{pe}/{core}` 等路径模板）。
 
 ---
 
@@ -36,7 +41,7 @@ SnnDL 的“通用 DRAM + memHierarchy”默认建模语义是 **cacheline（例
 
 - `api/IMemoryAccess.h` 只承诺 `addr + size ↔ bytes`，不承诺“行/矩阵 row”语义。
 - 论文/报告的 traffic 主口径建议以 memHierarchy 的 MemController 事务统计（`requests_received_*`）为准；
-  上层 `memory_bytes` 仅代表逻辑请求（L1），不等价于 off-chip 流量（L2）。
+  上层 `memory_bytes` 仅代表逻辑请求（L1；通常为 core 侧 `mem_req_size_bytes` 的汇总派生），不等价于 off-chip 流量（L2）。
 - row-streaming/DMA 属于显式架构假设，必须单列结果，避免与 cacheline 结论混算。
 
 ### NoC（纯传输：packet-first）
@@ -56,14 +61,20 @@ SnnDL 的“通用 DRAM + memHierarchy”默认建模语义是 **cacheline（例
 ### Synapse（业务语义：weights/route/gas）
 - `SnnWeightReader.h`
   - `IWeightReader` 抽象：为 compute core 提供统一权重读取/缓存入口（实现通常在 synapse/weights）。
+- `IWeightReaderAdopter.h`
+  - 窄接口：将 `IWeightReader` 所有权从装配方（CoreShell）移交给 workload（避免 control/workload 双实例装配）。
 - `ISynapseRoute.h` / `SynapseRouteBuildConfig.h`
   - fanout/route 的窄接口：路由构建与查询（语义集中在 synapse 域，不进入 NoC/Memory）。
 
 ### GAS/Step（控制面窄接口）
 - `IGasCmdSender.h` / `IGasStageSink.h` / `IGasStepGate.h` / `GasOps.h`
   - 阶段事件/统计/门控的窄接口（用于把 Stage 载体与具体实现隔离）。
-- `IGlobalStepHooks.h` / `ICoreControlHooks.h` / `IManualWindowDrive.h`
-  - Step/GAS 同步与控制钩子（平台面只看“开始/结束/触发”，业务语义在 workload/synapse/stimulus）。
+- `IGasOrchestrator.h`
+  - GAS 阶段编排接口（供 `services/synapse/gas` 控制器调用；services 仅依赖 api/，不 include control 实现）。
+- `IGlobalStepHooks.h` / `ICoreControlHooks.h`
+  - MultiCorePE → core 的注入接口：全局 step start、NoC 注入/门控决策、以及回退的手动驱动（debug/兜底）。
+- `IManualWindowDrive.h`（已弃用，仅兼容保留）
+  - 旧的“手动窗口驱动”兼容接口头；主线不再依赖/暴露该能力。
 
 ### PE 级聚合
 - `IPeAggregation.h`

@@ -31,6 +31,8 @@ public:
     SST_ELI_DOCUMENT_PARAMS(
         {"node_id", "网络节点ID（用于日志/状态）", "0"},
         {"port_name", "端口名称（连接到 router.local）", "network"},
+        {"stats_header_bytes", "Bytes added to payload for NIC byte statistics", "24"},
+        {"local_endpoint_multicast_enable", "Expand local endpoint fanout packets emitted by router", "0"},
         {"verbose", "日志详细级别", "0"}
     )
 
@@ -53,13 +55,19 @@ public:
 
 private:
     void handleNetworkLinkEvent_(SST::Event* ev);
+    uint64_t packetBytes_(const SST::Event* ev) const;
 
     SST::Output out_;
     std::string port_name_;
     uint32_t node_id_ = 0;
+    uint64_t stats_header_bytes_ = 24;
+    bool local_endpoint_multicast_enable_ = false;
+    uint64_t pkts_sent_total_ = 0;
+    uint64_t pkts_recv_total_ = 0;
+    uint64_t bytes_sent_total_ = 0;
+    uint64_t bytes_recv_total_ = 0;
     ReceiveHandler recv_handler_;
     SST::Link* network_link_ = nullptr;
 };
 
 }} // namespace SST::SnnDL
-

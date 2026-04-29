@@ -9,6 +9,7 @@
 #include "SnnPE.h"
 #include "SnnNeuronModel.h"
 #include "SnnDLLogging.h"
+#include "SnnPEConfig.h"
 
 #include <fstream>
 #include <sstream>
@@ -23,32 +24,32 @@ using namespace SST::SnnDL;
 
 // ===== 构造函数 =====
 SnnPE::SnnPE(ComponentId_t id, Params& params) : Component(id) {
+    const SnnPEConfig cfg = parseSnnPEConfig(params);
     // 初始化输出对象
-    int verbose_level = params.find<int>("verbose", 0);
-    output = new Output("SnnPE[@p:@l]: ", verbose_level, 0, Output::STDOUT);
+    output = new Output("SnnPE[@p:@l]: ", cfg.verbose, 0, Output::STDOUT);
     
     // Deprecation notice (prints once at construction)
     PE_LOG(1, "⚠️ Deprecated: SnnPE为旧架构兼容实现，推荐使用 MultiCorePE + SnnPESubComponent + SnnNIC\n");
     PE_LOG(1, "初始化SnnPE组件 (ID: %" PRIu64 ")\n", id);
     
     // 读取配置参数
-    num_neurons = params.find<uint32_t>("num_neurons");
+    num_neurons = cfg.num_neurons;
     if (num_neurons == 0) {
         output->fatal(CALL_INFO, -1, "错误: num_neurons参数是必需的且必须大于0\n");
     }
     
     // 网络配置
-    node_id = params.find<uint32_t>("node_id", 0);
+    node_id = cfg.node_id;
     
-    v_thresh = params.find<float>("v_thresh", 1.0f);
-    v_reset = params.find<float>("v_reset", 0.0f);
-    v_rest = params.find<float>("v_rest", 0.0f);
-    tau_mem = params.find<float>("tau_mem", 20.0f);
-    t_ref = params.find<uint32_t>("t_ref", 2);
+    v_thresh = cfg.v_thresh;
+    v_reset = cfg.v_reset;
+    v_rest = cfg.v_rest;
+    tau_mem = cfg.tau_mem;
+    t_ref = cfg.t_ref;
     
     // 内存相关参数（新增）
-    base_addr = params.find<uint64_t>("base_addr", 0);
-    weights_per_neuron = params.find<uint32_t>("weights_per_neuron", 0);
+    base_addr = cfg.base_addr;
+    weights_per_neuron = cfg.weights_per_neuron;
     
     PE_LOG(2, "神经元参数: num=%u, node_id=%u, v_thresh=%.3f, v_reset=%.3f, v_rest=%.3f, tau_mem=%.1fms, t_ref=%u\n",
         num_neurons, node_id, v_thresh, v_reset, v_rest, tau_mem, t_ref);
@@ -65,7 +66,7 @@ SnnPE::SnnPE(ComponentId_t id, Params& params) : Component(id) {
 
     // 初始化神经动力学模型（内部策略，不改变外部接口）
     {
-        std::string model_name = params.find<std::string>("neuron_model", "LIF");
+        std::string model_name = cfg.neuron_model;
         NeuronModelType model_type = parseNeuronModel(model_name);
         neuron_model_ = createNeuronModel(model_type);
         ModelConfig mcfg = buildModelConfigFromParams(params);
@@ -169,7 +170,7 @@ SnnPE::SnnPE(ComponentId_t id, Params& params) : Component(id) {
     }
     
     // 注册时钟处理器
-    std::string clock_freq = params.find<std::string>("clock", "1GHz");
+    std::string clock_freq = cfg.clock;
     registerClock(clock_freq, new Clock::Handler2<SnnPE,&SnnPE::clockTick>(this));
     PE_LOG(2, "注册了时钟处理器，频率: %s\n", clock_freq.c_str());
     
@@ -186,18 +187,18 @@ SnnPE::SnnPE(ComponentId_t id, Params& params) : Component(id) {
     stat_synaptic_ops = registerStatistic<uint64_t>("total_synaptic_ops");
     
     // 获取权重文件路径（在setup()中加载）
-    weights_file_path = params.find<std::string>("weights_file", "");
-    neuron_id_start = params.find<uint32_t>("neuron_id_start", 0);
+    weights_file_path = cfg.weights_file;
+    neuron_id_start = cfg.neuron_id_start;
     
     // 新增：二进制权重文件路径
-    binary_weights_file_path = params.find<std::string>("binary_weights_file", "");
+    binary_weights_file_path = cfg.binary_weights_file;
     
     // 测试流量配置
-    enable_test_traffic = params.find<bool>("enable_test_traffic", false);
-    test_target_node = params.find<uint32_t>("test_target_node", 0);
-    test_period = params.find<uint32_t>("test_period", 100);
-    test_spikes_per_burst = params.find<uint32_t>("test_spikes_per_burst", 4);
-    test_weight = params.find<float>("test_weight", 0.2);
+    enable_test_traffic = cfg.enable_test_traffic;
+    test_target_node = cfg.test_target_node;
+    test_period = cfg.test_period;
+    test_spikes_per_burst = cfg.test_spikes_per_burst;
+    test_weight = cfg.test_weight;
 
     if (!weights_file_path.empty()) {
         PE_LOG(1, "将从文件加载权重: %s\n", weights_file_path.c_str());
@@ -330,13 +331,14 @@ void SnnPE::finish() {
     }
     
     // 输出最终统计信息
-    output->output("=== SnnPE最终统计[节点%u] ===\n", node_id);
-    output->output("接收脉冲数: %" PRIu64 "\n", spikes_received_count);
-    output->output("生成脉冲数: %" PRIu64 "\n", spikes_generated_count);
-    output->output("发放神经元数: %" PRIu64 "\n", neurons_fired_count);
-    output->output("突触操作数: %" PRIu64 "\n", synaptic_ops_count);
-    output->output("接口模式: %s\n", use_interface_mode ? "SubComponent" : "传统Link");
-    output->output("路由模式: %s\n", use_embedded_router ? "嵌入式路由器" : "无路由器");
+    // 注意：避免使用 Output::output() 造成默认刷屏；统一走 verbose 门控
+    PE_LOG(1, "=== SnnPE最终统计[节点%u] ===\n", node_id);
+    PE_LOG(1, "接收脉冲数: %" PRIu64 "\n", spikes_received_count);
+    PE_LOG(1, "生成脉冲数: %" PRIu64 "\n", spikes_generated_count);
+    PE_LOG(1, "发放神经元数: %" PRIu64 "\n", neurons_fired_count);
+    PE_LOG(1, "突触操作数: %" PRIu64 "\n", synaptic_ops_count);
+    PE_LOG(1, "接口模式: %s\n", use_interface_mode ? "SubComponent" : "传统Link");
+    PE_LOG(1, "路由模式: %s\n", use_embedded_router ? "嵌入式路由器" : "无路由器");
     
     // 更新统计对象
     stat_spikes_received->addData(spikes_received_count);
@@ -921,16 +923,22 @@ void SnnPE::routeSpike(SpikeEvent* spike_event, uint32_t target_node) {
         return;
     }
     
-    if (router->spaceToSend(0, 8)) {
+    const int size_bits = static_cast<int>(sizeof(SpikeEvent) * 8);
+    if (router->spaceToSend(0, size_bits)) {
         // 创建脉冲事件副本作为负载
         SpikeEvent* payload = new SpikeEvent(*spike_event);
         
         // 创建网络请求
         SST::Interfaces::SimpleNetwork::Request* req = 
-            new SST::Interfaces::SimpleNetwork::Request(target_node, node_id, sizeof(SpikeEvent) * 8, true, true, payload);
+            new SST::Interfaces::SimpleNetwork::Request(target_node, node_id, static_cast<size_t>(size_bits), true, true, payload);
         
         // 发送
-        router->send(req, 0);
+        const bool sent = router->send(req, 0);
+        if (!sent) {
+            delete req; // Request 析构会释放 payload
+            PE_LOG(1, "警告：路由器发送失败，丢弃脉冲到节点%u\n", target_node);
+            return;
+        }
         
         PE_LOG(3, "路由脉冲：节点%u -> 节点%u\n", node_id, target_node);
     } else {

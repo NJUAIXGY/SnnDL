@@ -20,7 +20,7 @@
 #include <queue>
 #include <cstdint>
 
-#include "SpikeEvent.h"
+#include "events/SpikeEvent.h"
 
 namespace SST {
 namespace SnnDL {

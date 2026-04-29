@@ -24,6 +24,8 @@
 #include "ICoreControlHooks.h"
 #include "ICoreMemoryLink.h"
 #include "IGlobalStepHooks.h"
+#include "IGlobalStepCreditHooks.h"
+#include "ILoaderReadyHooks.h"
 #include "IGasOrchestrator.h"
 #include "IGasStageSink.h"
 
@@ -33,14 +35,16 @@ class SpikeEvent;
 class NocSpikeTransport;
 class BcsrWeightManager;
 class StdMemEndpoint;
+class ISnnAccelRuntimeServices;
 class ISnnSpikeCommWorkload;
 class IGasStageSink;
 class IWeightReader;
+class IMemoryAccess;
 
 class IPeAggregation; // PE级汇聚接口（避免依赖 MultiCorePE 具体实现）
-class IManualWindowDrive;
 class AccumulatorOps;
 class WeightCacheOps;
+class RiscvSnnShadowRuntimeServices;
 struct WeightAccessor;
 class WeightMemorySubsystem;
 class SpikeCommSubsystem;
@@ -53,6 +57,8 @@ class SnnPESubComponent : public SnnCoreAPI,
                           public ICoreControlHooks,
                           public ICoreMemoryLink,
                           public IGlobalStepHooks,
+                          public IGlobalStepCreditHooks,
+                          public ILoaderReadyHooks,
                           public IGasOrchestrator,
                           public IGasStageSink {
 public:
@@ -69,7 +75,7 @@ public:
         {"core_id", "ID of the core", ""},
         {"compute_core_impl", "Compute core implementation name (default/snn)", "default"},
         // Phase6：通用 workload（默认仍为 SNN；stream 用于通信+内存 read-after-write 验证负载）
-        {"workload_impl", "Workload implementation: snn (default) / stream / traffic", "snn"},
+        {"workload_impl", "Workload implementation: snn (default) / riscv_snn / stream / traffic / traffic_mem / tensor", "snn"},
         {"stream_mem_enable", "Enable stream memory read/write verify (0/1)", "1"},
         {"stream_mem_period_cycles", "Issue one stream write per N cycles (0=as fast as possible)", "100"},
         {"stream_mem_region_bytes", "Stream memory region size in bytes (0=disable mem)", "4096"},
@@ -81,6 +87,83 @@ public:
         {"stream_comm_payload_bytes", "RawBytes payload bytes (excluding header)", "64"},
         {"stream_strict", "Fail-fast on any stream verify error (0/1)", "1"},
         {"stream_seed", "Base seed for stream pattern generation (uint64)", "0"},
+        // Phase6+：tensor workload（systolic/GEMM microbench；完全非 SNN）
+        {"tensor_m", "Tensor workload: GEMM M dimension", "256"},
+        {"tensor_n", "Tensor workload: GEMM N dimension", "256"},
+        {"tensor_k", "Tensor workload: GEMM K dimension", "256"},
+        {"tensor_element_bytes", "Tensor workload: element size (bytes)", "2"},
+        {"tensor_array_m", "Tensor workload: systolic array M", "32"},
+        {"tensor_array_n", "Tensor workload: systolic array N", "32"},
+        {"tensor_compute_efficiency", "Tensor workload: peak efficiency [0,1]", "1.0"},
+        {"tensor_compute_precision", "Tensor workload: compute precision profile (fp16/bf16/fp32/tf32/int8/fp8)", "fp16"},
+        {"tensor_compute_profile_override_enable", "Tensor workload: override precision profile with explicit throughput/latency (0/1)", "0"},
+        {"tensor_compute_throughput_scale", "Tensor workload: explicit throughput scale when override enabled", "1.0"},
+        {"tensor_compute_pipeline_latency_cycles", "Tensor workload: explicit pipeline latency cycles when override enabled", "0"},
+        {"tensor_overlap_enable", "Tensor workload: overlap DMA and compute (0/1)", "1"},
+        {"tensor_start_cycle", "Tensor workload: start cycle", "1"},
+        {"tensor_iterations", "Tensor workload: total iterations (0=unbounded)", "0"},
+        {"tensor_mem_enable", "Tensor workload: enable IMemoryAccess reads/writes (0/1)", "1"},
+        {"tensor_mem_region_bytes", "Tensor workload: address region bytes (wrap-around)", "1048576"},
+        {"tensor_mem_req_bytes", "Tensor workload: memory request bytes", "64"},
+        {"tensor_mem_max_outstanding", "Tensor workload: max outstanding memory requests", "32"},
+        {"tensor_dataflow", "Tensor workload: dataflow (os/ws/is)", "os"},
+        {"tensor_tile_m", "Tensor workload: tile size M (0=use full M)", "0"},
+        {"tensor_tile_n", "Tensor workload: tile size N (0=use full N)", "0"},
+        {"tensor_tile_k", "Tensor workload: tile size K (0=use full K)", "0"},
+        {"tensor_exec_mode", "Tensor workload: execution mode (bulk/tile/program)", "bulk"},
+        {"tensor_program_dsl", "Tensor workload: program DSL (exec_mode=program)", ""},
+        {"tensor_program_loop", "Tensor workload: loop the program (0/1)", "1"},
+        {"tensor_program_issue_width", "Tensor workload: program issue width (ops/cycle, program mode)", "4"},
+        {"tensor_program_engine_priority", "Tensor workload: program engine priority (e.g. dma>mxu>vec>coll)", "dma>mxu>vec>coll"},
+        {"tensor_vector_elems_per_cycle", "Tensor workload: vector engine elems/cycle (program mode)", "64"},
+        {"tensor_vector_pipeline_latency_cycles", "Tensor workload: vector engine pipeline latency cycles (program mode)", "0"},
+        {"tensor_tile_schedule", "Tensor workload: tile schedule (auto/mnk/mkn/nkm)", "auto"},
+        {"tensor_writeback_policy", "Tensor workload: writeback policy (at_end_of_k)", "at_end_of_k"},
+        {"tensor_ub_bytes", "Tensor workload: on-chip unified buffer bytes (0=disable)", "0"},
+        {"tensor_acc_bytes", "Tensor workload: on-chip accumulator bytes (0=disable)", "0"},
+        {"tensor_onchip_model_enable", "Tensor workload: enable detailed on-chip capacity/port model (0/1)", "0"},
+        {"tensor_ub_bank_bytes", "Tensor workload: UB bank bytes (0=inherit tensor_ub_bytes)", "0"},
+        {"tensor_ub_read_ports", "Tensor workload: UB read ports per cycle (0=auto when on-chip model enabled)", "0"},
+        {"tensor_ub_write_ports", "Tensor workload: UB write ports per cycle (0=auto when on-chip model enabled)", "0"},
+        {"tensor_onchip_bank_model_enable", "Tensor workload: enable bank-aware on-chip arbitration/conflict model (0/1)", "0"},
+        {"tensor_ub_bank_count", "Tensor workload: UB bank count (bank-aware mode)", "1"},
+        {"tensor_ub_bank_select_policy", "Tensor workload: UB bank select policy (interleave/rr/hash)", "interleave"},
+        {"tensor_ub_bank_conflict_mode", "Tensor workload: UB bank conflict mode (queue/block)", "queue"},
+        {"tensor_acc_bank_bytes", "Tensor workload: ACC bank bytes (0=inherit tensor_acc_bytes)", "0"},
+        {"tensor_acc_read_ports", "Tensor workload: ACC read ports per cycle (0=auto when on-chip model enabled)", "0"},
+        {"tensor_acc_write_ports", "Tensor workload: ACC write ports per cycle (0=auto when on-chip model enabled)", "0"},
+        {"tensor_acc_bank_count", "Tensor workload: ACC bank count (bank-aware mode)", "1"},
+        {"tensor_acc_bank_select_policy", "Tensor workload: ACC bank select policy (interleave/rr/hash)", "interleave"},
+        {"tensor_acc_bank_conflict_mode", "Tensor workload: ACC bank conflict mode (queue/block)", "queue"},
+        {"tensor_bank_queue_depth", "Tensor workload: per-bank queue depth when conflict mode=queue", "16"},
+        {"tensor_spill_enable", "Tensor workload: allow UB/ACC overflow spill traffic (0/1)", "0"},
+        {"tensor_spill_packet_bytes", "Tensor workload: spill packet bytes", "256"},
+        {"tensor_spill_share_noc_budget", "Tensor workload: spill shares noc budget when capped (0/1)", "1"},
+        {"tensor_dma_bandwidth_bytes_per_cycle", "Tensor workload: DMA bandwidth (bytes/cycle, 0=disable)", "0"},
+        {"tensor_double_buffer", "Tensor workload: enable double-buffer overlap (0/1)", "0"},
+        {"tensor_collective_type", "Tensor workload: collective type (none/allreduce/allgather/reducescatter)", "none"},
+        {"tensor_collective_blocking", "Tensor workload: treat collective as barrier between iterations (0/1)", "0"},
+        {"tensor_collective_scope", "Tensor workload: collective scope (per_core/per_pe/per_system)", "per_core"},
+        {"tensor_collective_bytes", "Tensor workload: collective bytes per op", "0"},
+        {"tensor_collective_period_cycles", "Tensor workload: collective period cycles", "0"},
+        {"tensor_collective_pattern", "Tensor workload: collective pattern (ring/mesh_x/mesh_xy)", "ring"},
+        {"tensor_collective_packet_bytes", "Tensor workload: collective packet bytes", "256"},
+        {"tensor_collective_algo", "Tensor workload: collective algorithm (legacy_bytes/ring_chunked)", "legacy_bytes"},
+        {"tensor_collective_chunk_bytes", "Tensor workload: collective chunk bytes for ring_chunked (0=use packet bytes)", "0"},
+        {"tensor_collective_reduce_overhead_cycles", "Tensor workload: per-chunk reduce-to-gather switch overhead cycles", "0"},
+        {"tensor_collective_max_inflight_chunks", "Tensor workload: max collective chunks issued per cycle in ring_chunked", "1"},
+        {"tensor_collective_credit_enable", "Tensor workload: enable credit-window throttling for collective chunks (0/1)", "0"},
+        {"tensor_collective_credit_window_chunks", "Tensor workload: collective credit window in chunks (0=auto)", "0"},
+        {"tensor_collective_credit_return_mode", "Tensor workload: credit return mode (event_on_recv/legacy_tick)", "event_on_recv"},
+        {"tensor_collective_backpressure_mode", "Tensor workload: collective backpressure mode (hard/soft)", "hard"},
+        {"tensor_noc_bandwidth_bytes_per_cycle", "Tensor workload: NoC issue budget (bytes/cycle, collective+comm; 0=uncapped)", "0"},
+        {"tensor_collective_overlap_with_compute", "Tensor workload: allow compute/collective overlap (0/1)", "1"},
+        {"tensor_collective_issue_priority", "Tensor workload: collective issue priority (control_first/payload_first)", "control_first"},
+        {"tensor_comm_enable", "Tensor workload: enable RawBytes NoC traffic (0/1)", "0"},
+        {"tensor_comm_period_cycles", "Tensor workload: send one RawBytes packet per N cycles", "0"},
+        {"tensor_comm_payload_bytes", "Tensor workload: RawBytes payload bytes", "0"},
+        {"tensor_strict", "Tensor workload: fail-fast on missing mem/noc (0/1)", "1"},
+        {"tensor_seed", "Tensor workload: base seed (uint64)", "0"},
         {"total_cores", "Total number of cores in the PE", "8"},
         {"global_neuron_base", "Global base ID for neurons in this core", "0"},
         {"num_neurons", "Number of neurons in this core", "64"},
@@ -102,11 +185,53 @@ public:
         {"merge_read_cacheline", "Merge memory reads to cache line size", "1"},
         {"merge_read_row", "Merge memory reads to a full row", "0"},
         {"line_size_bytes", "Cache line size in bytes", "64"},
+        // Dense weights physical layout (experiment; default row_major)
+        {"dense_layout_mode", "Dense weights layout: row_major (default) | phys_v1", "row_major"},
+        {"dense_phys_dram_row_bytes", "Dense weights phys_v1: DRAM row bytes (must match weights_phys generator; 0 disables)", "0"},
+        // BCSR physical layout + runtime fetch granularity (default keeps legacy behavior).
+        {"bcsr_layout_mode", "BCSR layout mode: flat (default) | rowpack_v1", "flat"},
+        {"bcsr_colidx_row_stride_bytes", "BCSR rowpack_v1: row stride bytes for colidx region (0=unused in flat)", "0"},
+        {"bcsr_blockdata_row_stride_bytes", "BCSR rowpack_v1: row stride bytes for blockdata region (0=unused in flat)", "0"},
+        {"bcsr_blockids_row_stride_bytes", "BCSR rowpack_v1: row stride bytes for blockids region (optional)", "0"},
+        {"bcsr_block_fetch_mode", "BCSR blockdata fetch mode: full_block (default) | row_cacheline", "full_block"},
+        {"experimental_noc_rowidx_prefetch_enable", "Experimental STORM-PIF: prefetch BCSR row-index metadata from Gather touches (0/1)", "0"},
+        {"experimental_noc_rowidx_prefetch_budget_per_tick", "Experimental STORM-PIF: max prefetched block_rows per tick", "4"},
+        {"experimental_noc_rowidx_cache_rows", "Experimental STORM-PIF: max cached BCSR row-index rows (0=unlimited)", "1024"},
+        {"experimental_noc_rowidx_prefetch_gather_only", "Experimental STORM-PIF: only prefetch when not in Apply window (0/1)", "1"},
+        {"experimental_noc_rowidx_prefetch_carry_to_apply_enable", "Experimental STORM-PIF: retain Gather-enqueued rowidx frontier and start detached draining in BeginApply using the current window_seq (0/1)", "0"},
+        {"experimental_noc_rowidx_hot_touch_min", "Experimental STORM-PIF v8: min touches per block_row before enqueueing prefetch", "1"},
+        {"experimental_noc_rowidx_budget_adapt_enable", "Experimental STORM-PIF v8: enable queue/headroom adaptive prefetch budget (0/1)", "0"},
+        {"experimental_noc_rowidx_budget_adapt_max_per_tick", "Experimental STORM-PIF v8: adaptive budget upper bound per tick", "32"},
+        {"experimental_noc_rowidx_budget_adapt_q_depth", "Experimental STORM-PIF v8: queue depth target used for adaptive budget scaling", "16"},
+        {"experimental_idx2_ingress_prefetch_enable", "Experimental STORM-NIP: prefetch idx2 value lines from Gather ingress touches (0/1)", "0"},
+        {"experimental_idx2_ingress_prefetch_budget_per_tick", "Experimental STORM-NIP: base prefetch issue budget per tick", "4"},
+        {"experimental_idx2_ingress_prefetch_cache_entries", "Experimental STORM-NIP: max resident idx2 prefetched values in the private L0 cache", "4096"},
+        {"experimental_idx2_ingress_prefetch_max_inflight", "Experimental STORM-NIP: per-core inflight cap for idx2 ingress prefetch (0=auto)", "0"},
+        {"experimental_idx2_ingress_prefetch_gather_only", "Experimental STORM-NIP: restrict idx2 prefetch to Gather-only windows (0/1)", "1"},
+        {"experimental_idx2_ingress_prefetch_carry_to_apply_enable", "Experimental STORM-NIP: retain Gather-enqueued idx2 pending work and continue draining into Apply while still blocking new Apply-stage touches (0/1)", "0"},
+        {"experimental_idx2_ingress_prefetch_apply_max_inflight", "Experimental STORM-NIP: Apply-carry inflight cap for retained idx2 prefetches (0=inherit gather cap)", "0"},
+        {"experimental_idx2_ingress_prefetch_apply_outstanding_reserve", "Experimental STORM-NIP: reserve this many outstanding slots for non-prefetch demand when carry-to-apply is enabled", "0"},
+        {"experimental_idx2_ingress_prefetch_apply_frontier_keep_pending", "Experimental STORM-NIP: at BeginApply keep only this many retained pending idx2 prefetches after touch-rank frontier reordering (0=disable)", "0"},
+        {"experimental_idx2_ingress_tail_guard_enable", "Experimental STORM-NIP: drop tail completions that have no waiters in gather-only mode (0/1)", "0"},
+        {"experimental_idx2_ingress_budget_adapt_enable", "Experimental STORM-NIP: enable queue/headroom adaptive prefetch budget (0/1)", "0"},
+        {"experimental_idx2_ingress_budget_adapt_max_per_tick", "Experimental STORM-NIP: adaptive budget upper bound per tick", "32"},
+        {"experimental_idx2_ingress_budget_adapt_q_depth", "Experimental STORM-NIP: queue depth target used for adaptive budget scaling", "16"},
         {"weights_cols", "Number of columns in weight matrix when using global read (post_row_pre_col)", "0"},
         {"index_mode", "Indexing mode: pre_row_post_col (default) or post_row_pre_col", "pre_row_post_col"},
         {"use_soa_neuron_state", "Use Structure-of-Arrays layout for neuron state (0=AoS,1=SoA)", "0"},
         {"use_aosoa_neuron_state", "Use block-wise AoSoA iteration on top of SoA (0/1)", "0"},
         {"aosoa_block_rows", "AoSoA block row width; defaults to bcsr_block_rows when unset", "0"},
+        {"state_sram_enable", "Observe-only neuron-state SRAM model enable (0/1)", "0"},
+        {"state_sram_capacity_bytes", "Observe-only neuron-state SRAM capacity bytes", "0"},
+        {"state_sram_banks", "Observe-only neuron-state SRAM bank count", "16"},
+        {"state_sram_ports_per_bank", "Observe-only neuron-state SRAM ports per bank", "1"},
+        {"state_sram_bank_interleave_bytes", "Observe-only neuron-state SRAM bank interleave bytes", "4"},
+        {"state_sram_t_read_cycles", "Observe-only neuron-state SRAM read cycles", "1"},
+        {"state_sram_t_write_cycles", "Observe-only neuron-state SRAM write cycles", "1"},
+        {"state_sram_sample_log2", "Observe-only neuron-state SRAM sampling log2", "0"},
+        {"state_sram_vmem_base", "Observe-only neuron-state SRAM virtual base for vmem", "12884901888"},
+        {"state_sram_refrac_base", "Observe-only neuron-state SRAM virtual base for refrac", "17179869184"},
+        {"state_sram_last_spike_base", "Observe-only neuron-state SRAM virtual base for last_spike", "21474836480"},
         {"verify_routing_weights", "Log and verify routing fanout against weight threshold (0/1)", "0"},
         {"enable_detailed_map_log", "Enable detailed logging of neuron mapping", "0"},
         {"route_summary_enable", "Enable one-shot route summary logging per core (0/1)", "0"},
@@ -134,6 +259,23 @@ public:
         {"route_layers_mask", "Allowed layer transitions, e.g. I>H1,H1>H2,H2>O", ""},
         {"route_filter_warn", "Print prominent warning when route filters are enabled (0/1)", "1"},
         {"readresp_zero_fallback", "When DRAM returns 0 for weight, fallback to init_default_weight (0/1)", "0"},
+        {"synapse_weight_mode", "Synapse weight sourcing mode: bcsr_gas | gcss_valueonly_dstcore | gcss_valueonly_dstcore_idx2 | gcss_idx2_rowmphf | gcss_valueonly_dstcore_vlf_premphf | gcss_valueonly_dstcore_vlf_premphf_plp", "bcsr_gas"},
+        {"gcss_index_template", "Template for per-core GCSS index files, e.g. .../pe{pe:02d}/core{core:02d}.gcss.idx.bin", ""},
+        {"weight_sram_model_enable", "Observe-only weight SRAM model master enable (0/1)", "0"},
+        {"weight_idx_sram_enable", "Observe-only weight index SRAM enable (0/1)", "0"},
+        {"weight_l0_sram_enable", "Observe-only weight L0 SRAM enable (0/1)", "0"},
+        {"weight_idx_sram_capacity_bytes", "Observe-only weight index SRAM capacity bytes", "0"},
+        {"weight_l0_sram_capacity_bytes", "Observe-only weight L0 SRAM capacity bytes", "0"},
+        {"weight_idx_sram_banks", "Observe-only weight index SRAM bank count", "16"},
+        {"weight_l0_sram_banks", "Observe-only weight L0 SRAM bank count", "8"},
+        {"weight_sram_ports_per_bank", "Observe-only weight SRAM ports per bank", "1"},
+        {"weight_sram_bank_interleave_bytes", "Observe-only weight SRAM bank interleave bytes", "4"},
+        {"weight_sram_t_read_cycles", "Observe-only weight SRAM read cycles", "1"},
+        {"weight_sram_t_write_cycles", "Observe-only weight SRAM write cycles", "1"},
+        {"weight_sram_sample_log2", "Observe-only weight SRAM sampling log2", "0"},
+        {"weight_idx_sram_base", "Observe-only weight index SRAM virtual base", "4294967296"},
+        {"weight_l0_sram_base", "Observe-only weight L0 SRAM virtual base", "8589934592"},
+        {"weight_l0_sram_slots", "Observe-only weight L0 SRAM virtual slot count", "1048576"},
         // === GAS Apply/Scatter (Phase-1, default off) ===
         {"apply_acc_enable", "Enable Apply-side accumulation and Scatter-side fire (0/1)", "0"},
         {"acc_high_watermark_bytes", "Accumulator high-watermark in bytes before spilling", "16777216"},
@@ -177,7 +319,25 @@ public:
         {"window_read_budget", "Max number of (pre,post) single-col reads per window", "1024"},
         {"scatter_diag_limit", "Limit scatter diagnostic logs when window_read_debug=1 (0=disable)", "0"},
         // 安全保护：限制单窗边集合容量，防止极端随机发放导致内存增长
-        {"edge_collector_max_capacity", "Max edges per window before overflow protection", "1000000"}
+        {"edge_collector_max_capacity", "Max edges per window before overflow protection", "1000000"},
+        // Experimental retire policy in WeightMemorySubsystem (default keeps historical behavior).
+        {"experimental_retire_policy", "Retire policy: global_inorder | per_post", "global_inorder"},
+        {"experimental_gcss_phase_breakdown_enable", "Experimental observability: enable GCSS HOL phase breakdown counters (0/1)", "0"},
+        {"experimental_retire_shadow_per_post_enable", "Experimental observability: shadow per-post retire attribution in global_inorder mode (0/1)", "0"},
+        {"experimental_gcss_vlf_queue_policy", "Experimental GCSS-VLF queue policy: locality_first | banded_line_fair", "locality_first"},
+        {"experimental_gcss_vlf_fair_band_size", "Experimental GCSS-VLF fairness: retire-order edges per age band when queue_policy=banded_line_fair", "256"},
+        {"pulse_mfb_gather_preband_enable", "Experimental PULSE-MFB gather-preband barrier enable (0/1)", "0"},
+        {"pulse_mfb_gather_barrier_enable", "Experimental PULSE-MFB gather-preband PE barrier enable (0/1)", "0"},
+        {"pulse_mfb_gather_top_bands", "Experimental PULSE-MFB gather-preband top bands per window", "32"},
+        {"pulse_mfb_gather_lines_per_band", "Experimental PULSE-MFB gather-preband selected lines per band", "4"},
+        {"pulse_mfb_gather_window_budget", "Experimental PULSE-MFB gather-preband owner launch budget per window (0=unbounded)", "0"},
+        {"pulse_mfb_gather_min_consumers", "Experimental PULSE-MFB gather-preband minimum distinct consumer cores required before launching owner-first seed", "2"},
+        {"pulse_osa_metadata_txn_enable", "Enable PULSE-OSA metadata transaction seam (experimental, default off)", "0"},
+        {"pulse_osa_metadata_ready_lease_enable", "Enable PULSE-OSA metadata ready lease (experimental, default off)", "0"},
+        {"pulse_osa_metadata_ready_lease_ttl", "PULSE-OSA metadata ready lease TTL in cycles (0=disabled)", "0"},
+        {"pulse_osa_metadata_object_mask", "PULSE-OSA metadata object mask: rowdescriptor/rowidx/idx2/preband/all", "rowdescriptor"},
+        {"experimental_pre_window_profile_export_enable", "Experimental GCSS-PLP: export per-window pre first-touch profile (0/1)", "0"},
+        {"experimental_pre_window_profile_export_dir", "Experimental GCSS-PLP: output directory for per-core pre-window profile CSVs", ""}
     )
 
     SST_ELI_DOCUMENT_STATISTICS(
@@ -194,6 +354,10 @@ public:
         {"weights_verify_sum", "Sum of verified weights for averaging", "value", 1},
         {"routes_entries", "Total number of route entries built for weight-driven routing", "count", 1},
         {"fanout_per_spike", "Fanout size per emitted spike in weight-driven routing", "count", 1},
+        {"route3d_native_activation_total", "Total successful route3d native runtime activations", "count", 1},
+        {"route3d_native_gating_activation_total", "Successful route3d native runtime activations served by gating", "count", 1},
+        {"route3d_native_direct_activation_total", "Successful route3d native runtime activations served directly from routes", "count", 1},
+        {"route3d_native_unique_sources_total", "Unique source neurons that activated route3d native runtime fanout", "count", 1},
         {"cache_evictions", "Number of cache evictions in weight cache (LRU)", "count", 1},
         {"pending_reqs_peak", "Peak number of outstanding memory read requests", "count", 1},
         {"cycles_update_neuron", "Approximate cycles spent updating neuron states (layout-dependent)", "cycles", 1},
@@ -213,14 +377,192 @@ public:
         {"gas_bursts_total", "Total number of bursts (segments) built by GAS", "count", 1},
         {"gas_payload_bytes_total", "Total useful payload bytes requested upstream (sum of sub-reads)", "bytes", 1},
         {"gas_gap_absorbed_bytes_total", "Total gap bytes absorbed by fine-grained gap-merge", "bytes", 1},
+        {"exp_noc_rowidx_prefetch_rows_total", "Experimental STORM-PIF: number of BCSR row-index rows prefetched", "rows", 1},
+        {"exp_noc_rowidx_prefetch_bytes_total", "Experimental STORM-PIF: bytes issued for BCSR row-index prefetch", "bytes", 1},
+        {"exp_noc_rowidx_prefetch_rows_deferred_total", "Experimental STORM-PIF: row-index prefetch rows deferred by inflight pressure", "rows", 1},
+        {"exp_noc_rowidx_prefetch_rows_failed_total", "Experimental STORM-PIF: row-index prefetch rows that failed to issue", "rows", 1},
+        {"exp_noc_rowidx_cache_hits_total", "Experimental STORM-PIF: row-index cache hits on BCSR requests", "hits", 1},
+        {"exp_noc_rowidx_cache_misses_total", "Experimental STORM-PIF: row-index cache misses on BCSR requests", "misses", 1},
+        {"exp_noc_rowidx_cache_fills_total", "Experimental STORM-PIF: row-index cache fill operations", "fills", 1},
+        {"exp_noc_rowidx_cache_full_drop_total", "Experimental STORM-PIF: row-index cache insert drops due to capacity limit", "drops", 1},
+        {"exp_noc_rowidx_cache_entries_final", "Experimental STORM-PIF: final row-index cache entries at finish", "entries", 1},
+        {"exp_noc_rowidx_touch_rows_total", "Experimental STORM-PIF: unique touched block_rows enqueued from Gather", "rows", 1},
+        {"exp_noc_rowidx_touch_events_total", "Experimental STORM-PIF v8: total Gather touch events observed", "events", 1},
+        {"exp_noc_rowidx_rows_filtered_cold_total", "Experimental STORM-PIF v8: touches filtered by hot_touch_min threshold", "events", 1},
+        {"exp_noc_rowidx_carry_apply_pending_rows_total", "Experimental STORM-PIF v8: pending Gather-carried rowindex rows visible at BeginApply", "rows", 1},
+        {"exp_noc_rowidx_drain_skip_phase_gather_total", "Experimental STORM-PIF v8: drain ticks skipped because carry-to-apply blocks Gather-stage draining", "ticks", 1},
+        {"exp_noc_rowidx_drain_skip_phase_apply_disabled_total", "Experimental STORM-PIF v8: drain ticks skipped because gather-only mode disables Apply-stage draining", "ticks", 1},
+        {"exp_noc_rowidx_drain_skip_no_pending_total", "Experimental STORM-PIF v8: drain ticks skipped because no pending rowindex frontier remained", "ticks", 1},
+        {"exp_noc_rowidx_drain_skip_loader_not_ready_total", "Experimental STORM-PIF v8: drain ticks skipped because loader was not ready", "ticks", 1},
+        {"exp_noc_rowidx_drain_skip_rowptr_not_ready_total", "Experimental STORM-PIF v8: drain ticks skipped because BCSR rowptr was not ready", "ticks", 1},
+        {"exp_noc_rowidx_drain_skip_budget_zero_total", "Experimental STORM-PIF v8: drain attempts blocked after scheduling budget resolved to zero", "ticks", 1},
+        {"exp_noc_rowidx_drain_skip_cache_hit_total", "Experimental STORM-PIF v8: pending frontier rows skipped because rowindex cache was already hot", "rows", 1},
+        {"exp_noc_rowidx_drain_skip_detached_inflight_total", "Experimental STORM-PIF v8: pending frontier rows skipped because a detached rowindex prefetch was already inflight", "rows", 1},
+        {"exp_noc_rowidx_drain_skip_colidx_inflight_total", "Experimental STORM-PIF v8: pending frontier rows skipped because a window-scoped colidx inflight entry already existed", "rows", 1},
+        {"exp_noc_rowidx_drain_skip_empty_row_total", "Experimental STORM-PIF v8: pending frontier rows skipped because rowBounds was empty/invalid", "rows", 1},
+        {"exp_noc_rowidx_budget_ticks_total", "Experimental STORM-PIF v8: ticks where prefetch budget was computed", "ticks", 1},
+        {"exp_noc_rowidx_budget_effective_total", "Experimental STORM-PIF v8: effective prefetch budget consumed by scheduler", "rows", 1},
+        {"exp_noc_rowidx_budget_adapt_ticks_total", "Experimental STORM-PIF v8: ticks where adaptive budget deviated from base budget", "ticks", 1},
+        {"exp_noc_rowidx_detached_demand_join_total", "Experimental STORM-PIF v8: demand requests that joined a detached rowindex prefetch already in flight", "joins", 1},
+        {"exp_noc_rowidx_detached_demand_waiters_resolved_total", "Experimental STORM-PIF v8: detached-demand waiters resolved from detached rowindex completion", "waiters", 1},
+        {"exp_noc_rowidx_detached_demand_fallback_zero_total", "Experimental STORM-PIF v8: detached-demand waiters that fell back to zero because block_col was absent", "waiters", 1},
+        {"exp_noc_rowidx_detached_demand_ready_signal_total", "Experimental STORM-PIF v8: detached-demand rowindex ready signals emitted at detached completion", "signals", 1},
+        {"exp_noc_rowidx_detached_demand_ready_transition_total", "Experimental STORM-PIF v8: detached-demand rowindex ready transitions emitted at detached completion", "objects", 1},
+        {"pulse_metadata_txn_export_total", "PULSE-OSA metadata transaction: exported metadata objects observed by the seam", "objects", 1},
+        {"pulse_metadata_txn_owner_launch_total", "PULSE-OSA metadata transaction: owner launches admitted into the seam", "objects", 1},
+        {"pulse_metadata_txn_join_live_total", "PULSE-OSA metadata transaction: joins that landed on live owners", "objects", 1},
+        {"pulse_metadata_txn_join_ready_total", "PULSE-OSA metadata transaction: joins that landed on ready or leased-ready owners", "objects", 1},
+        {"pulse_metadata_txn_late_join_total", "PULSE-OSA metadata transaction: joins that arrived after owner release", "objects", 1},
+        {"pulse_metadata_txn_ready_lease_hit_total", "PULSE-OSA metadata transaction: joins served directly from ready lease", "objects", 1},
+        {"pulse_metadata_txn_ready_lease_expired_total", "PULSE-OSA metadata transaction: late joins that observed an expired ready lease", "objects", 1},
+        {"pulse_metadata_txn_envelope_size_sum_total", "PULSE-OSA metadata transaction: cumulative rowdescriptor envelope size launched by gather replay", "lines", 1},
+        {"pulse_metadata_frontier_observed_total", "PULSE metadata frontier: early metadata objects observed before rowdescriptor formation", "objects", 1},
+        {"pulse_metadata_frontier_same_window_reobserve_total", "PULSE metadata frontier: repeated observations of the same early metadata object within one window", "objects", 1},
+        {"pulse_metadata_frontier_owner_form_candidate_total", "PULSE metadata frontier: early metadata observations that advanced to owner-form candidate", "objects", 1},
+        {"pulse_metadata_frontier_join_ready_candidate_total", "PULSE metadata frontier: early metadata observations that advanced to ready-join candidate", "objects", 1},
+        {"pulse_metadata_frontier_premphf_base_observed_total", "PULSE metadata frontier: pre-mphf-base observations", "objects", 1},
+        {"pulse_metadata_frontier_premphf_base_same_window_reobserve_total", "PULSE metadata frontier: same-window reobserves on pre-mphf-base objects", "objects", 1},
+        {"pulse_metadata_frontier_premphf_base_owner_form_candidate_total", "PULSE metadata frontier: pre-mphf-base owner-form candidates", "objects", 1},
+        {"pulse_metadata_frontier_premphf_base_join_ready_candidate_total", "PULSE metadata frontier: pre-mphf-base ready-join candidates", "objects", 1},
+        {"pulse_metadata_frontier_premphf_band_observed_total", "PULSE metadata frontier: pre-mphf-band observations", "objects", 1},
+        {"pulse_metadata_frontier_premphf_band_same_window_reobserve_total", "PULSE metadata frontier: same-window reobserves on pre-mphf-band objects", "objects", 1},
+        {"pulse_metadata_frontier_premphf_band_owner_form_candidate_total", "PULSE metadata frontier: pre-mphf-band owner-form candidates", "objects", 1},
+        {"pulse_metadata_frontier_premphf_band_join_ready_candidate_total", "PULSE metadata frontier: pre-mphf-band ready-join candidates", "objects", 1},
+        {"pulse_metadata_frontier_idx2row_observed_total", "PULSE metadata frontier: idx2row observations", "objects", 1},
+        {"pulse_metadata_frontier_idx2row_same_window_reobserve_total", "PULSE metadata frontier: same-window reobserves on idx2row objects", "objects", 1},
+        {"pulse_metadata_frontier_idx2row_owner_form_candidate_total", "PULSE metadata frontier: idx2row owner-form candidates", "objects", 1},
+        {"pulse_metadata_frontier_idx2row_join_ready_candidate_total", "PULSE metadata frontier: idx2row ready-join candidates", "objects", 1},
+        {"pulse_metadata_frontier_rowindex_observed_total", "PULSE metadata frontier: rowindex observations", "objects", 1},
+        {"pulse_metadata_frontier_rowindex_same_window_reobserve_total", "PULSE metadata frontier: same-window reobserves on rowindex objects", "objects", 1},
+        {"pulse_metadata_frontier_rowindex_owner_form_candidate_total", "PULSE metadata frontier: rowindex owner-form candidates", "objects", 1},
+        {"pulse_metadata_frontier_rowindex_join_ready_candidate_total", "PULSE metadata frontier: rowindex ready-join candidates", "objects", 1},
+        {"atlas_census_premphf_base_frontier_events_total", "PE-Atlas census: pre-mphf-base frontier evidence totals", "events", 1},
+        {"atlas_census_premphf_base_producer_events_total", "PE-Atlas census: pre-mphf-base producer evidence totals", "events", 1},
+        {"atlas_census_premphf_base_gate_events_total", "PE-Atlas census: pre-mphf-base gate/proxy evidence totals", "events", 1},
+        {"atlas_census_premphf_base_service_events_total", "PE-Atlas census: pre-mphf-base service evidence totals", "events", 1},
+        {"atlas_census_premphf_band_frontier_events_total", "PE-Atlas census: pre-mphf-band frontier evidence totals", "events", 1},
+        {"atlas_census_premphf_band_producer_events_total", "PE-Atlas census: pre-mphf-band producer evidence totals", "events", 1},
+        {"atlas_census_premphf_band_gate_events_total", "PE-Atlas census: pre-mphf-band gate/proxy evidence totals", "events", 1},
+        {"atlas_census_premphf_band_service_events_total", "PE-Atlas census: pre-mphf-band service evidence totals", "events", 1},
+        {"atlas_census_idx2row_frontier_events_total", "PE-Atlas census: idx2row frontier evidence totals", "events", 1},
+        {"atlas_census_idx2row_producer_events_total", "PE-Atlas census: idx2row producer evidence totals", "events", 1},
+        {"atlas_census_idx2row_gate_events_total", "PE-Atlas census: idx2row gate/proxy evidence totals", "events", 1},
+        {"atlas_census_idx2row_service_events_total", "PE-Atlas census: idx2row service evidence totals", "events", 1},
+        {"atlas_census_rowindex_frontier_events_total", "PE-Atlas census: rowindex frontier evidence totals", "events", 1},
+        {"atlas_census_rowindex_producer_events_total", "PE-Atlas census: rowindex producer evidence totals", "events", 1},
+        {"atlas_census_rowindex_gate_events_total", "PE-Atlas census: rowindex gate/proxy evidence totals", "events", 1},
+        {"atlas_census_rowindex_service_events_total", "PE-Atlas census: rowindex service evidence totals", "events", 1},
+        {"atlas_census_rowdescriptor_frontier_events_total", "PE-Atlas census: rowdescriptor frontier evidence totals", "events", 1},
+        {"atlas_census_rowdescriptor_producer_events_total", "PE-Atlas census: rowdescriptor producer evidence totals", "events", 1},
+        {"atlas_census_rowdescriptor_gate_events_total", "PE-Atlas census: rowdescriptor gate/proxy evidence totals", "events", 1},
+        {"atlas_census_rowdescriptor_service_events_total", "PE-Atlas census: rowdescriptor service evidence totals", "events", 1},
+        {"atlas_proxy_rowindex_materialize_total", "PE-Atlas proxy ledger: rowindex materialize events", "events", 1},
+        {"atlas_proxy_rowindex_publicize_total", "PE-Atlas proxy ledger: rowindex publicize events", "events", 1},
+        {"atlas_proxy_rowindex_owner_form_total", "PE-Atlas proxy ledger: rowindex owner-form events", "events", 1},
+        {"atlas_proxy_rowindex_join_live_total", "PE-Atlas proxy ledger: rowindex join-live events", "events", 1},
+        {"atlas_proxy_rowindex_join_ready_total", "PE-Atlas proxy ledger: rowindex join-ready events", "events", 1},
+        {"atlas_proxy_rowindex_ready_total", "PE-Atlas proxy ledger: rowindex ready transitions", "events", 1},
+        {"atlas_proxy_rowindex_release_total", "PE-Atlas proxy ledger: rowindex release events", "events", 1},
+        {"atlas_proxy_rowindex_release_missing_total", "PE-Atlas proxy ledger: rowindex release misses", "events", 1},
+        {"atlas_proxy_rowindex_fallback_total", "PE-Atlas proxy ledger: rowindex fallback-to-private events", "events", 1},
+        {"atlas_proxy_idx2row_materialize_total", "PE-Atlas proxy ledger: idx2row materialize events", "events", 1},
+        {"atlas_proxy_idx2row_publicize_total", "PE-Atlas proxy ledger: idx2row publicize events", "events", 1},
+        {"atlas_proxy_idx2row_owner_form_total", "PE-Atlas proxy ledger: idx2row owner-form events", "events", 1},
+        {"atlas_proxy_idx2row_join_live_total", "PE-Atlas proxy ledger: idx2row join-live events", "events", 1},
+        {"atlas_proxy_idx2row_join_ready_total", "PE-Atlas proxy ledger: idx2row join-ready events", "events", 1},
+        {"atlas_proxy_idx2row_ready_total", "PE-Atlas proxy ledger: idx2row ready transitions", "events", 1},
+        {"atlas_proxy_idx2row_release_total", "PE-Atlas proxy ledger: idx2row release events", "events", 1},
+        {"atlas_proxy_idx2row_release_missing_total", "PE-Atlas proxy ledger: idx2row release misses", "events", 1},
+        {"atlas_proxy_idx2row_fallback_total", "PE-Atlas proxy ledger: idx2row fallback-to-private events", "events", 1},
+        {"atlas_proxy_premphf_base_materialize_total", "PE-Atlas proxy ledger: pre-mphf-base materialize events", "events", 1},
+        {"atlas_proxy_premphf_base_publicize_total", "PE-Atlas proxy ledger: pre-mphf-base publicize events", "events", 1},
+        {"atlas_proxy_premphf_base_owner_form_total", "PE-Atlas proxy ledger: pre-mphf-base owner-form events", "events", 1},
+        {"atlas_proxy_premphf_base_shared_hit_total", "PE-Atlas proxy ledger: pre-mphf-base shared-hit events", "events", 1},
+        {"atlas_proxy_premphf_base_lookup_ready_total", "PE-Atlas proxy ledger: pre-mphf-base lookup-ready events", "events", 1},
+        {"atlas_proxy_premphf_base_proxy_only_gap_total", "PE-Atlas proxy ledger: pre-mphf-base proxy-only gap events", "events", 1},
+        {"atlas_proxy_premphf_band_materialize_total", "PE-Atlas proxy ledger: pre-mphf-band materialize events", "events", 1},
+        {"atlas_proxy_premphf_band_publicize_total", "PE-Atlas proxy ledger: pre-mphf-band publicize events", "events", 1},
+        {"atlas_proxy_premphf_band_owner_form_candidate_total", "PE-Atlas proxy ledger: pre-mphf-band owner-form candidates", "events", 1},
+        {"atlas_proxy_premphf_band_join_ready_candidate_total", "PE-Atlas proxy ledger: pre-mphf-band join-ready candidates", "events", 1},
+        {"atlas_proxy_premphf_band_zero_service_total", "PE-Atlas proxy ledger: pre-mphf-band zero-service events", "events", 1},
+        {"gcss_lookup_hit_total", "GCSS lookup hits in gcss_valueonly mode", "hits", 1},
+        {"gcss_lookup_miss_total", "GCSS lookup misses in gcss_valueonly mode", "misses", 1},
+        {"weight_read_dense_reqs_total", "Issued weight-read requests classified as dense", "requests", 1},
+        {"weight_read_dense_bytes_total", "Issued weight-read bytes classified as dense", "bytes", 1},
+        {"weight_read_rowptr_reqs_total", "Issued weight-read requests classified as BCSR rowptr", "requests", 1},
+        {"weight_read_rowptr_bytes_total", "Issued weight-read bytes classified as BCSR rowptr", "bytes", 1},
+        {"weight_read_colidx_reqs_total", "Issued weight-read requests classified as BCSR colidx", "requests", 1},
+        {"weight_read_colidx_bytes_total", "Issued weight-read bytes classified as BCSR colidx", "bytes", 1},
+        {"weight_read_blockdata_reqs_total", "Issued weight-read requests classified as BCSR blockdata", "requests", 1},
+        {"weight_read_blockdata_bytes_total", "Issued weight-read bytes classified as BCSR blockdata", "bytes", 1},
+        {"weight_read_gcss_reqs_total", "Issued weight-read requests classified as GCSS value-only", "requests", 1},
+        {"weight_read_gcss_bytes_total", "Issued weight-read bytes classified as GCSS value-only", "bytes", 1},
+        {"weight_idx_sram_reads_total", "Observe-only weight idx SRAM reads", "reads", 1},
+        {"weight_idx_sram_writes_total", "Observe-only weight idx SRAM writes", "writes", 1},
+        {"weight_idx_sram_bytes_read_total", "Observe-only weight idx SRAM read bytes", "bytes", 1},
+        {"weight_idx_sram_bytes_write_total", "Observe-only weight idx SRAM write bytes", "bytes", 1},
+        {"weight_idx_sram_bank_conflict_ticks_total", "Observe-only weight idx SRAM ticks with bank conflicts", "ticks", 1},
+        {"weight_idx_sram_predicted_extra_cycles_total", "Observe-only weight idx SRAM predicted extra cycles", "cycles", 1},
+        {"weight_idx_sram_resident_bytes_peak", "Observe-only weight idx SRAM resident bytes peak", "bytes", 1},
+        {"weight_idx_sram_bank_peak_accesses_per_tick", "Weight idx SRAM peak accesses on any bank within a tick", "accesses", 1},
+        {"weight_idx_sram_energy_read_pj_total", "Weight idx SRAM read energy total", "pJ", 1},
+        {"weight_idx_sram_energy_write_pj_total", "Weight idx SRAM write energy total", "pJ", 1},
+        {"weight_idx_lookup_total", "Total GCSS index lookups", "lookups", 1},
+        {"weight_idx_lookup_idx2_total", "Total GCSSIDX2 lookups", "lookups", 1},
+        {"weight_l0_sram_reads_total", "Observe-only weight L0 SRAM reads", "reads", 1},
+        {"weight_l0_sram_writes_total", "Observe-only weight L0 SRAM writes", "writes", 1},
+        {"weight_l0_sram_bytes_read_total", "Observe-only weight L0 SRAM read bytes", "bytes", 1},
+        {"weight_l0_sram_bytes_write_total", "Observe-only weight L0 SRAM write bytes", "bytes", 1},
+        {"weight_l0_sram_bank_conflict_ticks_total", "Observe-only weight L0 SRAM ticks with bank conflicts", "ticks", 1},
+        {"weight_l0_sram_predicted_extra_cycles_total", "Observe-only weight L0 SRAM predicted extra cycles", "cycles", 1},
+        {"weight_l0_sram_resident_bytes_peak", "Observe-only weight L0 SRAM resident bytes peak", "bytes", 1},
+        {"weight_l0_sram_bank_peak_accesses_per_tick", "Weight L0 SRAM peak accesses on any bank within a tick", "accesses", 1},
+        {"weight_l0_sram_energy_read_pj_total", "Weight L0 SRAM read energy total", "pJ", 1},
+        {"weight_l0_sram_energy_write_pj_total", "Weight L0 SRAM write energy total", "pJ", 1},
+        {"weight_sram_enforced_stall_cycles_total", "Weight SRAM enforced stall cycles", "cycles", 1},
+        {"weight_l0_lookup_total", "Total weight L0 lookups", "lookups", 1},
+        {"weight_l0_hit_total", "Total weight L0 hits", "hits", 1},
+        {"weight_l0_fill_total", "Total weight L0 fills", "fills", 1},
+        {"weight_l0_evict_total", "Total weight L0 evictions", "evictions", 1},
+        {"core_state_sram_reads_total", "Observe-only neuron-state SRAM reads", "reads", 1},
+        {"core_state_sram_writes_total", "Observe-only neuron-state SRAM writes", "writes", 1},
+        {"core_state_sram_bytes_read_total", "Observe-only neuron-state SRAM read bytes", "bytes", 1},
+        {"core_state_sram_bytes_write_total", "Observe-only neuron-state SRAM write bytes", "bytes", 1},
+        {"core_state_sram_bank_conflict_ticks_total", "Observe-only neuron-state SRAM ticks with bank conflicts", "ticks", 1},
+        {"core_state_sram_predicted_extra_cycles_total", "Observe-only neuron-state SRAM predicted extra cycles", "cycles", 1},
+        {"core_state_sram_resident_bytes_peak", "Observe-only neuron-state SRAM resident bytes peak", "bytes", 1},
+        {"core_state_sram_bank_peak_accesses_per_tick", "Neuron-state SRAM peak accesses on any bank within a tick", "accesses", 1},
+        {"core_state_sram_energy_read_pj_total", "Neuron-state SRAM read energy total", "pJ", 1},
+        {"core_state_sram_energy_write_pj_total", "Neuron-state SRAM write energy total", "pJ", 1},
+        {"core_state_sram_stall_cycles_total", "Neuron-state SRAM enforced stall cycles", "cycles", 1},
+        {"riscv_snn_workload_selected", "riscv_snn workload: constructor/config path selected workload_impl=riscv_snn", "count", 1},
+        {"riscv_snn_firmware_elf_present", "riscv_snn workload: firmware ELF path configured and non-empty", "count", 1},
+        {"riscv_snn_firmware_loaded", "riscv_snn workload: firmware ELF loaded successfully", "count", 1},
+        {"riscv_snn_backend_runtime_bridge", "riscv_snn workload: backend configured as runtime_bridge", "count", 1},
+        {"riscv_snn_firmware_started_count", "riscv_snn workload: firmware retired its first instruction", "count", 1},
+        {"riscv_snn_submitted_commands", "riscv_snn workload: commands submitted by firmware or boot driver", "count", 1},
+        {"riscv_snn_accepted_commands", "riscv_snn workload: commands accepted by accelerator backend", "count", 1},
+        {"riscv_snn_completion_visible_count", "riscv_snn workload: completions made visible to firmware", "count", 1},
+        {"riscv_snn_completion_consumed_count", "riscv_snn workload: completions consumed by firmware", "count", 1},
+        {"riscv_snn_fused_step_completion_count", "riscv_snn workload: fused-step completions observed", "count", 1},
+        {"riscv_snn_fault_count", "riscv_snn workload: faults surfaced to firmware", "count", 1},
+        {"riscv_snn_last_completion_status", "riscv_snn workload: last completion status code", "value", 1},
+        {"riscv_snn_last_fault_csr", "riscv_snn workload: last architectural fault CSR snapshot", "value", 1},
+        {"riscv_snn_backend_runtime_bridge_provider_bound", "riscv_snn workload: runtime-bridge provider ready at bind time", "count", 1},
         // Apply/Scatter端到端统计（Phase-1）
         {"gas_apply_acc_updates_total", "Apply阶段的delta累加次数（有效子读）", "count", 1},
         {"gas_acc_posts_touched_total", "Apply阶段触达的post计数（去重）", "posts", 1},
         {"gas_scatter_spikes_emitted_total", "Scatter阶段发放的spike个数", "spikes", 1},
         {"gas_acc_high_watermark_bytes_total", "累加器峰值占用（bytes）", "bytes", 1},
         {"gas_acc_spill_records_total", "溢写到增量日志的记录条数", "records", 1},
-        {"gas_acc_spilled_bytes_total", "溢写到增量日志的有效字节数（payload）", "bytes", 1}
-        ,
+        {"gas_acc_spilled_bytes_total", "溢写到增量日志的有效字节数（payload）", "bytes", 1},
+        {"gas_retire_global_hol_cycles_total", "Global retire路径head未ready且存在ready-edge时的阻塞周期", "cycles", 1},
+        {"gas_retire_ready_but_blocked_edges_total", "Global retire路径中ready但被head阻塞的edge累计量", "edge_cycles", 1},
+        {"gas_retire_per_post_progress_total", "Per-post retire模式下实际退役次数", "count", 1},
+        {"gas_retire_samepost_blocked_edges_total", "Global retire路径中同post ready-edge被head阻塞的累计量", "edge_cycles", 1},
+        {"gas_retire_crosspost_blocked_edges_total", "Global retire路径中跨post ready-edge被head阻塞的累计量", "edge_cycles", 1},
+        {"gas_retire_policy_loss_cycles_total", "Global retire路径中可由更弱contract释放的阻塞周期", "cycles", 1},
+        {"gas_retire_policy_loss_edges_total", "Global retire路径中可由更弱contract释放的blocked edge累计量", "edge_cycles", 1},
         {"weight_read_requests", "Number of weight read requests issued by core", "requests", 1},
         {"gas_edge_overflow", "Number of times per-window edge collector hit capacity and stopped recording", "events", 1},
         // Phase6：stream workload 统计（默认不影响 SNN；仅在 workload_impl=stream 时有意义）
@@ -242,6 +584,8 @@ public:
     virtual void setParentInterface(IPeAggregation* parent) override;
     void setNocTransport(INocTransport* noc) override;
     void onGlobalStepStart(uint32_t seq) override;
+    void onGlobalStepApplyBankCredit(uint32_t seq, uint32_t apply_bank_credit) override;
+    void onLoaderReady() override;
     virtual void init(unsigned int phase) override;
     virtual void complete(unsigned int phase) override;
     virtual void setup() override;
@@ -249,6 +593,8 @@ public:
 
     virtual void deliverSpike(SpikeEvent* spike) override;
     virtual bool deliverPacket(NocPacketEvent* packet) override;
+    virtual bool syntheticEmitNeuronFire(uint32_t neuron_idx, uint64_t now_cycle) override;
+    virtual uint64_t syntheticEmitNeuronFireBatch(const std::vector<uint32_t>& neuron_indices, uint64_t now_cycle) override;
     virtual bool hasWork() const override;
     virtual double getUtilization() const override;
     virtual void getStatistics(std::map<std::string, uint64_t>& stats) const override;
@@ -288,6 +634,10 @@ private:
 
     // Helper modules extracted to standalone files; keep private access via friends.
     friend struct WeightAccessor;
+
+    // Dense 权重地址映射（用于 naive/legacy 辅助路径；与 WeightMemorySubsystem 的配置保持一致）
+    uint64_t denseWeightAddr_(uint32_t row, uint32_t col, uint32_t width) const;
+
     struct Impl;
     std::unique_ptr<Impl> impl_;
 
@@ -295,6 +645,18 @@ private:
 	    void bindWorkloadRuntime_();
 	    void fillStreamRuntime_(ICoreWorkload::Runtime& rt);
         static uint64_t workloadNowNsThunk_(void* ctx);
+        bool experimentalWorkloadSerializationEnabled_() const {
+            return experimental_workload_serialization_enable_;
+        }
+        template <typename Fn>
+        auto withExperimentalWorkloadSerialization_(Fn&& fn)
+            -> decltype(fn()) {
+            if (!experimentalWorkloadSerializationEnabled_()) {
+                return fn();
+            }
+            std::lock_guard<std::recursive_mutex> lock(experimental_workload_mutex_);
+            return fn();
+        }
 
     // 学习/梯度/误差相关状态已下沉到 compute core（SnnComputeCore）
 
@@ -311,6 +673,8 @@ private:
 	    ISnnSpikeCommWorkload* snn_comm_workload_ = nullptr;
         // Phase4 Task6.4: GAS/window stage events forwarded to workload=snn (non-owning, optional).
         IGasStageSink* gas_stage_workload_ = nullptr;
+        bool experimental_workload_serialization_enable_ = false;
+        mutable std::recursive_mutex experimental_workload_mutex_;
     inline void applySynapticDelta_(uint32_t idx, float dv) {
         if (compute_core_) compute_core_->applySynapticDelta(idx, dv);
     }
@@ -354,6 +718,9 @@ private:
 	    enum class GasStage { Idle=0, Gather=1, Apply=2, Scatter=3 };
 	    GasStage gas_stage_ = GasStage::Idle;
 	    uint32_t curr_stage_seq_ = 0;             // gather/apply/scatter sequence id
+        // Global step control-plane: Apply-stage per-bank credit target for this seq (0 means "no override").
+        uint32_t global_step_apply_bank_credit_seq_ = 0;
+        uint32_t global_step_apply_bank_credit_target_ = 0;
 	    // Extracted accumulator/cache helpers (constructed in ctor)
 	    std::unique_ptr<AccumulatorOps> acc_ops_;
 	    std::unique_ptr<WeightCacheOps> weight_cache_ops_;
@@ -371,7 +738,14 @@ private:
     Statistic<uint64_t>* stat_gas_scatter_spikes_emitted_total_ = nullptr;
     Statistic<uint64_t>* stat_gas_acc_hwm_bytes_total_ = nullptr;
     Statistic<uint64_t>* stat_gas_acc_spill_records_total_ = nullptr;
-	    Statistic<uint64_t>* stat_gas_acc_spilled_bytes_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_acc_spilled_bytes_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_retire_global_hol_cycles_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_retire_ready_but_blocked_edges_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_retire_per_post_progress_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_retire_samepost_blocked_edges_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_retire_crosspost_blocked_edges_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_retire_policy_loss_cycles_total_ = nullptr;
+    Statistic<uint64_t>* stat_gas_retire_policy_loss_edges_total_ = nullptr;
     // GAS superstep duration statistics (cycles)
     Statistic<uint64_t>* stat_gas_superstep_gather_cycles_  = nullptr;
     Statistic<uint64_t>* stat_gas_superstep_apply_cycles_   = nullptr;
@@ -452,6 +826,7 @@ private:
     void initializeStatistics();
     uint64_t applyAccumulatedWindowAndScatter_();
     void configureWeightReaderSubsystem_(const Params& params);
+    void refreshSharedWeightObjectPlaneBinding_();
     void processLocalSpike(SpikeEvent* spike_event);
     size_t drainReadySpikes_(uint64_t now_ns);
     void requestWeight(uint32_t pre_neuron, uint32_t post_neuron, std::function<void(float)> callback);
@@ -497,14 +872,22 @@ private:
     bool read_force_single_ = false; // 当为真时，强制按单元素读取（req_size=4B），用于定位对齐/切片问题
 
 	    // === Phase6: Workload selection ===
-	    enum class WorkloadImpl : uint8_t { Snn = 0, Stream = 1, Traffic = 2 };
+	    enum class WorkloadImpl : uint8_t { Snn = 0, RiscvSnn = 1, Stream = 2, Traffic = 3, TrafficMem = 4, Tensor = 5 };
 	    WorkloadImpl workload_impl_ = WorkloadImpl::Snn;
+        inline bool isRiscvSnnWorkload_() const { return workload_impl_ == WorkloadImpl::RiscvSnn; }
 	    inline bool isStreamWorkload_() const { return workload_impl_ == WorkloadImpl::Stream; }
 	    inline bool isTrafficWorkload_() const { return workload_impl_ == WorkloadImpl::Traffic; }
+	    inline bool isTrafficMemWorkload_() const { return workload_impl_ == WorkloadImpl::TrafficMem; }
+	    inline bool isStreamLikeWorkload_() const {
+	        return workload_impl_ == WorkloadImpl::Stream || workload_impl_ == WorkloadImpl::TrafficMem;
+	    }
+	    inline bool isTensorWorkload_() const { return workload_impl_ == WorkloadImpl::Tensor; }
 	    inline bool isNonSnnWorkload_() const { return workload_impl_ != WorkloadImpl::Snn; }
 
 	    // Phase6.3：workload 插件（Phase6/Phase3）；当前仅 stream 通过工厂创建，SNN 保持原快路径。
 	    std::unique_ptr<ICoreWorkload> workload_;
+        std::unique_ptr<RiscvSnnShadowRuntimeServices> riscv_snn_runtime_bridge_;
+        ISnnAccelRuntimeServices* accel_runtime_services_ = nullptr;
         // Phase4（方案 B）：仅 SNN workload 需要 SpikeEvent 语义；在初始化阶段缓存指针，热路径避免 RTTI。
         ISpikeWorkload* spike_workload_ = nullptr; // non-owning; points into workload_
         // Phase7 (opt-in): allow migrating strict window-read spike input into workload=snn.
@@ -512,19 +895,18 @@ private:
 	    static void reportStreamMemIssueThunk_(void* ctx, size_t bytes);
         static void reportSnnMemIssueThunk_(void* ctx, size_t bytes);
         static void reportApplyScatterThunk_(void* ctx,
-                                            uint64_t acc_updates,
-                                            uint64_t posts_touched,
-                                            uint64_t spikes_emitted,
-                                            uint64_t hwm_bytes,
-                                            uint64_t spill_records,
-                                            uint64_t spilled_bytes);
+                                             uint64_t acc_updates,
+                                             uint64_t posts_touched,
+                                             uint64_t spikes_emitted,
+                                             uint64_t hwm_bytes,
+                                             uint64_t spill_records,
+                                             uint64_t spilled_bytes);
         static void requestGasEndGatherThunk_(void* ctx, uint32_t superstep);
         static void requestGasEndScatterThunk_(void* ctx, uint32_t superstep);
 
     IPeAggregation* parent_pe_cached_ = nullptr;
     Output* output_;
     std::unique_ptr<StdMemEndpoint> stdmem_ep_;
-    bool manual_window_tick_logged_ = false;
     bool clock_tick_logged_ = false;
     SST::Link* memory_link_;
 
@@ -557,13 +939,16 @@ private:
     std::string byte_exact_verify_mode_;
     uint32_t byte_exact_verify_row_scale_ = 1024;
     uint32_t byte_exact_verify_max_mismatch_ = 8;
+    // BCSR semantic verification (orchestrator-level; off by default).
+    // 注意：这是“验证/诊断”能力，不改变正常仿真语义；仅用于实验正确性闭环。
+    bool bcsr_semantic_verify_enable_ = false;
+    uint32_t bcsr_semantic_verify_max_edges_ = 64;
+    uint32_t bcsr_semantic_verify_max_mismatch_ = 8;
+    float bcsr_semantic_verify_abs_tol_ = 1e-6f;
+    float bcsr_semantic_verify_rel_tol_ = 1e-6f;
     // GAS control (component-driven phases)
     bool gas_enable_ = false; // enable GAS control-plane (v1: Begin/EndGather per tick)
     bool gas_window_mode_ = false; // 当为true时，不再每周期发送Begin/EndGather，由下游window驱动
-    bool gas_manual_window_drive_ = false; // 已弃用，保持字段以兼容旧配置
-    uint64_t manual_gas_counter_ = 0;
-    uint64_t manual_gas_gather_cycles_cfg_ = 200; // fallback
-    bool manual_tick_sampled_ = false;
     std::string loader_done_key_;
     bool wait_for_loader_done_ = false;
     bool loader_ready_latched_ = false;
@@ -622,6 +1007,7 @@ private:
     }
     void handleNeuronFire_(uint32_t neuron_idx, float v_before, float v_after);
     std::queue<SpikeEvent*> incoming_spikes_;
+    bool drainIncomingSpikesDeterministic_();
     bool weightCacheTryGet_(uint64_t key, float& out);
     void weightCacheStore_(uint64_t key, float value);
     bool window_read_enable_ = false;   // 严格GAS：按窗发起权重读取
@@ -660,6 +1046,10 @@ private:
     // 扩展统计
     Statistic<uint64_t>* stat_routes_entries_ = nullptr;
     Statistic<uint64_t>* stat_fanout_per_spike_ = nullptr;
+    Statistic<uint64_t>* stat_route3d_native_activation_total_ = nullptr;
+    Statistic<uint64_t>* stat_route3d_native_gating_activation_total_ = nullptr;
+    Statistic<uint64_t>* stat_route3d_native_direct_activation_total_ = nullptr;
+    Statistic<uint64_t>* stat_route3d_native_unique_sources_total_ = nullptr;
     Statistic<uint64_t>* stat_cache_evictions_ = nullptr;
     Statistic<uint64_t>* stat_pending_reqs_peak_ = nullptr;
     Statistic<uint64_t>* stat_cycles_update_neuron_ = nullptr;
@@ -668,7 +1058,6 @@ private:
     Statistic<uint64_t>* stat_s1_bytes_read_ = nullptr;
     // 门控诊断：权重读请求发起计数（用于判定发起端是否触发）
     Statistic<uint64_t>* stat_weight_read_requests_ = nullptr;
-    Statistic<uint64_t>* stat_window_reads_issued_total_ = nullptr;
     // GAS totals accumulated from GatherBufferIF via CustomResp
     Statistic<uint64_t>* stat_gas_unique_reads_total_ = nullptr;
     Statistic<uint64_t>* stat_gas_unique_bytes_total_ = nullptr;
@@ -677,6 +1066,178 @@ private:
     Statistic<uint64_t>* stat_gas_bursts_total_ = nullptr;
     Statistic<uint64_t>* stat_gas_payload_bytes_total_ = nullptr;
     Statistic<uint64_t>* stat_gas_gap_absorbed_bytes_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_prefetch_rows_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_prefetch_bytes_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_prefetch_rows_deferred_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_prefetch_rows_failed_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_cache_hits_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_cache_misses_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_cache_fills_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_cache_full_drop_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_cache_entries_final_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_touch_rows_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_touch_events_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_rows_filtered_cold_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_carry_apply_pending_rows_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_drain_skip_phase_gather_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_drain_skip_phase_apply_disabled_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_drain_skip_no_pending_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_drain_skip_loader_not_ready_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_drain_skip_rowptr_not_ready_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_drain_skip_budget_zero_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_drain_skip_cache_hit_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_drain_skip_detached_inflight_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_drain_skip_colidx_inflight_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_drain_skip_empty_row_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_budget_ticks_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_budget_effective_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_budget_adapt_ticks_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_detached_demand_join_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_detached_demand_waiters_resolved_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_detached_demand_fallback_zero_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_detached_demand_ready_signal_total_ = nullptr;
+    Statistic<uint64_t>* stat_exp_noc_rowidx_detached_demand_ready_transition_total_ = nullptr;
+    Statistic<uint64_t>* stat_pulse_metadata_txn_export_total_ = nullptr;
+    Statistic<uint64_t>* stat_pulse_metadata_txn_owner_launch_total_ = nullptr;
+    Statistic<uint64_t>* stat_pulse_metadata_txn_join_live_total_ = nullptr;
+    Statistic<uint64_t>* stat_pulse_metadata_txn_join_ready_total_ = nullptr;
+    Statistic<uint64_t>* stat_pulse_metadata_txn_late_join_total_ = nullptr;
+    Statistic<uint64_t>* stat_pulse_metadata_txn_ready_lease_hit_total_ = nullptr;
+    Statistic<uint64_t>* stat_pulse_metadata_txn_ready_lease_expired_total_ = nullptr;
+    Statistic<uint64_t>* stat_pulse_metadata_txn_envelope_size_sum_total_ = nullptr;
+    Statistic<uint64_t>* stat_pulse_metadata_frontier_observed_total_ = nullptr;
+    Statistic<uint64_t>* stat_pulse_metadata_frontier_same_window_reobserve_total_ = nullptr;
+    Statistic<uint64_t>* stat_pulse_metadata_frontier_owner_form_candidate_total_ = nullptr;
+    Statistic<uint64_t>* stat_pulse_metadata_frontier_join_ready_candidate_total_ = nullptr;
+    Statistic<uint64_t>* stat_pulse_metadata_frontier_premphf_base_observed_total_ = nullptr;
+    Statistic<uint64_t>* stat_pulse_metadata_frontier_premphf_base_same_window_reobserve_total_ = nullptr;
+    Statistic<uint64_t>* stat_pulse_metadata_frontier_premphf_base_owner_form_candidate_total_ = nullptr;
+    Statistic<uint64_t>* stat_pulse_metadata_frontier_premphf_base_join_ready_candidate_total_ = nullptr;
+    Statistic<uint64_t>* stat_pulse_metadata_frontier_premphf_band_observed_total_ = nullptr;
+    Statistic<uint64_t>* stat_pulse_metadata_frontier_premphf_band_same_window_reobserve_total_ = nullptr;
+    Statistic<uint64_t>* stat_pulse_metadata_frontier_premphf_band_owner_form_candidate_total_ = nullptr;
+    Statistic<uint64_t>* stat_pulse_metadata_frontier_premphf_band_join_ready_candidate_total_ = nullptr;
+    Statistic<uint64_t>* stat_pulse_metadata_frontier_idx2row_observed_total_ = nullptr;
+    Statistic<uint64_t>* stat_pulse_metadata_frontier_idx2row_same_window_reobserve_total_ = nullptr;
+    Statistic<uint64_t>* stat_pulse_metadata_frontier_idx2row_owner_form_candidate_total_ = nullptr;
+    Statistic<uint64_t>* stat_pulse_metadata_frontier_idx2row_join_ready_candidate_total_ = nullptr;
+    Statistic<uint64_t>* stat_pulse_metadata_frontier_rowindex_observed_total_ = nullptr;
+    Statistic<uint64_t>* stat_pulse_metadata_frontier_rowindex_same_window_reobserve_total_ = nullptr;
+    Statistic<uint64_t>* stat_pulse_metadata_frontier_rowindex_owner_form_candidate_total_ = nullptr;
+    Statistic<uint64_t>* stat_pulse_metadata_frontier_rowindex_join_ready_candidate_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_census_premphf_base_frontier_events_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_census_premphf_base_producer_events_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_census_premphf_base_gate_events_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_census_premphf_base_service_events_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_census_premphf_band_frontier_events_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_census_premphf_band_producer_events_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_census_premphf_band_gate_events_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_census_premphf_band_service_events_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_census_idx2row_frontier_events_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_census_idx2row_producer_events_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_census_idx2row_gate_events_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_census_idx2row_service_events_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_census_rowindex_frontier_events_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_census_rowindex_producer_events_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_census_rowindex_gate_events_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_census_rowindex_service_events_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_census_rowdescriptor_frontier_events_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_census_rowdescriptor_producer_events_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_census_rowdescriptor_gate_events_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_census_rowdescriptor_service_events_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_proxy_rowindex_materialize_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_proxy_rowindex_publicize_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_proxy_rowindex_owner_form_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_proxy_rowindex_join_live_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_proxy_rowindex_join_ready_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_proxy_rowindex_ready_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_proxy_rowindex_release_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_proxy_rowindex_release_missing_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_proxy_rowindex_fallback_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_proxy_idx2row_materialize_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_proxy_idx2row_publicize_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_proxy_idx2row_owner_form_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_proxy_idx2row_join_live_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_proxy_idx2row_join_ready_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_proxy_idx2row_ready_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_proxy_idx2row_release_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_proxy_idx2row_release_missing_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_proxy_idx2row_fallback_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_proxy_premphf_base_materialize_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_proxy_premphf_base_publicize_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_proxy_premphf_base_owner_form_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_proxy_premphf_base_shared_hit_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_proxy_premphf_base_lookup_ready_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_proxy_premphf_base_proxy_only_gap_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_proxy_premphf_band_materialize_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_proxy_premphf_band_publicize_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_proxy_premphf_band_owner_form_candidate_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_proxy_premphf_band_join_ready_candidate_total_ = nullptr;
+    Statistic<uint64_t>* stat_atlas_proxy_premphf_band_zero_service_total_ = nullptr;
+    Statistic<uint64_t>* stat_gcss_lookup_hit_total_ = nullptr;
+    Statistic<uint64_t>* stat_gcss_lookup_miss_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_read_dense_reqs_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_read_dense_bytes_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_read_rowptr_reqs_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_read_rowptr_bytes_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_read_colidx_reqs_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_read_colidx_bytes_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_read_blockdata_reqs_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_read_blockdata_bytes_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_read_gcss_reqs_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_read_gcss_bytes_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_idx_sram_reads_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_idx_sram_writes_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_idx_sram_bytes_read_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_idx_sram_bytes_write_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_idx_sram_bank_conflict_ticks_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_idx_sram_predicted_extra_cycles_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_idx_sram_resident_bytes_peak_ = nullptr;
+    Statistic<uint64_t>* stat_weight_idx_sram_bank_peak_accesses_per_tick_ = nullptr;
+    Statistic<uint64_t>* stat_weight_idx_sram_energy_read_pj_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_idx_sram_energy_write_pj_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_idx_lookup_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_idx_lookup_idx2_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_l0_sram_reads_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_l0_sram_writes_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_l0_sram_bytes_read_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_l0_sram_bytes_write_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_l0_sram_bank_conflict_ticks_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_l0_sram_predicted_extra_cycles_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_l0_sram_resident_bytes_peak_ = nullptr;
+    Statistic<uint64_t>* stat_weight_l0_sram_bank_peak_accesses_per_tick_ = nullptr;
+    Statistic<uint64_t>* stat_weight_l0_sram_energy_read_pj_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_l0_sram_energy_write_pj_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_sram_enforced_stall_cycles_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_l0_lookup_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_l0_hit_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_l0_fill_total_ = nullptr;
+    Statistic<uint64_t>* stat_weight_l0_evict_total_ = nullptr;
+    Statistic<uint64_t>* stat_core_state_sram_reads_total_ = nullptr;
+    Statistic<uint64_t>* stat_core_state_sram_writes_total_ = nullptr;
+    Statistic<uint64_t>* stat_core_state_sram_bytes_read_total_ = nullptr;
+    Statistic<uint64_t>* stat_core_state_sram_bytes_write_total_ = nullptr;
+    Statistic<uint64_t>* stat_core_state_sram_bank_conflict_ticks_total_ = nullptr;
+    Statistic<uint64_t>* stat_core_state_sram_predicted_extra_cycles_total_ = nullptr;
+    Statistic<uint64_t>* stat_core_state_sram_resident_bytes_peak_ = nullptr;
+    Statistic<uint64_t>* stat_core_state_sram_bank_peak_accesses_per_tick_ = nullptr;
+    Statistic<uint64_t>* stat_core_state_sram_energy_read_pj_total_ = nullptr;
+    Statistic<uint64_t>* stat_core_state_sram_energy_write_pj_total_ = nullptr;
+    Statistic<uint64_t>* stat_core_state_sram_stall_cycles_total_ = nullptr;
+    Statistic<uint64_t>* stat_riscv_snn_workload_selected_ = nullptr;
+    Statistic<uint64_t>* stat_riscv_snn_firmware_elf_present_ = nullptr;
+    Statistic<uint64_t>* stat_riscv_snn_firmware_loaded_ = nullptr;
+    Statistic<uint64_t>* stat_riscv_snn_backend_runtime_bridge_ = nullptr;
+    Statistic<uint64_t>* stat_riscv_snn_firmware_started_count_ = nullptr;
+    Statistic<uint64_t>* stat_riscv_snn_submitted_commands_ = nullptr;
+    Statistic<uint64_t>* stat_riscv_snn_accepted_commands_ = nullptr;
+    Statistic<uint64_t>* stat_riscv_snn_completion_visible_count_ = nullptr;
+    Statistic<uint64_t>* stat_riscv_snn_completion_consumed_count_ = nullptr;
+    Statistic<uint64_t>* stat_riscv_snn_fused_step_completion_count_ = nullptr;
+    Statistic<uint64_t>* stat_riscv_snn_fault_count_ = nullptr;
+    Statistic<uint64_t>* stat_riscv_snn_last_completion_status_ = nullptr;
+    Statistic<uint64_t>* stat_riscv_snn_last_fault_csr_ = nullptr;
+    Statistic<uint64_t>* stat_riscv_snn_backend_runtime_bridge_provider_bound_ = nullptr;
     
     // 内部计数器用于getStatistics()方法
     uint64_t count_spikes_received_;
@@ -690,6 +1251,10 @@ private:
     uint64_t count_stream_pkt_recv_ = 0;
     uint64_t count_stream_pkt_bad_crc_ = 0;
     uint64_t count_stream_pkt_bad_magic_ = 0;
+    uint64_t count_route3d_native_activation_total_ = 0;
+    uint64_t count_route3d_native_gating_activation_total_ = 0;
+    uint64_t count_route3d_native_direct_activation_total_ = 0;
+    uint64_t count_route3d_native_unique_sources_total_ = 0;
     // 内部计数：用于收尾摘要打印（不依赖SST统计聚合）
     uint64_t count_cache_hits_ = 0;
     uint64_t count_cache_misses_ = 0;
@@ -728,6 +1293,13 @@ private:
 
     // Dense 权重区域上界（用于区域分组）；BCSR 通过 bcsr_kind 判别
     uint64_t weight_region_end_ = 0; // [base_addr_, weight_region_end_) 视为权重区（dense）
+    // Dense 权重“物理布局”（实验性；默认 row_major）
+    std::string dense_layout_mode_ = "row_major"; // row_major|phys_v1
+    uint32_t dense_phys_dram_row_bytes_ = 0;
+    bool dense_phys_enable_ = false;
+    uint32_t dense_phys_row_stride_bytes_ = 0;
+    uint32_t dense_phys_rows_per_dram_row_ = 1;
+    uint32_t dense_phys_group_stride_bytes_ = 0;
 
     // BCSR 布局描述（集中校验与寻址）
     struct BcsrLayout {
@@ -741,6 +1313,10 @@ private:
         uint64_t colidx_offset = 0;
         uint64_t blockdata_offset = 0;
         uint64_t blockids_offset = 0;
+        std::string layout_mode = "flat"; // flat|rowpack_v1
+        uint32_t colidx_row_stride_bytes = 0;
+        uint32_t blockdata_row_stride_bytes = 0;
+        uint32_t blockids_row_stride_bytes = 0;
         uint64_t per_core_stride = 0;
         bool validate(uint64_t base, Output* out, bool debug, uint32_t core_id, uint32_t node_id) const;
         uint64_t maxOffset() const {
@@ -807,6 +1383,8 @@ private:
 
     // weights_template_ 保留：用于 BCSR 文件兜底与诊断读取
     std::string weights_template_;
+    std::string gcss_index_template_;
+    std::string synapse_weight_mode_ = "bcsr_gas";
     bool record_edge_apply_enable_ = false;
     bool record_edge_idle_enable_ = true;
     bool record_edge_scatter_enable_ = false;

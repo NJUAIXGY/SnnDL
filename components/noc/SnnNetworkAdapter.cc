@@ -6,11 +6,14 @@
 //
 
 #include "SnnNetworkAdapter.h"
+#include "SnnNetworkAdapterConfig.h"
 #include "SimpleNetworkWrapper.h"
 #include "NocPacketBatchEvent.h"
 #include "SnnDLLogging.h"
+#include "SnnDLStringUtil.h"
 
 #include <algorithm>
+#include <inttypes.h>
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
@@ -115,26 +118,26 @@ SST::Event* NetworkEventConverter::convertRequestToEvent(SST::Interfaces::Simple
 SnnNetworkAdapter::SnnNetworkAdapter(SST::ComponentId_t id, SST::Params& params)
     : SnnInterface(id, params)
 {
-    int verbose_level = params.find<int>("verbose", 0);
-    output = new SST::Output("SnnNetworkAdapter[@p:@l]: ", verbose_level, 0, SST::Output::STDOUT);
+    const SnnNetworkAdapterConfig cfg = parseSnnNetworkAdapterConfig(params);
 
-    node_id = params.find<uint32_t>("node_id", 0);
-    routing_algorithm = params.find<std::string>("routing_algorithm", "XY");
-    link_bw = params.find<std::string>("link_bw", "40GiB/s");
-    packet_size = params.find<std::string>("packet_size", "64B");
-    input_buf_size = params.find<std::string>("input_buf_size", "1KiB");
-    output_buf_size = params.find<std::string>("output_buf_size", "1KiB");
+    output = new SST::Output("SnnNetworkAdapter[@p:@l]: ", cfg.verbose, 0, SST::Output::STDOUT);
 
-    enable_adaptive_routing = params.find<bool>("enable_adaptive_routing", false);
-    congestion_threshold = params.find<double>("congestion_threshold", 0.8);
-    enable_merlin_router = params.find<bool>("enable_merlin_router", false);
-    use_direct_link = params.find<bool>("use_direct_link", false);
-    use_multi_port = params.find<bool>("use_multi_port", false);
-    port_name = params.find<std::string>("port_name", "network");
+    node_id = cfg.node_id;
+    routing_algorithm = cfg.routing_algorithm;
+    link_bw = cfg.link_bw;
+    packet_size = cfg.packet_size;
+    input_buf_size = cfg.input_buf_size;
+    output_buf_size = cfg.output_buf_size;
 
-    std::string topology_str = params.find<std::string>("topology_type", "mesh2d");
-    topology_type = parseTopologyType(topology_str);
-    topology_shape = params.find<std::string>("topology_shape", "4x4");
+    enable_adaptive_routing = cfg.enable_adaptive_routing;
+    congestion_threshold = cfg.congestion_threshold;
+    enable_merlin_router = cfg.enable_merlin_router;
+    use_direct_link = cfg.use_direct_link;
+    use_multi_port = cfg.use_multi_port;
+    port_name = cfg.port_name;
+
+    topology_type = parseTopologyType(cfg.topology_type);
+    topology_shape = cfg.topology_shape;
 
     // counters
     spikes_routed_count = 0;
@@ -148,6 +151,11 @@ SnnNetworkAdapter::SnnNetworkAdapter(SST::ComponentId_t id, SST::Params& params)
     max_hops_observed = 0;
     bandwidth_bytes_sent = 0;
     packets_dropped = 0;
+    pending_send_enqueue_total_ = 0;
+    pending_send_dequeue_total_ = 0;
+    pending_send_high_watermark_ = 0;
+    pending_send_space_block_total_ = 0;
+    pending_send_send_fail_total_ = 0;
 
     stat_spikes_routed = registerStatistic<uint64_t>("spikes_routed");
     stat_local_spikes = registerStatistic<uint64_t>("local_spikes");
@@ -185,6 +193,9 @@ SnnNetworkAdapter::~SnnNetworkAdapter()
 {
     if (output) delete output;
     output = nullptr;
+
+    if (simple_network_wrapper) delete simple_network_wrapper;
+    simple_network_wrapper = nullptr;
 
     while (!pending_sends_.empty()) {
         auto& ps = pending_sends_.front();
@@ -230,11 +241,18 @@ std::string SnnNetworkAdapter::getNetworkStatus() const
     return status.str();
 }
 
+size_t SnnNetworkAdapter::pendingSendCount() const
+{
+    return pending_sends_.size();
+}
+
 bool SnnNetworkAdapter::handleIncoming(int vn)
 {
     if (!router) return true;
     auto* req = router->recv(vn);
     while (req) {
+        const uint32_t req_src = static_cast<uint32_t>(req->src);
+        const uint32_t req_dst = static_cast<uint32_t>(req->dest);
         SST::Event* ev = extractEventFromRequest(req);
         delete req;
         if (!ev) {
@@ -243,6 +261,9 @@ bool SnnNetworkAdapter::handleIncoming(int vn)
         }
 
         if (auto* batch = dynamic_cast<NocPacketBatchEvent*>(ev)) {
+            // Keep metadata consistent with SimpleNetwork envelope.
+            batch->src_node = req_src;
+            batch->dst_node = req_dst;
             for (auto& p : batch->packets) {
                 auto* pkt = new NocPacketEvent();
                 pkt->src_node = batch->src_node;
@@ -251,12 +272,19 @@ bool SnnNetworkAdapter::handleIncoming(int vn)
                 pkt->dst_endpoint = p.dst_endpoint;
                 pkt->kind = p.kind;
                 pkt->hop_count = p.hop_count;
+                pkt->step_seq = p.step_seq;
                 pkt->timestamp = p.timestamp;
                 pkt->payload = std::move(p.payload);
                 if (receive_handler_) receive_handler_(pkt);
                 else delete pkt;
             }
             delete batch;
+        } else if (auto* pkt = dynamic_cast<NocPacketEvent*>(ev)) {
+            // Keep metadata consistent with SimpleNetwork envelope.
+            pkt->src_node = req_src;
+            pkt->dst_node = req_dst;
+            if (receive_handler_) receive_handler_(pkt);
+            else delete pkt;
         } else {
             if (receive_handler_) receive_handler_(ev);
             else delete ev;
@@ -277,9 +305,13 @@ bool SnnNetworkAdapter::spaceAvailable(int vn)
         bool sent = false;
         if (router->spaceToSend(req->vn, req->size_in_bits)) {
             sent = router->send(req, req->vn);
+            if (!sent) pending_send_send_fail_total_++;
+        } else {
+            pending_send_space_block_total_++;
         }
         if (sent) {
             pending_sends_.pop();
+            pending_send_dequeue_total_++;
             continue;
         }
         SST::Event* payload = req->takePayload();
@@ -294,7 +326,7 @@ void SnnNetworkAdapter::handleDirectEvent(SST::Event* event)
 {
     if (!event) return;
     if (auto* pkt = dynamic_cast<NocPacketEvent*>(event)) {
-        constexpr uint16_t kMaxHops = 10;
+        constexpr uint16_t kMaxHops = NocPacketEvent::kDefaultMaxHops;
         if (pkt->hop_count >= kMaxHops) { delete pkt; return; }
         pkt->hop_count += 1;
         if (pkt->dst_node == node_id) {
@@ -314,20 +346,21 @@ void SnnNetworkAdapter::injectDirectionLink(const std::string& direction, SST::L
     if (link) parent_direction_links[direction] = link;
 }
 
-void SnnNetworkAdapter::sendEventToDirection(SST::Event* event, const std::string& direction)
+bool SnnNetworkAdapter::sendEventToDirection(SST::Event* event, const std::string& direction)
 {
-    if (!event) return;
+    if (!event) return false;
     auto it = direction_links.find(direction);
     if (it != direction_links.end() && it->second) {
         it->second->send(event);
-        return;
+        return true;
     }
     auto it2 = parent_direction_links.find(direction);
     if (it2 != parent_direction_links.end() && it2->second) {
         it2->second->send(event);
-        return;
+        return true;
     }
     delete event;
+    return false;
 }
 
 void SnnNetworkAdapter::init(unsigned int phase)
@@ -348,6 +381,16 @@ void SnnNetworkAdapter::setup()
 
 void SnnNetworkAdapter::finish()
 {
+    output->verbose(CALL_INFO, 0, 0,
+        "[snn-nic-pending] node=%u enq=%" PRIu64 " deq=%" PRIu64 " hwm=%" PRIu64
+        " space_block=%" PRIu64 " send_fail=%" PRIu64 " final=%zu\n",
+        node_id,
+        pending_send_enqueue_total_,
+        pending_send_dequeue_total_,
+        pending_send_high_watermark_,
+        pending_send_space_block_total_,
+        pending_send_send_fail_total_,
+        pending_sends_.size());
     if (router) router->finish();
 }
 
@@ -365,9 +408,7 @@ void SnnNetworkAdapter::initializeTopologyHandler()
 
 TopologyType SnnNetworkAdapter::parseTopologyType(const std::string& type_str)
 {
-    std::string t = type_str;
-    std::transform(t.begin(), t.end(), t.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    const std::string t = toLowerCopy(type_str);
     if (t == "torus2d") return TopologyType::TORUS_2D;
     return TopologyType::MESH_2D;
 }
@@ -396,11 +437,16 @@ void SnnNetworkAdapter::routeEvent_(SST::Event* event, uint32_t dest_node)
         int port = topology_handler->calculateRoute(dest_node);
         const char* dir = portToDirection_(port);
         if (dir) {
-            sendEventToDirection(event, dir);
-            remote_spikes_count++;
-            if (stat_remote_spikes) stat_remote_spikes->addData(1);
-            spikes_routed_count++;
-            if (stat_spikes_routed) stat_spikes_routed->addData(1);
+            const bool sent = sendEventToDirection(event, dir);
+            if (sent) {
+                remote_spikes_count++;
+                if (stat_remote_spikes) stat_remote_spikes->addData(1);
+                spikes_routed_count++;
+                if (stat_spikes_routed) stat_spikes_routed->addData(1);
+            } else {
+                packets_dropped++;
+                if (stat_packets_dropped) stat_packets_dropped->addData(1);
+            }
             return;
         }
     }
@@ -423,12 +469,18 @@ void SnnNetworkAdapter::sendViaMerlinRouter_(SST::Event* event, uint32_t dest_no
     bool sent = false;
     if (router->spaceToSend(req->vn, req->size_in_bits)) {
         sent = router->send(req, req->vn);
+        if (!sent) pending_send_send_fail_total_++;
+    } else {
+        pending_send_space_block_total_++;
     }
     if (sent) return;
 
     SST::Event* payload = req->takePayload();
     delete req;
     pending_sends_.push(PendingSend{dest_node, payload});
+    pending_send_enqueue_total_++;
+    const uint64_t pending_depth = static_cast<uint64_t>(pending_sends_.size());
+    if (pending_depth > pending_send_high_watermark_) pending_send_high_watermark_ = pending_depth;
 }
 
 void SnnNetworkAdapter::sendViaMultiPortLink_(SST::Event* event, uint32_t dest_node, int /*next_port*/)

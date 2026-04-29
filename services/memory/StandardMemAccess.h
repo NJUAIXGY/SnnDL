@@ -38,6 +38,16 @@ public:
     bool handleMemoryResponse(SST::Interfaces::StandardMem::Request* req);
 
 private:
+    struct FragmentGroup {
+        uint64_t orig_addr = 0;
+        size_t slice_off = 0;
+        size_t slice_len = 0;
+        uint64_t line_bytes = 0;
+        size_t remaining = 0;
+        std::vector<uint8_t> buf;
+        ReadCallback cb;
+    };
+
     struct PendingEntry {
         uint64_t address = 0;
         size_t bytes = 0;
@@ -46,12 +56,18 @@ private:
         WriteCallback write_cb;
     };
 
+    uint64_t lineBytes_() const;
+    uint64_t allocFragmentGroupId_();
+    void onFragmentResp_(uint64_t group_id, uint64_t line_index, std::vector<uint8_t> data);
+
     SST::Interfaces::StandardMem* mem_ = nullptr;
     SST::Output* out_ = nullptr;
     int node_id_ = -1;
     int core_id_ = -1;
     bool force_noncacheable_ = false;
     std::unordered_map<uint64_t, PendingEntry> pending_;
+    uint64_t next_group_id_ = 1;
+    std::unordered_map<uint64_t, FragmentGroup> frag_groups_;
 };
 
 }} // namespace SST::SnnDL

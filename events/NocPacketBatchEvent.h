@@ -23,6 +23,7 @@ public:
         uint16_t dst_endpoint = 0;
         uint16_t kind = 0;
         uint16_t hop_count = 0;
+        uint32_t step_seq = 0;
         uint64_t timestamp = 0;
         std::vector<uint8_t> payload;
 
@@ -31,6 +32,7 @@ public:
             SST_SER(dst_endpoint);
             SST_SER(kind);
             SST_SER(hop_count);
+            SST_SER(step_seq);
             SST_SER(timestamp);
             SST_SER(payload);
         }
@@ -56,4 +58,3 @@ private:
 }} // namespace SST::SnnDL
 
 #endif // SNNDL_NOC_PACKET_BATCH_EVENT_H
-

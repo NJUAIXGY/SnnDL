@@ -192,6 +192,7 @@ public:
     void setNodeId(uint32_t node_id) override;
     uint32_t getNodeId() const override;
     std::string getNetworkStatus() const override;
+    size_t pendingSendCount() const override;
 
     // === 网络接口回调方法 ===
     bool handleIncoming(int vn);
@@ -222,17 +223,18 @@ public:
      */
     void injectDirectionLink(const std::string& direction, SST::Link* link);
     
-    /**
-     * @brief 从父组件发送事件到指定方向
-     * @param event 要发送的事件
-     * @param direction 发送方向
-     */
-    void sendEventToDirection(SST::Event* event, const std::string& direction);
-    
-    // === SST组件生命周期方法 ===
-    void init(unsigned int phase) override;
-    void setup() override;
-    void finish() override;
+	    /**
+	     * @brief 从父组件发送事件到指定方向
+	     * @param event 要发送的事件
+	     * @param direction 发送方向
+	     * @return true 表示已成功注入链路（send接管event生命周期），false 表示丢弃（已delete event）
+	     */
+	    bool sendEventToDirection(SST::Event* event, const std::string& direction);
+	    
+	    // === SST组件生命周期方法 ===
+	    void init(unsigned int phase) override;
+	    void setup() override;
+	    void finish() override;
 
 private:
     // === 内部初始化方法 ===
@@ -364,6 +366,11 @@ private:
     std::map<int, uint64_t> port_counters;    ///< 端口计数器
     struct PendingSend { uint32_t dest_node = 0; SST::Event* payload = nullptr; };
     std::queue<PendingSend> pending_sends_;   ///< 待发送队列
+    uint64_t pending_send_enqueue_total_;     ///< pending_sends_ 累计入队数
+    uint64_t pending_send_dequeue_total_;     ///< pending_sends_ 累计出队数
+    uint64_t pending_send_high_watermark_;    ///< pending_sends_ 峰值深度
+    uint64_t pending_send_space_block_total_; ///< router->spaceToSend 阻塞次数
+    uint64_t pending_send_send_fail_total_;   ///< router->send 失败次数
     
     // 基础统计计数器
     uint64_t spikes_routed_count;

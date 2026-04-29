@@ -21,12 +21,15 @@
 #include <sst/core/statapi/stataccumulator.h>
 
 #include "synapse/route/BcsrRouteBuilder.h"
+#include "SnnDLStringUtil.h"
 
 namespace SST { namespace SnnDL {
 
 // Process-wide shared route cache (avoid per-core route table duplication).
 std::mutex SynapseRouteSubsystem::s_route_cache_mtx_;
 std::unordered_map<std::string, std::weak_ptr<const SynapseRouteSubsystem::RouteMap>> SynapseRouteSubsystem::s_route_cache_;
+std::mutex SynapseRouteSubsystem::s_route_weight_cache_mtx_;
+std::unordered_map<std::string, std::weak_ptr<const SynapseRouteSubsystem::RouteWeightMap>> SynapseRouteSubsystem::s_route_weight_cache_;
 
 std::mutex SynapseRouteSubsystem::s_multicast_cache_mtx_;
 std::unordered_map<std::string, std::weak_ptr<const SynapseRouteSubsystem::MulticastTargetMap>> SynapseRouteSubsystem::s_multicast_cache_;
@@ -56,6 +59,39 @@ bool parseIngressPolicy_(const std::string& s, IngressPolicy& out) {
     if (s == "bottom_right") { out = IngressPolicy::BottomRight; return true; }
     if (s == "hash4") { out = IngressPolicy::Hash4; return true; }
     return false;
+}
+
+std::string sourcePrimaryKindFromCfg_(const SynapseRouteBuildConfig& cfg) {
+    const bool edges_csv_bootstrap =
+        cfg.mapping_mode == "edges_csv" && !cfg.mapping_edges_file.empty();
+    const bool legacy_route_tables_bootstrap =
+        !edges_csv_bootstrap && (!cfg.weights_template.empty() || cfg.real_synapse_inputs_available);
+    if (edges_csv_bootstrap) return "edges_csv_bootstrap";
+    if (legacy_route_tables_bootstrap && cfg.real_synapse_inputs_available) {
+        return "legacy_route_tables_with_real_synapse_inputs";
+    }
+    if (legacy_route_tables_bootstrap) return "legacy_route_tables_bootstrap";
+    if (cfg.real_synapse_inputs_available) return "real_synapse_inputs_only";
+    return "legacy_only";
+}
+
+inline bool parseU32CsvField_(std::string tok, uint32_t& out) {
+    size_t b = 0;
+    while (b < tok.size() && std::isspace(static_cast<unsigned char>(tok[b]))) ++b;
+    size_t e = tok.size();
+    while (e > b && std::isspace(static_cast<unsigned char>(tok[e - 1]))) --e;
+    tok = tok.substr(b, e - b);
+    if (tok.empty()) return false;
+    try {
+        size_t pos = 0;
+        const unsigned long long v = std::stoull(tok, &pos, 10);
+        if (pos != tok.size()) return false;
+        if (v > static_cast<unsigned long long>(std::numeric_limits<uint32_t>::max())) return false;
+        out = static_cast<uint32_t>(v);
+        return true;
+    } catch (...) {
+        return false;
+    }
 }
 
 inline uint32_t selectIngressNodeBlocked_(IngressPolicy policy,
@@ -199,7 +235,13 @@ void buildRoutesFromCandidates_(const SynapseRouteBuildConfig& cfg,
                                const std::unordered_map<uint32_t, std::vector<std::pair<float,uint32_t>>>& tmp,
                                uint32_t rows,
                                bool group_by_pe,
-                               SynapseRouteSubsystem::RouteMap& routes_out) {
+                               SynapseRouteSubsystem::RouteMap& routes_out,
+                               SynapseRouteSubsystem::RouteWeightMap* route_weights_out) {
+    if (group_by_pe && rows == 0) {
+        if (out) out->verbose(CALL_INFO, 1, 0,
+                              "⚠️ 路由构建：rows=0 且 group_by_pe=1，已回退为 group_by_pe=0（避免除零）\n");
+        group_by_pe = false;
+    }
     for (auto& kv : tmp) {
         uint32_t pre = kv.first;
         const auto& lst_in = kv.second;
@@ -320,6 +362,27 @@ void buildRoutesFromCandidates_(const SynapseRouteBuildConfig& cfg,
         std::sort(final_routes.begin(), final_routes.end());
         final_routes.erase(std::unique(final_routes.begin(), final_routes.end()), final_routes.end());
 
+        if (route_weights_out) {
+            for (uint32_t dest : final_routes) {
+                bool found = false;
+                float selected = 0.0f;
+                float selected_abs = 0.0f;
+                for (const auto& cand : lst_in) {
+                    if (cand.second != dest) continue;
+                    const float absw = std::fabs(cand.first);
+                    if (!found || absw > selected_abs) {
+                        found = true;
+                        selected = cand.first;
+                        selected_abs = absw;
+                    }
+                }
+                if (!found) continue;
+                const uint64_t key =
+                    (static_cast<uint64_t>(pre) << 32) | static_cast<uint64_t>(dest);
+                (*route_weights_out)[key] = selected;
+            }
+        }
+
         routes_out[pre] = std::move(final_routes);
     }
 }
@@ -328,7 +391,8 @@ bool buildRoutesFromEdgesCSV_(const SynapseRouteBuildConfig& cfg,
                              Output* out,
                              const std::unordered_set<uint32_t>& allowed_layer_edges,
                              bool allow_all_layers,
-                             SynapseRouteSubsystem::RouteMap& routes_out) {
+                             SynapseRouteSubsystem::RouteMap& routes_out,
+                             SynapseRouteSubsystem::RouteWeightMap* route_weights_out) {
     routes_out.clear();
     const uint32_t rows = cfg.rows;
     std::ifstream fin(cfg.mapping_edges_file);
@@ -357,12 +421,35 @@ bool buildRoutesFromEdgesCSV_(const SynapseRouteBuildConfig& cfg,
     };
     std::unordered_map<uint32_t, std::vector<std::pair<float,uint32_t>>> tmp;
     uint64_t dropped_self = 0, dropped_layer = 0;
+    uint64_t bad_rows = 0;
+    uint64_t bad_rows_logged = 0;
+    uint64_t total_rows = 0;
+    constexpr uint64_t kMaxBadRowsLog = 8;
     while (std::getline(fin, line)) {
         if (line.empty()) continue;
+        total_rows++;
         auto toks = split(line);
-        if (toks.size() < 2) continue;
-        uint32_t src = (uint32_t) std::stoul(toks[0]);
-        uint32_t dst = (uint32_t) std::stoul(toks[1]);
+        if (toks.size() < 2) {
+            bad_rows++;
+            if (out && bad_rows_logged < kMaxBadRowsLog) {
+                out->verbose(CALL_INFO, 1, 0,
+                             "⚠️ 映射CSV坏行(列数<2) line='%s'\n",
+                             line.c_str());
+                bad_rows_logged++;
+            }
+            continue;
+        }
+        uint32_t src = 0, dst = 0;
+        if (!parseU32CsvField_(toks[0], src) || !parseU32CsvField_(toks[1], dst)) {
+            bad_rows++;
+            if (out && bad_rows_logged < kMaxBadRowsLog) {
+                out->verbose(CALL_INFO, 1, 0,
+                             "⚠️ 映射CSV坏行(src/dst解析失败) src='%s' dst='%s' line='%s'\n",
+                             toks[0].c_str(), toks[1].c_str(), line.c_str());
+                bad_rows_logged++;
+            }
+            continue;
+        }
         float w = 1.0f;
         if (toks.size() >= 3) { try { w = std::stof(toks[2]); } catch(...) { w = 1.0f; } }
         if (std::fabs(w) <= cfg.routing_epsilon) continue;
@@ -377,10 +464,15 @@ bool buildRoutesFromEdgesCSV_(const SynapseRouteBuildConfig& cfg,
                 if (allowed_layer_edges.find(key) == allowed_layer_edges.end()) { dropped_layer++; continue; }
             }
         }
-        tmp[src].emplace_back(std::fabs(w), dst);
+        tmp[src].emplace_back(w, dst);
+    }
+    if (bad_rows > 0 && out) {
+        out->verbose(CALL_INFO, 1, 0,
+                     "⚠️ 映射CSV解析存在坏行: file=%s total_rows=%" PRIu64 " bad_rows=%" PRIu64 "\n",
+                     cfg.mapping_edges_file.c_str(), total_rows, bad_rows);
     }
     buildRoutesFromCandidates_(cfg, out, cfg.verify_routing_weights, tmp, rows,
-                              /*group_by_pe=*/cfg.mapping_assume_block_ids, routes_out);
+                              /*group_by_pe=*/cfg.mapping_assume_block_ids, routes_out, route_weights_out);
     if ((cfg.route_exclude_self_pe || !allow_all_layers) && cfg.route_filter_warn && out) {
         out->verbose(CALL_INFO, 1, 0,
             "⚠️ 路由过滤(映射CSV)启用: exclude_self_pe=%d, layers_mask='%s' (丢弃: self=%" PRIu64 ", layer=%" PRIu64 ")\n",
@@ -391,8 +483,10 @@ bool buildRoutesFromEdgesCSV_(const SynapseRouteBuildConfig& cfg,
 
 bool buildWeightDrivenRoutesFromBcsr_(const SynapseRouteBuildConfig& cfg,
                                      Output* out,
-                                     SynapseRouteSubsystem::RouteMap& routes_out) {
+                                     SynapseRouteSubsystem::RouteMap& routes_out,
+                                     SynapseRouteSubsystem::RouteWeightMap* route_weights_out) {
     routes_out.clear();
+    if (route_weights_out) route_weights_out->clear();
     const uint32_t cores_per_pe = (cfg.cores_per_pe > 0) ? cfg.cores_per_pe : 1u;
     uint32_t rows_hint = (cores_per_pe > 0) ? static_cast<uint32_t>((cfg.rows + cores_per_pe - 1) / cores_per_pe) : cfg.rows;
     if (rows_hint == 0) rows_hint = cfg.rows;
@@ -402,7 +496,7 @@ bool buildWeightDrivenRoutesFromBcsr_(const SynapseRouteBuildConfig& cfg,
             std::string path = resolveBcsrTemplate(cfg.weights_template, pe, static_cast<int>(core));
             if (path.empty()) { ok = false; break; }
             if (!appendRoutesFromBcsrFile(cfg, out, path, pe, static_cast<int>(core),
-                                          rows_hint, routes_out, BcsrAppendOptions{})) {
+                                          rows_hint, routes_out, BcsrAppendOptions{}, route_weights_out)) {
                 ok = false;
                 break;
             }
@@ -420,21 +514,32 @@ bool buildWeightDrivenRoutesDense_(const SynapseRouteBuildConfig& cfg,
                                   Output* out,
                                   const std::unordered_set<uint32_t>& allowed_layer_edges,
                                   bool allow_all_layers,
-                                  SynapseRouteSubsystem::RouteMap& routes_out) {
+                                  SynapseRouteSubsystem::RouteMap& routes_out,
+                                  SynapseRouteSubsystem::RouteWeightMap* route_weights_out) {
     routes_out.clear();
+    if (route_weights_out) route_weights_out->clear();
     if (cfg.weights_template.empty()) {
         if (out) out->verbose(CALL_INFO, 1, 0, "⚠️ 路由构建失败：weights_template 未提供\n");
         return false;
     }
     if (cfg.weights_template.find(".bcsr") != std::string::npos ||
         cfg.weights_template.find(".BCSR") != std::string::npos) {
-        return buildWeightDrivenRoutesFromBcsr_(cfg, out, routes_out);
+        return buildWeightDrivenRoutesFromBcsr_(cfg, out, routes_out, route_weights_out);
     }
 
     const uint32_t rows = cfg.rows;
     const uint32_t cols = cfg.cols;
     const uint32_t total_nodes = cfg.total_nodes;
-    const size_t expected = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+    if (rows == 0 || cols == 0) {
+        if (out) out->verbose(CALL_INFO, 1, 0, "⚠️ 路由构建失败：rows/cols 非法（rows=%u cols=%u）\n", rows, cols);
+        return false;
+    }
+    const uint64_t expected64 = static_cast<uint64_t>(rows) * static_cast<uint64_t>(cols);
+    if (expected64 > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+        if (out) out->verbose(CALL_INFO, 1, 0, "⚠️ 路由构建失败：rows*cols 溢出 size_t（rows=%u cols=%u）\n", rows, cols);
+        return false;
+    }
+    const size_t expected = static_cast<size_t>(expected64);
     std::unordered_map<uint32_t, std::vector<std::pair<float,uint32_t>>> tmp;
     tmp.reserve(cols);
     uint64_t dropped_self_pe = 0;
@@ -442,14 +547,8 @@ bool buildWeightDrivenRoutesDense_(const SynapseRouteBuildConfig& cfg,
 
     for (uint32_t pe = 0; pe < total_nodes; ++pe) {
         std::string path = cfg.weights_template;
-        size_t pos = path.find("{pe:02d}");
-        if (pos != std::string::npos) {
-            char buf[16]; std::snprintf(buf, sizeof(buf), "%02u", pe);
-            path.replace(pos, 8, buf);
-        } else {
-            pos = path.find("{pe}");
-            if (pos != std::string::npos) path.replace(pos, 4, std::to_string(pe));
-        }
+        replaceAllIndexed(path, "{pe:02d}", pe, 2);
+        replaceAll(path, "{pe}", std::to_string(pe));
         std::ifstream fin(path, std::ios::binary);
         if (!fin.good()) {
             if (out) out->verbose(CALL_INFO, 1, 0, "⚠️ 路由构建：无法读取权重文件 %s\n", path.c_str());
@@ -475,7 +574,10 @@ bool buildWeightDrivenRoutesDense_(const SynapseRouteBuildConfig& cfg,
                 float w = buf[idx];
                 if (std::fabs(w) > cfg.routing_epsilon) {
                     uint32_t pre_global = col;
-                    uint32_t dest_global = pe * rows + row;
+                    const uint64_t dest_global64 =
+                        static_cast<uint64_t>(pe) * static_cast<uint64_t>(rows) + static_cast<uint64_t>(row);
+                    if (dest_global64 > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) continue;
+                    uint32_t dest_global = static_cast<uint32_t>(dest_global64);
                     if (cfg.route_exclude_self_pe) {
                         uint32_t src_pe = pre_global / rows;
                         if (src_pe == pe) { dropped_self_pe++; continue; }
@@ -487,12 +589,13 @@ bool buildWeightDrivenRoutesDense_(const SynapseRouteBuildConfig& cfg,
                         uint32_t key = (la<<8) | lb;
                         if (allowed_layer_edges.find(key) == allowed_layer_edges.end()) { dropped_layer_mask++; continue; }
                     }
-                    tmp[pre_global].emplace_back(std::fabs(w), dest_global);
+                    tmp[pre_global].emplace_back(w, dest_global);
                 }
             }
         }
     }
-    buildRoutesFromCandidates_(cfg, out, cfg.verify_routing_weights, tmp, rows, /*group_by_pe=*/true, routes_out);
+    buildRoutesFromCandidates_(cfg, out, cfg.verify_routing_weights, tmp, rows,
+                               /*group_by_pe=*/true, routes_out, route_weights_out);
     if ((cfg.route_exclude_self_pe || !allow_all_layers) && cfg.route_filter_warn && out) {
         out->verbose(CALL_INFO, 1, 0,
             "⚠️ 路由过滤启用: exclude_self_pe=%d, layers_mask='%s' (丢弃: self_pe=%" PRIu64 ", layer_mask=%" PRIu64 ")\n",
@@ -508,6 +611,8 @@ void SynapseRouteSubsystem::configure(const SynapseRouteBuildConfig& cfg) {
     routing_weight_driven_active_ = false;
     routes_shared_.reset();
     routes_local_fallback_.clear();
+    route_weights_shared_.reset();
+    route_weights_local_fallback_.clear();
     route_summary_logged_ = false;
     fanout_provider_ready_ = false;
     gating_cache_.clear();
@@ -544,9 +649,15 @@ void SynapseRouteSubsystem::bindFanoutStat(SST::Statistics::Statistic<uint64_t>*
     if (stat_fanout_per_spike) stat_fanout_per_spike_ = stat_fanout_per_spike;
 }
 
+void SynapseRouteSubsystem::bindRouteRuntimeStats(const RouteRuntimeStatSinks& stats) {
+    route_runtime_stats_ = stats;
+}
+
 bool SynapseRouteSubsystem::initRoutes() {
     routes_shared_.reset();
     routes_local_fallback_.clear();
+    route_weights_shared_.reset();
+    route_weights_local_fallback_.clear();
     fanout_provider_ready_ = false;
     multicast_ready_ = false;
     mesh_w_ = 0;
@@ -567,13 +678,20 @@ bool SynapseRouteSubsystem::initRoutes() {
 
     if (!cache_key.empty()) {
         std::shared_ptr<const RouteMap> hit;
+        std::shared_ptr<const RouteWeightMap> hit_weights;
         {
             std::lock_guard<std::mutex> g(s_route_cache_mtx_);
             auto it = s_route_cache_.find(cache_key);
             if (it != s_route_cache_.end()) hit = it->second.lock();
         }
-        if (hit) {
+        {
+            std::lock_guard<std::mutex> g(s_route_weight_cache_mtx_);
+            auto it = s_route_weight_cache_.find(cache_key);
+            if (it != s_route_weight_cache_.end()) hit_weights = it->second.lock();
+        }
+        if (hit && hit_weights) {
             routes_shared_ = hit;
+            route_weights_shared_ = hit_weights;
             ok = true;
             hit_cache = true;
             uint64_t total_entries = 0;
@@ -593,10 +711,13 @@ bool SynapseRouteSubsystem::initRoutes() {
         parseLayerMask_(cfg_.route_layers_mask, allowed_layer_edges, allow_all_layers);
 
         RouteMap built_routes;
+        RouteWeightMap built_weights;
         if (cfg_.mapping_mode == "edges_csv" && !cfg_.mapping_edges_file.empty()) {
-            ok = buildRoutesFromEdgesCSV_(cfg_, log_, allowed_layer_edges, allow_all_layers, built_routes);
+            ok = buildRoutesFromEdgesCSV_(cfg_, log_, allowed_layer_edges, allow_all_layers,
+                                          built_routes, &built_weights);
         } else {
-            ok = buildWeightDrivenRoutesDense_(cfg_, log_, allowed_layer_edges, allow_all_layers, built_routes);
+            ok = buildWeightDrivenRoutesDense_(cfg_, log_, allowed_layer_edges, allow_all_layers,
+                                               built_routes, &built_weights);
         }
 
         if (!ok) {
@@ -608,7 +729,9 @@ bool SynapseRouteSubsystem::initRoutes() {
             routing_weight_driven_active_ = false;
         } else {
             auto shared = std::make_shared<RouteMap>(std::move(built_routes));
+            auto shared_weights = std::make_shared<RouteWeightMap>(std::move(built_weights));
             routes_shared_ = shared;
+            route_weights_shared_ = shared_weights;
             uint64_t total_entries = 0;
             for (auto& kv : *routes_shared_) total_entries += (uint64_t)kv.second.size();
             if (stat_routes_entries_) stat_routes_entries_->addData(total_entries);
@@ -636,6 +759,10 @@ bool SynapseRouteSubsystem::initRoutes() {
             if (!cache_key.empty()) {
                 std::lock_guard<std::mutex> g(s_route_cache_mtx_);
                 s_route_cache_[cache_key] = shared;
+            }
+            if (!cache_key.empty()) {
+                std::lock_guard<std::mutex> g(s_route_weight_cache_mtx_);
+                s_route_weight_cache_[cache_key] = shared_weights;
             }
         }
     }
@@ -673,6 +800,31 @@ void SynapseRouteSubsystem::applyGatingDecision(uint32_t src_global,
             "📥 应用门控: src_g=%u, k=%zu, expire=%" PRIu64 "\n",
             src_global, dest_pes.size(), gating_cache_[src_global].expire_cycle);
     }
+}
+
+SynapseRouteSubsystem::RouteSemanticDescriptor SynapseRouteSubsystem::describeRouteSemantics() const {
+    RouteSemanticDescriptor descriptor{};
+    descriptor.source_semantics_authority = "legacy_provider";
+    descriptor.source_primary_kind = sourcePrimaryKindFromCfg_(cfg_);
+    descriptor.route_topology = "mesh_2d";
+    descriptor.target_semantics_authority = "legacy_multicast_fallback";
+    descriptor.real_synapse_inputs_available = cfg_.real_synapse_inputs_available;
+    descriptor.native_synapse_source_candidate = false;
+    descriptor.native_source_fanout_active = false;
+    descriptor.native_target_synthesis_active = false;
+    descriptor.bootstrap_dependency_active = false;
+    descriptor.native_bootstrap_source.clear();
+    if (descriptor.source_primary_kind == "edges_csv_bootstrap") {
+        descriptor.bootstrap_dependency_active = true;
+        descriptor.native_bootstrap_source = "edges_csv";
+    } else if (
+        descriptor.source_primary_kind == "legacy_route_tables_bootstrap"
+        || descriptor.source_primary_kind == "legacy_route_tables_with_real_synapse_inputs"
+    ) {
+        descriptor.bootstrap_dependency_active = true;
+        descriptor.native_bootstrap_source = "legacy_route_tables";
+    }
+    return descriptor;
 }
 
 bool SynapseRouteSubsystem::multicastEnabled() const {
@@ -851,7 +1003,11 @@ void SynapseRouteSubsystem::initMulticastTargets_() {
         if (!per_block.empty()) {
             std::vector<BlockTarget> vec;
             vec.reserve(per_block.size());
-            for (auto& itb : per_block) vec.push_back(itb.second);
+            for (auto& itb : per_block) {
+                itb.second.cohort_id = 0;
+                itb.second.band_color = 0;
+                vec.push_back(itb.second);
+            }
             std::sort(vec.begin(), vec.end(),
                       [](const BlockTarget& a, const BlockTarget& b) { return a.block_id < b.block_id; });
             built.emplace(pre_global, std::move(vec));
@@ -880,7 +1036,9 @@ void SynapseRouteSubsystem::configureFanoutProvider_() {
     cfg.out = log_;
     cfg.stat_fanout = stat_fanout_per_spike_;
 
-    fanout_provider_.configure(cfg, routes_shared_, &routes_local_fallback_);
+    const RouteWeightMap* route_weights =
+        route_weights_shared_ ? route_weights_shared_.get() : &route_weights_local_fallback_;
+    fanout_provider_.configure(cfg, routes_shared_, &routes_local_fallback_, route_weights);
     fanout_provider_ready_ = true;
 }
 

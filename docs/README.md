@@ -15,9 +15,11 @@ row-streaming/DMA 或更大 granule 读（例如 GAS 合并读导致 overfetch�
 - `SNNDL_HIERARCHY_AND_WORKFLOW.md`
   - SnnDL 总览文档：目录层次（Hierarchy）、跨层接口、以及以 `sst_dram_si/test_mesh_4x4.py` 为例的端到端工作流与回归口径。
 - `BCSR_WEIGHT_GENERATION_GUIDE.md`
-  - BCSR 权重文件的二进制布局（rowptr/colidx/blockdata/blockids）、常用数据集（10k/100k）生成命令、meta/stride/对齐校验与在 mesh 模版中的加载方式。
+  - BCSR 权重文件的二进制布局（rowptr/colidx/blockdata/blockids）、常用数据集（10k/100k）生成命令、meta/stride/对齐校验与在 mesh 模板中的加载方式。
 - `plans/2026-01-03-universal-core-completion.md`
   - “通用计算核完成态”（packet-first + 可插拔 workload）推进计划与 DoD（最终验收口径的唯一真源）。
+- `plans/2026-02-14-gas-ab-weights-phys-layout-v1.md`
+  - GAS Apply 侧的可选发射策略（`apply_issue_policy`）与“bank/row 映射口径校准”、dense 权重物理布局（`phys_v1`）的实验记录与结论。
 - `UNIVERSAL_CONTROL_CORE_DESIGN.md`
   - 通用控制子核（`control/SnnPESubComponent`）目标形态、分层与迁移路线（Phase A/B/C/D）。
 - `SUBSYSTEM_MODULARIZATION_ROADMAP.md`
@@ -35,3 +37,13 @@ row-streaming/DMA 或更大 granule 读（例如 GAS 合并读导致 overfetch�
 
 - 文档应描述“为什么/做什么/如何验证/风险与回退”，避免重复粘贴代码实现细节。
 - 与可替换 compute core 相关的接口契约，优先维护在仓库根部的 `ISnnComputeCore_SPEC.md`，并在此目录做设计补充与案例记录。
+
+## DRAM-aware Apply（可选优化）提示
+
+`components/GatherBufferIF` 支持可选的 Apply 发射策略（`apply_issue_policy=bank_rr_row_sticky_age|dram_aware_v1|cmd_aware_v1`），用于研究 DRAM 行局部性/BLP 对 GAS Apply 阶段的影响。
+`cmd_aware_v1` 为实验性策略，必须与主线口径隔离（默认关闭，脚本层需显式开启实验开关）。
+这些策略依赖 `bank_bits/bank_shift/row_bytes_guess` 的 bank×row 映射口径；使用 Ramulator2 时建议显式校准并固定（避免“伪 bank/伪 row”导致退化）。
+
+入口与说明：
+- `../components/gather/README.md`（参数含义、Ramulator2 推荐值与复现脚本）
+- `plans/2026-02-14-gas-ab-weights-phys-layout-v1.md`（实验记录与推导）

@@ -12,7 +12,7 @@
 #include "GlobalNeuronLayout.h"
 #include "INocTransport.h"
 #include "NocPacketEvent.h"
-#include "SpikeEvent.h"
+#include "events/SpikeEvent.h"
 #include "synapse/route/SpikeNocCodec.h"
 
 namespace SST { namespace SnnDL {
@@ -41,6 +41,10 @@ int ExternalSpikeInputSubsystem::determineTargetUnit_(uint32_t global_neuron_id)
 
 void ExternalSpikeInputSubsystem::onSpike(SpikeEvent* spike) {
     if (!spike) return;
+    if (!rt_.enabled) {
+        delete spike;
+        return;
+    }
 
     if (!rt_.noc || !rt_.layout || !rt_.layout->valid()) {
         delete spike;

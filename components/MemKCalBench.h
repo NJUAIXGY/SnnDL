@@ -24,6 +24,7 @@ public:
 
     SST_ELI_DOCUMENT_PARAMS(
         {"verbose", "verbosity", "0"},
+        {"base_addr", "base address offset for generated requests", "0"},
         {"row_bytes", "row byte size guess (bytes)", "8192"},
         {"bank_bits", "Number of bits in bank field (0=disabled)", "0"},
         {"bank_shift", "LSB bit index of bank field", "0"},
@@ -55,7 +56,7 @@ private:
     inline uint64_t rowIndex(uint64_t addr) const { return row_bytes_? (addr / row_bytes_) : 0; }
     inline uint64_t bankIndex(uint64_t addr) const { return bank_bits_ ? ((addr >> bank_shift_) & ((1ull<<bank_bits_)-1)) : 0; }
     inline uint64_t makeAddr(uint32_t bank, uint32_t row, uint32_t col) const {
-        uint64_t a = (uint64_t)row * (uint64_t)row_bytes_ + (uint64_t)col;
+        uint64_t a = base_addr_ + (uint64_t)row * (uint64_t)row_bytes_ + (uint64_t)col;
         if (bank_bits_) {
             uint64_t mask = ((1ull<<bank_bits_)-1ull);
             a &= ~(mask << bank_shift_);
@@ -85,6 +86,7 @@ private:
     SST::Interfaces::StandardMem* mem_ = nullptr;
     std::string clock_ = "1GHz";
     std::string out_csv_;
+    uint64_t base_addr_ = 0;
     uint32_t row_bytes_ = 8192;
     uint32_t bank_bits_ = 0;
     uint32_t bank_shift_ = 0;
@@ -95,4 +97,3 @@ private:
 }} // namespace
 
 #endif
-

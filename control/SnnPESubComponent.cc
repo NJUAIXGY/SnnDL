@@ -8,19 +8,26 @@
 #include <sst/core/sst_config.h>
 #include "SnnPESubComponent.h"
 #include "SnnPESubComponent_impl.h"
+#include "SnnPESubComponentConfig.h"
 #include <fstream>
 #include "synapse/gas/GasCustomCmd.h"
 #include "synapse/gas/GasPhaseController.h"
 #include "synapse/gas/AccumulatorOps.h"
 #include "IPeAggregation.h"
-#include "IManualWindowDrive.h"
+#include "IGasCreditGate.h"
 #include "IGasStepGate.h"
+#include "api/IPePodSharedMetadataProvider.h"
+#include "api/IPeSharedCoreFabricProvider.h"
+#include "api/IPeWeightObjectPlaneProvider.h"
 #include "ISnnComputeCore.h"
 #include "synapse/stdmem/StdMemEndpoint.h"
 #include "synapse/weights/SnnBcsrWeightManager.h"
 #include "synapse/weights/WeightMemorySubsystem.h"
 #include "synapse/weights/WeightCacheOps.h"
 #include "synapse/weights/WeightAccessor.h"
+#include "synapse/weights/DenseWeightLayout.h"
+#include "services/local_storage/PeLocalServiceObjectTable.h"
+#include "services/local_storage/PeWeightObjectPlane.h"
 #include "ISpikeTransport.h"
 #include "NocSpikeTransport.h"
 #include "NocPacketEvent.h"
@@ -28,15 +35,19 @@
 #include "CoreWorkloadFactory.h"
 #include "ISpikeWorkload.h"
 #include "ISnnSpikeCommWorkload.h"
+#include "IWeightReaderAdopter.h"
 #include "synapse/route/SpikeCommSubsystem.h"
 #include "synapse/route/SynapseRouteSubsystem.h"
 #include "WorkloadConfig.h"
 #include "SnnDLLogging.h"
+#include "components/MultiCorePE.h"
+#include "workload/riscv_snn/RiscvSnnShadowRuntimeServices.h"
 
 #include <sstream>
 #include <cmath>
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <cstdlib>
 #include <cstdint>
@@ -47,6 +58,55 @@
 
 using namespace SST;
 using namespace SST::SnnDL;
+
+namespace {
+static std::string normalizePulseMetadataMaskToken_(std::string token) {
+    for (char& ch : token) {
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+    token.erase(
+        std::remove_if(
+            token.begin(),
+            token.end(),
+            [](unsigned char ch) {
+                return ch == '_' || ch == '-' || std::isspace(ch) != 0;
+            }),
+        token.end());
+    return token;
+}
+
+static uint32_t parsePulseMetadataObjectMask_(const std::string& raw_mask) {
+    if (raw_mask.empty()) return 0u;
+
+    uint32_t mask = 0u;
+    size_t start = 0u;
+    while (start <= raw_mask.size()) {
+        const size_t end = raw_mask.find_first_of(",|+; ", start);
+        const std::string token = normalizePulseMetadataMaskToken_(
+            raw_mask.substr(start, (end == std::string::npos) ? std::string::npos : (end - start)));
+        if (!token.empty()) {
+            if (token == "all") {
+                mask |= PeLocalServiceObjectTable::kMetadataKindMaskAll;
+            } else if (token == "preband") {
+                mask |= PeLocalServiceObjectTable::kMetadataKindMaskPreband;
+            } else if (token == "prebase" || token == "base" || token == "premphfbase") {
+                mask |= PeLocalServiceObjectTable::kMetadataKindMaskPreMphfBase;
+            } else if (token == "band" || token == "premphfband") {
+                mask |= PeLocalServiceObjectTable::kMetadataKindMaskPreMphfBand;
+            } else if (token == "idx2" || token == "idx2row") {
+                mask |= PeLocalServiceObjectTable::kMetadataKindMaskIdx2Row;
+            } else if (token == "rowidx" || token == "rowindex") {
+                mask |= PeLocalServiceObjectTable::kMetadataKindMaskRowIndex;
+            } else if (token == "rowdescriptor") {
+                mask |= PeLocalServiceObjectTable::kMetadataKindMaskRowDescriptor;
+            }
+        }
+        if (end == std::string::npos) break;
+        start = end + 1u;
+    }
+    return mask;
+}
+} // namespace
 
 // 诊断门控改为参数化：由 enable_extended_diagnostics_ 成员控制
 
@@ -79,6 +139,23 @@ void SnnPESubComponent::reportApplyScatterThunk_(void* ctx,
         core->impl_->reportApplyScatter(acc_updates, posts_touched, spikes_emitted,
                                         hwm_bytes, spill_records, spilled_bytes);
     }
+    if (auto* pe = dynamic_cast<MultiCorePE*>(core->parent_pe_cached_)) {
+        pe->recordStepApplyScatter(static_cast<uint32_t>(core->curr_stage_seq_),
+                                   acc_updates,
+                                   posts_touched,
+                                   spikes_emitted,
+                                   hwm_bytes,
+                                   spill_records,
+                                   spilled_bytes);
+        pe->recordCoreStepApplyScatter(core->core_id_,
+                                       static_cast<uint32_t>(core->curr_stage_seq_),
+                                       acc_updates,
+                                       posts_touched,
+                                       spikes_emitted,
+                                       hwm_bytes,
+                                       spill_records,
+                                       spilled_bytes);
+    }
 }
 
 void SnnPESubComponent::requestGasEndGatherThunk_(void* ctx, uint32_t superstep) {
@@ -103,6 +180,17 @@ std::mutex SnnPESubComponent::s_stage_csv_mutex_;
 // === Stage event hub (Phase5.2-A1): absorbed into Impl ===
 void SnnPESubComponent::Impl::markBeginGather(uint32_t seq) {
     if (!core) return;
+    const bool trace_step_path =
+        core->output_ &&
+        core->node_id_ == 0 &&
+        seq <= 2 &&
+        core->core_id_ >= 15;
+    if (trace_step_path) {
+        core->output_->verbose(
+            CALL_INFO, 2, 0,
+            "[[sentinel-step-path]] node=%u core=%d seq=%u markBeginGather enter\n",
+            core->node_id_, core->core_id_, seq);
+    }
     if (gas_ctrl_) gas_ctrl_->onBeginGather(seq);
     if (core->use_bcsr_) {
         core->logBcsrWindowStats_("prev");
@@ -110,6 +198,12 @@ void SnnPESubComponent::Impl::markBeginGather(uint32_t seq) {
     }
     uint64_t now = core->getCurrentSimTimeNano();
     core->appendStageEventRow_("BeginGather", now, 0);
+    if (trace_step_path) {
+        core->output_->verbose(
+            CALL_INFO, 2, 0,
+            "[[sentinel-step-path]] node=%u core=%d seq=%u markBeginGather after_append now=%" PRIu64 "\n",
+            core->node_id_, core->core_id_, seq, now);
+    }
     t_begin_gather = now;
     have_begin_gather = true;
     have_begin_apply = false;
@@ -140,9 +234,243 @@ void SnnPESubComponent::Impl::markEndScatter(uint32_t seq, uint64_t spikes_emitt
     if (gas_ctrl_) gas_ctrl_->onEndScatter(seq, spikes_emitted);
     uint64_t now = core->getCurrentSimTimeNano();
     core->appendStageEventRow_("EndScatter", now, spikes_emitted);
-    // 额外诊断：输出本窗口权重/BCSR 读流量摘要（仅 window_read_debug=1 时启用）
-    if (core->window_read_debug_ && core->weight_mem_subsystem_) {
+    // Always perform end-of-window housekeeping.
+    // endScatterWindow() keeps diagnostic printing internally gated by debug flags.
+    if (core->weight_mem_subsystem_) {
         core->weight_mem_subsystem_->endScatterWindow(seq);
+        const auto retire_obs = core->weight_mem_subsystem_->retireObservabilityStats();
+        const auto pulse_obs = core->weight_mem_subsystem_->pulseAgendaObservabilityStats();
+        const auto pod_align =
+            core->weight_mem_subsystem_->experimentalPeInternalPodPathAlignmentStats();
+        const auto& pod_rowdescriptor = pod_align.rowdescriptor;
+        if (auto* pe = dynamic_cast<MultiCorePE*>(core->parent_pe_cached_)) {
+            pe->recordStepRetireStat(
+                seq,
+                retire_obs.global_hol_cycles_total,
+                retire_obs.ready_but_blocked_edges_total,
+                retire_obs.per_post_progress_total,
+                retire_obs.wait_cycles_total,
+                retire_obs.wait_cycles_due_to_hol_total,
+                retire_obs.wait_cycles_due_to_barrier_total,
+                retire_obs.wait_cycles_due_to_not_ready_total,
+                retire_obs.samepost_blocked_edges_total,
+                retire_obs.crosspost_blocked_edges_total,
+                retire_obs.policy_loss_cycles_total,
+                retire_obs.policy_loss_edges_total,
+                retire_obs.shadow_per_post_recoverable_cycles_total,
+                retire_obs.shadow_per_post_recoverable_edges_total,
+                retire_obs.shadow_per_post_ready_posts_peak,
+                retire_obs.shadow_per_post_committable_edges_peak,
+                retire_obs.head_hol_cycles_dense_total,
+                retire_obs.head_hol_cycles_cache_total,
+                retire_obs.head_hol_cycles_miss_total,
+                retire_obs.head_hol_cycles_bcsr_total,
+                retire_obs.head_hol_cycles_bcsr_file_total,
+                retire_obs.head_hol_cycles_gcss_total,
+                retire_obs.head_blocked_edges_dense_total,
+                retire_obs.head_blocked_edges_cache_total,
+                retire_obs.head_blocked_edges_miss_total,
+                retire_obs.head_blocked_edges_bcsr_total,
+                retire_obs.head_blocked_edges_bcsr_file_total,
+                retire_obs.head_blocked_edges_gcss_total,
+                retire_obs.gcss_head_queued_not_issued_cycles_total,
+                retire_obs.gcss_qni_head_wait_episodes_total,
+                retire_obs.gcss_qni_head_wait_cycles_max,
+                retire_obs.gcss_head_queued_not_issued_blocked_edges_total,
+                retire_obs.gcss_head_issued_wait_resp_cycles_total,
+                retire_obs.gcss_head_issued_wait_resp_blocked_edges_total,
+                retire_obs.gcss_resp_ready_but_hol_cycles_total,
+                retire_obs.gcss_resp_ready_but_hol_blocked_edges_total,
+                retire_obs.gcss_qni_loader_not_ready_cycles_total,
+                retire_obs.gcss_qni_loader_not_ready_blocked_edges_total,
+                retire_obs.gcss_qni_weight_sram_stall_cycles_total,
+                retire_obs.gcss_qni_weight_sram_stall_blocked_edges_total,
+                retire_obs.gcss_qni_vlf_younger_ahead_cycles_total,
+                retire_obs.gcss_qni_vlf_younger_ahead_blocked_edges_total,
+                retire_obs.gcss_qni_vlf_younger_ahead_depth_total,
+                retire_obs.gcss_qni_vlf_younger_ahead_depth_samples_total,
+                retire_obs.gcss_qni_vlf_younger_ahead_depth_max,
+                retire_obs.gcss_qni_issue_deferred_total,
+                retire_obs.gcss_qni_pending_direct_queue_residency_cycles_total,
+                retire_obs.gcss_qni_pending_direct_queue_residency_samples_total,
+                retire_obs.gcss_qni_pending_direct_queue_residency_cycles_max,
+                retire_obs.gcss_qni_vlf_front_inflight_full_cycles_total,
+                retire_obs.gcss_qni_vlf_front_inflight_full_blocked_edges_total,
+                retire_obs.gcss_qni_vlf_front_waiting_issue_cycles_total,
+                retire_obs.gcss_qni_vlf_front_waiting_issue_blocked_edges_total,
+                retire_obs.gcss_qni_pending_younger_ahead_cycles_total,
+                retire_obs.gcss_qni_pending_younger_ahead_blocked_edges_total,
+                retire_obs.gcss_qni_pending_front_inflight_full_cycles_total,
+                retire_obs.gcss_qni_pending_front_inflight_full_blocked_edges_total,
+                retire_obs.gcss_qni_pending_front_waiting_tick_cycles_total,
+                retire_obs.gcss_qni_pending_front_waiting_tick_blocked_edges_total,
+                retire_obs.gcss_qni_unknown_cycles_total,
+                retire_obs.gcss_qni_unknown_blocked_edges_total,
+                retire_obs.begin_apply_windows_total,
+                retire_obs.begin_apply_prev_edges_total,
+                retire_obs.begin_apply_outstanding_carryin_total,
+                retire_obs.begin_apply_outstanding_carryin_windows_total,
+                retire_obs.begin_apply_loader_not_ready_windows_total,
+                retire_obs.edge_retire_registered_total,
+                retire_obs.edge_retire_retired_total,
+                retire_obs.end_scatter_gcss_vlf_issue_queue_residual_total,
+                retire_obs.end_scatter_pending_direct_reads_residual_total,
+                retire_obs.end_scatter_outstanding_residual_total,
+                retire_obs.end_scatter_residual_work_windows_total,
+                retire_obs.gcss_vlf_issue_prepare_total,
+                retire_obs.gcss_vlf_issue_edges_total,
+                retire_obs.gcss_vlf_issue_reorder_trigger_total,
+                retire_obs.gcss_vlf_issue_line_groups_total,
+                retire_obs.ready_queue_peak,
+                retire_obs.unblock_events_total);
+            pe->recordPulseAgendaObservability(
+                seq,
+                pulse_obs.candidates_total,
+                pulse_obs.accepted_total,
+                pulse_obs.rejected_total,
+                pulse_obs.reject_gate_total,
+                pulse_obs.correctness_ready_blocked_cycles_total,
+                pulse_obs.correctness_scoreboard_occupancy_peak,
+                pulse_obs.shared_service_hits_total,
+                pulse_obs.shared_service_misses_total,
+                pulse_obs.region_service_entries_peak,
+                pulse_obs.ready_fanout_total,
+                pulse_obs.rowdescriptor_ready_transition_total,
+                pulse_obs.rowdescriptor_join_ready_total,
+                pulse_obs.rowdescriptor_ready_join_shortcut_candidates_total,
+                pulse_obs.rowdescriptor_ready_join_shortcut_taken_total,
+                pulse_obs.rowdescriptor_ready_join_shortcut_late_release_taken_total,
+                pulse_obs.rowdescriptor_ready_join_shortcut_deferred_live_park_total,
+                pulse_obs.rowdescriptor_ready_join_shortcut_deferred_live_apply_total,
+                pulse_obs.rowdescriptor_owner_form_deferred_park_total,
+                pulse_obs.rowdescriptor_owner_form_deferred_activate_total,
+                pulse_obs.rowdescriptor_ready_join_shortcut_blocked_not_ready_total,
+                pulse_obs.rowdescriptor_ready_join_shortcut_blocked_owner_form_total,
+                pulse_obs.rowdescriptor_ready_join_shortcut_blocked_join_live_total,
+                pulse_obs.rowdescriptor_ready_join_shortcut_blocked_other_total,
+                pulse_obs.rowdescriptor_ready_join_shortcut_release_deferred_total,
+                pulse_obs.rowdescriptor_ready_join_shortcut_apply_complete_total,
+                pulse_obs.rowdescriptor_ready_join_shortcut_release_forwarded_total,
+                pulse_obs.rowdescriptor_ready_join_shortcut_release_missing_total,
+                pulse_obs.rowdescriptor_ready_join_descriptor_elide_total,
+                pulse_obs.rowdescriptor_ready_join_lines_elide_total,
+                pulse_obs.rowdescriptor_owner_first_service_elide_join_live_total,
+                pulse_obs.rowdescriptor_owner_first_service_elide_join_ready_total,
+                pulse_obs.rowdescriptor_owner_first_service_elide_late_join_total,
+                pulse_obs.actual_gate_enable_false_total,
+                pulse_obs.actual_gate_window_zero_total,
+                pulse_obs.actual_gate_line_too_small_total,
+                pulse_obs.actual_gate_taken_total,
+                pulse_obs.frontier_windows_total,
+                pulse_obs.frontier_lines_exported_total,
+                pulse_obs.frontier_overlap_lines_total,
+                pulse_obs.frontier_overlap_peer_total,
+                pulse_obs.frontier_max_exported_per_window,
+                pulse_obs.prebase_lookup_owner_fill_total,
+                pulse_obs.prebase_lookup_shared_hits_total,
+                pulse_obs.prebase_lookup_entries_peak);
+            pe->recordPulsePodRowdescriptorObservability(
+                seq,
+                pod_rowdescriptor.seam_owner_form_total,
+                pod_rowdescriptor.seam_joiner_hit_total,
+                pod_rowdescriptor.seam_owner_live_join_total,
+                pod_rowdescriptor.seam_owner_ready_join_total,
+                pod_rowdescriptor.seam_ready_transition_total,
+                pod_rowdescriptor.seam_late_join_total,
+                pod_rowdescriptor.seam_guard_total,
+                pod_rowdescriptor.seam_guard_disabled_total,
+                pod_rowdescriptor.seam_guard_missing_metadata_plane_total,
+                pod_rowdescriptor.seam_guard_missing_owner_table_total,
+                pod_rowdescriptor.seam_guard_zero_pod_count_total,
+                pod_rowdescriptor.seam_guard_window_zero_total,
+                pod_rowdescriptor.seam_guard_invalid_cfg_pod_total,
+                pod_rowdescriptor.seam_reject_total,
+                pod_rowdescriptor.seam_attempted_total,
+                pod_rowdescriptor.seam_potential_private_service_elide_total,
+                pod_rowdescriptor.seam_owner_first_issue_deferred_total,
+                pod_rowdescriptor.seam_owner_first_private_issue_avoided_total,
+                pod_rowdescriptor.seam_owner_first_service_elide_total);
+            pe->recordCoreStepRetireStat(
+                core->core_id_,
+                seq,
+                retire_obs.global_hol_cycles_total,
+                retire_obs.ready_but_blocked_edges_total,
+                retire_obs.per_post_progress_total,
+                retire_obs.wait_cycles_total,
+                retire_obs.wait_cycles_due_to_hol_total,
+                retire_obs.wait_cycles_due_to_barrier_total,
+                retire_obs.wait_cycles_due_to_not_ready_total,
+                retire_obs.samepost_blocked_edges_total,
+                retire_obs.crosspost_blocked_edges_total,
+                retire_obs.policy_loss_cycles_total,
+                retire_obs.policy_loss_edges_total,
+                retire_obs.shadow_per_post_recoverable_cycles_total,
+                retire_obs.shadow_per_post_recoverable_edges_total,
+                retire_obs.shadow_per_post_ready_posts_peak,
+                retire_obs.shadow_per_post_committable_edges_peak,
+                retire_obs.head_hol_cycles_dense_total,
+                retire_obs.head_hol_cycles_cache_total,
+                retire_obs.head_hol_cycles_miss_total,
+                retire_obs.head_hol_cycles_bcsr_total,
+                retire_obs.head_hol_cycles_bcsr_file_total,
+                retire_obs.head_hol_cycles_gcss_total,
+                retire_obs.head_blocked_edges_dense_total,
+                retire_obs.head_blocked_edges_cache_total,
+                retire_obs.head_blocked_edges_miss_total,
+                retire_obs.head_blocked_edges_bcsr_total,
+                retire_obs.head_blocked_edges_bcsr_file_total,
+                retire_obs.head_blocked_edges_gcss_total,
+                retire_obs.gcss_head_queued_not_issued_cycles_total,
+                retire_obs.gcss_qni_head_wait_episodes_total,
+                retire_obs.gcss_qni_head_wait_cycles_max,
+                retire_obs.gcss_head_queued_not_issued_blocked_edges_total,
+                retire_obs.gcss_head_issued_wait_resp_cycles_total,
+                retire_obs.gcss_head_issued_wait_resp_blocked_edges_total,
+                retire_obs.gcss_resp_ready_but_hol_cycles_total,
+                retire_obs.gcss_resp_ready_but_hol_blocked_edges_total,
+                retire_obs.gcss_qni_loader_not_ready_cycles_total,
+                retire_obs.gcss_qni_loader_not_ready_blocked_edges_total,
+                retire_obs.gcss_qni_weight_sram_stall_cycles_total,
+                retire_obs.gcss_qni_weight_sram_stall_blocked_edges_total,
+                retire_obs.gcss_qni_vlf_younger_ahead_cycles_total,
+                retire_obs.gcss_qni_vlf_younger_ahead_blocked_edges_total,
+                retire_obs.gcss_qni_vlf_younger_ahead_depth_total,
+                retire_obs.gcss_qni_vlf_younger_ahead_depth_samples_total,
+                retire_obs.gcss_qni_vlf_younger_ahead_depth_max,
+                retire_obs.gcss_qni_issue_deferred_total,
+                retire_obs.gcss_qni_pending_direct_queue_residency_cycles_total,
+                retire_obs.gcss_qni_pending_direct_queue_residency_samples_total,
+                retire_obs.gcss_qni_pending_direct_queue_residency_cycles_max,
+                retire_obs.gcss_qni_vlf_front_inflight_full_cycles_total,
+                retire_obs.gcss_qni_vlf_front_inflight_full_blocked_edges_total,
+                retire_obs.gcss_qni_vlf_front_waiting_issue_cycles_total,
+                retire_obs.gcss_qni_vlf_front_waiting_issue_blocked_edges_total,
+                retire_obs.gcss_qni_pending_younger_ahead_cycles_total,
+                retire_obs.gcss_qni_pending_younger_ahead_blocked_edges_total,
+                retire_obs.gcss_qni_pending_front_inflight_full_cycles_total,
+                retire_obs.gcss_qni_pending_front_inflight_full_blocked_edges_total,
+                retire_obs.gcss_qni_pending_front_waiting_tick_cycles_total,
+                retire_obs.gcss_qni_pending_front_waiting_tick_blocked_edges_total,
+                retire_obs.gcss_qni_unknown_cycles_total,
+                retire_obs.gcss_qni_unknown_blocked_edges_total,
+                retire_obs.begin_apply_windows_total,
+                retire_obs.begin_apply_prev_edges_total,
+                retire_obs.begin_apply_outstanding_carryin_total,
+                retire_obs.begin_apply_outstanding_carryin_windows_total,
+                retire_obs.begin_apply_loader_not_ready_windows_total,
+                retire_obs.edge_retire_registered_total,
+                retire_obs.edge_retire_retired_total,
+                retire_obs.end_scatter_gcss_vlf_issue_queue_residual_total,
+                retire_obs.end_scatter_pending_direct_reads_residual_total,
+                retire_obs.end_scatter_outstanding_residual_total,
+                retire_obs.end_scatter_residual_work_windows_total,
+                retire_obs.gcss_vlf_issue_prepare_total,
+                retire_obs.gcss_vlf_issue_edges_total,
+                retire_obs.gcss_vlf_issue_reorder_trigger_total,
+                retire_obs.gcss_vlf_issue_line_groups_total,
+                retire_obs.ready_queue_peak,
+                retire_obs.unblock_events_total);
+        }
     }
     reportWindowSpikes(static_cast<uint32_t>(seq), spikes_emitted);
     core->spikes_emitted_window_ = 0;
@@ -276,6 +604,11 @@ bool SnnPESubComponent::ensureLoaderReady_() {
     return false;
 }
 
+void SnnPESubComponent::onLoaderReady() {
+    if (!wait_for_loader_done_) return;
+    loader_ready_latched_ = true;
+}
+
 bool SnnPESubComponent::ensureMemoryReady_() const {
     return stdmem_ep_ && stdmem_ep_->available() && memory_ready_;
 }
@@ -363,13 +696,11 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     : SnnCoreAPI(id, params),
       output_(nullptr),
       memory_link_(nullptr) {
+    const SnnPESubComponentConfig cfg = parseSnnPESubComponentConfig(params);
+
     // 构造期最早哨兵（P2：参数优先，未设置回退到环境变量，以保持兼容）。
     // 避免直接使用 stdout，统一走 SST Output。
-    const bool kSentinelOn = [&params](){
-        // P2 Step3：仅参数驱动，默认0=禁用
-        int sent_p = params.find<int>("sentinel_enable", 0);
-        return sent_p != 0;
-    }();
+    const bool kSentinelOn = cfg.sentinel_enable;
     // 提前构建一个最低等级的输出对象，避免后续早期初始化路径使用 output_ 时发生空指针
     // 真实 verbose 等级稍后在解析完参数后再生效（此处仅用于早期诊断与防护）
     if (!output_) {
@@ -382,7 +713,7 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     // 注意：其余子模块初始化挪到参数解析之后，避免早期未初始化成员被使用
     
     // 读取配置参数
-    core_id_ = params.find<int>("core_id", 0);
+    core_id_ = cfg.core_id;
     // Phase5.2：将实现类型改为指针持有，避免在 control 头文件中包含 synapse 实现头
     if (!stdmem_ep_) stdmem_ep_ = std::make_unique<StdMemEndpoint>();
     if (!bcsr_weights_) bcsr_weights_ = std::make_unique<BcsrWeightManager>();
@@ -390,35 +721,51 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
         SNNDL_LOG(2, "[[sentinel-core-ctor]] core_ctor enter\n");
         SNNDL_LOG(2, "[[sentinel-core-ctor]] after params: core_id=%d\n", core_id_);
     }
-    total_cores_ = params.find<int>("total_cores", 8);
-    global_neuron_base_ = params.find<uint64_t>("global_neuron_base", 0);
-    num_neurons_ = params.find<uint32_t>("num_neurons", 64);
-    base_addr_ = params.find<uint64_t>("base_addr", 0);
-    node_id_ = params.find<uint32_t>("node_id", 0);
-    verbose_ = params.find<int>("verbose", 0);
-    enable_extended_diagnostics_ = params.find<int>("enable_extended_diagnostics", 0) != 0;
-    total_nodes_cfg_ = params.find<uint32_t>("total_nodes", 1);
+    total_cores_ = cfg.total_cores;
+    global_neuron_base_ = cfg.global_neuron_base;
+    num_neurons_ = cfg.num_neurons;
+    base_addr_ = cfg.base_addr;
+    node_id_ = cfg.node_id;
+    verbose_ = cfg.verbose;
+    enable_extended_diagnostics_ = cfg.enable_extended_diagnostics;
+    total_nodes_cfg_ = cfg.total_nodes;
+    if (output_) {
+        output_->setVerboseLevel(verbose_ < 0 ? 0u : static_cast<uint32_t>(verbose_));
+    }
 
     // Phase6：workload 选择（优先 Params，其次环境变量）
     // 约定：默认 "snn" 仍走 legacy 主链路；仅当显式选择 stream/traffic 时才启用 workload_。
-    std::string w = params.find<std::string>("workload_impl", "snn");
-    if (const char* env = workloadImplFromEnvCached()) {
-        // 兼容：允许用环境变量覆盖（README 中用于 stream/traffic 回归切换）
-        w = std::string(env);
+    const WorkloadKind workload_kind = workloadKindFromString(cfg.workload_impl);
+    switch (workload_kind) {
+        case WorkloadKind::RiscvSnn:
+            workload_impl_ = WorkloadImpl::RiscvSnn;
+            break;
+        case WorkloadKind::Stream:
+            workload_impl_ = WorkloadImpl::Stream;
+            break;
+        case WorkloadKind::Traffic:
+            workload_impl_ = WorkloadImpl::Traffic;
+            break;
+        case WorkloadKind::TrafficMem:
+            workload_impl_ = WorkloadImpl::TrafficMem;
+            break;
+        case WorkloadKind::Tensor:
+            workload_impl_ = WorkloadImpl::Tensor;
+            break;
+        case WorkloadKind::Snn:
+        default:
+            workload_impl_ = WorkloadImpl::Snn;
+            break;
     }
-    std::transform(w.begin(), w.end(), w.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    if (w == "stream") {
-        workload_impl_ = WorkloadImpl::Stream;
-    } else if (w == "traffic") {
-        workload_impl_ = WorkloadImpl::Traffic;
-    } else {
-        workload_impl_ = WorkloadImpl::Snn;
-    }
+    experimental_workload_serialization_enable_ =
+        (workload_impl_ == WorkloadImpl::Snn) &&
+        (params.find<int>("pulse_enable", 0) != 0) &&
+        (params.find<int>("pulse_descriptor_actual_enable", 0) != 0) &&
+        false;
 
     // Phase6：通过工厂创建 workload（snn/stream/traffic）
     {
-        const char* name = isTrafficWorkload_() ? "traffic" : (isStreamWorkload_() ? "stream" : "snn");
+        const char* name = workloadKindName(workload_kind);
         if (!workload_) workload_ = createWorkloadByName(std::string(name));
         if (!workload_) {
             if (output_) {
@@ -431,12 +778,20 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
         snn_comm_workload_ = dynamic_cast<ISnnSpikeCommWorkload*>(workload_.get());
         gas_stage_workload_ = dynamic_cast<IGasStageSink*>(workload_.get());
     }
+    if (workload_kind == WorkloadKind::RiscvSnn &&
+        params.find<std::string>("riscv_snn_backend_name", "null") == "runtime_bridge") {
+        if (!riscv_snn_runtime_bridge_) {
+            riscv_snn_runtime_bridge_ = std::make_unique<RiscvSnnShadowRuntimeServices>();
+            riscv_snn_runtime_bridge_->configureFromParams(params);
+        }
+        accel_runtime_services_ = riscv_snn_runtime_bridge_.get();
+    }
     if (kSentinelOn && output_) {
         SNNDL_LOG(2, "[[sentinel-core-ctor]] after params2: node_id=%u num_neurons=%u base_addr=%" PRIu64 "\n",
                 node_id_, num_neurons_, (uint64_t)base_addr_);
     }
-    enable_weight_fetch_ = params.find<int>("enable_weight_fetch", 0) != 0;
-    workload_spike_input_enable_ = params.find<int>("workload_spike_input_enable", 0) != 0;
+    enable_weight_fetch_ = cfg.enable_weight_fetch;
+    workload_spike_input_enable_ = cfg.workload_spike_input_enable;
     // Phase5.2-A1：StageEventHub 吸收到 Impl（不再单独编译 control/StageEventHub.*）
     if (!impl_) impl_ = std::make_unique<Impl>();
     impl_->init(this);
@@ -449,56 +804,59 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
         SNNDL_DEBUG_LOG(1, "[diag-init] core=%d enable_weight_fetch=%d\n", core_id_, enable_weight_fetch_ ? 1 : 0);
     }
 #endif
-    write_weights_on_init_ = params.find<int>("write_weights_on_init", 1) != 0;
-    memory_warmup_cycles_ = params.find<uint64_t>("memory_warmup_cycles", 1000);
-    init_default_weight_ = params.find<float>("init_default_weight", 0.5f);
-    readresp_zero_fallback_ = params.find<int>("readresp_zero_fallback", 0) != 0;
-    max_outstanding_requests_ = params.find<uint32_t>("max_outstanding_requests", 16);
-    const uint32_t max_cache_entries = params.find<uint32_t>("max_cache_entries", 65536);
-    const bool use_clock_weight_cache = params.find<int>("use_clock_weight_cache", 0) != 0;
-    const bool disable_weight_cache = params.find<int>("disable_weight_cache", 0) != 0;
+    write_weights_on_init_ = cfg.write_weights_on_init;
+    memory_warmup_cycles_ = cfg.memory_warmup_cycles;
+    init_default_weight_ = cfg.init_default_weight;
+    readresp_zero_fallback_ = cfg.readresp_zero_fallback;
+    max_outstanding_requests_ = cfg.max_outstanding_requests;
+    const uint32_t max_cache_entries = cfg.max_cache_entries;
+    const bool use_clock_weight_cache = cfg.use_clock_weight_cache;
+    const bool disable_weight_cache = cfg.disable_weight_cache;
     {
         WeightCacheOps::Config cache_cfg{};
         cache_cfg.max_entries = max_cache_entries;
         cache_cfg.use_clock = use_clock_weight_cache;
         cache_cfg.disable_cache = disable_weight_cache;
         if (!weight_cache_ops_) weight_cache_ops_ = std::make_unique<WeightCacheOps>();
-        weight_cache_ops_->configure(cache_cfg, [this]() {
+        weight_cache_ops_->configure(cache_cfg, [this](uint64_t) {
             if (stat_cache_evictions_) stat_cache_evictions_->addData(1);
             count_cache_evictions_++;
         });
         weight_cache_ops_->reserve(cache_cfg.max_entries ? cache_cfg.max_entries : 1);
     }
-    use_event_weight_fallback_ = params.find<int>("use_event_weight_fallback", 0) != 0;
+    use_event_weight_fallback_ = cfg.use_event_weight_fallback;
     event_weight_fallback_warned_ = false;
-    merge_read_cacheline_ = params.find<int>("merge_read_cacheline", 1) != 0;
-    merge_read_row_ = params.find<int>("merge_read_row", 0) != 0;
-    gas_enable_ = params.find<int>("gas_enable", 0) != 0; // 默认关闭
-    gas_window_mode_ = params.find<int>("gas_window_mode", 0) != 0; // 当为true时采用GatherBufferIF的window驱动
-    // Deprecate manual window driving: read param for compatibility but force-disable
-    bool manual_drive_param = params.find<int>("gas_manual_window_drive", 0) != 0;
-    gas_manual_window_drive_ = false;
+    route_summary_enable_ = cfg.route_summary_enable;
+    merge_read_cacheline_ = cfg.merge_read_cacheline;
+    merge_read_row_ = cfg.merge_read_row;
+    gas_enable_ = cfg.gas_enable; // 默认关闭
+    gas_window_mode_ = cfg.gas_window_mode; // 当为true时采用GatherBufferIF的window驱动
+    // 已弃用：保留参数解析以兼容旧配置，但运行期强制忽略
+    bool manual_drive_param = cfg.gas_manual_window_drive_requested;
     if (manual_drive_param && output_ && output_->getVerboseLevel() >= 2) {
         output_->verbose(CALL_INFO, 2, 0,
             "[diag-gas-config] core=%d gas_manual_window_drive 已弃用，仍将使用自动窗口驱动\n",
             core_id_);
     }
-    manual_gas_gather_cycles_cfg_ = params.find<uint64_t>("gas_window_cycles_gather", 200);
-    if (manual_gas_gather_cycles_cfg_ == 0) manual_gas_gather_cycles_cfg_ = 1;
     // 方案1（slice顺序执行）
-    scheme1_enable_ = params.find<int>("scheme1_enable", 0) != 0;
-    scheme1_slices_ = params.find<uint32_t>("scheme1_slices", 8);
-    scheme1_gather_cycles_cfg_ = params.find<uint64_t>("scheme1_gather_cycles", 100);
-    scheme1_slice_gap_cycles_ = params.find<uint64_t>("scheme1_slice_gap_cycles", 0);
-    scheme1_scatter_cycles_ = params.find<uint64_t>("scheme1_scatter_cycles", 1);
-    scheme1_partition_mod_ = params.find<int>("scheme1_partition_mod", 0) != 0;
-    merge_read_auto_ = params.find<int>("merge_read_auto", 0) != 0; // default off
-    line_size_bytes_ = params.find<uint32_t>("line_size_bytes", 64);
-    byte_exact_verify_enable_ = params.find<int>("byte_exact_verify_enable", 0) != 0;
-    byte_exact_verify_mode_ = params.find<std::string>("byte_exact_verify_mode", "");
-    byte_exact_verify_row_scale_ = params.find<uint32_t>("byte_exact_verify_row_scale", 1024);
-    byte_exact_verify_max_mismatch_ = params.find<uint32_t>("byte_exact_verify_max_mismatch", 8);
-    loader_done_key_ = params.find<std::string>("loader_done_key", "");
+    scheme1_enable_ = cfg.scheme1_enable;
+    scheme1_slices_ = cfg.scheme1_slices;
+    scheme1_gather_cycles_cfg_ = cfg.scheme1_gather_cycles;
+    scheme1_slice_gap_cycles_ = cfg.scheme1_slice_gap_cycles;
+    scheme1_scatter_cycles_ = cfg.scheme1_scatter_cycles;
+    scheme1_partition_mod_ = cfg.scheme1_partition_mod;
+    merge_read_auto_ = cfg.merge_read_auto; // default off
+    line_size_bytes_ = cfg.line_size_bytes;
+    byte_exact_verify_enable_ = cfg.byte_exact_verify_enable;
+    byte_exact_verify_mode_ = cfg.byte_exact_verify_mode;
+    byte_exact_verify_row_scale_ = cfg.byte_exact_verify_row_scale;
+    byte_exact_verify_max_mismatch_ = cfg.byte_exact_verify_max_mismatch;
+    bcsr_semantic_verify_enable_ = cfg.bcsr_semantic_verify_enable;
+    bcsr_semantic_verify_max_edges_ = cfg.bcsr_semantic_verify_max_edges;
+    bcsr_semantic_verify_max_mismatch_ = cfg.bcsr_semantic_verify_max_mismatch;
+    bcsr_semantic_verify_abs_tol_ = cfg.bcsr_semantic_verify_abs_tol;
+    bcsr_semantic_verify_rel_tol_ = cfg.bcsr_semantic_verify_rel_tol;
+    loader_done_key_ = cfg.loader_done_key;
     wait_for_loader_done_ = !loader_done_key_.empty();
     if (wait_for_loader_done_) {
         loader_done_shared_.initialize(loader_done_key_, 1, 0);
@@ -509,17 +867,16 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
                 core_id_, loader_done_key_.c_str());
         }
     }
-    window_read_enable_ = params.find<int>("window_read_enable", 0) != 0;
-    window_read_debug_ = params.find<int>("window_read_debug", 0) != 0;
-    scatter_diag_limit_ = params.find<uint32_t>("scatter_diag_limit", 0);
+    window_read_enable_ = cfg.window_read_enable;
+    window_read_debug_ = cfg.window_read_debug;
+    scatter_diag_limit_ = cfg.scatter_diag_limit;
     scatter_diag_count_ = 0;
-    route_summary_enable_ = params.find<int>("route_summary_enable", 0) != 0;
     if (impl_ && impl_->gas_ctrl_) impl_->gas_ctrl_->setDebug(window_read_debug_, enable_extended_diagnostics_);
-    window_read_budget_ = params.find<uint32_t>("window_read_budget", 1024);
+    window_read_budget_ = cfg.window_read_budget;
     windowStateConfigure_();
-    read_force_single_ = params.find<int>("read_force_single", 0) != 0;
+    read_force_single_ = cfg.read_force_single;
     // 边集合容量上限（极端保护）
-    edge_collector_max_capacity_ = static_cast<size_t>(params.find<uint64_t>("edge_collector_max_capacity", 1000000));
+    edge_collector_max_capacity_ = static_cast<size_t>(cfg.edge_collector_max_capacity);
     if (window_read_enable_) {
         reserveWindowContainers_();
     if (!record_edge_idle_enable_ && !record_edge_scatter_enable_ && window_read_debug_ &&
@@ -532,10 +889,18 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
             "[diag-record-edge] core=%d window_read_enable=0 => 忽略 window_read_debug", core_id_);
     }
     // 全网读取扩展参数
-    weights_cols_ = params.find<uint32_t>("weights_cols", 0);
-    std::string index_mode_str = params.find<std::string>("index_mode", "pre_row_post_col");
+    weights_cols_ = cfg.weights_cols;
+    synapse_weight_mode_ = cfg.synapse_weight_mode;
+    const bool gcss_valueonly_mode =
+        (synapse_weight_mode_ == "gcss_valueonly_dstcore") ||
+        (synapse_weight_mode_ == "gcss_valueonly_dstcore_idx2") ||
+        (synapse_weight_mode_ == "gcss_idx2_rowmphf") ||
+        (synapse_weight_mode_ == "gcss_valueonly_dstcore_vlf_premphf") ||
+        (synapse_weight_mode_ == "gcss_valueonly_dstcore_vlf_premphf_plp");
+    gcss_index_template_ = cfg.gcss_index_template;
+    std::string index_mode_str = cfg.index_mode;
     // 神经元状态布局参数已下沉到 compute core（控制层不再持有）
-    verify_routing_weights_ = params.find<int>("verify_routing_weights", 0) != 0;
+    verify_routing_weights_ = cfg.verify_routing_weights;
     use_post_row_pre_col_ = (index_mode_str == "post_row_pre_col");
     if (index_mode_str == "bcsr_post_row") {
         use_bcsr_ = true;
@@ -544,6 +909,9 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
         // CSR 模式已弃用：统一禁用
         use_post_row_pre_col_ = true;
         SNNDL_DEBUG_LOG(1, "[CSR] 索引模式已禁用，改用密集/BCSR读取\n");
+    }
+    if (gcss_valueonly_mode) {
+        use_bcsr_ = false;
     }
     if (weights_cols_ == 0) weights_cols_ = num_neurons_; // 默认沿用旧行宽
     // 配置权重索引解析器（独立于控制层实现）
@@ -555,26 +923,67 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
         static_cast<uint32_t>(weights_cols_),
         use_post_row_pre_col_
     });
-    // 预计算dense权重区域上界（按行*列*4B）
-    {
-        uint64_t bytes = static_cast<uint64_t>(num_neurons_) * static_cast<uint64_t>(weights_cols_) * static_cast<uint64_t>(sizeof(float));
+    // Dense 权重“物理布局”（实验性；默认 row_major）
+    dense_layout_mode_ = toLowerCopy(cfg.dense_layout_mode);
+    if (dense_layout_mode_.empty()) dense_layout_mode_ = "row_major";
+    dense_phys_dram_row_bytes_ = cfg.dense_phys_dram_row_bytes;
+    dense_phys_enable_ = (dense_layout_mode_ == "phys_v1");
+    dense_phys_row_stride_bytes_ = 0;
+    dense_phys_rows_per_dram_row_ = 1;
+    dense_phys_group_stride_bytes_ = 0;
+
+    if (dense_phys_enable_) {
+        const uint32_t cols = use_post_row_pre_col_ ? weights_cols_ : num_neurons_;
+        DensePhysV1Derived d{};
+        const bool ok = computeDensePhysV1Derived(num_neurons_, cols, line_size_bytes_, dense_phys_dram_row_bytes_, d);
+        if (!ok) {
+            if (output_) {
+                output_->fatal(CALL_INFO, -1,
+                               "SnnPESubComponent fatal: invalid dense phys_v1 layout rows=%u cols=%u line=%u row_bytes=%u\n",
+                               num_neurons_, cols, line_size_bytes_, dense_phys_dram_row_bytes_);
+            }
+            std::abort();
+        }
+        if (dense_phys_dram_row_bytes_ != 0 &&
+            (base_addr_ % static_cast<uint64_t>(dense_phys_dram_row_bytes_)) != 0) {
+            if (output_) {
+                output_->fatal(CALL_INFO, -1,
+                               "SnnPESubComponent fatal: dense phys_v1 requires base_addr aligned to dram_row_bytes "
+                               "(base=0x%llx row_bytes=%u)\n",
+                               (unsigned long long)base_addr_,
+                               dense_phys_dram_row_bytes_);
+            }
+            std::abort();
+        }
+        dense_phys_row_stride_bytes_ = d.row_stride_bytes;
+        dense_phys_rows_per_dram_row_ = d.rows_per_dram_row;
+        dense_phys_group_stride_bytes_ = d.group_stride_bytes;
+        weight_region_end_ = base_addr_ + d.total_bytes;
+    } else {
+        // 预计算dense权重区域上界（按行*列*4B）
+        uint64_t bytes = static_cast<uint64_t>(num_neurons_) * static_cast<uint64_t>(weights_cols_) *
+                         static_cast<uint64_t>(sizeof(float));
         weight_region_end_ = base_addr_ + bytes;
     }
-    enable_detailed_map_log_ = params.find<int>("enable_detailed_map_log", 0) != 0;
-    log_weight_details_ = params.find<int>("log_weight_details", 0) != 0;
-    loader_barrier_cycles_ = params.find<uint64_t>("loader_barrier_cycles", 0);
+    enable_detailed_map_log_ = cfg.enable_detailed_map_log;
+    log_weight_details_ = cfg.log_weight_details;
+    loader_barrier_cycles_ = cfg.loader_barrier_cycles;
     // BCSR 参数
     bcsr_layout_.rows = num_neurons_;
-    bcsr_layout_.cols = params.find<uint32_t>("weights_cols", num_neurons_);
-    bcsr_layout_.block_rows = params.find<uint32_t>("bcsr_block_rows", 16);
-    bcsr_layout_.block_cols = params.find<uint32_t>("bcsr_block_cols", 16);
-    bcsr_layout_.idx_bytes = params.find<uint32_t>("bcsr_idx_bytes", 2);
-    bcsr_layout_.val_bytes = params.find<uint32_t>("bcsr_val_bytes", 4);
-    bcsr_layout_.rowptr_offset = params.find<uint64_t>("bcsr_rowptr_offset", 0);
-    bcsr_layout_.colidx_offset = params.find<uint64_t>("bcsr_colidx_offset", 0);
-    bcsr_layout_.blockdata_offset = params.find<uint64_t>("bcsr_blockdata_offset", 0);
-    bcsr_layout_.blockids_offset = params.find<uint64_t>("bcsr_blockids_offset", 0);
-    bcsr_layout_.per_core_stride = params.find<uint64_t>("per_core_stride", 0);
+    bcsr_layout_.cols = cfg.bcsr_cols;
+    bcsr_layout_.block_rows = cfg.bcsr_block_rows;
+    bcsr_layout_.block_cols = cfg.bcsr_block_cols;
+    bcsr_layout_.idx_bytes = cfg.bcsr_idx_bytes;
+    bcsr_layout_.val_bytes = cfg.bcsr_val_bytes;
+    bcsr_layout_.rowptr_offset = cfg.bcsr_rowptr_offset;
+    bcsr_layout_.colidx_offset = cfg.bcsr_colidx_offset;
+    bcsr_layout_.blockdata_offset = cfg.bcsr_blockdata_offset;
+    bcsr_layout_.blockids_offset = cfg.bcsr_blockids_offset;
+    bcsr_layout_.layout_mode = cfg.bcsr_layout_mode;
+    bcsr_layout_.colidx_row_stride_bytes = cfg.bcsr_colidx_row_stride_bytes;
+    bcsr_layout_.blockdata_row_stride_bytes = cfg.bcsr_blockdata_row_stride_bytes;
+    bcsr_layout_.blockids_row_stride_bytes = cfg.bcsr_blockids_row_stride_bytes;
+    bcsr_layout_.per_core_stride = cfg.per_core_stride;
     bcsr_layout_.validate(base_addr_, output_, (window_read_debug_ || enable_extended_diagnostics_), core_id_, node_id_);
     bcsr_br_ = bcsr_layout_.block_rows;
     bcsr_bc_ = bcsr_layout_.block_cols;
@@ -589,38 +998,41 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
         bcsr_colidx_addr_,
         bcsr_blockdata_addr_,
         bcsr_blockids_addr_,
-        bcsr_br_, bcsr_bc_, bcsr_idx_bytes_, bcsr_val_bytes_);
+        bcsr_br_, bcsr_bc_, bcsr_idx_bytes_, bcsr_val_bytes_,
+        bcsr_layout_.layout_mode,
+        bcsr_layout_.colidx_row_stride_bytes,
+        bcsr_layout_.blockdata_row_stride_bytes,
+        bcsr_layout_.blockids_row_stride_bytes);
     // Revert: 默认值恢复为 64/256，避免影响发放路径；如需禁用由脚本显式传入 0
-    bcsr_row_index_cache_cap_ = params.find<uint32_t>("bcsr_row_index_cache_cap", 64);
-    bcsr_block_cache_cap_ = params.find<uint32_t>("bcsr_block_cache_cap", 256);
+    bcsr_row_index_cache_cap_ = cfg.bcsr_row_index_cache_cap;
+    bcsr_block_cache_cap_ = cfg.bcsr_block_cache_cap;
     // GAS Apply/Scatter Phase‑1
-    apply_acc_enable_ = params.find<int>("apply_acc_enable", 0) != 0;
-    acc_hwm_bytes_cfg_ = params.find<uint64_t>("acc_high_watermark_bytes", 16*1024*1024);
-    acc_spill_enable_cfg_ = params.find<int>("acc_spill_enable", 1) != 0;
-    stage_events_csv_ = params.find<std::string>("stage_events_csv", "");
+    apply_acc_enable_ = cfg.apply_acc_enable;
+    acc_hwm_bytes_cfg_ = cfg.acc_high_watermark_bytes;
+    acc_spill_enable_cfg_ = cfg.acc_spill_enable;
+    stage_events_csv_ = cfg.stage_events_csv;
     if (impl_ && impl_->gas_ctrl_) impl_->gas_ctrl_->setStageEventsCsv(stage_events_csv_);
     // aosoa_block_rows 默认推导已转移至 compute core
     // CSR 参数已移除
-    bcsr_prefetch_all_ = params.find<int>("bcsr_prefetch_all", 0) != 0;
+    bcsr_prefetch_all_ = cfg.bcsr_prefetch_all;
     // 权重验证开关（具体采样/文件配置由 compute core 解析并执行）
-    verify_weights_ = params.find<int>("verify_weights", 0) != 0;
-    bcsr_force_file_read_ = params.find<int>("bcsr_force_file_read", 0) != 0;
-    bcsr_rowptr_file_fallback_enable_ = params.find<int>("bcsr_rowptr_file_fallback_enable", 0) != 0;
-    quiet_finish_logs_ = params.find<int>("quiet_finish_logs", 0) != 0;
-    const int record_apply_default = (gas_window_mode_ && apply_acc_enable_) ? 1 : 0;
-    record_edge_apply_enable_ = params.find<int>("record_edge_apply_enable", record_apply_default) != 0;
-    record_edge_idle_enable_ = params.find<int>("record_edge_idle_enable", 0) != 0;
+    verify_weights_ = cfg.verify_weights;
+    bcsr_force_file_read_ = cfg.bcsr_force_file_read;
+    bcsr_rowptr_file_fallback_enable_ = cfg.bcsr_rowptr_file_fallback_enable;
+    quiet_finish_logs_ = cfg.quiet_finish_logs;
+    record_edge_apply_enable_ = cfg.record_edge_apply_enable;
+    record_edge_idle_enable_ = cfg.record_edge_idle_enable;
     if (record_edge_idle_enable_ && output_ && enable_extended_diagnostics_ && output_->getVerboseLevel() >= 2) {
         output_->verbose(CALL_INFO, 2, 0,
             "[diag-gas-config] core=%d 已启用 record_edge_idle（诊断配置，回归默认关闭）\n",
             core_id_);
     }
-    record_edge_scatter_enable_ = params.find<int>("record_edge_scatter_enable", 0) != 0;
+    record_edge_scatter_enable_ = cfg.record_edge_scatter_enable;
 
     // ---- Profiling init (optional; minimal overhead when disabled) ----
 #ifdef SNNDL_ENABLE_PROFILING
-    profiler_enabled_ = params.find<int>("enable_profiler", 0) != 0;
-    profiler_csv_prefix_ = params.find<std::string>("profiler_csv_prefix", "");
+    profiler_enabled_ = cfg.profiler_enable;
+    profiler_csv_prefix_ = cfg.profiler_csv_prefix;
     if (profiler_enabled_) {
         try {
             profiler_ = new SST::SnnDL::Profiler(std::string("SnnPESubComponent_Core") + std::to_string(core_id_));
@@ -631,12 +1043,8 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     }
 #endif
     // 默认启用致密累加器（与头文件参数表一致）
-    const bool dense_acc_enable = params.find<int>("apply_dense_acc_enable", 1) != 0;
-    // P3: 影子验证开关仅由参数决定（dense 模式才有意义）
-    const bool shadow_verify_enable =
-        dense_acc_enable && (params.find<int>("acc_shadow_verify_enable", 0) != 0);
-    acc_dense_enable_cfg_ = dense_acc_enable;
-    acc_shadow_verify_enable_cfg_ = shadow_verify_enable;
+    acc_dense_enable_cfg_ = cfg.apply_dense_acc_enable;
+    acc_shadow_verify_enable_cfg_ = cfg.acc_shadow_verify_enable;
     // 构建窗口累加器（所有状态收敛到 AccumulatorOps）
     {
         AccumulatorOpsConfig acc_cfg{};
@@ -659,10 +1067,17 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     }
 
     // Weights template is used by both synapse/weights (BCSR) and synapse/route; keep cached here.
-    weights_template_ = params.find<std::string>("weights_template", "");
+    weights_template_ = cfg.weights_template;
+    if (gcss_valueonly_mode &&
+        gcss_index_template_.empty() &&
+        output_ && output_->getVerboseLevel() >= 1) {
+        output_->verbose(CALL_INFO, 1, 0,
+            "[gcss] warning: synapse_weight_mode=%s but gcss_index_template is empty (core=%d node=%u)\n",
+            synapse_weight_mode_.c_str(), core_id_, node_id_);
+    }
 
     // neurons_per_pe：默认按 total_cores*num_neurons 推导；但允许脚本显式覆盖（保持兼容）
-    uint32_t np_from_params = params.find<uint32_t>("neurons_per_pe", 0);
+    uint32_t np_from_params = cfg.neurons_per_pe;
     uint32_t computed_neurons_per_pe = static_cast<uint32_t>(total_cores_) * static_cast<uint32_t>(num_neurons_);
     if (np_from_params > 0) {
         neurons_per_pe_cfg_ = np_from_params;
@@ -676,9 +1091,9 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     }
 
     // 获取权重文件路径（由 WeightLoader 负责加载；控制层仅缓存以便日志/兼容）
-    weights_file_path_ = params.find<std::string>("weights_file", "");
+    weights_file_path_ = cfg.weights_file;
 
-    if (!isStreamWorkload_()) {
+    if (!isNonSnnWorkload_()) {
         // Phase4 Task6.1：compute core 创建/配置下沉到 workload=snn；
         // 控制层此处仅构建 synapse/weights 的 weight reader 子系统。
         configureWeightReaderSubsystem_(params);
@@ -767,6 +1182,10 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     count_stream_pkt_recv_ = 0;
     count_stream_pkt_bad_crc_ = 0;
     count_stream_pkt_bad_magic_ = 0;
+    count_route3d_native_activation_total_ = 0;
+    count_route3d_native_gating_activation_total_ = 0;
+    count_route3d_native_direct_activation_total_ = 0;
+    count_route3d_native_unique_sources_total_ = 0;
     
     // 配置时钟
     std::string clock_freq = "1GHz";
@@ -909,7 +1328,9 @@ void SnnPESubComponent::bindWorkloadRuntime_() {
     rt.time.ctx = this;
     rt.time.now_ns = &SnnPESubComponent::workloadNowNsThunk_;
     rt.reporting.ctx = this;
-    rt.reporting.report_mem_issue = &SnnPESubComponent::reportSnnMemIssueThunk_;
+    // Non-SNN workloads must not be counted as weight reads (keep analysis semantics clean).
+    rt.reporting.report_mem_issue =
+        isNonSnnWorkload_() ? &SnnPESubComponent::reportStreamMemIssueThunk_ : &SnnPESubComponent::reportSnnMemIssueThunk_;
     rt.reporting.report_apply_scatter = &SnnPESubComponent::reportApplyScatterThunk_;
     rt.reporting.request_gas_end_gather = &SnnPESubComponent::requestGasEndGatherThunk_;
     rt.reporting.request_gas_end_scatter = &SnnPESubComponent::requestGasEndScatterThunk_;
@@ -923,21 +1344,96 @@ void SnnPESubComponent::bindWorkloadRuntime_() {
     rt.sinks.stat_spikes_generated_total = stat_spikes_generated_;
     rt.sinks.stat_neurons_fired_total = stat_neurons_fired_;
     rt.sinks.stat_synaptic_accesses_total = stat_synaptic_accesses_;
+    rt.sinks.stat_compute_active_cycles_total = nullptr;
+    if (auto* pe = dynamic_cast<MultiCorePE*>(parent_pe_cached_)) {
+        rt.sinks.stat_compute_active_cycles_total = pe->getComputeActiveCyclesTotalStatistic();
+    }
     rt.sinks.stat_gas_scatter_spikes_emitted_total = stat_gas_scatter_spikes_emitted_total_;
+    rt.sinks.route3d_native_activation_total = &count_route3d_native_activation_total_;
+    rt.sinks.route3d_native_gating_activation_total = &count_route3d_native_gating_activation_total_;
+    rt.sinks.route3d_native_direct_activation_total = &count_route3d_native_direct_activation_total_;
+    rt.sinks.route3d_native_unique_sources_total = &count_route3d_native_unique_sources_total_;
     rt.sinks.stat_routes_entries_total = stat_routes_entries_;
     rt.sinks.stat_fanout_per_spike_total = stat_fanout_per_spike_;
+    rt.sinks.stat_route3d_native_activation_total = stat_route3d_native_activation_total_;
+    rt.sinks.stat_route3d_native_gating_activation_total = stat_route3d_native_gating_activation_total_;
+    rt.sinks.stat_route3d_native_direct_activation_total = stat_route3d_native_direct_activation_total_;
+    rt.sinks.stat_route3d_native_unique_sources_total = stat_route3d_native_unique_sources_total_;
 
-    if (isStreamWorkload_()) {
+    if (riscv_snn_runtime_bridge_) {
+        riscv_snn_runtime_bridge_->bindRuntime(rt);
+        accel_runtime_services_ = riscv_snn_runtime_bridge_.get();
+    }
+    rt.accel_runtime = accel_runtime_services_;
+
+    if (isStreamLikeWorkload_()) {
         fillStreamRuntime_(rt);
     }
 
     workload_->bindRuntime(rt);
+
+    // Tier2-E (A): CoreShell 统一装配 weight reader（WMS），并将所有权一次性移交给 workload=snn。
+    // - 避免 control 与 workload 重复创建 WeightMemorySubsystem/WeightCacheOps；
+    // - 不改变脚本侧参数/接口，仅在 C++ 内部通过窄接口移交所有权。
+    if (auto* adopter = dynamic_cast<IWeightReaderAdopter*>(workload_.get())) {
+        std::unique_ptr<IWeightReader> reader = legacySnnTakeWeightReader();
+        if (reader) adopter->adoptWeightReader(std::move(reader));
+    }
 }
 
 void SnnPESubComponent::setParentInterface(IPeAggregation* parent) {
     parent_pe_cached_ = parent;
+    refreshSharedWeightObjectPlaneBinding_();
     // output_->verbose(CALL_INFO, 2, 0, "🔗 核心%d设置父级接口\n", core_id_);
     bindWorkloadRuntime_();
+}
+
+void SnnPESubComponent::refreshSharedWeightObjectPlaneBinding_() {
+    if (!weight_mem_subsystem_) return;
+
+    auto* provider = dynamic_cast<IPeWeightObjectPlaneProvider*>(parent_pe_cached_);
+    auto* plane = provider ? provider->peWeightObjectPlane() : nullptr;
+    auto* pod_provider = dynamic_cast<IPePodSharedMetadataProvider*>(parent_pe_cached_);
+    auto* metadata_plane =
+        pod_provider ? pod_provider->pePodMetadataObjectPlane() : nullptr;
+    auto* owner_table =
+        pod_provider ? pod_provider->pePodOwnerServiceTable() : nullptr;
+    auto* service_table =
+        pod_provider ? pod_provider->peLocalServiceObjectTable() : nullptr;
+    auto* fabric_provider = dynamic_cast<IPeSharedCoreFabricProvider*>(parent_pe_cached_);
+    auto* fabric = fabric_provider ? fabric_provider->peSharedCoreFabric() : nullptr;
+    auto* mc_pe = dynamic_cast<MultiCorePE*>(parent_pe_cached_);
+
+    weight_mem_subsystem_->bindSharedWeightObjectPlane(plane);
+    weight_mem_subsystem_->bindPodMetadataObjectPlane(metadata_plane);
+    weight_mem_subsystem_->bindPodOwnerServiceTable(owner_table);
+    weight_mem_subsystem_->bindPeLocalServiceObjectTable(service_table);
+    weight_mem_subsystem_->bindPeSharedCoreFabric(fabric);
+    weight_mem_subsystem_->setPulseOsaMetadataTxnConfig(
+        mc_pe ? mc_pe->pulseOsaMetadataTxnEnabled() : false,
+        mc_pe ? mc_pe->pulseOsaMetadataReadyLeaseEnabled() : false,
+        mc_pe ? mc_pe->pulseOsaMetadataObjectMaskBits() : 0u);
+    if (mc_pe) {
+        const uint32_t pod_count =
+            std::max<uint32_t>(1u, mc_pe->peInternalPodCountConfig());
+        const uint32_t pod_size =
+            std::max<uint32_t>(1u, mc_pe->peInternalPodSizeConfig());
+        const uint32_t pod_id =
+            std::min<uint32_t>(
+                static_cast<uint32_t>(core_id_) / pod_size,
+                pod_count - 1u);
+        weight_mem_subsystem_->setPeInternalPodRuntimeConfig(
+            mc_pe->peInternalCpeEnabledConfig(),
+            mc_pe->peInternalPodEnabledConfig(),
+            mc_pe->peInternalPodMetadataEnabledConfig(),
+            mc_pe->peInternalPodOwnerEnabledConfig(),
+            pod_id,
+            pod_count,
+            pod_size,
+            static_cast<uint32_t>(core_id_));
+    }
+    weight_mem_subsystem_->setSharedWeightObjectPlaneResidencyAuthority(
+        plane != nullptr && plane->actualOwnerEnabled());
 }
 
 void SnnPESubComponent::setNocTransport(INocTransport* noc) {
@@ -946,38 +1442,107 @@ void SnnPESubComponent::setNocTransport(INocTransport* noc) {
 }
 
 bool SnnPESubComponent::deliverPacket(NocPacketEvent* packet) {
-    if (!packet) return true;
-    // Phase7（B）：平台侧不再调用 deliverSpike；所有输入（含 Spike）统一以 packet 形式进入 workload。
-    if (workload_) {
-        return workload_->deliverPacket(packet);
-    }
+    return withExperimentalWorkloadSerialization_([&]() {
+        if (!packet) return true;
+        // Experimental PULSE gather-preband isolation:
+        // serialize PE-side workload ingress so packet delivery cannot race
+        // with stage transitions / workload ticks on the same core.
+        if (workload_) {
+            return workload_->deliverPacket(packet);
+        }
 
-    if (enable_extended_diagnostics_ && output_) {
-        output_->verbose(
-            CALL_INFO, 1, 0,
-            "[core-packet] core=%d kind=%u payload=%zu src=%u:%u dst=%u:%u\n",
-            core_id_,
-            static_cast<unsigned>(packet->kind),
-            packet->payload.size(),
-            packet->src_node,
-            packet->src_endpoint,
-            packet->dst_node,
-            packet->dst_endpoint);
-    }
-    delete packet;
+        if (enable_extended_diagnostics_ && output_) {
+            output_->verbose(
+                CALL_INFO, 1, 0,
+                "[core-packet] core=%d kind=%u payload=%zu src=%u:%u dst=%u:%u\n",
+                core_id_,
+                static_cast<unsigned>(packet->kind),
+                packet->payload.size(),
+                packet->src_node,
+                packet->src_endpoint,
+                packet->dst_node,
+                packet->dst_endpoint);
+        }
+        delete packet;
+        return true;
+    });
+}
+
+bool SnnPESubComponent::syntheticEmitNeuronFire(uint32_t neuron_idx, uint64_t now_cycle) {
+    if (!snn_comm_workload_ || !snn_comm_workload_->ready()) return false;
+    if (neuron_idx >= num_neurons_) return false;
+    snn_comm_workload_->emitNeuronFire(neuron_idx, now_cycle);
     return true;
 }
 
+uint64_t SnnPESubComponent::syntheticEmitNeuronFireBatch(const std::vector<uint32_t>& neuron_indices, uint64_t now_cycle) {
+    if (!snn_comm_workload_ || !snn_comm_workload_->ready() || neuron_indices.empty()) return 0;
+
+    std::vector<uint32_t> filtered;
+    filtered.reserve(neuron_indices.size());
+    for (uint32_t neuron_idx : neuron_indices) {
+        if (neuron_idx < num_neurons_) filtered.push_back(neuron_idx);
+    }
+    if (filtered.empty()) return 0;
+    return snn_comm_workload_->emitNeuronFireBatch(filtered, now_cycle);
+}
+
 void SnnPESubComponent::onGlobalStepStart(uint32_t seq) {
-    if (isStreamWorkload_()) {
+    const bool trace_step_path =
+        output_ &&
+        node_id_ == 0 &&
+        seq <= 2 &&
+        core_id_ >= 15;
+    withExperimentalWorkloadSerialization_([&]() {
+    if (trace_step_path) {
+        output_->verbose(
+            CALL_INFO, 2, 0,
+            "[[sentinel-step-path]] node=%u core=%d seq=%u onGlobalStepStart enter non_snn=%d gas_window=%d\n",
+            node_id_, core_id_, seq, isNonSnnWorkload_() ? 1 : 0, gas_window_mode_ ? 1 : 0);
+    }
+    if (isNonSnnWorkload_()) {
         // stream workload 不参与 SNN/GAS window 编排；
         // 但仍需要打开 memory(GatherBufferIF) 的 step gate，否则 StandardMemAccess 会拒绝请求（write/read 返回失败）。
         curr_stage_seq_ = seq;
         if (stdmem_ep_ && stdmem_ep_->available()) {
             auto* gate = stdmem_ep_->stepGate();
             if (gate) {
+                auto* credit_gate = stdmem_ep_->creditGate();
+                if (credit_gate &&
+                    global_step_apply_bank_credit_seq_ == seq &&
+                    global_step_apply_bank_credit_target_ > 0) {
+                    credit_gate->setApplyBankCreditTarget(seq, global_step_apply_bank_credit_target_);
+                    global_step_apply_bank_credit_seq_ = 0;
+                    global_step_apply_bank_credit_target_ = 0;
+                }
                 gate->openStep(seq);
+                if (trace_step_path) {
+                    output_->verbose(
+                        CALL_INFO, 2, 0,
+                        "[[sentinel-step-path]] node=%u core=%d seq=%u onGlobalStepStart non_snn gate_opened\n",
+                        node_id_, core_id_, seq);
+                }
             }
+        }
+        if (trace_step_path) {
+            output_->verbose(
+                CALL_INFO, 2, 0,
+                "[[sentinel-step-path]] node=%u core=%d seq=%u onGlobalStepStart non_snn before_workload\n",
+                node_id_, core_id_, seq);
+        }
+        if (workload_) workload_->onGlobalStepStart(seq);
+        if (trace_step_path) {
+            output_->verbose(
+                CALL_INFO, 2, 0,
+                "[[sentinel-step-path]] node=%u core=%d seq=%u onGlobalStepStart non_snn after_workload\n",
+                node_id_, core_id_, seq);
+        }
+        if (accel_runtime_services_) accel_runtime_services_->onGlobalStepStart(seq);
+        if (trace_step_path) {
+            output_->verbose(
+                CALL_INFO, 2, 0,
+                "[[sentinel-step-path]] node=%u core=%d seq=%u onGlobalStepStart non_snn after_runtime_services\n",
+                node_id_, core_id_, seq);
         }
         return;
     }
@@ -989,7 +1554,47 @@ void SnnPESubComponent::onGlobalStepStart(uint32_t seq) {
     }
     auto* gate = stdmem_ep_->stepGate();
     if (gate) {
+        auto* credit_gate = stdmem_ep_->creditGate();
+        if (credit_gate &&
+            global_step_apply_bank_credit_seq_ == seq &&
+            global_step_apply_bank_credit_target_ > 0) {
+            credit_gate->setApplyBankCreditTarget(seq, global_step_apply_bank_credit_target_);
+            global_step_apply_bank_credit_seq_ = 0;
+            global_step_apply_bank_credit_target_ = 0;
+        }
         gate->openStep(seq);
+        if (trace_step_path) {
+            output_->verbose(
+                CALL_INFO, 2, 0,
+                "[[sentinel-step-path]] node=%u core=%d seq=%u onGlobalStepStart gate_opened\n",
+                node_id_, core_id_, seq);
+        }
+        if (trace_step_path) {
+            output_->verbose(
+                CALL_INFO, 2, 0,
+                "[[sentinel-step-path]] node=%u core=%d seq=%u onGlobalStepStart before_workload\n",
+                node_id_, core_id_, seq);
+        }
+        if (workload_) workload_->onGlobalStepStart(seq);
+        if (trace_step_path) {
+            output_->verbose(
+                CALL_INFO, 2, 0,
+                "[[sentinel-step-path]] node=%u core=%d seq=%u onGlobalStepStart after_workload\n",
+                node_id_, core_id_, seq);
+        }
+        if (trace_step_path) {
+            output_->verbose(
+                CALL_INFO, 2, 0,
+                "[[sentinel-step-path]] node=%u core=%d seq=%u onGlobalStepStart before_runtime_services\n",
+                node_id_, core_id_, seq);
+        }
+        if (accel_runtime_services_) accel_runtime_services_->onGlobalStepStart(seq);
+        if (trace_step_path) {
+            output_->verbose(
+                CALL_INFO, 2, 0,
+                "[[sentinel-step-path]] node=%u core=%d seq=%u onGlobalStepStart after_runtime_services\n",
+                node_id_, core_id_, seq);
+        }
         return;
     }
 
@@ -1003,10 +1608,25 @@ void SnnPESubComponent::onGlobalStepStart(uint32_t seq) {
         return;
     }
     curr_stage_seq_ = seq;
+    if (workload_) workload_->onGlobalStepStart(seq);
+    if (accel_runtime_services_) accel_runtime_services_->onGlobalStepStart(seq);
+    if (trace_step_path) {
+        output_->verbose(
+            CALL_INFO, 2, 0,
+            "[[sentinel-step-path]] node=%u core=%d seq=%u onGlobalStepStart no_gate_after_callbacks\n",
+            node_id_, core_id_, seq);
+    }
+    });
+}
+
+void SnnPESubComponent::onGlobalStepApplyBankCredit(uint32_t seq, uint32_t apply_bank_credit) {
+    global_step_apply_bank_credit_seq_ = seq;
+    global_step_apply_bank_credit_target_ = apply_bank_credit;
 }
 
 // === GAS stage/stat sink (Phase4-Task6.4) ===
 void SnnPESubComponent::onGasStageEvent(const GasStageEvent& ev) {
+    withExperimentalWorkloadSerialization_([&]() {
     // CoreShell 保留最小镜像状态用于：
     // - StageEventHub 统计/CSV 口径（仍由 CoreShell 汇聚写出）
     // - activity f 等 PE 级聚合（兼容历史分析脚本）
@@ -1081,6 +1701,10 @@ void SnnPESubComponent::onGasStageEvent(const GasStageEvent& ev) {
     if (gas_stage_workload_) {
         gas_stage_workload_->onGasStageEvent(ev);
     }
+    if (accel_runtime_services_) {
+        accel_runtime_services_->onGasStageEvent(ev);
+    }
+    });
 }
 
 void SnnPESubComponent::onGasStatEvent(const GasStatEvent& st) {
@@ -1089,7 +1713,21 @@ void SnnPESubComponent::onGasStatEvent(const GasStatEvent& st) {
         pe->accumulateGasStatsExt(st.unique_bytes, st.unique_reads,
                                   st.rowwin_triggers, st.rowwin_bytes,
                                   st.bursts, st.payload_bytes,
-                                  st.window_inflight_peak, st.window_buffer_max_bytes);
+                                  st.window_inflight_peak, st.window_buffer_max_bytes,
+                                  st.frontend_staged_reads,
+                                  st.frontend_staged_line_touches,
+                                  st.frontend_granules_built,
+                                  st.unique_line_count, st.covered_line_count, st.overfetch_bytes,
+                                  st.apply_bank_credit_effective,
+                                  st.cmd_cost_veto,
+                                  st.cmd_cost_veto_fine_gap,
+                                  st.cmd_cost_veto_row_window,
+                                  st.stall_on_step_gate_cycles);
+        if (auto* mpe = dynamic_cast<MultiCorePE*>(pe)) {
+            const uint32_t seq = (st.superstep != 0) ? st.superstep : static_cast<uint32_t>(curr_stage_seq_);
+            mpe->recordStepGasStat(seq, st);
+            mpe->recordCoreStepGasStat(core_id_, seq, st);
+        }
     }
     // Local (per-core) copies for unique_* only (optional)
     if (stat_gas_unique_reads_total_ && st.unique_reads) stat_gas_unique_reads_total_->addData(st.unique_reads);
@@ -1104,6 +1742,9 @@ void SnnPESubComponent::onGasStatEvent(const GasStatEvent& st) {
     if (gas_stage_workload_) {
         gas_stage_workload_->onGasStatEvent(st);
     }
+    if (accel_runtime_services_) {
+        accel_runtime_services_->onGasStatEvent(st);
+    }
 }
 
 void SnnPESubComponent::configureWeightReaderSubsystem_(const Params& params) {
@@ -1114,6 +1755,7 @@ void SnnPESubComponent::configureWeightReaderSubsystem_(const Params& params) {
             [this](uint64_t key, float& out) { return weightCacheTryGet_(key, out); },
             [this](uint64_t key, float val) { weightCacheStore_(key, val); }
         );
+        const bool disable_weight_cache = params.find<int>("disable_weight_cache", 0) != 0;
         // Phase A/E：窗口读集合/预算/outstanding + 读发起/响应闭环下沉到子系统（保持行为与日志口径）
         {
             WeightMemorySubsystem::OrchestratorConfig ocfg{};
@@ -1155,13 +1797,70 @@ void SnnPESubComponent::configureWeightReaderSubsystem_(const Params& params) {
             ocfg.use_bcsr = use_bcsr_;
             ocfg.bcsr_force_file_read = bcsr_force_file_read_;
             ocfg.bcsr_prefetch_all = bcsr_prefetch_all_;
+            ocfg.bcsr_rowptr_file_fallback_enable = bcsr_rowptr_file_fallback_enable_;
+            ocfg.bcsr_colidx_inflight_coalesce_enable =
+                params.find<int>("bcsr_colidx_inflight_coalesce_enable", 1) != 0;
+            ocfg.bcsr_block_inflight_coalesce_enable =
+                params.find<int>("bcsr_block_inflight_coalesce_enable", 1) != 0;
+            ocfg.bcsr_block_fetch_mode =
+                params.find<std::string>("bcsr_block_fetch_mode", "full_block");
+            ocfg.bcsr_row_index_prefetch_mode =
+                params.find<std::string>("bcsr_row_index_prefetch_mode", "auto");
+            ocfg.bcsr_row_index_prefetch_all_rows_threshold =
+                params.find<uint32_t>("bcsr_row_index_prefetch_all_rows_threshold", 1024);
+            ocfg.bcsr_row_index_prefetch_all_rows_max_bytes =
+                params.find<uint64_t>("bcsr_row_index_prefetch_all_rows_max_bytes", 64ull * 1024ull);
+            ocfg.experimental_noc_rowidx_prefetch_enable =
+                params.find<int>("experimental_noc_rowidx_prefetch_enable", 0) != 0;
+            ocfg.experimental_noc_rowidx_prefetch_budget_per_tick =
+                params.find<uint32_t>("experimental_noc_rowidx_prefetch_budget_per_tick", 4);
+            ocfg.experimental_noc_rowidx_cache_rows =
+                params.find<uint32_t>("experimental_noc_rowidx_cache_rows", 1024);
+            ocfg.experimental_noc_rowidx_prefetch_gather_only =
+                params.find<int>("experimental_noc_rowidx_prefetch_gather_only", 1) != 0;
+            ocfg.experimental_noc_rowidx_prefetch_detached_enable =
+                params.find<int>("experimental_noc_rowidx_prefetch_detached_enable", 0) != 0;
+            ocfg.experimental_noc_rowidx_prefetch_carry_to_apply_enable =
+                params.find<int>("experimental_noc_rowidx_prefetch_carry_to_apply_enable", 0) != 0;
+            ocfg.experimental_noc_rowidx_hot_touch_min =
+                params.find<uint32_t>("experimental_noc_rowidx_hot_touch_min", 1);
+            ocfg.experimental_noc_rowidx_budget_adapt_enable =
+                params.find<int>("experimental_noc_rowidx_budget_adapt_enable", 0) != 0;
+            ocfg.experimental_noc_rowidx_budget_adapt_max_per_tick =
+                params.find<uint32_t>("experimental_noc_rowidx_budget_adapt_max_per_tick", 32);
+            ocfg.experimental_noc_rowidx_budget_adapt_q_depth =
+                params.find<uint32_t>("experimental_noc_rowidx_budget_adapt_q_depth", 16);
+            ocfg.experimental_idx2_ingress_prefetch_enable = false;
+            ocfg.experimental_idx2_ingress_prefetch_budget_per_tick = 0;
+            ocfg.experimental_idx2_ingress_prefetch_cache_entries = 0;
+            ocfg.experimental_idx2_ingress_prefetch_max_inflight = 0;
+            ocfg.experimental_idx2_ingress_prefetch_gather_only = false;
+            ocfg.experimental_idx2_ingress_prefetch_carry_to_apply_enable = false;
+            ocfg.experimental_idx2_ingress_prefetch_apply_max_inflight = 0;
+            ocfg.experimental_idx2_ingress_prefetch_apply_outstanding_reserve = 0;
+            ocfg.experimental_idx2_ingress_prefetch_apply_frontier_keep_pending = 0;
+            ocfg.experimental_idx2_ingress_tail_guard_enable = false;
+            ocfg.experimental_idx2_ingress_budget_adapt_enable = false;
+            ocfg.experimental_idx2_ingress_budget_adapt_max_per_tick = 0;
+            ocfg.experimental_idx2_ingress_budget_adapt_q_depth = 0;
+            ocfg.bcsr_block_cache_auto_tune =
+                params.find<int>("bcsr_block_cache_auto_tune", 1) != 0;
+            ocfg.bcsr_block_cache_max_bytes =
+                params.find<uint64_t>("bcsr_block_cache_max_bytes", 64ull * 1024ull * 1024ull);
+            ocfg.bcsr_block_cache_tune_miss_ratio =
+                params.find<float>("bcsr_block_cache_tune_miss_ratio", 0.05f);
+            ocfg.bcsr_block_cache_tune_min_misses =
+                params.find<uint32_t>("bcsr_block_cache_tune_min_misses", 64);
+            ocfg.bcsr_populate_weight_cache_enable =
+                params.find<int>("bcsr_populate_weight_cache_enable", 1) != 0;
+            if (disable_weight_cache) ocfg.bcsr_populate_weight_cache_enable = false;
             ocfg.bcsr_weight_guard_enable = bcsr_weight_guard_enable_;
             ocfg.bcsr_weight_abs_max = bcsr_weight_abs_max_;
-            ocfg.bcsr_semantic_verify_enable = params.find<int>("bcsr_semantic_verify_enable", 0) != 0;
-            ocfg.bcsr_semantic_verify_max_edges = params.find<uint32_t>("bcsr_semantic_verify_max_edges", 64);
-            ocfg.bcsr_semantic_verify_max_mismatch = params.find<uint32_t>("bcsr_semantic_verify_max_mismatch", 8);
-            ocfg.bcsr_semantic_verify_abs_tol = params.find<float>("bcsr_semantic_verify_abs_tol", 1e-6f);
-            ocfg.bcsr_semantic_verify_rel_tol = params.find<float>("bcsr_semantic_verify_rel_tol", 1e-6f);
+            ocfg.bcsr_semantic_verify_enable = bcsr_semantic_verify_enable_;
+            ocfg.bcsr_semantic_verify_max_edges = bcsr_semantic_verify_max_edges_;
+            ocfg.bcsr_semantic_verify_max_mismatch = bcsr_semantic_verify_max_mismatch_;
+            ocfg.bcsr_semantic_verify_abs_tol = bcsr_semantic_verify_abs_tol_;
+            ocfg.bcsr_semantic_verify_rel_tol = bcsr_semantic_verify_rel_tol_;
             ocfg.readresp_zero_fallback = readresp_zero_fallback_;
             ocfg.init_default_weight = init_default_weight_;
             ocfg.num_neurons = num_neurons_;
@@ -1169,6 +1868,8 @@ void SnnPESubComponent::configureWeightReaderSubsystem_(const Params& params) {
             ocfg.use_post_row_pre_col = use_post_row_pre_col_;
             ocfg.base_addr = static_cast<uint64_t>(base_addr_);
             ocfg.weight_region_end = weight_region_end_;
+            ocfg.dense_layout_mode = dense_phys_enable_ ? DenseLayoutMode::PhysV1 : DenseLayoutMode::RowMajor;
+            ocfg.dense_phys_dram_row_bytes = dense_phys_dram_row_bytes_;
             ocfg.read_force_single = read_force_single_;
             ocfg.merge_read_cacheline = merge_read_cacheline_;
             ocfg.merge_read_row = merge_read_row_;
@@ -1178,11 +1879,177 @@ void SnnPESubComponent::configureWeightReaderSubsystem_(const Params& params) {
             ocfg.byte_exact_verify_mode = byte_exact_verify_mode_;
             ocfg.byte_exact_verify_row_scale = byte_exact_verify_row_scale_;
             ocfg.byte_exact_verify_max_mismatch = byte_exact_verify_max_mismatch_;
+            ocfg.synapse_weight_mode = synapse_weight_mode_;
+            ocfg.weight_sram_model_enable =
+                params.find<int>("weight_sram_model_enable", 0) != 0;
+            ocfg.weight_idx_sram_enable =
+                params.find<int>("weight_idx_sram_enable", 0) != 0;
+            ocfg.weight_l0_sram_enable =
+                params.find<int>("weight_l0_sram_enable", 0) != 0;
+            ocfg.weight_idx_sram_capacity_bytes =
+                params.find<uint64_t>("weight_idx_sram_capacity_bytes", 0);
+            ocfg.weight_l0_sram_capacity_bytes =
+                params.find<uint64_t>("weight_l0_sram_capacity_bytes", 0);
+            ocfg.weight_idx_sram_banks =
+                params.find<uint32_t>("weight_idx_sram_banks", 16);
+            ocfg.weight_l0_sram_banks =
+                params.find<uint32_t>("weight_l0_sram_banks", 8);
+            ocfg.weight_sram_ports_per_bank =
+                params.find<uint32_t>("weight_sram_ports_per_bank", 1);
+            ocfg.weight_sram_bank_interleave_bytes =
+                params.find<uint64_t>("weight_sram_bank_interleave_bytes", 4);
+            ocfg.weight_sram_t_read_cycles =
+                params.find<uint32_t>("weight_sram_t_read_cycles", 1);
+            ocfg.weight_sram_t_write_cycles =
+                params.find<uint32_t>("weight_sram_t_write_cycles", 1);
+            ocfg.weight_sram_sample_log2 =
+                params.find<uint32_t>("weight_sram_sample_log2", 0);
+            ocfg.weight_idx_sram_base =
+                params.find<uint64_t>("weight_idx_sram_base", 0x100000000ull);
+            ocfg.weight_l0_sram_base =
+                params.find<uint64_t>("weight_l0_sram_base", 0x200000000ull);
+            ocfg.weight_l0_sram_slots =
+                params.find<uint64_t>("weight_l0_sram_slots", (1ull << 20));
             ocfg.memory_warmup_cycles = memory_warmup_cycles_;
             ocfg.loader_barrier_cycles = loader_barrier_cycles_;
             ocfg.node_id = node_id_;
             ocfg.core_id = static_cast<uint32_t>(core_id_);
+            ocfg.total_cores = static_cast<uint32_t>(total_cores_);
             ocfg.weights_template = weights_template_;
+            ocfg.gcss_index_template = gcss_index_template_;
+            ocfg.experimental_retire_policy =
+                params.find<std::string>("experimental_retire_policy", "global_inorder");
+            ocfg.experimental_gcss_phase_breakdown_enable =
+                params.find<int>("experimental_gcss_phase_breakdown_enable", 0) != 0;
+            ocfg.experimental_retire_shadow_per_post_enable = false;
+            ocfg.experimental_gcss_vlf_queue_policy =
+                params.find<std::string>("experimental_gcss_vlf_queue_policy", "locality_first");
+            ocfg.experimental_gcss_vlf_fair_band_size =
+                params.find<uint32_t>("experimental_gcss_vlf_fair_band_size", 256);
+            const bool pulse_enable = params.find<int>("pulse_enable", 0) != 0;
+            const bool pulse_agenda_observe_only =
+                params.find<int>("pulse_agenda_observe_only", 1) != 0;
+            const bool pulse_descriptor_actual_enable =
+                params.find<int>("pulse_descriptor_actual_enable", 0) != 0;
+            ocfg.pulse_agenda_enable =
+                pulse_enable &&
+                (pulse_agenda_observe_only || pulse_descriptor_actual_enable);
+            ocfg.pulse_descriptor_actual_enable =
+                pulse_enable && pulse_descriptor_actual_enable;
+            ocfg.pulse_osa_metadata_txn_enable =
+                pulse_enable && (params.find<int>("pulse_osa_metadata_txn_enable", 0) != 0);
+            ocfg.pulse_osa_metadata_ready_lease_enable =
+                pulse_enable && (params.find<int>("pulse_osa_metadata_ready_lease_enable", 0) != 0);
+            const std::string pulse_osa_metadata_object_mask =
+                pulse_enable
+                    ? params.find<std::string>("pulse_osa_metadata_object_mask", "rowdescriptor")
+                    : "rowdescriptor";
+            ocfg.pulse_osa_metadata_object_mask =
+                pulse_enable
+                    ? parsePulseMetadataObjectMask_(
+                          pulse_osa_metadata_object_mask.empty() ? "rowdescriptor"
+                                                                 : pulse_osa_metadata_object_mask)
+                    : 0u;
+            ocfg.experimental_rowdescriptor_ready_join_dedup_enable =
+                ocfg.pulse_descriptor_actual_enable &&
+                (params.find<int>("experimental_rowdescriptor_ready_join_dedup_enable", 0) != 0);
+            ocfg.pulse_domain_retire_enable = false;
+            ocfg.pulse_domain_retire_observe_only = true;
+            ocfg.pulse_frontier_observe_enable =
+                pulse_enable && (params.find<int>("pulse_frontier_observe_enable", 0) != 0);
+            ocfg.pulse_frontier_top_lines =
+                std::max<uint32_t>(1u, params.find<uint32_t>("pulse_frontier_top_lines", 32));
+            ocfg.pulse_metadata_frontier_observe_enable =
+                pulse_enable && (params.find<int>("pulse_metadata_frontier_observe_enable", 0) != 0);
+            ocfg.pulse_metadata_frontier_top_items =
+                std::max<uint32_t>(1u, params.find<uint32_t>("pulse_metadata_frontier_top_items", 32));
+            ocfg.pulse_metadata_frontier_band_slots =
+                std::max<uint32_t>(1u, params.find<uint32_t>("pulse_metadata_frontier_band_slots", 128));
+            ocfg.pulse_mfb_preband_band_slots =
+                params.find<uint32_t>("pulse_mfb_preband_band_slots", 0u);
+            ocfg.pulse_metadata_seed_enable = false;
+            ocfg.pulse_metadata_seed_top_bases =
+                std::max<uint32_t>(1u, params.find<uint32_t>("pulse_metadata_seed_top_bases", 32));
+            ocfg.pulse_metadata_seed_window_budget =
+                params.find<uint32_t>("pulse_metadata_seed_window_budget", 0);
+            ocfg.pulse_mfb_preband_seed_enable = false;
+            ocfg.pulse_mfb_preband_top_bands =
+                std::max<uint32_t>(1u, params.find<uint32_t>("pulse_mfb_preband_top_bands", 32));
+            ocfg.pulse_mfb_preband_lines_per_band =
+                std::max<uint32_t>(1u, params.find<uint32_t>("pulse_mfb_preband_lines_per_band", 4));
+            ocfg.pulse_mfb_preband_window_budget =
+                params.find<uint32_t>("pulse_mfb_preband_window_budget", 0);
+            ocfg.pulse_mfb_gather_preband_enable = false;
+            ocfg.pulse_mfb_gather_barrier_enable = false;
+            ocfg.pulse_mfb_gather_top_bands =
+                std::max<uint32_t>(1u, params.find<uint32_t>("pulse_mfb_gather_top_bands", 32));
+            ocfg.pulse_mfb_gather_lines_per_band =
+                std::max<uint32_t>(1u, params.find<uint32_t>("pulse_mfb_gather_lines_per_band", 4));
+            ocfg.pulse_mfb_gather_window_budget =
+                params.find<uint32_t>("pulse_mfb_gather_window_budget", 0);
+            ocfg.pulse_mfb_gather_min_consumers =
+                std::max<uint32_t>(2u, params.find<uint32_t>("pulse_mfb_gather_min_consumers", 2));
+            ocfg.pulse_prebase_shared_lookup_enable =
+                pulse_enable &&
+                (params.find<int>("pulse_prebase_shared_lookup_enable", 0) != 0);
+            ocfg.pe_internal_cpe_enable =
+                params.find<int>("pe_internal_cpe_enable", 0) != 0;
+            ocfg.pe_internal_pod_enable =
+                ocfg.pe_internal_cpe_enable &&
+                (params.find<int>("pe_internal_pod_enable", 0) != 0);
+            ocfg.pe_internal_pod_metadata_enable =
+                ocfg.pe_internal_pod_enable &&
+                (params.find<int>("pe_internal_pod_metadata_enable", 0) != 0);
+            ocfg.pe_internal_pod_owner_enable =
+                ocfg.pe_internal_pod_enable &&
+                (params.find<int>("pe_internal_pod_owner_enable", 0) != 0);
+            {
+                const uint32_t configured_pod_count =
+                    params.find<uint32_t>("pe_internal_pod_count", 0);
+                const uint32_t configured_pod_size =
+                    params.find<uint32_t>("pe_internal_pod_size", 0);
+                const uint32_t total_cores =
+                    std::max<uint32_t>(1u, static_cast<uint32_t>(total_cores_));
+                uint32_t pod_count = 1u;
+                if (ocfg.pe_internal_pod_enable) {
+                    if (configured_pod_count > 0u) {
+                        pod_count = configured_pod_count;
+                    } else if (configured_pod_size > 0u) {
+                        pod_count =
+                            static_cast<uint32_t>((total_cores + configured_pod_size - 1u) /
+                                                  configured_pod_size);
+                    } else {
+                        pod_count = total_cores;
+                    }
+                    pod_count = std::max<uint32_t>(1u, std::min<uint32_t>(pod_count, total_cores));
+                }
+                uint32_t pod_size = configured_pod_size;
+                if (pod_size == 0u) {
+                    pod_size =
+                        static_cast<uint32_t>((total_cores + pod_count - 1u) / pod_count);
+                }
+                pod_size = std::max<uint32_t>(1u, pod_size);
+                ocfg.pe_internal_pod_count = pod_count;
+                ocfg.pe_internal_pod_size = pod_size;
+                ocfg.pe_internal_pod_id =
+                    std::min<uint32_t>(ocfg.core_id / pod_size, pod_count - 1u);
+            }
+            ocfg.pulse_domain_retire_mode =
+                params.find<std::string>("pulse_domain_retire_mode", "per_post");
+            std::transform(
+                ocfg.pulse_domain_retire_mode.begin(),
+                ocfg.pulse_domain_retire_mode.end(),
+                ocfg.pulse_domain_retire_mode.begin(),
+                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (ocfg.pulse_domain_retire_mode != "descriptor_domain") {
+                ocfg.pulse_domain_retire_mode = "per_post";
+            }
+            ocfg.pulse_domain_retire_release_budget =
+                params.find<uint32_t>("pulse_domain_retire_release_budget", 0);
+            ocfg.experimental_pre_window_profile_export_enable =
+                params.find<int>("experimental_pre_window_profile_export_enable", 0) != 0;
+            ocfg.experimental_pre_window_profile_export_dir =
+                params.find<std::string>("experimental_pre_window_profile_export_dir", "");
             ocfg.bcsr_mgr = bcsr_weights_.get();
             mem->configureOrchestrator(std::move(ocfg));
             if (byte_exact_verify_enable_ && output_) {
@@ -1195,9 +2062,43 @@ void SnnPESubComponent::configureWeightReaderSubsystem_(const Params& params) {
             }
         }
         weight_mem_subsystem_ = mem.get();
+        refreshSharedWeightObjectPlaneBinding_();
         // Phase E：BCSR 缓存容量配置下沉到 BcsrWeightManager
-        bcsr_weights_->setRowIndexCacheCapacity(bcsr_row_index_cache_cap_);
+        uint32_t row_cap = bcsr_row_index_cache_cap_;
+        const bool row_auto_fit = params.find<int>("bcsr_row_index_cache_auto_fit", 0) != 0;
+        if (row_auto_fit && row_cap > 0 && bcsr_weights_) {
+            const uint32_t br_eff = bcsr_weights_->effectiveBlockRows();
+            const uint32_t n_block_rows =
+                br_eff ? ((num_neurons_ + br_eff - 1u) / br_eff) : static_cast<uint32_t>(num_neurons_);
+            if (n_block_rows > 0 && row_cap < n_block_rows) {
+                if (window_read_debug_ && output_ && output_->getVerboseLevel() >= 2) {
+                    output_->verbose(CALL_INFO, 2, 0,
+                                     "[bcsr] auto-fit row_index_cache_cap %u -> %u (node=%u core=%d rows=%u br=%u)\n",
+                                     row_cap,
+                                     n_block_rows,
+                                     node_id_,
+                                     core_id_,
+                                     num_neurons_,
+                                     br_eff);
+                }
+                row_cap = n_block_rows;
+            }
+        }
+        bcsr_weights_->setRowIndexCacheCapacity(row_cap);
         bcsr_weights_->setBlockCacheCapacity(bcsr_block_cache_cap_);
+        {
+            std::string pol = params.find<std::string>("bcsr_block_cache_policy", "lru");
+            for (auto& ch : pol) {
+                if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+            }
+            if (pol == "fifo") {
+                bcsr_weights_->setBlockCachePolicy(BcsrWeightManager::BlockCachePolicy::FIFO);
+            } else if (pol == "legacy_unordered" || pol == "legacy") {
+                bcsr_weights_->setBlockCachePolicy(BcsrWeightManager::BlockCachePolicy::LegacyUnordered);
+            } else {
+                bcsr_weights_->setBlockCachePolicy(BcsrWeightManager::BlockCachePolicy::LRU);
+            }
+        }
         windowStateConfigure_();
         if (window_read_enable_) reserveWindowContainers_();
         weight_reader_adapter_ = std::move(mem);
@@ -1243,6 +2144,7 @@ void SnnPESubComponent::init(unsigned int phase) {
 
     // Phase4：将生命周期相位转发给 workload（CoreShell 统一出口）。
     if (workload_) workload_->onInitPhase(phase);
+    if (accel_runtime_services_) accel_runtime_services_->onInitPhase(phase);
 }
 
 void SnnPESubComponent::complete(unsigned int phase) {
@@ -1288,6 +2190,7 @@ void SnnPESubComponent::setup() {
     if (isNonSnnWorkload_()) {
         // Non-SNN workloads (stream/traffic) do not depend on GAS/Apply/Scatter.
         if (workload_) workload_->onSetup();
+        if (accel_runtime_services_) accel_runtime_services_->onSetup();
         return;
     }
     if (apply_acc_enable_ && (!gas_enable_ || !gas_window_mode_)) {
@@ -1295,6 +2198,7 @@ void SnnPESubComponent::setup() {
     }
     // Phase4 Task6.1：compute core setup 下沉到 workload=snn。
     if (workload_) workload_->onSetup();
+    if (accel_runtime_services_) accel_runtime_services_->onSetup();
     // output_->verbose(CALL_INFO, 1, 0, "✅ SnnPE SubComponent核心%d setup完成\n", core_id_);
 }
 
@@ -1303,6 +2207,34 @@ void SnnPESubComponent::finish() {
     if (stat_pending_reqs_peak_) stat_pending_reqs_peak_->addData(pending_reqs_peak_);
     double avg_lat = (count_mem_responses_ > 0) ? ((double)accum_mem_latency_cycles_ / (double)count_mem_responses_) : 0.0;
     double utilization = (total_cycles_ > 0) ? (double)active_cycles_ / (double)total_cycles_ : 0.0;
+    uint64_t core_state_sram_reads_total = 0;
+    uint64_t core_state_sram_writes_total = 0;
+    uint64_t core_state_sram_bytes_read_total = 0;
+    uint64_t core_state_sram_bytes_write_total = 0;
+    uint64_t core_state_sram_bank_conflict_ticks_total = 0;
+    uint64_t core_state_sram_predicted_extra_cycles_total = 0;
+    uint64_t core_state_sram_resident_bytes_peak = 0;
+    uint64_t core_state_sram_bank_peak_accesses_per_tick = 0;
+    uint64_t core_state_sram_energy_read_pj_total = 0;
+    uint64_t core_state_sram_energy_write_pj_total = 0;
+    uint64_t core_state_sram_stall_cycles_total = 0;
+    const uint64_t riscv_snn_workload_selected = isRiscvSnnWorkload_() ? 1ull : 0ull;
+    uint64_t riscv_snn_firmware_elf_present = 0;
+    uint64_t riscv_snn_firmware_loaded = 0;
+    uint64_t riscv_snn_backend_runtime_bridge = 0;
+    uint64_t riscv_snn_firmware_started_count = 0;
+    uint64_t riscv_snn_submitted_commands = 0;
+    uint64_t riscv_snn_accepted_commands = 0;
+    uint64_t riscv_snn_completion_visible_count = 0;
+    uint64_t riscv_snn_completion_consumed_count = 0;
+    uint64_t riscv_snn_fused_step_completion_count = 0;
+    uint64_t riscv_snn_fault_count = 0;
+    uint64_t riscv_snn_last_completion_status = 0;
+    uint64_t riscv_snn_last_fault_csr = 0;
+    uint64_t riscv_snn_backend_runtime_bridge_provider_bound = 0;
+    if (stat_riscv_snn_workload_selected_) {
+        stat_riscv_snn_workload_selected_->addData(riscv_snn_workload_selected);
+    }
     if (!quiet_finish_logs_) {
         // 输出统计信息（使用内部计数器获得正确值）
         output_->verbose(CALL_INFO, 1, 0,
@@ -1325,6 +2257,174 @@ void SnnPESubComponent::finish() {
             "[summary] core=%d perf total_cycles=%" PRIu64 " active_cycles=%" PRIu64 " util=%.4f mem_req=%" PRIu64 " cache_hit=%" PRIu64 " cache_miss=%" PRIu64 " pending_peak=%u avg_mem_lat=%.2f\n",
             core_id_, total_cycles_, active_cycles_, utilization,
             count_memory_requests_, count_cache_hits_, count_cache_misses_, pending_reqs_peak_, avg_lat);
+    }
+    if (compute_core_) {
+        std::map<std::string, uint64_t> core_stats;
+        compute_core_->getStatistics(core_stats);
+        auto get_core_u64 = [&core_stats](const char* key) -> uint64_t {
+            if (!key) return 0;
+            auto it = core_stats.find(key);
+            if (it == core_stats.end()) return 0;
+            return it->second;
+        };
+        auto add_core_stat = [&core_stats](const char* key, Statistic<uint64_t>* st) {
+            if (!st || !key) return;
+            auto it = core_stats.find(key);
+            if (it == core_stats.end()) return;
+            if (it->second == 0) return;
+            st->addData(it->second);
+        };
+        core_state_sram_reads_total = get_core_u64("core_state_sram_reads_total");
+        core_state_sram_writes_total = get_core_u64("core_state_sram_writes_total");
+        core_state_sram_bytes_read_total = get_core_u64("core_state_sram_bytes_read_total");
+        core_state_sram_bytes_write_total = get_core_u64("core_state_sram_bytes_write_total");
+        core_state_sram_bank_conflict_ticks_total = get_core_u64("core_state_sram_bank_conflict_ticks_total");
+        core_state_sram_predicted_extra_cycles_total = get_core_u64("core_state_sram_predicted_extra_cycles_total");
+        core_state_sram_resident_bytes_peak = get_core_u64("core_state_sram_resident_bytes_peak");
+        core_state_sram_bank_peak_accesses_per_tick = get_core_u64("core_state_sram_bank_peak_accesses_per_tick");
+        core_state_sram_energy_read_pj_total = get_core_u64("core_state_sram_energy_read_pj_total");
+        core_state_sram_energy_write_pj_total = get_core_u64("core_state_sram_energy_write_pj_total");
+        core_state_sram_stall_cycles_total = get_core_u64("core_state_sram_stall_cycles_total");
+        add_core_stat("core_state_sram_reads_total", stat_core_state_sram_reads_total_);
+        add_core_stat("core_state_sram_writes_total", stat_core_state_sram_writes_total_);
+        add_core_stat("core_state_sram_bytes_read_total", stat_core_state_sram_bytes_read_total_);
+        add_core_stat("core_state_sram_bytes_write_total", stat_core_state_sram_bytes_write_total_);
+        add_core_stat("core_state_sram_bank_conflict_ticks_total", stat_core_state_sram_bank_conflict_ticks_total_);
+        add_core_stat("core_state_sram_predicted_extra_cycles_total", stat_core_state_sram_predicted_extra_cycles_total_);
+        add_core_stat("core_state_sram_resident_bytes_peak", stat_core_state_sram_resident_bytes_peak_);
+        add_core_stat("core_state_sram_bank_peak_accesses_per_tick", stat_core_state_sram_bank_peak_accesses_per_tick_);
+        add_core_stat("core_state_sram_energy_read_pj_total", stat_core_state_sram_energy_read_pj_total_);
+        add_core_stat("core_state_sram_energy_write_pj_total", stat_core_state_sram_energy_write_pj_total_);
+        add_core_stat("core_state_sram_stall_cycles_total", stat_core_state_sram_stall_cycles_total_);
+        if (workload_) {
+            std::map<std::string, uint64_t> workload_stats;
+            workload_->getStatistics(workload_stats);
+            auto get_workload_u64 = [&workload_stats](const char* key) -> uint64_t {
+                if (!key) return 0;
+                auto it = workload_stats.find(key);
+                if (it == workload_stats.end()) return 0;
+                return it->second;
+            };
+            auto add_workload_stat_allow_zero = [&workload_stats](const char* key, Statistic<uint64_t>* st) {
+                if (!st || !key) return;
+                auto it = workload_stats.find(key);
+                if (it == workload_stats.end()) return;
+                st->addData(it->second);
+            };
+            riscv_snn_firmware_elf_present = get_workload_u64("riscv_snn_firmware_elf_present");
+            riscv_snn_firmware_loaded = get_workload_u64("riscv_snn_firmware_loaded");
+            riscv_snn_backend_runtime_bridge = get_workload_u64("riscv_snn_backend_runtime_bridge");
+            riscv_snn_firmware_started_count = get_workload_u64("riscv_snn_firmware_started_count");
+            riscv_snn_submitted_commands = get_workload_u64("riscv_snn_submitted_commands");
+            riscv_snn_accepted_commands = get_workload_u64("riscv_snn_accepted_commands");
+            riscv_snn_completion_visible_count = get_workload_u64("riscv_snn_completion_visible_count");
+            riscv_snn_completion_consumed_count = get_workload_u64("riscv_snn_completion_consumed_count");
+            riscv_snn_fused_step_completion_count = get_workload_u64("riscv_snn_fused_step_completion_count");
+            riscv_snn_fault_count = get_workload_u64("riscv_snn_fault_count");
+            riscv_snn_last_completion_status = get_workload_u64("riscv_snn_last_completion_status");
+            riscv_snn_last_fault_csr = get_workload_u64("riscv_snn_last_fault_csr");
+            riscv_snn_backend_runtime_bridge_provider_bound = get_workload_u64("riscv_snn_backend_runtime_bridge_provider_bound");
+            add_workload_stat_allow_zero("riscv_snn_firmware_elf_present", stat_riscv_snn_firmware_elf_present_);
+            add_workload_stat_allow_zero("riscv_snn_firmware_loaded", stat_riscv_snn_firmware_loaded_);
+            add_workload_stat_allow_zero("riscv_snn_backend_runtime_bridge", stat_riscv_snn_backend_runtime_bridge_);
+            add_workload_stat_allow_zero("riscv_snn_firmware_started_count", stat_riscv_snn_firmware_started_count_);
+            add_workload_stat_allow_zero("riscv_snn_submitted_commands", stat_riscv_snn_submitted_commands_);
+            add_workload_stat_allow_zero("riscv_snn_accepted_commands", stat_riscv_snn_accepted_commands_);
+            add_workload_stat_allow_zero("riscv_snn_completion_visible_count", stat_riscv_snn_completion_visible_count_);
+            add_workload_stat_allow_zero("riscv_snn_completion_consumed_count", stat_riscv_snn_completion_consumed_count_);
+            add_workload_stat_allow_zero("riscv_snn_fused_step_completion_count", stat_riscv_snn_fused_step_completion_count_);
+            add_workload_stat_allow_zero("riscv_snn_fault_count", stat_riscv_snn_fault_count_);
+            add_workload_stat_allow_zero("riscv_snn_last_completion_status", stat_riscv_snn_last_completion_status_);
+            add_workload_stat_allow_zero("riscv_snn_last_fault_csr", stat_riscv_snn_last_fault_csr_);
+            add_workload_stat_allow_zero("riscv_snn_backend_runtime_bridge_provider_bound", stat_riscv_snn_backend_runtime_bridge_provider_bound_);
+        }
+    } else if (workload_) {
+        std::map<std::string, uint64_t> core_stats;
+        workload_->getStatistics(core_stats);
+        auto get_core_u64 = [&core_stats](const char* key) -> uint64_t {
+            if (!key) return 0;
+            auto it = core_stats.find(key);
+            if (it == core_stats.end()) return 0;
+            return it->second;
+        };
+        auto add_core_stat = [&core_stats](const char* key, Statistic<uint64_t>* st) {
+            if (!st || !key) return;
+            auto it = core_stats.find(key);
+            if (it == core_stats.end()) return;
+            if (it->second == 0) return;
+            st->addData(it->second);
+        };
+        auto add_core_stat_allow_zero = [&core_stats](const char* key, Statistic<uint64_t>* st) {
+            if (!st || !key) return;
+            auto it = core_stats.find(key);
+            if (it == core_stats.end()) return;
+            st->addData(it->second);
+        };
+        core_state_sram_reads_total = get_core_u64("core_state_sram_reads_total");
+        core_state_sram_writes_total = get_core_u64("core_state_sram_writes_total");
+        core_state_sram_bytes_read_total = get_core_u64("core_state_sram_bytes_read_total");
+        core_state_sram_bytes_write_total = get_core_u64("core_state_sram_bytes_write_total");
+        core_state_sram_bank_conflict_ticks_total = get_core_u64("core_state_sram_bank_conflict_ticks_total");
+        core_state_sram_predicted_extra_cycles_total = get_core_u64("core_state_sram_predicted_extra_cycles_total");
+        core_state_sram_resident_bytes_peak = get_core_u64("core_state_sram_resident_bytes_peak");
+        core_state_sram_bank_peak_accesses_per_tick = get_core_u64("core_state_sram_bank_peak_accesses_per_tick");
+        core_state_sram_energy_read_pj_total = get_core_u64("core_state_sram_energy_read_pj_total");
+        core_state_sram_energy_write_pj_total = get_core_u64("core_state_sram_energy_write_pj_total");
+        core_state_sram_stall_cycles_total = get_core_u64("core_state_sram_stall_cycles_total");
+        add_core_stat("core_state_sram_reads_total", stat_core_state_sram_reads_total_);
+        add_core_stat("core_state_sram_writes_total", stat_core_state_sram_writes_total_);
+        add_core_stat("core_state_sram_bytes_read_total", stat_core_state_sram_bytes_read_total_);
+        add_core_stat("core_state_sram_bytes_write_total", stat_core_state_sram_bytes_write_total_);
+        add_core_stat("core_state_sram_bank_conflict_ticks_total", stat_core_state_sram_bank_conflict_ticks_total_);
+        add_core_stat("core_state_sram_predicted_extra_cycles_total", stat_core_state_sram_predicted_extra_cycles_total_);
+        add_core_stat("core_state_sram_resident_bytes_peak", stat_core_state_sram_resident_bytes_peak_);
+        add_core_stat("core_state_sram_bank_peak_accesses_per_tick", stat_core_state_sram_bank_peak_accesses_per_tick_);
+        add_core_stat("core_state_sram_energy_read_pj_total", stat_core_state_sram_energy_read_pj_total_);
+        add_core_stat("core_state_sram_energy_write_pj_total", stat_core_state_sram_energy_write_pj_total_);
+        add_core_stat("core_state_sram_stall_cycles_total", stat_core_state_sram_stall_cycles_total_);
+        riscv_snn_firmware_elf_present = get_core_u64("riscv_snn_firmware_elf_present");
+        riscv_snn_firmware_loaded = get_core_u64("riscv_snn_firmware_loaded");
+        riscv_snn_backend_runtime_bridge = get_core_u64("riscv_snn_backend_runtime_bridge");
+        riscv_snn_firmware_started_count = get_core_u64("riscv_snn_firmware_started_count");
+        riscv_snn_submitted_commands = get_core_u64("riscv_snn_submitted_commands");
+        riscv_snn_accepted_commands = get_core_u64("riscv_snn_accepted_commands");
+        riscv_snn_completion_visible_count = get_core_u64("riscv_snn_completion_visible_count");
+        riscv_snn_completion_consumed_count = get_core_u64("riscv_snn_completion_consumed_count");
+        riscv_snn_fused_step_completion_count = get_core_u64("riscv_snn_fused_step_completion_count");
+        riscv_snn_fault_count = get_core_u64("riscv_snn_fault_count");
+        riscv_snn_last_completion_status = get_core_u64("riscv_snn_last_completion_status");
+        riscv_snn_last_fault_csr = get_core_u64("riscv_snn_last_fault_csr");
+        riscv_snn_backend_runtime_bridge_provider_bound = get_core_u64("riscv_snn_backend_runtime_bridge_provider_bound");
+        add_core_stat_allow_zero("riscv_snn_firmware_elf_present", stat_riscv_snn_firmware_elf_present_);
+        add_core_stat_allow_zero("riscv_snn_firmware_loaded", stat_riscv_snn_firmware_loaded_);
+        add_core_stat_allow_zero("riscv_snn_backend_runtime_bridge", stat_riscv_snn_backend_runtime_bridge_);
+        add_core_stat_allow_zero("riscv_snn_firmware_started_count", stat_riscv_snn_firmware_started_count_);
+        add_core_stat_allow_zero("riscv_snn_submitted_commands", stat_riscv_snn_submitted_commands_);
+        add_core_stat_allow_zero("riscv_snn_accepted_commands", stat_riscv_snn_accepted_commands_);
+        add_core_stat_allow_zero("riscv_snn_completion_visible_count", stat_riscv_snn_completion_visible_count_);
+        add_core_stat_allow_zero("riscv_snn_completion_consumed_count", stat_riscv_snn_completion_consumed_count_);
+        add_core_stat_allow_zero("riscv_snn_fused_step_completion_count", stat_riscv_snn_fused_step_completion_count_);
+        add_core_stat_allow_zero("riscv_snn_fault_count", stat_riscv_snn_fault_count_);
+        add_core_stat_allow_zero("riscv_snn_last_completion_status", stat_riscv_snn_last_completion_status_);
+        add_core_stat_allow_zero("riscv_snn_last_fault_csr", stat_riscv_snn_last_fault_csr_);
+        add_core_stat_allow_zero("riscv_snn_backend_runtime_bridge_provider_bound", stat_riscv_snn_backend_runtime_bridge_provider_bound_);
+        if (auto* mc_pe = dynamic_cast<MultiCorePE*>(parent_pe_cached_)) {
+            mc_pe->accumulateRiscvSnnRuntimeStats(
+                riscv_snn_workload_selected,
+                riscv_snn_firmware_elf_present,
+                riscv_snn_firmware_loaded,
+                riscv_snn_backend_runtime_bridge,
+                riscv_snn_firmware_started_count,
+                riscv_snn_submitted_commands,
+                riscv_snn_accepted_commands,
+                riscv_snn_completion_visible_count,
+                riscv_snn_completion_consumed_count,
+                riscv_snn_fused_step_completion_count,
+                riscv_snn_fault_count,
+                riscv_snn_last_completion_status,
+                riscv_snn_last_fault_csr,
+                riscv_snn_backend_runtime_bridge_provider_bound);
+        }
     }
 
 #ifdef SNNDL_ENABLE_PROFILING
@@ -1353,85 +2453,923 @@ void SnnPESubComponent::finish() {
         }
     }
     if (workload_) workload_->onFinish();
+    if (accel_runtime_services_) accel_runtime_services_->onFinish();
+
+    if (weight_mem_subsystem_) {
+        const auto exp_noc_rowidx = weight_mem_subsystem_->experimentalNocRowidxStats();
+        if (stat_exp_noc_rowidx_prefetch_rows_total_) {
+            stat_exp_noc_rowidx_prefetch_rows_total_->addData(exp_noc_rowidx.prefetch_rows_issued);
+        }
+        if (stat_exp_noc_rowidx_prefetch_bytes_total_) {
+            stat_exp_noc_rowidx_prefetch_bytes_total_->addData(exp_noc_rowidx.prefetch_bytes_issued);
+        }
+        if (stat_exp_noc_rowidx_prefetch_rows_deferred_total_) {
+            stat_exp_noc_rowidx_prefetch_rows_deferred_total_->addData(exp_noc_rowidx.prefetch_rows_deferred);
+        }
+        if (stat_exp_noc_rowidx_prefetch_rows_failed_total_) {
+            stat_exp_noc_rowidx_prefetch_rows_failed_total_->addData(exp_noc_rowidx.prefetch_rows_failed);
+        }
+        if (stat_exp_noc_rowidx_cache_hits_total_) {
+            stat_exp_noc_rowidx_cache_hits_total_->addData(exp_noc_rowidx.cache_hits);
+        }
+        if (stat_exp_noc_rowidx_cache_misses_total_) {
+            stat_exp_noc_rowidx_cache_misses_total_->addData(exp_noc_rowidx.cache_misses);
+        }
+        if (stat_exp_noc_rowidx_cache_fills_total_) {
+            stat_exp_noc_rowidx_cache_fills_total_->addData(exp_noc_rowidx.cache_fills);
+        }
+        if (stat_exp_noc_rowidx_cache_full_drop_total_) {
+            stat_exp_noc_rowidx_cache_full_drop_total_->addData(exp_noc_rowidx.cache_full_drop);
+        }
+        if (stat_exp_noc_rowidx_cache_entries_final_) {
+            stat_exp_noc_rowidx_cache_entries_final_->addData(exp_noc_rowidx.cache_entries);
+        }
+        if (stat_exp_noc_rowidx_touch_rows_total_) {
+            stat_exp_noc_rowidx_touch_rows_total_->addData(exp_noc_rowidx.rows_touched_enqueued);
+        }
+        if (stat_exp_noc_rowidx_touch_events_total_) {
+            stat_exp_noc_rowidx_touch_events_total_->addData(exp_noc_rowidx.touch_events_total);
+        }
+        if (stat_exp_noc_rowidx_rows_filtered_cold_total_) {
+            stat_exp_noc_rowidx_rows_filtered_cold_total_->addData(exp_noc_rowidx.rows_filtered_cold);
+        }
+        if (stat_exp_noc_rowidx_carry_apply_pending_rows_total_) {
+            stat_exp_noc_rowidx_carry_apply_pending_rows_total_->addData(
+                exp_noc_rowidx.carry_apply_pending_rows_total);
+        }
+        if (stat_exp_noc_rowidx_drain_skip_phase_gather_total_) {
+            stat_exp_noc_rowidx_drain_skip_phase_gather_total_->addData(
+                exp_noc_rowidx.drain_skip_phase_gather_total);
+        }
+        if (stat_exp_noc_rowidx_drain_skip_phase_apply_disabled_total_) {
+            stat_exp_noc_rowidx_drain_skip_phase_apply_disabled_total_->addData(
+                exp_noc_rowidx.drain_skip_phase_apply_disabled_total);
+        }
+        if (stat_exp_noc_rowidx_drain_skip_no_pending_total_) {
+            stat_exp_noc_rowidx_drain_skip_no_pending_total_->addData(
+                exp_noc_rowidx.drain_skip_no_pending_total);
+        }
+        if (stat_exp_noc_rowidx_drain_skip_loader_not_ready_total_) {
+            stat_exp_noc_rowidx_drain_skip_loader_not_ready_total_->addData(
+                exp_noc_rowidx.drain_skip_loader_not_ready_total);
+        }
+        if (stat_exp_noc_rowidx_drain_skip_rowptr_not_ready_total_) {
+            stat_exp_noc_rowidx_drain_skip_rowptr_not_ready_total_->addData(
+                exp_noc_rowidx.drain_skip_rowptr_not_ready_total);
+        }
+        if (stat_exp_noc_rowidx_drain_skip_budget_zero_total_) {
+            stat_exp_noc_rowidx_drain_skip_budget_zero_total_->addData(
+                exp_noc_rowidx.drain_skip_budget_zero_total);
+        }
+        if (stat_exp_noc_rowidx_drain_skip_cache_hit_total_) {
+            stat_exp_noc_rowidx_drain_skip_cache_hit_total_->addData(
+                exp_noc_rowidx.drain_skip_cache_hit_total);
+        }
+        if (stat_exp_noc_rowidx_drain_skip_detached_inflight_total_) {
+            stat_exp_noc_rowidx_drain_skip_detached_inflight_total_->addData(
+                exp_noc_rowidx.drain_skip_detached_inflight_total);
+        }
+        if (stat_exp_noc_rowidx_drain_skip_colidx_inflight_total_) {
+            stat_exp_noc_rowidx_drain_skip_colidx_inflight_total_->addData(
+                exp_noc_rowidx.drain_skip_colidx_inflight_total);
+        }
+        if (stat_exp_noc_rowidx_drain_skip_empty_row_total_) {
+            stat_exp_noc_rowidx_drain_skip_empty_row_total_->addData(
+                exp_noc_rowidx.drain_skip_empty_row_total);
+        }
+        if (stat_exp_noc_rowidx_budget_ticks_total_) {
+            stat_exp_noc_rowidx_budget_ticks_total_->addData(exp_noc_rowidx.budget_ticks_total);
+        }
+        if (stat_exp_noc_rowidx_budget_effective_total_) {
+            stat_exp_noc_rowidx_budget_effective_total_->addData(exp_noc_rowidx.budget_effective_total);
+        }
+        if (stat_exp_noc_rowidx_budget_adapt_ticks_total_) {
+            stat_exp_noc_rowidx_budget_adapt_ticks_total_->addData(exp_noc_rowidx.budget_adapt_ticks);
+        }
+        if (stat_exp_noc_rowidx_detached_demand_join_total_) {
+            stat_exp_noc_rowidx_detached_demand_join_total_->addData(
+                exp_noc_rowidx.detached_demand_join_total);
+        }
+        if (stat_exp_noc_rowidx_detached_demand_waiters_resolved_total_) {
+            stat_exp_noc_rowidx_detached_demand_waiters_resolved_total_->addData(
+                exp_noc_rowidx.detached_demand_waiters_resolved_total);
+        }
+        if (stat_exp_noc_rowidx_detached_demand_fallback_zero_total_) {
+            stat_exp_noc_rowidx_detached_demand_fallback_zero_total_->addData(
+                exp_noc_rowidx.detached_demand_fallback_zero_total);
+        }
+        if (stat_exp_noc_rowidx_detached_demand_ready_signal_total_) {
+            stat_exp_noc_rowidx_detached_demand_ready_signal_total_->addData(
+                exp_noc_rowidx.detached_demand_ready_signal_total);
+        }
+        if (stat_exp_noc_rowidx_detached_demand_ready_transition_total_) {
+            stat_exp_noc_rowidx_detached_demand_ready_transition_total_->addData(
+                exp_noc_rowidx.detached_demand_ready_transition_total);
+        }
+        const auto pulse_metadata_txn = weight_mem_subsystem_->pulseOsaMetadataTxnStats();
+        if (auto* mc_pe = dynamic_cast<MultiCorePE*>(parent_pe_cached_)) {
+            mc_pe->recordPulseOsaMetadataTxnObservability(pulse_metadata_txn);
+        }
+        if (stat_pulse_metadata_txn_export_total_) {
+            stat_pulse_metadata_txn_export_total_->addData(
+                pulse_metadata_txn.export_total);
+        }
+        if (stat_pulse_metadata_txn_owner_launch_total_) {
+            stat_pulse_metadata_txn_owner_launch_total_->addData(
+                pulse_metadata_txn.owner_launch_total);
+        }
+        if (stat_pulse_metadata_txn_join_live_total_) {
+            stat_pulse_metadata_txn_join_live_total_->addData(
+                pulse_metadata_txn.join_live_total);
+        }
+        if (stat_pulse_metadata_txn_join_ready_total_) {
+            stat_pulse_metadata_txn_join_ready_total_->addData(
+                pulse_metadata_txn.join_ready_total);
+        }
+        if (stat_pulse_metadata_txn_late_join_total_) {
+            stat_pulse_metadata_txn_late_join_total_->addData(
+                pulse_metadata_txn.late_join_total);
+        }
+        if (stat_pulse_metadata_txn_ready_lease_hit_total_) {
+            stat_pulse_metadata_txn_ready_lease_hit_total_->addData(
+                pulse_metadata_txn.ready_lease_hit_total);
+        }
+        if (stat_pulse_metadata_txn_ready_lease_expired_total_) {
+            stat_pulse_metadata_txn_ready_lease_expired_total_->addData(
+                pulse_metadata_txn.ready_lease_expired_total);
+        }
+        if (stat_pulse_metadata_txn_envelope_size_sum_total_) {
+            stat_pulse_metadata_txn_envelope_size_sum_total_->addData(
+                pulse_metadata_txn.envelope_size_sum_total);
+        }
+        if (stat_pulse_metadata_frontier_observed_total_) {
+            stat_pulse_metadata_frontier_observed_total_->addData(
+                pulse_metadata_txn.frontier_observed_total);
+        }
+        if (stat_pulse_metadata_frontier_same_window_reobserve_total_) {
+            stat_pulse_metadata_frontier_same_window_reobserve_total_->addData(
+                pulse_metadata_txn.frontier_same_window_reobserve_total);
+        }
+        if (stat_pulse_metadata_frontier_owner_form_candidate_total_) {
+            stat_pulse_metadata_frontier_owner_form_candidate_total_->addData(
+                pulse_metadata_txn.frontier_owner_form_candidate_total);
+        }
+        if (stat_pulse_metadata_frontier_join_ready_candidate_total_) {
+            stat_pulse_metadata_frontier_join_ready_candidate_total_->addData(
+                pulse_metadata_txn.frontier_join_ready_candidate_total);
+        }
+        if (stat_pulse_metadata_frontier_premphf_base_observed_total_) {
+            stat_pulse_metadata_frontier_premphf_base_observed_total_->addData(
+                pulse_metadata_txn.frontier_premphf_base_observed_total);
+        }
+        if (stat_pulse_metadata_frontier_premphf_base_same_window_reobserve_total_) {
+            stat_pulse_metadata_frontier_premphf_base_same_window_reobserve_total_->addData(
+                pulse_metadata_txn.frontier_premphf_base_same_window_reobserve_total);
+        }
+        if (stat_pulse_metadata_frontier_premphf_base_owner_form_candidate_total_) {
+            stat_pulse_metadata_frontier_premphf_base_owner_form_candidate_total_->addData(
+                pulse_metadata_txn.frontier_premphf_base_owner_form_candidate_total);
+        }
+        if (stat_pulse_metadata_frontier_premphf_base_join_ready_candidate_total_) {
+            stat_pulse_metadata_frontier_premphf_base_join_ready_candidate_total_->addData(
+                pulse_metadata_txn.frontier_premphf_base_join_ready_candidate_total);
+        }
+        if (stat_pulse_metadata_frontier_premphf_band_observed_total_) {
+            stat_pulse_metadata_frontier_premphf_band_observed_total_->addData(
+                pulse_metadata_txn.frontier_premphf_band_observed_total);
+        }
+        if (stat_pulse_metadata_frontier_premphf_band_same_window_reobserve_total_) {
+            stat_pulse_metadata_frontier_premphf_band_same_window_reobserve_total_->addData(
+                pulse_metadata_txn.frontier_premphf_band_same_window_reobserve_total);
+        }
+        if (stat_pulse_metadata_frontier_premphf_band_owner_form_candidate_total_) {
+            stat_pulse_metadata_frontier_premphf_band_owner_form_candidate_total_->addData(
+                pulse_metadata_txn.frontier_premphf_band_owner_form_candidate_total);
+        }
+        if (stat_pulse_metadata_frontier_premphf_band_join_ready_candidate_total_) {
+            stat_pulse_metadata_frontier_premphf_band_join_ready_candidate_total_->addData(
+                pulse_metadata_txn.frontier_premphf_band_join_ready_candidate_total);
+        }
+        if (stat_pulse_metadata_frontier_idx2row_observed_total_) {
+            stat_pulse_metadata_frontier_idx2row_observed_total_->addData(
+                pulse_metadata_txn.frontier_idx2row_observed_total);
+        }
+        if (stat_pulse_metadata_frontier_idx2row_same_window_reobserve_total_) {
+            stat_pulse_metadata_frontier_idx2row_same_window_reobserve_total_->addData(
+                pulse_metadata_txn.frontier_idx2row_same_window_reobserve_total);
+        }
+        if (stat_pulse_metadata_frontier_idx2row_owner_form_candidate_total_) {
+            stat_pulse_metadata_frontier_idx2row_owner_form_candidate_total_->addData(
+                pulse_metadata_txn.frontier_idx2row_owner_form_candidate_total);
+        }
+        if (stat_pulse_metadata_frontier_idx2row_join_ready_candidate_total_) {
+            stat_pulse_metadata_frontier_idx2row_join_ready_candidate_total_->addData(
+                pulse_metadata_txn.frontier_idx2row_join_ready_candidate_total);
+        }
+        if (stat_pulse_metadata_frontier_rowindex_observed_total_) {
+            stat_pulse_metadata_frontier_rowindex_observed_total_->addData(
+                pulse_metadata_txn.frontier_rowindex_observed_total);
+        }
+        if (stat_pulse_metadata_frontier_rowindex_same_window_reobserve_total_) {
+            stat_pulse_metadata_frontier_rowindex_same_window_reobserve_total_->addData(
+                pulse_metadata_txn.frontier_rowindex_same_window_reobserve_total);
+        }
+        if (stat_pulse_metadata_frontier_rowindex_owner_form_candidate_total_) {
+            stat_pulse_metadata_frontier_rowindex_owner_form_candidate_total_->addData(
+                pulse_metadata_txn.frontier_rowindex_owner_form_candidate_total);
+        }
+        if (stat_pulse_metadata_frontier_rowindex_join_ready_candidate_total_) {
+            stat_pulse_metadata_frontier_rowindex_join_ready_candidate_total_->addData(
+                pulse_metadata_txn.frontier_rowindex_join_ready_candidate_total);
+        }
+        const auto atlas_census = weight_mem_subsystem_->experimentalPeAtlasObjectCensus();
+        if (stat_atlas_census_premphf_base_frontier_events_total_) {
+            stat_atlas_census_premphf_base_frontier_events_total_->addData(
+                atlas_census.premphf_base.frontier_events_total);
+        }
+        if (stat_atlas_census_premphf_base_producer_events_total_) {
+            stat_atlas_census_premphf_base_producer_events_total_->addData(
+                atlas_census.premphf_base.producer_events_total);
+        }
+        if (stat_atlas_census_premphf_base_gate_events_total_) {
+            stat_atlas_census_premphf_base_gate_events_total_->addData(
+                atlas_census.premphf_base.gate_events_total);
+        }
+        if (stat_atlas_census_premphf_base_service_events_total_) {
+            stat_atlas_census_premphf_base_service_events_total_->addData(
+                atlas_census.premphf_base.service_events_total);
+        }
+        if (stat_atlas_census_premphf_band_frontier_events_total_) {
+            stat_atlas_census_premphf_band_frontier_events_total_->addData(
+                atlas_census.premphf_band.frontier_events_total);
+        }
+        if (stat_atlas_census_premphf_band_producer_events_total_) {
+            stat_atlas_census_premphf_band_producer_events_total_->addData(
+                atlas_census.premphf_band.producer_events_total);
+        }
+        if (stat_atlas_census_premphf_band_gate_events_total_) {
+            stat_atlas_census_premphf_band_gate_events_total_->addData(
+                atlas_census.premphf_band.gate_events_total);
+        }
+        if (stat_atlas_census_premphf_band_service_events_total_) {
+            stat_atlas_census_premphf_band_service_events_total_->addData(
+                atlas_census.premphf_band.service_events_total);
+        }
+        if (stat_atlas_census_idx2row_frontier_events_total_) {
+            stat_atlas_census_idx2row_frontier_events_total_->addData(
+                atlas_census.idx2row.frontier_events_total);
+        }
+        if (stat_atlas_census_idx2row_producer_events_total_) {
+            stat_atlas_census_idx2row_producer_events_total_->addData(
+                atlas_census.idx2row.producer_events_total);
+        }
+        if (stat_atlas_census_idx2row_gate_events_total_) {
+            stat_atlas_census_idx2row_gate_events_total_->addData(
+                atlas_census.idx2row.gate_events_total);
+        }
+        if (stat_atlas_census_idx2row_service_events_total_) {
+            stat_atlas_census_idx2row_service_events_total_->addData(
+                atlas_census.idx2row.service_events_total);
+        }
+        if (stat_atlas_census_rowindex_frontier_events_total_) {
+            stat_atlas_census_rowindex_frontier_events_total_->addData(
+                atlas_census.rowindex.frontier_events_total);
+        }
+        if (stat_atlas_census_rowindex_producer_events_total_) {
+            stat_atlas_census_rowindex_producer_events_total_->addData(
+                atlas_census.rowindex.producer_events_total);
+        }
+        if (stat_atlas_census_rowindex_gate_events_total_) {
+            stat_atlas_census_rowindex_gate_events_total_->addData(
+                atlas_census.rowindex.gate_events_total);
+        }
+        if (stat_atlas_census_rowindex_service_events_total_) {
+            stat_atlas_census_rowindex_service_events_total_->addData(
+                atlas_census.rowindex.service_events_total);
+        }
+        if (stat_atlas_census_rowdescriptor_frontier_events_total_) {
+            stat_atlas_census_rowdescriptor_frontier_events_total_->addData(
+                atlas_census.rowdescriptor.frontier_events_total);
+        }
+        if (stat_atlas_census_rowdescriptor_producer_events_total_) {
+            stat_atlas_census_rowdescriptor_producer_events_total_->addData(
+                atlas_census.rowdescriptor.producer_events_total);
+        }
+        if (stat_atlas_census_rowdescriptor_gate_events_total_) {
+            stat_atlas_census_rowdescriptor_gate_events_total_->addData(
+                atlas_census.rowdescriptor.gate_events_total);
+        }
+        if (stat_atlas_census_rowdescriptor_service_events_total_) {
+            stat_atlas_census_rowdescriptor_service_events_total_->addData(
+                atlas_census.rowdescriptor.service_events_total);
+        }
+        const auto atlas_rowindex_ledger =
+            weight_mem_subsystem_->experimentalPeAtlasRowIndexLifecycleLedger();
+        if (stat_atlas_proxy_rowindex_materialize_total_) {
+            stat_atlas_proxy_rowindex_materialize_total_->addData(
+                atlas_rowindex_ledger.materialize_total);
+        }
+        if (stat_atlas_proxy_rowindex_publicize_total_) {
+            stat_atlas_proxy_rowindex_publicize_total_->addData(
+                atlas_rowindex_ledger.publicize_total);
+        }
+        if (stat_atlas_proxy_rowindex_owner_form_total_) {
+            stat_atlas_proxy_rowindex_owner_form_total_->addData(
+                atlas_rowindex_ledger.owner_form_total);
+        }
+        if (stat_atlas_proxy_rowindex_join_live_total_) {
+            stat_atlas_proxy_rowindex_join_live_total_->addData(
+                atlas_rowindex_ledger.join_live_total);
+        }
+        if (stat_atlas_proxy_rowindex_join_ready_total_) {
+            stat_atlas_proxy_rowindex_join_ready_total_->addData(
+                atlas_rowindex_ledger.join_ready_total);
+        }
+        if (stat_atlas_proxy_rowindex_ready_total_) {
+            stat_atlas_proxy_rowindex_ready_total_->addData(
+                atlas_rowindex_ledger.ready_total);
+        }
+        if (stat_atlas_proxy_rowindex_release_total_) {
+            stat_atlas_proxy_rowindex_release_total_->addData(
+                atlas_rowindex_ledger.release_total);
+        }
+        if (stat_atlas_proxy_rowindex_release_missing_total_) {
+            stat_atlas_proxy_rowindex_release_missing_total_->addData(
+                atlas_rowindex_ledger.release_missing_total);
+        }
+        if (stat_atlas_proxy_rowindex_fallback_total_) {
+            stat_atlas_proxy_rowindex_fallback_total_->addData(
+                atlas_rowindex_ledger.fallback_total);
+        }
+        const auto atlas_idx2row_ledger =
+            weight_mem_subsystem_->experimentalPeAtlasIdx2RowLifecycleLedger();
+        if (stat_atlas_proxy_idx2row_materialize_total_) {
+            stat_atlas_proxy_idx2row_materialize_total_->addData(
+                atlas_idx2row_ledger.materialize_total);
+        }
+        if (stat_atlas_proxy_idx2row_publicize_total_) {
+            stat_atlas_proxy_idx2row_publicize_total_->addData(
+                atlas_idx2row_ledger.publicize_total);
+        }
+        if (stat_atlas_proxy_idx2row_owner_form_total_) {
+            stat_atlas_proxy_idx2row_owner_form_total_->addData(
+                atlas_idx2row_ledger.owner_form_total);
+        }
+        if (stat_atlas_proxy_idx2row_join_live_total_) {
+            stat_atlas_proxy_idx2row_join_live_total_->addData(
+                atlas_idx2row_ledger.join_live_total);
+        }
+        if (stat_atlas_proxy_idx2row_join_ready_total_) {
+            stat_atlas_proxy_idx2row_join_ready_total_->addData(
+                atlas_idx2row_ledger.join_ready_total);
+        }
+        if (stat_atlas_proxy_idx2row_ready_total_) {
+            stat_atlas_proxy_idx2row_ready_total_->addData(
+                atlas_idx2row_ledger.ready_total);
+        }
+        if (stat_atlas_proxy_idx2row_release_total_) {
+            stat_atlas_proxy_idx2row_release_total_->addData(
+                atlas_idx2row_ledger.release_total);
+        }
+        if (stat_atlas_proxy_idx2row_release_missing_total_) {
+            stat_atlas_proxy_idx2row_release_missing_total_->addData(
+                atlas_idx2row_ledger.release_missing_total);
+        }
+        if (stat_atlas_proxy_idx2row_fallback_total_) {
+            stat_atlas_proxy_idx2row_fallback_total_->addData(
+                atlas_idx2row_ledger.fallback_total);
+        }
+        const auto atlas_premphf_base_ledger =
+            weight_mem_subsystem_->experimentalPeAtlasPreMphfBaseProxyLedger();
+        if (stat_atlas_proxy_premphf_base_materialize_total_) {
+            stat_atlas_proxy_premphf_base_materialize_total_->addData(
+                atlas_premphf_base_ledger.materialize_total);
+        }
+        if (stat_atlas_proxy_premphf_base_publicize_total_) {
+            stat_atlas_proxy_premphf_base_publicize_total_->addData(
+                atlas_premphf_base_ledger.publicize_total);
+        }
+        if (stat_atlas_proxy_premphf_base_owner_form_total_) {
+            stat_atlas_proxy_premphf_base_owner_form_total_->addData(
+                atlas_premphf_base_ledger.owner_form_total);
+        }
+        if (stat_atlas_proxy_premphf_base_shared_hit_total_) {
+            stat_atlas_proxy_premphf_base_shared_hit_total_->addData(
+                atlas_premphf_base_ledger.shared_hit_total);
+        }
+        if (stat_atlas_proxy_premphf_base_lookup_ready_total_) {
+            stat_atlas_proxy_premphf_base_lookup_ready_total_->addData(
+                atlas_premphf_base_ledger.lookup_ready_total);
+        }
+        if (stat_atlas_proxy_premphf_base_proxy_only_gap_total_) {
+            stat_atlas_proxy_premphf_base_proxy_only_gap_total_->addData(
+                atlas_premphf_base_ledger.proxy_only_gap_total);
+        }
+        const auto atlas_premphf_band_ledger =
+            weight_mem_subsystem_->experimentalPeAtlasPreMphfBandProxyLedger();
+        const auto atlas_phase_ledger =
+            weight_mem_subsystem_->experimentalPeAtlasPhaseStats();
+        const auto atlas_pod_runtime =
+            weight_mem_subsystem_->peInternalPodStats();
+        if (stat_atlas_proxy_premphf_band_materialize_total_) {
+            stat_atlas_proxy_premphf_band_materialize_total_->addData(
+                atlas_premphf_band_ledger.materialize_total);
+        }
+        if (stat_atlas_proxy_premphf_band_publicize_total_) {
+            stat_atlas_proxy_premphf_band_publicize_total_->addData(
+                atlas_premphf_band_ledger.publicize_total);
+        }
+        if (stat_atlas_proxy_premphf_band_owner_form_candidate_total_) {
+            stat_atlas_proxy_premphf_band_owner_form_candidate_total_->addData(
+                atlas_premphf_band_ledger.owner_form_candidate_total);
+        }
+        if (stat_atlas_proxy_premphf_band_join_ready_candidate_total_) {
+            stat_atlas_proxy_premphf_band_join_ready_candidate_total_->addData(
+                atlas_premphf_band_ledger.join_ready_candidate_total);
+        }
+        if (stat_atlas_proxy_premphf_band_zero_service_total_) {
+            stat_atlas_proxy_premphf_band_zero_service_total_->addData(
+                atlas_premphf_band_ledger.zero_service_total);
+        }
+        if (auto* mc_pe = dynamic_cast<MultiCorePE*>(parent_pe_cached_)) {
+            mc_pe->recordAtlasObjectObservability(
+                atlas_census,
+                atlas_rowindex_ledger,
+                atlas_idx2row_ledger,
+                atlas_premphf_base_ledger,
+                atlas_premphf_band_ledger,
+                atlas_phase_ledger,
+                atlas_pod_runtime);
+        }
+        weight_mem_subsystem_->flushSramObservability(static_cast<uint64_t>(total_cycles_));
+        const auto weight_sram = weight_mem_subsystem_->sramObservabilityStats();
+        if (stat_weight_idx_sram_reads_total_) {
+            stat_weight_idx_sram_reads_total_->addData(weight_sram.idx_sram.reads_total);
+        }
+        if (stat_weight_idx_sram_writes_total_) {
+            stat_weight_idx_sram_writes_total_->addData(weight_sram.idx_sram.writes_total);
+        }
+        if (stat_weight_idx_sram_bytes_read_total_) {
+            stat_weight_idx_sram_bytes_read_total_->addData(weight_sram.idx_sram.bytes_read_total);
+        }
+        if (stat_weight_idx_sram_bytes_write_total_) {
+            stat_weight_idx_sram_bytes_write_total_->addData(weight_sram.idx_sram.bytes_write_total);
+        }
+        if (stat_weight_idx_sram_bank_conflict_ticks_total_) {
+            stat_weight_idx_sram_bank_conflict_ticks_total_->addData(weight_sram.idx_sram.bank_conflict_ticks_total);
+        }
+        if (stat_weight_idx_sram_predicted_extra_cycles_total_) {
+            stat_weight_idx_sram_predicted_extra_cycles_total_->addData(weight_sram.idx_sram.predicted_extra_cycles_total);
+        }
+        if (stat_weight_idx_sram_resident_bytes_peak_) {
+            stat_weight_idx_sram_resident_bytes_peak_->addData(weight_sram.idx_sram.resident_bytes_peak);
+        }
+        if (stat_weight_idx_sram_bank_peak_accesses_per_tick_) {
+            stat_weight_idx_sram_bank_peak_accesses_per_tick_->addData(weight_sram.idx_sram.bank_peak_accesses_per_tick);
+        }
+        if (stat_weight_idx_sram_energy_read_pj_total_) {
+            stat_weight_idx_sram_energy_read_pj_total_->addData(static_cast<uint64_t>(weight_sram.idx_sram.energy_read_pj_total));
+        }
+        if (stat_weight_idx_sram_energy_write_pj_total_) {
+            stat_weight_idx_sram_energy_write_pj_total_->addData(static_cast<uint64_t>(weight_sram.idx_sram.energy_write_pj_total));
+        }
+        if (stat_weight_idx_lookup_total_) {
+            stat_weight_idx_lookup_total_->addData(weight_sram.idx_lookup_total);
+        }
+        if (stat_weight_idx_lookup_idx2_total_) {
+            stat_weight_idx_lookup_idx2_total_->addData(weight_sram.idx_lookup_idx2_total);
+        }
+        if (stat_weight_l0_sram_reads_total_) {
+            stat_weight_l0_sram_reads_total_->addData(weight_sram.l0_sram.reads_total);
+        }
+        if (stat_weight_l0_sram_writes_total_) {
+            stat_weight_l0_sram_writes_total_->addData(weight_sram.l0_sram.writes_total);
+        }
+        if (stat_weight_l0_sram_bytes_read_total_) {
+            stat_weight_l0_sram_bytes_read_total_->addData(weight_sram.l0_sram.bytes_read_total);
+        }
+        if (stat_weight_l0_sram_bytes_write_total_) {
+            stat_weight_l0_sram_bytes_write_total_->addData(weight_sram.l0_sram.bytes_write_total);
+        }
+        if (stat_weight_l0_sram_bank_conflict_ticks_total_) {
+            stat_weight_l0_sram_bank_conflict_ticks_total_->addData(weight_sram.l0_sram.bank_conflict_ticks_total);
+        }
+        if (stat_weight_l0_sram_predicted_extra_cycles_total_) {
+            stat_weight_l0_sram_predicted_extra_cycles_total_->addData(weight_sram.l0_sram.predicted_extra_cycles_total);
+        }
+        if (stat_weight_l0_sram_resident_bytes_peak_) {
+            stat_weight_l0_sram_resident_bytes_peak_->addData(weight_sram.l0_sram.resident_bytes_peak);
+        }
+        if (stat_weight_l0_sram_bank_peak_accesses_per_tick_) {
+            stat_weight_l0_sram_bank_peak_accesses_per_tick_->addData(weight_sram.l0_sram.bank_peak_accesses_per_tick);
+        }
+        if (stat_weight_l0_sram_energy_read_pj_total_) {
+            stat_weight_l0_sram_energy_read_pj_total_->addData(static_cast<uint64_t>(weight_sram.l0_sram.energy_read_pj_total));
+        }
+        if (stat_weight_l0_sram_energy_write_pj_total_) {
+            stat_weight_l0_sram_energy_write_pj_total_->addData(static_cast<uint64_t>(weight_sram.l0_sram.energy_write_pj_total));
+        }
+        if (stat_weight_sram_enforced_stall_cycles_total_) {
+            stat_weight_sram_enforced_stall_cycles_total_->addData(weight_sram.enforced_stall_cycles_total);
+        }
+        if (stat_weight_l0_lookup_total_) {
+            stat_weight_l0_lookup_total_->addData(weight_sram.l0_lookup_total);
+        }
+        if (stat_weight_l0_hit_total_) {
+            stat_weight_l0_hit_total_->addData(weight_sram.l0_hit_total);
+        }
+        if (stat_weight_l0_fill_total_) {
+            stat_weight_l0_fill_total_->addData(weight_sram.l0_fill_total);
+        }
+        if (stat_weight_l0_evict_total_) {
+            stat_weight_l0_evict_total_->addData(weight_sram.l0_evict_total);
+        }
+        const auto gcss_lookup = weight_mem_subsystem_->gcssLookupStats();
+        if (stat_gcss_lookup_hit_total_) {
+            stat_gcss_lookup_hit_total_->addData(gcss_lookup.hit_total);
+        }
+        if (stat_gcss_lookup_miss_total_) {
+            stat_gcss_lookup_miss_total_->addData(gcss_lookup.miss_total);
+        }
+        const auto read_source = weight_mem_subsystem_->readSourceStats();
+        if (stat_weight_read_dense_reqs_total_) {
+            stat_weight_read_dense_reqs_total_->addData(read_source.dense_reqs_total);
+        }
+        if (stat_weight_read_dense_bytes_total_) {
+            stat_weight_read_dense_bytes_total_->addData(read_source.dense_bytes_total);
+        }
+        if (stat_weight_read_rowptr_reqs_total_) {
+            stat_weight_read_rowptr_reqs_total_->addData(read_source.rowptr_reqs_total);
+        }
+        if (stat_weight_read_rowptr_bytes_total_) {
+            stat_weight_read_rowptr_bytes_total_->addData(read_source.rowptr_bytes_total);
+        }
+        if (stat_weight_read_colidx_reqs_total_) {
+            stat_weight_read_colidx_reqs_total_->addData(read_source.colidx_reqs_total);
+        }
+        if (stat_weight_read_colidx_bytes_total_) {
+            stat_weight_read_colidx_bytes_total_->addData(read_source.colidx_bytes_total);
+        }
+        if (stat_weight_read_blockdata_reqs_total_) {
+            stat_weight_read_blockdata_reqs_total_->addData(read_source.blockdata_reqs_total);
+        }
+        if (stat_weight_read_blockdata_bytes_total_) {
+            stat_weight_read_blockdata_bytes_total_->addData(read_source.blockdata_bytes_total);
+        }
+        if (stat_weight_read_gcss_reqs_total_) {
+            stat_weight_read_gcss_reqs_total_->addData(read_source.gcss_reqs_total);
+        }
+        if (stat_weight_read_gcss_bytes_total_) {
+            stat_weight_read_gcss_bytes_total_->addData(read_source.gcss_bytes_total);
+        }
+        const auto retire_obs = weight_mem_subsystem_->retireObservabilityStats();
+        if (stat_gas_retire_global_hol_cycles_total_) {
+            stat_gas_retire_global_hol_cycles_total_->addData(retire_obs.global_hol_cycles_total);
+        }
+        if (stat_gas_retire_ready_but_blocked_edges_total_) {
+            stat_gas_retire_ready_but_blocked_edges_total_->addData(retire_obs.ready_but_blocked_edges_total);
+        }
+        if (stat_gas_retire_per_post_progress_total_) {
+            stat_gas_retire_per_post_progress_total_->addData(retire_obs.per_post_progress_total);
+        }
+        if (stat_gas_retire_samepost_blocked_edges_total_) {
+            stat_gas_retire_samepost_blocked_edges_total_->addData(retire_obs.samepost_blocked_edges_total);
+        }
+        if (stat_gas_retire_crosspost_blocked_edges_total_) {
+            stat_gas_retire_crosspost_blocked_edges_total_->addData(retire_obs.crosspost_blocked_edges_total);
+        }
+        if (stat_gas_retire_policy_loss_cycles_total_) {
+            stat_gas_retire_policy_loss_cycles_total_->addData(retire_obs.policy_loss_cycles_total);
+        }
+        if (stat_gas_retire_policy_loss_edges_total_) {
+            stat_gas_retire_policy_loss_edges_total_->addData(retire_obs.policy_loss_edges_total);
+        }
+        if (auto* pe = parent_pe_cached_) {
+            ExperimentalNocRowidxPeStats rowidx_pe{};
+            rowidx_pe.accumulateCore(
+                exp_noc_rowidx.touch_events_total,
+                exp_noc_rowidx.rows_touched_enqueued,
+                exp_noc_rowidx.rows_filtered_cold,
+                exp_noc_rowidx.prefetch_rows_issued,
+                exp_noc_rowidx.prefetch_complete_inflight_miss_total,
+                exp_noc_rowidx.prefetch_complete_zero_waiters_total,
+                exp_noc_rowidx.prefetch_complete_waiters_total,
+                exp_noc_rowidx.prefetch_rows_deferred,
+                exp_noc_rowidx.prefetch_rows_failed,
+                exp_noc_rowidx.prefetch_bytes_issued,
+                exp_noc_rowidx.budget_ticks_total,
+                exp_noc_rowidx.budget_effective_total,
+                exp_noc_rowidx.budget_adapt_ticks,
+                exp_noc_rowidx.cache_hits,
+                exp_noc_rowidx.cache_misses,
+                exp_noc_rowidx.cache_fills,
+                exp_noc_rowidx.cache_full_drop,
+                exp_noc_rowidx.cache_entries,
+                exp_noc_rowidx.bulk_fill_total,
+                exp_noc_rowidx.bulk_rows_cached_total,
+                exp_noc_rowidx.bulk_waiters_resolved_total,
+                exp_noc_rowidx.ready_transition_apply_promote_cached_total,
+                exp_noc_rowidx.ready_signal_rowindex_response_total,
+                exp_noc_rowidx.ready_transition_rowindex_response_total,
+                exp_noc_rowidx.ready_signal_prefetch_response_total,
+                exp_noc_rowidx.ready_transition_prefetch_response_total,
+                exp_noc_rowidx.ready_signal_rowindex_response_inflight_waiters_total,
+                exp_noc_rowidx.ready_transition_rowindex_response_inflight_waiters_total,
+                exp_noc_rowidx.ready_signal_rowindex_response_inflight_zero_waiters_total,
+                exp_noc_rowidx.ready_transition_rowindex_response_inflight_zero_waiters_total,
+                exp_noc_rowidx.ready_signal_rowindex_response_noninflight_prefetch_only_total,
+                exp_noc_rowidx.ready_transition_rowindex_response_noninflight_prefetch_only_total,
+                exp_noc_rowidx.ready_signal_prefetch_response_inflight_waiters_total,
+                exp_noc_rowidx.ready_transition_prefetch_response_inflight_waiters_total,
+                exp_noc_rowidx.ready_signal_prefetch_response_inflight_zero_waiters_total,
+                exp_noc_rowidx.ready_transition_prefetch_response_inflight_zero_waiters_total,
+                exp_noc_rowidx.ready_signal_prefetch_response_noninflight_prefetch_only_total,
+                exp_noc_rowidx.ready_transition_prefetch_response_noninflight_prefetch_only_total,
+                exp_noc_rowidx.detached_demand_join_total,
+                exp_noc_rowidx.detached_demand_waiters_resolved_total,
+                exp_noc_rowidx.detached_demand_fallback_zero_total,
+                exp_noc_rowidx.detached_demand_ready_signal_total,
+                exp_noc_rowidx.detached_demand_ready_transition_total,
+                exp_noc_rowidx.ready_bypass_experimental_cache_hit_total,
+                exp_noc_rowidx.ready_bypass_rowindex_get_hit_total,
+                exp_noc_rowidx.close_attempt_total,
+                exp_noc_rowidx.close_attempt_active_owner_total,
+                exp_noc_rowidx.close_attempt_already_pending_total,
+                exp_noc_rowidx.close_attempt_not_active_total,
+                exp_noc_rowidx.close_attempt_not_owner_total);
+            auto* mc_pe = dynamic_cast<MultiCorePE*>(pe);
+            if (mc_pe) {
+                mc_pe->accumulateExperimentalNocPrefetchStats(rowidx_pe);
+            }
+            pe->accumulateSynapseReadStats(
+                gcss_lookup.hit_total,
+                gcss_lookup.miss_total,
+                read_source.dense_reqs_total,
+                read_source.dense_bytes_total,
+                read_source.rowptr_reqs_total,
+                read_source.rowptr_bytes_total,
+                read_source.colidx_reqs_total,
+                read_source.colidx_bytes_total,
+                read_source.blockdata_reqs_total,
+                read_source.blockdata_bytes_total,
+                read_source.gcss_reqs_total,
+                read_source.gcss_bytes_total,
+                weight_sram.idx_sram.reads_total,
+                weight_sram.idx_sram.writes_total,
+                weight_sram.idx_sram.bytes_read_total,
+                weight_sram.idx_sram.bytes_write_total,
+                weight_sram.idx_sram.bank_conflict_ticks_total,
+                weight_sram.idx_sram.predicted_extra_cycles_total,
+                weight_sram.idx_sram.resident_bytes_peak,
+                weight_sram.idx_sram.bank_peak_accesses_per_tick,
+                static_cast<uint64_t>(weight_sram.idx_sram.energy_read_pj_total),
+                static_cast<uint64_t>(weight_sram.idx_sram.energy_write_pj_total),
+                weight_sram.idx_lookup_total,
+                weight_sram.idx_lookup_idx2_total,
+                weight_sram.l0_sram.reads_total,
+                weight_sram.l0_sram.writes_total,
+                weight_sram.l0_sram.bytes_read_total,
+                weight_sram.l0_sram.bytes_write_total,
+                weight_sram.l0_sram.bank_conflict_ticks_total,
+                weight_sram.l0_sram.predicted_extra_cycles_total,
+                weight_sram.l0_sram.resident_bytes_peak,
+                weight_sram.l0_sram.bank_peak_accesses_per_tick,
+                static_cast<uint64_t>(weight_sram.l0_sram.energy_read_pj_total),
+                static_cast<uint64_t>(weight_sram.l0_sram.energy_write_pj_total),
+                weight_sram.enforced_stall_cycles_total,
+                weight_sram.l0_lookup_total,
+                weight_sram.l0_hit_total,
+                weight_sram.l0_fill_total,
+                weight_sram.l0_evict_total,
+                core_state_sram_reads_total,
+                core_state_sram_writes_total,
+                core_state_sram_bytes_read_total,
+                core_state_sram_bytes_write_total,
+                core_state_sram_bank_conflict_ticks_total,
+                core_state_sram_predicted_extra_cycles_total,
+                core_state_sram_resident_bytes_peak,
+                core_state_sram_bank_peak_accesses_per_tick,
+                core_state_sram_energy_read_pj_total,
+                core_state_sram_energy_write_pj_total,
+                core_state_sram_stall_cycles_total,
+                retire_obs.global_hol_cycles_total,
+                retire_obs.ready_but_blocked_edges_total,
+                retire_obs.per_post_progress_total,
+                retire_obs.samepost_blocked_edges_total,
+                retire_obs.crosspost_blocked_edges_total,
+                retire_obs.policy_loss_cycles_total,
+                retire_obs.policy_loss_edges_total,
+                retire_obs.shadow_per_post_recoverable_cycles_total,
+                retire_obs.shadow_per_post_recoverable_edges_total,
+                retire_obs.shadow_per_post_ready_posts_peak,
+                retire_obs.shadow_per_post_committable_edges_peak);
+            if (mc_pe) {
+                mc_pe->accumulateRiscvSnnRuntimeStats(
+                    riscv_snn_workload_selected,
+                    riscv_snn_firmware_elf_present,
+                    riscv_snn_firmware_loaded,
+                    riscv_snn_backend_runtime_bridge,
+                    riscv_snn_firmware_started_count,
+                    riscv_snn_submitted_commands,
+                    riscv_snn_accepted_commands,
+                    riscv_snn_completion_visible_count,
+                    riscv_snn_completion_consumed_count,
+                    riscv_snn_fused_step_completion_count,
+                    riscv_snn_fault_count,
+                    riscv_snn_last_completion_status,
+                    riscv_snn_last_fault_csr,
+                    riscv_snn_backend_runtime_bridge_provider_bound);
+            }
+        }
+
+        const uint64_t exp_total_observed =
+            exp_noc_rowidx.touch_events_total +
+            exp_noc_rowidx.rows_touched_enqueued +
+            exp_noc_rowidx.rows_filtered_cold +
+            exp_noc_rowidx.prefetch_rows_issued +
+            exp_noc_rowidx.prefetch_rows_deferred +
+            exp_noc_rowidx.prefetch_rows_failed +
+            exp_noc_rowidx.budget_ticks_total +
+            exp_noc_rowidx.budget_effective_total +
+            exp_noc_rowidx.budget_adapt_ticks +
+            exp_noc_rowidx.cache_hits +
+            exp_noc_rowidx.cache_misses +
+            exp_noc_rowidx.cache_fills +
+            exp_noc_rowidx.cache_full_drop +
+            exp_noc_rowidx.detached_demand_join_total +
+            exp_noc_rowidx.detached_demand_waiters_resolved_total +
+            exp_noc_rowidx.detached_demand_fallback_zero_total +
+            exp_noc_rowidx.detached_demand_ready_signal_total +
+            exp_noc_rowidx.detached_demand_ready_transition_total;
+        if (exp_total_observed > 0 && output_) {
+            output_->verbose(
+                CALL_INFO, 1, 0,
+                "[exp-rowidx] core=%d touch=%" PRIu64 " touch_events=%" PRIu64
+                " cold_filtered=%" PRIu64 " prefetch_rows=%" PRIu64
+                " prefetch_bytes=%" PRIu64 " deferred=%" PRIu64 " failed=%" PRIu64
+                " budget_ticks=%" PRIu64 " budget_eff=%" PRIu64 " budget_adapt_ticks=%" PRIu64
+                " cache_hit=%" PRIu64 " cache_miss=%" PRIu64 " cache_fill=%" PRIu64
+                " cache_drop=%" PRIu64 " cache_entries=%" PRIu64
+                " carry_pending=%" PRIu64
+                " drain_skip_gather=%" PRIu64
+                " drain_skip_apply_disabled=%" PRIu64
+                " drain_skip_no_pending=%" PRIu64
+                " drain_skip_loader=%" PRIu64
+                " drain_skip_rowptr=%" PRIu64
+                " drain_skip_budget0=%" PRIu64
+                " drain_skip_cache=%" PRIu64
+                " drain_skip_detached_inflight=%" PRIu64
+                " drain_skip_colidx_inflight=%" PRIu64
+                " drain_skip_empty_row=%" PRIu64 "\n",
+                core_id_,
+                exp_noc_rowidx.rows_touched_enqueued,
+                exp_noc_rowidx.touch_events_total,
+                exp_noc_rowidx.rows_filtered_cold,
+                exp_noc_rowidx.prefetch_rows_issued,
+                exp_noc_rowidx.prefetch_bytes_issued,
+                exp_noc_rowidx.prefetch_rows_deferred,
+                exp_noc_rowidx.prefetch_rows_failed,
+                exp_noc_rowidx.budget_ticks_total,
+                exp_noc_rowidx.budget_effective_total,
+                exp_noc_rowidx.budget_adapt_ticks,
+                exp_noc_rowidx.cache_hits,
+                exp_noc_rowidx.cache_misses,
+                exp_noc_rowidx.cache_fills,
+                exp_noc_rowidx.cache_full_drop,
+                exp_noc_rowidx.cache_entries,
+                exp_noc_rowidx.carry_apply_pending_rows_total,
+                exp_noc_rowidx.drain_skip_phase_gather_total,
+                exp_noc_rowidx.drain_skip_phase_apply_disabled_total,
+                exp_noc_rowidx.drain_skip_no_pending_total,
+                exp_noc_rowidx.drain_skip_loader_not_ready_total,
+                exp_noc_rowidx.drain_skip_rowptr_not_ready_total,
+                exp_noc_rowidx.drain_skip_budget_zero_total,
+                exp_noc_rowidx.drain_skip_cache_hit_total,
+                exp_noc_rowidx.drain_skip_detached_inflight_total,
+                exp_noc_rowidx.drain_skip_colidx_inflight_total,
+                exp_noc_rowidx.drain_skip_empty_row_total);
+        }
+        const auto atlas_rowindex =
+            weight_mem_subsystem_->experimentalPeAtlasRowIndexLifecycleLedger();
+        const auto pod_stats = weight_mem_subsystem_->peInternalPodStats();
+        const uint64_t atlas_rowindex_total_observed =
+            atlas_rowindex.materialize_total +
+            atlas_rowindex.publicize_total +
+            atlas_rowindex.owner_form_total +
+            atlas_rowindex.join_live_total +
+            atlas_rowindex.join_ready_total +
+            atlas_rowindex.ready_total +
+            atlas_rowindex.release_total +
+            atlas_rowindex.release_deferred_total +
+            atlas_rowindex.ready_release_total +
+            atlas_rowindex.release_missing_total +
+            atlas_rowindex.fallback_total;
+        const uint64_t pod_guard_total_observed =
+            pod_stats.guard_drop_total +
+            pod_stats.guard_disabled_total +
+            pod_stats.guard_missing_metadata_plane_total +
+            pod_stats.guard_missing_owner_table_total +
+            pod_stats.guard_zero_pod_count_total +
+            pod_stats.guard_window_zero_total +
+            pod_stats.guard_invalid_cfg_pod_total +
+            pod_stats.guard_rowindex_total;
+        const uint64_t pod_service_total_observed =
+            pod_stats.frontier_export_total +
+            pod_stats.owner_lookup_total +
+            pod_stats.owner_alloc_total +
+            pod_stats.owner_hit_total +
+            pod_stats.owner_reject_total +
+            pod_stats.join_request_total +
+            pod_stats.join_grant_total +
+            pod_stats.join_reject_total +
+            pod_stats.service_join_live_total +
+            pod_stats.service_join_ready_total +
+            pod_stats.service_ready_transition_total +
+            pod_stats.service_ready_fanout_total +
+            pod_stats.service_release_deferred_total +
+            pod_stats.service_ready_release_total +
+            pod_stats.service_late_join_total +
+            pod_stats.service_potential_private_service_elide_total +
+            pod_stats.fallback_private_issue_total;
+        if ((atlas_rowindex_total_observed > 0 ||
+             pod_guard_total_observed > 0 ||
+             pod_service_total_observed > 0) &&
+            output_) {
+            output_->verbose(
+                CALL_INFO, 1, 0,
+                "[atlas-rowidx] core=%d materialize=%" PRIu64
+                " publicize=%" PRIu64 " owner_form=%" PRIu64
+                " join_live=%" PRIu64 " join_ready=%" PRIu64
+                " ready=%" PRIu64 " release=%" PRIu64
+                " release_deferred=%" PRIu64
+                " ready_release=%" PRIu64
+                " release_missing=%" PRIu64 " fallback=%" PRIu64
+                " guard_drop=%" PRIu64 " guard_disabled=%" PRIu64
+                " guard_missing_meta=%" PRIu64 " guard_missing_owner=%" PRIu64
+                " guard_zero_pod=%" PRIu64 " guard_window_zero=%" PRIu64
+                " guard_invalid_pod=%" PRIu64 " guard_rowindex=%" PRIu64
+                " frontier=%" PRIu64 " owner_lookup=%" PRIu64
+                " owner_alloc=%" PRIu64 " owner_hit=%" PRIu64
+                " owner_reject=%" PRIu64 " join_req=%" PRIu64
+                " join_grant=%" PRIu64 " join_reject=%" PRIu64
+                " svc_live=%" PRIu64 " svc_ready=%" PRIu64
+                " svc_ready_tx=%" PRIu64 " svc_ready_fanout=%" PRIu64
+                " svc_late=%" PRIu64 " svc_elide=%" PRIu64 "\n",
+                core_id_,
+                atlas_rowindex.materialize_total,
+                atlas_rowindex.publicize_total,
+                atlas_rowindex.owner_form_total,
+                atlas_rowindex.join_live_total,
+                atlas_rowindex.join_ready_total,
+                atlas_rowindex.ready_total,
+                atlas_rowindex.release_total,
+                atlas_rowindex.release_deferred_total,
+                atlas_rowindex.ready_release_total,
+                atlas_rowindex.release_missing_total,
+                atlas_rowindex.fallback_total,
+                pod_stats.guard_drop_total,
+                pod_stats.guard_disabled_total,
+                pod_stats.guard_missing_metadata_plane_total,
+                pod_stats.guard_missing_owner_table_total,
+                pod_stats.guard_zero_pod_count_total,
+                pod_stats.guard_window_zero_total,
+                pod_stats.guard_invalid_cfg_pod_total,
+                pod_stats.guard_rowindex_total,
+                pod_stats.frontier_export_total,
+                pod_stats.owner_lookup_total,
+                pod_stats.owner_alloc_total,
+                pod_stats.owner_hit_total,
+                pod_stats.owner_reject_total,
+                pod_stats.join_request_total,
+                pod_stats.join_grant_total,
+                pod_stats.join_reject_total,
+                pod_stats.service_join_live_total,
+                pod_stats.service_join_ready_total,
+                pod_stats.service_ready_transition_total,
+                pod_stats.service_ready_fanout_total,
+                pod_stats.service_late_join_total,
+                pod_stats.service_potential_private_service_elide_total);
+        }
+    }
 }
 
 bool SnnPESubComponent::clockTick(Cycle_t current_cycle) {
-    (void)current_cycle; // 统一使用内部 cycle 计数，避免不同 SST 调度口径导致漂移
-    total_cycles_++;
-    bool did = false;
-    if (workload_) {
-        did = workload_->onClockTick(static_cast<uint64_t>(total_cycles_));
-    } else {
-        did = legacyClockTickInternal_(current_cycle);
-    }
-    // Phase10: active_cycles 由 workload 的返回值定义（SNN/stream 一致）。
-    if (did) active_cycles_++;
-    return false;
+    return withExperimentalWorkloadSerialization_([&]() {
+        (void)current_cycle; // 统一使用内部 cycle 计数，避免不同 SST 调度口径导致漂移
+        total_cycles_++;
+        bool did = false;
+        if (workload_) {
+            did = workload_->onClockTick(static_cast<uint64_t>(total_cycles_));
+        } else {
+            did = legacyClockTickInternal_(current_cycle);
+        }
+        // Phase10: active_cycles 由 workload 的返回值定义（SNN/stream 一致）。
+        if (did) active_cycles_++;
+        return false;
+    });
 }
 
-bool SnnPESubComponent::legacyClockTickInternal_(Cycle_t current_cycle) {
-    (void)current_cycle;
-    // Phase4-Task6.1：compute core 的 per-tick 驱动已下沉到 workload=snn（SnnWorkload）。
-    bool has_activity = false;
-    if (!clock_tick_logged_ && window_read_debug_ && output_ && output_->getVerboseLevel() >= 2) {
-        output_->verbose(CALL_INFO, 2, 0,
-            "[diag-gas] 核心%d clockTick start stage=%d gas_enable=%d window_mode=%d manual_drive=%d\n",
-            core_id_, (int)gas_stage_, gas_enable_ ? 1 : 0, gas_window_mode_ ? 1 : 0,
-            gas_manual_window_drive_ ? 1 : 0);
-        clock_tick_logged_ = true;
-    }
-    // 不在时钟顶层阻断loader，允许deliver/recordEdge提前进行；
-    // 在发起权重读取时（issueFromEdges_）再检查 loader 是否就绪。
-    // 方案1：优先处理 slice 顺序执行路径；若启用则该函数接管整个周期流程
-    if (scheme1_enable_) {
-        if (scheme1Tick_()) return false; // 已完成本周期
-    }
-    // GAS: mark gather window start for this cycle (barrier-based)
-    if (gas_enable_ && !gas_window_mode_ && ensureMemoryReady_()) {
-        stdmem_ep_->sendGasCmd(GasOp::BeginGather, /*ss*/0, /*slice*/0, /*tot*/1);
-    }
-    if (gas_enable_ && gas_window_mode_ && gas_manual_window_drive_) {
-        auto* drive = (stdmem_ep_ && stdmem_ep_->available()) ? stdmem_ep_->manualWindowDrive() : nullptr;
-        if (!drive) {
-            if (window_read_debug_ && output_ && !manual_window_tick_logged_ && output_->getVerboseLevel() >= 2) {
-                output_->verbose(CALL_INFO, 2, 0,
-                    "[diag-gas] core=%d manual window drive requested but unavailable (IManualWindowDrive not provided by stdmem)\n",
-                    core_id_);
-                manual_window_tick_logged_ = true;
-            }
-        } else {
-            drive->manualWindowTick();
-            manual_gas_counter_++;
-            if (!manual_tick_sampled_ && manual_gas_counter_ <= manual_gas_gather_cycles_cfg_ &&
-                window_read_debug_ && output_ && output_->getVerboseLevel() >= 2) {
-                output_->verbose(CALL_INFO, 2, 0,
-                    "[diag-gas] 核心%d manual_tick stage=%d counter=%" PRIu64 " threshold=%" PRIu64 "\n",
-                    core_id_, (int)gas_stage_, manual_gas_counter_, manual_gas_gather_cycles_cfg_);
-                if (manual_gas_counter_ >= manual_gas_gather_cycles_cfg_) manual_tick_sampled_ = true;
-            }
-            if (manual_gas_counter_ >= manual_gas_gather_cycles_cfg_) {
-                stdmem_ep_->sendGasCmd(GasOp::EndGather, /*ss*/0, /*slice*/0, /*tot*/1);
-                if (window_read_debug_ && output_ && output_->getVerboseLevel() >= 2) {
-                    output_->verbose(CALL_INFO, 2, 0,
-                    "[diag-gas] 核心%d手动发出 EndGather (stage=%d cnt=%" PRIu64 ")\n",
-                    core_id_, (int)gas_stage_, manual_gas_counter_);
-                }
-                manual_gas_counter_ = 0;
-                manual_tick_sampled_ = false;
-            }
-        }
-    }
-    // 学习窗口边界由 compute core 驱动
-    
-    // 调试权重验证状态 (仅在前几个周期输出)
-    /*
-    if (verify_weights_ && total_cycles_ < 10) {
-        output_->verbose(CALL_INFO, 2, 0, "🔍 核心%d状态检查: verify_weights=%d, memory_link=%s, memory_ready=%d, cycles=%lu, warmup=%lu\n",
-                        core_id_, verify_weights_ ? 1 : 0, memory_link_ ? "yes" : "no", memory_ready_ ? 1 : 0, 
-                        total_cycles_, memory_warmup_cycles_);
-    }
-    */
-    
+bool SnnPESubComponent::drainIncomingSpikesDeterministic_() {
     // 处理输入脉冲队列：为避免与同周期 GAS 阶段切换事件产生“先后次序竞态”，
     // 仅处理时间戳严格早于当前仿真时间的脉冲；同周期到达的脉冲延后到下一tick处理。
     //
@@ -1446,6 +3384,7 @@ bool SnnPESubComponent::legacyClockTickInternal_(Cycle_t current_cycle) {
             "this indicates an unintended fallback to legacy spike queueing.\n",
             core_id_);
     }
+
     const uint64_t now_ns = getCurrentSimTimeNano();
     std::vector<SpikeEvent*> ready_spikes;
     ready_spikes.reserve(std::min<size_t>(incoming_spikes_.size(), 256));
@@ -1484,11 +3423,40 @@ bool SnnPESubComponent::legacyClockTickInternal_(Cycle_t current_cycle) {
                       return wa < wb;
                   });
     }
+
+    bool has_activity = false;
     for (auto* spike : ready_spikes) {
         processLocalSpike(spike);
         has_activity = true;
         delete spike;
     }
+    return has_activity;
+}
+
+bool SnnPESubComponent::legacyClockTickInternal_(Cycle_t current_cycle) {
+    (void)current_cycle;
+    // Phase4-Task6.1：compute core 的 per-tick 驱动已下沉到 workload=snn（SnnWorkload）。
+    bool has_activity = false;
+    if (!clock_tick_logged_ && window_read_debug_ && output_ && output_->getVerboseLevel() >= 2) {
+        output_->verbose(CALL_INFO, 2, 0,
+            "[diag-gas] 核心%d clockTick start stage=%d gas_enable=%d window_mode=%d manual_drive=%d\n",
+            core_id_, (int)gas_stage_, gas_enable_ ? 1 : 0, gas_window_mode_ ? 1 : 0,
+            0);
+        clock_tick_logged_ = true;
+    }
+    // 不在时钟顶层阻断loader，允许deliver/recordEdge提前进行；
+    // 在发起权重读取时（issueFromEdges_）再检查 loader 是否就绪。
+    // 方案1：优先处理 slice 顺序执行路径；若启用则该函数接管整个周期流程
+    if (scheme1_enable_) {
+        if (scheme1Tick_()) return false; // 已完成本周期
+    }
+    // GAS: mark gather window start for this cycle (barrier-based)
+    if (gas_enable_ && !gas_window_mode_ && ensureMemoryReady_()) {
+        stdmem_ep_->sendGasCmd(GasOp::BeginGather, /*ss*/0, /*slice*/0, /*tot*/1);
+    }
+    // 学习窗口边界由 compute core 驱动
+
+    has_activity |= drainIncomingSpikesDeterministic_();
 
     // Apply窗口内的机会式发起：若BeginApply时未能捕获到上一窗集合，
     // 但在本窗内由于deliverSpike处理使得 prev/curr 集合非空，则本窗内立即发起读取。
@@ -1497,237 +3465,6 @@ bool SnnPESubComponent::legacyClockTickInternal_(Cycle_t current_cycle) {
     
     // test-only 延迟读取示例已移除：权重通路由 compute core + 控制层窗口读编排负责
     // 权重验证与 BCSR 探针已下沉到 compute core（DefaultSnnComputeCore::onClockTick）
-#if 0
-    // 权重正确性验证：在暖机完成后进行固定次数采样读取，对比 expected_weight_value_
-    if (verify_weights_ && memory_ && memory_ready_ && total_cycles_ >= memory_warmup_cycles_ &&
-        (loader_barrier_cycles_ == 0 || total_cycles_ >= loader_barrier_cycles_)) {
-        if (!verify_started_) {
-            verify_started_ = true;
-            // 降低默认日志级别
-            output_->verbose(CALL_INFO, 3, 0, "🎯 核心%d权重验证启动: 周期=%lu, 暖机阈值=%lu\n", 
-                            core_id_, total_cycles_, memory_warmup_cycles_);
-        }
-        // 每个周期发起至多一个样本，避免拥塞
-        if (verify_completed_ < weight_verify_samples_ && verify_requested_ - verify_completed_ < max_outstanding_requests_) {
-            uint32_t sample_idx = verify_requested_;
-            // 采样若干 (row, col)
-            uint32_t row;
-            uint32_t col;
-            if (verify_cluster_enable_) {
-                // 将前weight_verify_samples_个样本聚类到同一cacheline：固定行0，列在一个cacheline范围内循环
-                uint32_t fpl = std::max<uint32_t>(1, line_size_bytes_ / (uint32_t)sizeof(float));
-                row = 0;
-                col = (sample_idx % fpl);
-                if (use_post_row_pre_col_) {
-                    // 新模式 col 表示 pre_global；为了命中同一CL，选取一小段连续 pre_global
-                    // 这里使用全局列 0..fpl-1，足够验证命中
-                } else {
-                    // 旧模式 col=post_local，同样聚到同一CL
-                }
-            } else {
-                row = (sample_idx * 13) % num_neurons_;                // 本地目标行
-                col = use_post_row_pre_col_ ? ((sample_idx * 7) % std::max<uint32_t>(1, weights_cols_))
-                                             : ((sample_idx * 7) % num_neurons_);
-            }
-            // 新模式传参：(pre_global=col, post_local=row)；旧模式：(pre_local=row, post_local=col)
-            uint32_t arg0 = use_post_row_pre_col_ ? col : row;
-            uint32_t arg1 = use_post_row_pre_col_ ? row : col;
-            requestWeight(arg0, arg1, [this, row, col](float w){
-                verify_completed_++;
-                verify_sum_ += static_cast<double>(w);
-                bool mismatch = false;
-                if (verify_against_file_ && verify_file_loaded_) {
-                    // 使用文件中的期望值（row-major: row*weights_cols_ + col）
-                    uint64_t idx = static_cast<uint64_t>(row) * static_cast<uint64_t>(weights_cols_) + static_cast<uint64_t>(col);
-                    float expected = 0.0f;
-                    if (idx < verify_file_buf_.size()) expected = verify_file_buf_[idx];
-                    mismatch = (std::fabs(w - expected) > verify_epsilon_);
-                    if (verify_log_each_sample_) {
-                        output_->verbose(CALL_INFO, 1, 0,
-                            "🔎 权重样本(FILE): row=%u col=%u value=%.6f expected=%.6f diff=%.6f %s\n",
-                            row, col, w, expected, std::fabs(w-expected), (mismatch?"MISMATCH":"OK"));
-                    }
-                } else {
-                    // 回退到常数期望（兼容旧行为）
-                    mismatch = (std::fabs(w - expected_weight_value_) > verify_epsilon_);
-                    if (verify_log_each_sample_) {
-                        output_->verbose(CALL_INFO, 1, 0,
-                            "🔎 权重样本(CONST): row=%u col=%u value=%.6f expected=%.6f diff=%.6f %s\n",
-                            row, col, w, expected_weight_value_, std::fabs(w-expected_weight_value_), (mismatch?"MISMATCH":"OK"));
-                    }
-                }
-                if (mismatch) verify_mismatch_count_++;
-                // 详细调试权重读取值（禁用默认回调日志；仅当逐样本日志开启时输出）
-                if (verify_log_each_sample_) {
-                    output_->verbose(CALL_INFO, 2, 0,
-                        "🔎 权重验证回调: core=%d row=%u col=%u value=%.6f sum=%.6f count=%u\n",
-                        core_id_, row, col, w, verify_sum_, verify_completed_);
-                }
-                if (stat_weights_verify_count_) stat_weights_verify_count_->addData(1);
-                if (verify_mismatch_count_ && stat_weights_mismatch_count_) stat_weights_mismatch_count_->addData(1);
-                if (stat_weights_verify_sum_) stat_weights_verify_sum_->addData(verify_sum_);
-            });
-            verify_requested_++;
-        }
-    }
-
-    // BCSR探针：尽力在同一窗口发起一次按边读，扫描一个块内的列，促成 1.0 样本出现（仅诊断；不影响GAS语义）
-    if (verify_weights_ && use_bcsr_ && ensureMemoryReady_() && bcsr_weights_->isRowptrReady() &&
-        total_cycles_ >= memory_warmup_cycles_ && (loader_barrier_cycles_ == 0 || total_cycles_ >= loader_barrier_cycles_)) {
-        if (!verify_bcsr_done_ && !verify_bcsr_inflight_) {
-            uint32_t br = (bcsr_br_>0? bcsr_br_:16);
-            uint32_t bc = (bcsr_bc_>0? bcsr_bc_:16);
-            uint32_t nBlockRows = (num_neurons_ + br - 1) / br;
-            if (!verify_bcsr_started_) {
-                const auto& rp = bcsr_weights_->rowptrHost();
-                for (uint32_t r = 0; r < nBlockRows; ++r) {
-                    if (r + 1 >= rp.size()) break;
-                    uint32_t start = rp[r];
-                    uint32_t end   = rp[r+1];
-                    if (end > start) { verify_bcsr_post_local_ = r * br; verify_bcsr_block_col_ = 0; verify_bcsr_intra_col_ = 0; verify_bcsr_started_ = true; if (output_) output_->verbose(CALL_INFO, 1, 0, "[VERIFY][init-bcsr] core=%d post_local=%u rowptr=(%u,%u)\n", core_id_, verify_bcsr_post_local_, start, end); break; }
-                }
-                if (!verify_bcsr_started_) verify_bcsr_done_ = true;
-            }
-            if (verify_bcsr_started_ && !verify_bcsr_done_) {
-                uint32_t r = verify_bcsr_post_local_ / br;
-                // 若该行的colidx已缓存，解析出第一个block_col；否则先触发一次colidx读取
-                if (!verify_bcsr_block_resolved_) {
-                    std::vector<uint32_t> cols;
-                    if (bcsrRowIndexGet_(r, cols) && !cols.empty()) {
-                        verify_bcsr_block_col_ = cols[0];
-                        verify_bcsr_block_resolved_ = true;
-                        if (output_) output_->verbose(CALL_INFO, 1, 0, "[VERIFY][bcsr-colidx] core=%d row=%u first_block_col=%u\n", core_id_, r, verify_bcsr_block_col_);
-                    } else {
-                        // 文件直读一次，解析该行第一个块并且定位块内首个非零位置（诊断用途）
-                        std::string bin_path = resolveWeightTemplate(node_id_, core_id_);
-                        if (!bin_path.empty()) {
-                            uint32_t rows=0, colsN=0, brM=0, bcM=0, idxB=0, valB=0, totalB=0;
-                            uint64_t rp_off=0, ci_off=0, bd_off=0, id_off=0;
-                            std::string meta_path = bin_path + ".meta.json";
-                            if (parseBcsrMeta(meta_path, rows, colsN, brM, bcM, idxB, valB, rp_off, ci_off, bd_off, id_off, totalB)) {
-                                std::ifstream fin(bin_path, std::ios::binary);
-                                if (fin.good()) {
-                                    const auto& rp = bcsr_weights_->rowptrHost();
-                                    uint32_t start = (r+1 < rp.size() ? rp[r] : 0);
-                                    uint32_t end   = (r+1 < rp.size() ? rp[r+1] : start);
-                                    uint32_t brEff = (brM? brM : 1), bcEff = (bcM? bcM : 16);
-                                    size_t blk_bytes = (size_t)brEff * (size_t)bcEff * (size_t)valB;
-                                    uint32_t nblocks = (end > start ? (end - start) : 0);
-                                    for (uint32_t j = 0; j < nblocks && !verify_bcsr_block_resolved_; ++j) {
-                                        // 读第 j 个块列值
-                                        fin.seekg(static_cast<std::streamoff>(ci_off + (size_t)(start + j) * idxB), std::ios::beg);
-                                        uint32_t blk_col = 0; if (idxB == 2) { uint16_t v=0; fin.read(reinterpret_cast<char*>(&v), 2); blk_col = v; } else { fin.read(reinterpret_cast<char*>(&blk_col), 4); }
-                                        if (!fin.good()) break;
-                                        // 读该块数据
-                                        fin.seekg(static_cast<std::streamoff>(bd_off + (uint64_t)(start + j) * blk_bytes), std::ios::beg);
-                                        std::vector<float> blk(brEff*bcEff, 0.0f);
-                                        if (valB == 4) fin.read(reinterpret_cast<char*>(blk.data()), blk_bytes);
-                                        if (!fin.good()) break;
-                                        for (uint32_t cc = 0; cc < bcEff; ++cc) {
-                                            if (std::fabs(blk[cc]) > verify_epsilon_) { verify_bcsr_block_col_ = blk_col; verify_bcsr_intra_col_ = cc; verify_bcsr_block_resolved_ = true; break; }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                uint32_t intra = verify_bcsr_intra_col_;
-                uint32_t pre_global = (verify_bcsr_block_resolved_ ? (verify_bcsr_block_col_ * bc + intra) : intra);
-                uint32_t post_local = verify_bcsr_post_local_;
-                verify_bcsr_inflight_ = true;
-                uint32_t block_row = verify_bcsr_post_local_ / br;
-                uint32_t bc_eff = (bcsr_bc_>0? bcsr_bc_:16);
-                uint32_t blk_col = (bc_eff? (pre_global / bc_eff) : 0);
-                size_t block_bytes = (size_t)(bcsr_br_>0?bcsr_br_:1) * (size_t)bc_eff * (size_t)bcsr_val_bytes_;
-                uint32_t start = 0;
-                uint64_t block_addr = 0;
-                const auto& rp = bcsr_weights_->rowptrHost();
-                if (block_row + 1 < rp.size()) {
-                    start = rp[block_row];
-                    block_addr = bcsr_blockdata_addr_ + (uint64_t)(start + verify_bcsr_block_col_) * block_bytes;
-                }
-                if (output_) {
-                    if (output_->getVerboseLevel() >= 2) {
-                        output_->verbose(CALL_INFO, 2, 0,
-                        "[VERIFY][mem-addr] core=%d post=%u pre=%u blk_row=%u blk_col=%u block_addr=0x%llx rowptr_start=%u block_bytes=%zu\n",
-                        core_id_, post_local, pre_global, block_row, blk_col,
-                        (unsigned long long)block_addr, start, block_bytes);
-                    }
-                }
-                requestWeightBCSR(pre_global, post_local, [this, post_local, pre_global](float w){
-                    if (output_) {
-                        output_->verbose(CALL_INFO, 1, 0, "[VERIFY][probe-bcsr] post=%u pre=%u value=%.6f\n", post_local, pre_global, w);
-                    }
-                    verify_completed_++;
-                    verify_sum_ += static_cast<double>(w);
-                    // 仅诊断：读取文件中的同一位置，打印文件权重（不改变语义）
-                    do {
-                        std::string bin_path = resolveWeightTemplate(node_id_, core_id_);
-                        if (bin_path.empty()) break;
-                        uint32_t rows=0, colsN=0, brM=0, bcM=0, idxB=0, valB=0, totalB=0;
-                        uint64_t rp_off=0, ci_off=0, bd_off=0, id_off=0;
-                        std::string meta_path = bin_path + ".meta.json";
-                        if (!parseBcsrMeta(meta_path, rows, colsN, brM, bcM, idxB, valB, rp_off, ci_off, bd_off, id_off, totalB)) break;
-                        std::ifstream fin(bin_path, std::ios::binary);
-                        if (!fin.good()) break;
-                        uint32_t brEff = (brM? brM : 1), bcEff = (bcM? bcM : 16);
-                        uint32_t r = (brEff? (post_local / brEff) : 0);
-                        // 直接从文件读取 rowptr
-                        fin.seekg(static_cast<std::streamoff>(rp_off + (size_t)r * sizeof(uint32_t)), std::ios::beg);
-                        uint32_t start=0, end=0; fin.read(reinterpret_cast<char*>(&start), 4); fin.read(reinterpret_cast<char*>(&end), 4);
-                        if (!fin.good() || end <= start) break;
-                        uint32_t total_blocks = end - start;
-                        if (total_blocks > 1'000'000) break; // 防止异常数据
-                        uint32_t blk_col_target = (bcEff? (pre_global / bcEff) : 0);
-                        int idx_in_row = -1;
-                        for (uint32_t j=0; j < total_blocks; ++j) {
-                            fin.seekg(static_cast<std::streamoff>(ci_off + (size_t)(start + j) * idxB), std::ios::beg);
-                            uint32_t blk_col = 0; if (idxB == 2) { uint16_t v=0; fin.read(reinterpret_cast<char*>(&v), 2); blk_col = v; } else { fin.read(reinterpret_cast<char*>(&blk_col), 4); }
-                            if (!fin.good()) break;
-                            if (blk_col == blk_col_target) { idx_in_row = (int)j; break; }
-                        }
-                        if (idx_in_row < 0) break;
-                        // 读该块数据并取 intra 列值
-                        size_t blk_bytes = (size_t)brEff * (size_t)bcEff * (size_t)valB;
-                        fin.seekg(static_cast<std::streamoff>(bd_off + (uint64_t)(start + (uint32_t)idx_in_row) * blk_bytes), std::ios::beg);
-                        std::vector<float> blk(brEff*bcEff, 0.0f);
-                        if (valB == 4) fin.read(reinterpret_cast<char*>(blk.data()), blk_bytes);
-                        if (!fin.good()) break;
-                        uint32_t intra = (bcEff? (pre_global % bcEff) : 0);
-                        float fv = (intra < blk.size()? blk[intra] : 0.0f);
-                        if (output_) output_->verbose(CALL_INFO, 1, 0, "[VERIFY][file-probe] post=%u pre=%u file_value=%.6f mem_value=%.6f\n", post_local, pre_global, fv, w);
-                    } while(0);
-                    if (std::fabs(w) > verify_epsilon_) {
-                        verify_bcsr_done_ = true;
-                    } else {
-                        uint32_t bc = (bcsr_bc_>0? bcsr_bc_:16);
-                        if (verify_bcsr_intra_col_ + 1 < bc) {
-                            // 立即尝试下一列
-                            verify_bcsr_intra_col_++;
-                            uint32_t next_pre = (verify_bcsr_block_resolved_ ? (verify_bcsr_block_col_ * bc + verify_bcsr_intra_col_) : verify_bcsr_intra_col_);
-                            requestWeightBCSR(next_pre, post_local, [this, post_local, next_pre](float w2){
-                                if (output_) output_->verbose(CALL_INFO, 1, 0, "[VERIFY][probe-bcsr] post=%u pre=%u value=%.6f\n", post_local, next_pre, w2);
-                                verify_completed_++;
-                                verify_sum_ += static_cast<double>(w2);
-                                if (std::fabs(w2) > verify_epsilon_) {
-                                    verify_bcsr_done_ = true;
-                                } else {
-                                    // 若仍未命中，则留给下一tick继续
-                                }
-                                verify_bcsr_inflight_ = false;
-                            });
-                            return; // 由内层回调负责清理 inflight
-                        } else {
-                            verify_bcsr_done_ = true;
-                        }
-                    }
-                    verify_bcsr_inflight_ = false;
-                });
-            }
-        }
-    }
-#endif // legacy verify/probe path (moved to compute core)
 
     // Phase4-Task6.3：非 window 模式下的 “endCycle->drain->route/comm” 闭环已迁入 workload=snn（SnnWorkload::onClockTick）。
     // 控制层仅保留 GAS/window/阶段编排等 control-plane 逻辑，避免重复推进导致行为漂移。
@@ -1824,11 +3561,8 @@ void SnnPESubComponent::legacySnnGetStatistics(std::map<std::string, uint64_t>& 
 }
 
 void SnnPESubComponent::forceEndGather() {
-    if (!(gas_enable_ && gas_window_mode_ && gas_manual_window_drive_ && ensureMemoryReady_())) return;
-    stdmem_ep_->sendGasCmd(GasOp::EndGather, /*ss*/0, /*slice*/0, /*tot*/1);
-    if (window_read_debug_ && output_ && output_->getVerboseLevel() >= 2) {
-        output_->verbose(CALL_INFO, 2, 0, "[diag-gas] 核心%d 手动触发 EndGather\n", core_id_);
-    }
+    // 已弃用：手动窗口驱动不再支持；保持接口为兼容 no-op。
+    return;
 }
 
 void SnnPESubComponent::orchestrateBeginGatherWindowSetup() {
@@ -1884,7 +3618,14 @@ void SnnPESubComponent::orchestrateEndScatterSequence() {
 // deliverSpike 实现已拆分到 SnnPESubComponent_spike.cc（输入路径控制逻辑）
 
 void SnnPESubComponent::resetMembraneState(float v_rest_value) {
-    resetMembraneState_(v_rest_value);
+    if (workload_) {
+        workload_->resetMembraneState(v_rest_value);
+    } else {
+        resetMembraneState_(v_rest_value);
+    }
+    if (accel_runtime_services_) {
+        accel_runtime_services_->resetMembraneState(v_rest_value);
+    }
     accReset_();
 }
 
@@ -1914,9 +3655,11 @@ double SnnPESubComponent::getUtilization() const {
 void SnnPESubComponent::getStatistics(std::map<std::string, uint64_t>& stats) const {
     if (workload_) {
         workload_->getStatistics(stats);
+        stats["riscv_snn_workload_selected"] = isRiscvSnnWorkload_() ? 1ull : 0ull;
         return;
     }
     legacySnnGetStatistics(stats);
+    stats["riscv_snn_workload_selected"] = isRiscvSnnWorkload_() ? 1ull : 0ull;
 }
 
 void SnnPESubComponent::legacySnnOnNeuronFires(const std::vector<uint32_t>& neuron_indices, uint64_t /*now_cycle*/) {
@@ -2018,6 +3761,10 @@ void SnnPESubComponent::initializeStatistics() {
     // 扩展统计
     stat_routes_entries_ = registerStatistic<uint64_t>("routes_entries");
     stat_fanout_per_spike_ = registerStatistic<uint64_t>("fanout_per_spike");
+    stat_route3d_native_activation_total_ = registerStatistic<uint64_t>("route3d_native_activation_total");
+    stat_route3d_native_gating_activation_total_ = registerStatistic<uint64_t>("route3d_native_gating_activation_total");
+    stat_route3d_native_direct_activation_total_ = registerStatistic<uint64_t>("route3d_native_direct_activation_total");
+    stat_route3d_native_unique_sources_total_ = registerStatistic<uint64_t>("route3d_native_unique_sources_total");
     stat_cache_evictions_ = registerStatistic<uint64_t>("cache_evictions");
     stat_pending_reqs_peak_ = registerStatistic<uint64_t>("pending_reqs_peak");
     stat_cycles_update_neuron_ = registerStatistic<uint64_t>("cycles_update_neuron");
@@ -2033,6 +3780,179 @@ void SnnPESubComponent::initializeStatistics() {
     stat_gas_bursts_total_ = registerStatistic<uint64_t>("gas_bursts_total");
     stat_gas_payload_bytes_total_ = registerStatistic<uint64_t>("gas_payload_bytes_total");
     stat_gas_gap_absorbed_bytes_total_ = registerStatistic<uint64_t>("gas_gap_absorbed_bytes_total");
+    stat_exp_noc_rowidx_prefetch_rows_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_prefetch_rows_total");
+    stat_exp_noc_rowidx_prefetch_bytes_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_prefetch_bytes_total");
+    stat_exp_noc_rowidx_prefetch_rows_deferred_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_prefetch_rows_deferred_total");
+    stat_exp_noc_rowidx_prefetch_rows_failed_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_prefetch_rows_failed_total");
+    stat_exp_noc_rowidx_cache_hits_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_cache_hits_total");
+    stat_exp_noc_rowidx_cache_misses_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_cache_misses_total");
+    stat_exp_noc_rowidx_cache_fills_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_cache_fills_total");
+    stat_exp_noc_rowidx_cache_full_drop_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_cache_full_drop_total");
+    stat_exp_noc_rowidx_cache_entries_final_ = registerStatistic<uint64_t>("exp_noc_rowidx_cache_entries_final");
+    stat_exp_noc_rowidx_touch_rows_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_touch_rows_total");
+    stat_exp_noc_rowidx_touch_events_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_touch_events_total");
+    stat_exp_noc_rowidx_rows_filtered_cold_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_rows_filtered_cold_total");
+    stat_exp_noc_rowidx_carry_apply_pending_rows_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_carry_apply_pending_rows_total");
+    stat_exp_noc_rowidx_drain_skip_phase_gather_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_drain_skip_phase_gather_total");
+    stat_exp_noc_rowidx_drain_skip_phase_apply_disabled_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_drain_skip_phase_apply_disabled_total");
+    stat_exp_noc_rowidx_drain_skip_no_pending_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_drain_skip_no_pending_total");
+    stat_exp_noc_rowidx_drain_skip_loader_not_ready_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_drain_skip_loader_not_ready_total");
+    stat_exp_noc_rowidx_drain_skip_rowptr_not_ready_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_drain_skip_rowptr_not_ready_total");
+    stat_exp_noc_rowidx_drain_skip_budget_zero_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_drain_skip_budget_zero_total");
+    stat_exp_noc_rowidx_drain_skip_cache_hit_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_drain_skip_cache_hit_total");
+    stat_exp_noc_rowidx_drain_skip_detached_inflight_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_drain_skip_detached_inflight_total");
+    stat_exp_noc_rowidx_drain_skip_colidx_inflight_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_drain_skip_colidx_inflight_total");
+    stat_exp_noc_rowidx_drain_skip_empty_row_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_drain_skip_empty_row_total");
+    stat_exp_noc_rowidx_budget_ticks_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_budget_ticks_total");
+    stat_exp_noc_rowidx_budget_effective_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_budget_effective_total");
+    stat_exp_noc_rowidx_budget_adapt_ticks_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_budget_adapt_ticks_total");
+    stat_exp_noc_rowidx_detached_demand_join_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_detached_demand_join_total");
+    stat_exp_noc_rowidx_detached_demand_waiters_resolved_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_detached_demand_waiters_resolved_total");
+    stat_exp_noc_rowidx_detached_demand_fallback_zero_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_detached_demand_fallback_zero_total");
+    stat_exp_noc_rowidx_detached_demand_ready_signal_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_detached_demand_ready_signal_total");
+    stat_exp_noc_rowidx_detached_demand_ready_transition_total_ = registerStatistic<uint64_t>("exp_noc_rowidx_detached_demand_ready_transition_total");
+    stat_pulse_metadata_txn_export_total_ = registerStatistic<uint64_t>("pulse_metadata_txn_export_total");
+    stat_pulse_metadata_txn_owner_launch_total_ = registerStatistic<uint64_t>("pulse_metadata_txn_owner_launch_total");
+    stat_pulse_metadata_txn_join_live_total_ = registerStatistic<uint64_t>("pulse_metadata_txn_join_live_total");
+    stat_pulse_metadata_txn_join_ready_total_ = registerStatistic<uint64_t>("pulse_metadata_txn_join_ready_total");
+    stat_pulse_metadata_txn_late_join_total_ = registerStatistic<uint64_t>("pulse_metadata_txn_late_join_total");
+    stat_pulse_metadata_txn_ready_lease_hit_total_ = registerStatistic<uint64_t>("pulse_metadata_txn_ready_lease_hit_total");
+    stat_pulse_metadata_txn_ready_lease_expired_total_ = registerStatistic<uint64_t>("pulse_metadata_txn_ready_lease_expired_total");
+    stat_pulse_metadata_txn_envelope_size_sum_total_ = registerStatistic<uint64_t>("pulse_metadata_txn_envelope_size_sum_total");
+    stat_pulse_metadata_frontier_observed_total_ = registerStatistic<uint64_t>("pulse_metadata_frontier_observed_total");
+    stat_pulse_metadata_frontier_same_window_reobserve_total_ = registerStatistic<uint64_t>("pulse_metadata_frontier_same_window_reobserve_total");
+    stat_pulse_metadata_frontier_owner_form_candidate_total_ = registerStatistic<uint64_t>("pulse_metadata_frontier_owner_form_candidate_total");
+    stat_pulse_metadata_frontier_join_ready_candidate_total_ = registerStatistic<uint64_t>("pulse_metadata_frontier_join_ready_candidate_total");
+    stat_pulse_metadata_frontier_premphf_base_observed_total_ = registerStatistic<uint64_t>("pulse_metadata_frontier_premphf_base_observed_total");
+    stat_pulse_metadata_frontier_premphf_base_same_window_reobserve_total_ = registerStatistic<uint64_t>("pulse_metadata_frontier_premphf_base_same_window_reobserve_total");
+    stat_pulse_metadata_frontier_premphf_base_owner_form_candidate_total_ = registerStatistic<uint64_t>("pulse_metadata_frontier_premphf_base_owner_form_candidate_total");
+    stat_pulse_metadata_frontier_premphf_base_join_ready_candidate_total_ = registerStatistic<uint64_t>("pulse_metadata_frontier_premphf_base_join_ready_candidate_total");
+    stat_pulse_metadata_frontier_premphf_band_observed_total_ = registerStatistic<uint64_t>("pulse_metadata_frontier_premphf_band_observed_total");
+    stat_pulse_metadata_frontier_premphf_band_same_window_reobserve_total_ = registerStatistic<uint64_t>("pulse_metadata_frontier_premphf_band_same_window_reobserve_total");
+    stat_pulse_metadata_frontier_premphf_band_owner_form_candidate_total_ = registerStatistic<uint64_t>("pulse_metadata_frontier_premphf_band_owner_form_candidate_total");
+    stat_pulse_metadata_frontier_premphf_band_join_ready_candidate_total_ = registerStatistic<uint64_t>("pulse_metadata_frontier_premphf_band_join_ready_candidate_total");
+    stat_pulse_metadata_frontier_idx2row_observed_total_ = registerStatistic<uint64_t>("pulse_metadata_frontier_idx2row_observed_total");
+    stat_pulse_metadata_frontier_idx2row_same_window_reobserve_total_ = registerStatistic<uint64_t>("pulse_metadata_frontier_idx2row_same_window_reobserve_total");
+    stat_pulse_metadata_frontier_idx2row_owner_form_candidate_total_ = registerStatistic<uint64_t>("pulse_metadata_frontier_idx2row_owner_form_candidate_total");
+    stat_pulse_metadata_frontier_idx2row_join_ready_candidate_total_ = registerStatistic<uint64_t>("pulse_metadata_frontier_idx2row_join_ready_candidate_total");
+    stat_pulse_metadata_frontier_rowindex_observed_total_ = registerStatistic<uint64_t>("pulse_metadata_frontier_rowindex_observed_total");
+    stat_pulse_metadata_frontier_rowindex_same_window_reobserve_total_ = registerStatistic<uint64_t>("pulse_metadata_frontier_rowindex_same_window_reobserve_total");
+    stat_pulse_metadata_frontier_rowindex_owner_form_candidate_total_ = registerStatistic<uint64_t>("pulse_metadata_frontier_rowindex_owner_form_candidate_total");
+    stat_pulse_metadata_frontier_rowindex_join_ready_candidate_total_ = registerStatistic<uint64_t>("pulse_metadata_frontier_rowindex_join_ready_candidate_total");
+    stat_atlas_census_premphf_base_frontier_events_total_ = registerStatistic<uint64_t>("atlas_census_premphf_base_frontier_events_total");
+    stat_atlas_census_premphf_base_producer_events_total_ = registerStatistic<uint64_t>("atlas_census_premphf_base_producer_events_total");
+    stat_atlas_census_premphf_base_gate_events_total_ = registerStatistic<uint64_t>("atlas_census_premphf_base_gate_events_total");
+    stat_atlas_census_premphf_base_service_events_total_ = registerStatistic<uint64_t>("atlas_census_premphf_base_service_events_total");
+    stat_atlas_census_premphf_band_frontier_events_total_ = registerStatistic<uint64_t>("atlas_census_premphf_band_frontier_events_total");
+    stat_atlas_census_premphf_band_producer_events_total_ = registerStatistic<uint64_t>("atlas_census_premphf_band_producer_events_total");
+    stat_atlas_census_premphf_band_gate_events_total_ = registerStatistic<uint64_t>("atlas_census_premphf_band_gate_events_total");
+    stat_atlas_census_premphf_band_service_events_total_ = registerStatistic<uint64_t>("atlas_census_premphf_band_service_events_total");
+    stat_atlas_census_idx2row_frontier_events_total_ = registerStatistic<uint64_t>("atlas_census_idx2row_frontier_events_total");
+    stat_atlas_census_idx2row_producer_events_total_ = registerStatistic<uint64_t>("atlas_census_idx2row_producer_events_total");
+    stat_atlas_census_idx2row_gate_events_total_ = registerStatistic<uint64_t>("atlas_census_idx2row_gate_events_total");
+    stat_atlas_census_idx2row_service_events_total_ = registerStatistic<uint64_t>("atlas_census_idx2row_service_events_total");
+    stat_atlas_census_rowindex_frontier_events_total_ = registerStatistic<uint64_t>("atlas_census_rowindex_frontier_events_total");
+    stat_atlas_census_rowindex_producer_events_total_ = registerStatistic<uint64_t>("atlas_census_rowindex_producer_events_total");
+    stat_atlas_census_rowindex_gate_events_total_ = registerStatistic<uint64_t>("atlas_census_rowindex_gate_events_total");
+    stat_atlas_census_rowindex_service_events_total_ = registerStatistic<uint64_t>("atlas_census_rowindex_service_events_total");
+    stat_atlas_census_rowdescriptor_frontier_events_total_ = registerStatistic<uint64_t>("atlas_census_rowdescriptor_frontier_events_total");
+    stat_atlas_census_rowdescriptor_producer_events_total_ = registerStatistic<uint64_t>("atlas_census_rowdescriptor_producer_events_total");
+    stat_atlas_census_rowdescriptor_gate_events_total_ = registerStatistic<uint64_t>("atlas_census_rowdescriptor_gate_events_total");
+    stat_atlas_census_rowdescriptor_service_events_total_ = registerStatistic<uint64_t>("atlas_census_rowdescriptor_service_events_total");
+    stat_atlas_proxy_rowindex_materialize_total_ = registerStatistic<uint64_t>("atlas_proxy_rowindex_materialize_total");
+    stat_atlas_proxy_rowindex_publicize_total_ = registerStatistic<uint64_t>("atlas_proxy_rowindex_publicize_total");
+    stat_atlas_proxy_rowindex_owner_form_total_ = registerStatistic<uint64_t>("atlas_proxy_rowindex_owner_form_total");
+    stat_atlas_proxy_rowindex_join_live_total_ = registerStatistic<uint64_t>("atlas_proxy_rowindex_join_live_total");
+    stat_atlas_proxy_rowindex_join_ready_total_ = registerStatistic<uint64_t>("atlas_proxy_rowindex_join_ready_total");
+    stat_atlas_proxy_rowindex_ready_total_ = registerStatistic<uint64_t>("atlas_proxy_rowindex_ready_total");
+    stat_atlas_proxy_rowindex_release_total_ = registerStatistic<uint64_t>("atlas_proxy_rowindex_release_total");
+    stat_atlas_proxy_rowindex_release_missing_total_ = registerStatistic<uint64_t>("atlas_proxy_rowindex_release_missing_total");
+    stat_atlas_proxy_rowindex_fallback_total_ = registerStatistic<uint64_t>("atlas_proxy_rowindex_fallback_total");
+    stat_atlas_proxy_idx2row_materialize_total_ = registerStatistic<uint64_t>("atlas_proxy_idx2row_materialize_total");
+    stat_atlas_proxy_idx2row_publicize_total_ = registerStatistic<uint64_t>("atlas_proxy_idx2row_publicize_total");
+    stat_atlas_proxy_idx2row_owner_form_total_ = registerStatistic<uint64_t>("atlas_proxy_idx2row_owner_form_total");
+    stat_atlas_proxy_idx2row_join_live_total_ = registerStatistic<uint64_t>("atlas_proxy_idx2row_join_live_total");
+    stat_atlas_proxy_idx2row_join_ready_total_ = registerStatistic<uint64_t>("atlas_proxy_idx2row_join_ready_total");
+    stat_atlas_proxy_idx2row_ready_total_ = registerStatistic<uint64_t>("atlas_proxy_idx2row_ready_total");
+    stat_atlas_proxy_idx2row_release_total_ = registerStatistic<uint64_t>("atlas_proxy_idx2row_release_total");
+    stat_atlas_proxy_idx2row_release_missing_total_ = registerStatistic<uint64_t>("atlas_proxy_idx2row_release_missing_total");
+    stat_atlas_proxy_idx2row_fallback_total_ = registerStatistic<uint64_t>("atlas_proxy_idx2row_fallback_total");
+    stat_atlas_proxy_premphf_base_materialize_total_ = registerStatistic<uint64_t>("atlas_proxy_premphf_base_materialize_total");
+    stat_atlas_proxy_premphf_base_publicize_total_ = registerStatistic<uint64_t>("atlas_proxy_premphf_base_publicize_total");
+    stat_atlas_proxy_premphf_base_owner_form_total_ = registerStatistic<uint64_t>("atlas_proxy_premphf_base_owner_form_total");
+    stat_atlas_proxy_premphf_base_shared_hit_total_ = registerStatistic<uint64_t>("atlas_proxy_premphf_base_shared_hit_total");
+    stat_atlas_proxy_premphf_base_lookup_ready_total_ = registerStatistic<uint64_t>("atlas_proxy_premphf_base_lookup_ready_total");
+    stat_atlas_proxy_premphf_base_proxy_only_gap_total_ = registerStatistic<uint64_t>("atlas_proxy_premphf_base_proxy_only_gap_total");
+    stat_atlas_proxy_premphf_band_materialize_total_ = registerStatistic<uint64_t>("atlas_proxy_premphf_band_materialize_total");
+    stat_atlas_proxy_premphf_band_publicize_total_ = registerStatistic<uint64_t>("atlas_proxy_premphf_band_publicize_total");
+    stat_atlas_proxy_premphf_band_owner_form_candidate_total_ = registerStatistic<uint64_t>("atlas_proxy_premphf_band_owner_form_candidate_total");
+    stat_atlas_proxy_premphf_band_join_ready_candidate_total_ = registerStatistic<uint64_t>("atlas_proxy_premphf_band_join_ready_candidate_total");
+    stat_atlas_proxy_premphf_band_zero_service_total_ = registerStatistic<uint64_t>("atlas_proxy_premphf_band_zero_service_total");
+    stat_gcss_lookup_hit_total_ = registerStatistic<uint64_t>("gcss_lookup_hit_total");
+    stat_gcss_lookup_miss_total_ = registerStatistic<uint64_t>("gcss_lookup_miss_total");
+    stat_weight_read_dense_reqs_total_ = registerStatistic<uint64_t>("weight_read_dense_reqs_total");
+    stat_weight_read_dense_bytes_total_ = registerStatistic<uint64_t>("weight_read_dense_bytes_total");
+    stat_weight_read_rowptr_reqs_total_ = registerStatistic<uint64_t>("weight_read_rowptr_reqs_total");
+    stat_weight_read_rowptr_bytes_total_ = registerStatistic<uint64_t>("weight_read_rowptr_bytes_total");
+    stat_weight_read_colidx_reqs_total_ = registerStatistic<uint64_t>("weight_read_colidx_reqs_total");
+    stat_weight_read_colidx_bytes_total_ = registerStatistic<uint64_t>("weight_read_colidx_bytes_total");
+    stat_weight_read_blockdata_reqs_total_ = registerStatistic<uint64_t>("weight_read_blockdata_reqs_total");
+    stat_weight_read_blockdata_bytes_total_ = registerStatistic<uint64_t>("weight_read_blockdata_bytes_total");
+    stat_weight_read_gcss_reqs_total_ = registerStatistic<uint64_t>("weight_read_gcss_reqs_total");
+    stat_weight_read_gcss_bytes_total_ = registerStatistic<uint64_t>("weight_read_gcss_bytes_total");
+    stat_weight_idx_sram_reads_total_ = registerStatistic<uint64_t>("weight_idx_sram_reads_total");
+    stat_weight_idx_sram_writes_total_ = registerStatistic<uint64_t>("weight_idx_sram_writes_total");
+    stat_weight_idx_sram_bytes_read_total_ = registerStatistic<uint64_t>("weight_idx_sram_bytes_read_total");
+    stat_weight_idx_sram_bytes_write_total_ = registerStatistic<uint64_t>("weight_idx_sram_bytes_write_total");
+    stat_weight_idx_sram_bank_conflict_ticks_total_ = registerStatistic<uint64_t>("weight_idx_sram_bank_conflict_ticks_total");
+    stat_weight_idx_sram_predicted_extra_cycles_total_ = registerStatistic<uint64_t>("weight_idx_sram_predicted_extra_cycles_total");
+    stat_weight_idx_sram_resident_bytes_peak_ = registerStatistic<uint64_t>("weight_idx_sram_resident_bytes_peak");
+    stat_weight_idx_sram_bank_peak_accesses_per_tick_ = registerStatistic<uint64_t>("weight_idx_sram_bank_peak_accesses_per_tick");
+    stat_weight_idx_sram_energy_read_pj_total_ = registerStatistic<uint64_t>("weight_idx_sram_energy_read_pj_total");
+    stat_weight_idx_sram_energy_write_pj_total_ = registerStatistic<uint64_t>("weight_idx_sram_energy_write_pj_total");
+    stat_weight_idx_lookup_total_ = registerStatistic<uint64_t>("weight_idx_lookup_total");
+    stat_weight_idx_lookup_idx2_total_ = registerStatistic<uint64_t>("weight_idx_lookup_idx2_total");
+    stat_weight_l0_sram_reads_total_ = registerStatistic<uint64_t>("weight_l0_sram_reads_total");
+    stat_weight_l0_sram_writes_total_ = registerStatistic<uint64_t>("weight_l0_sram_writes_total");
+    stat_weight_l0_sram_bytes_read_total_ = registerStatistic<uint64_t>("weight_l0_sram_bytes_read_total");
+    stat_weight_l0_sram_bytes_write_total_ = registerStatistic<uint64_t>("weight_l0_sram_bytes_write_total");
+    stat_weight_l0_sram_bank_conflict_ticks_total_ = registerStatistic<uint64_t>("weight_l0_sram_bank_conflict_ticks_total");
+    stat_weight_l0_sram_predicted_extra_cycles_total_ = registerStatistic<uint64_t>("weight_l0_sram_predicted_extra_cycles_total");
+    stat_weight_l0_sram_resident_bytes_peak_ = registerStatistic<uint64_t>("weight_l0_sram_resident_bytes_peak");
+    stat_weight_l0_sram_bank_peak_accesses_per_tick_ = registerStatistic<uint64_t>("weight_l0_sram_bank_peak_accesses_per_tick");
+    stat_weight_l0_sram_energy_read_pj_total_ = registerStatistic<uint64_t>("weight_l0_sram_energy_read_pj_total");
+    stat_weight_l0_sram_energy_write_pj_total_ = registerStatistic<uint64_t>("weight_l0_sram_energy_write_pj_total");
+    stat_weight_sram_enforced_stall_cycles_total_ = registerStatistic<uint64_t>("weight_sram_enforced_stall_cycles_total");
+    stat_weight_l0_lookup_total_ = registerStatistic<uint64_t>("weight_l0_lookup_total");
+    stat_weight_l0_hit_total_ = registerStatistic<uint64_t>("weight_l0_hit_total");
+    stat_weight_l0_fill_total_ = registerStatistic<uint64_t>("weight_l0_fill_total");
+    stat_weight_l0_evict_total_ = registerStatistic<uint64_t>("weight_l0_evict_total");
+    stat_core_state_sram_reads_total_ = registerStatistic<uint64_t>("core_state_sram_reads_total");
+    stat_core_state_sram_writes_total_ = registerStatistic<uint64_t>("core_state_sram_writes_total");
+    stat_core_state_sram_bytes_read_total_ = registerStatistic<uint64_t>("core_state_sram_bytes_read_total");
+    stat_core_state_sram_bytes_write_total_ = registerStatistic<uint64_t>("core_state_sram_bytes_write_total");
+    stat_core_state_sram_bank_conflict_ticks_total_ = registerStatistic<uint64_t>("core_state_sram_bank_conflict_ticks_total");
+    stat_core_state_sram_predicted_extra_cycles_total_ = registerStatistic<uint64_t>("core_state_sram_predicted_extra_cycles_total");
+    stat_core_state_sram_resident_bytes_peak_ = registerStatistic<uint64_t>("core_state_sram_resident_bytes_peak");
+    stat_core_state_sram_bank_peak_accesses_per_tick_ = registerStatistic<uint64_t>("core_state_sram_bank_peak_accesses_per_tick");
+    stat_core_state_sram_energy_read_pj_total_ = registerStatistic<uint64_t>("core_state_sram_energy_read_pj_total");
+    stat_core_state_sram_energy_write_pj_total_ = registerStatistic<uint64_t>("core_state_sram_energy_write_pj_total");
+    stat_core_state_sram_stall_cycles_total_ = registerStatistic<uint64_t>("core_state_sram_stall_cycles_total");
+    stat_riscv_snn_workload_selected_ = registerStatistic<uint64_t>("riscv_snn_workload_selected");
+    stat_riscv_snn_firmware_elf_present_ = registerStatistic<uint64_t>("riscv_snn_firmware_elf_present");
+    stat_riscv_snn_firmware_loaded_ = registerStatistic<uint64_t>("riscv_snn_firmware_loaded");
+    stat_riscv_snn_backend_runtime_bridge_ = registerStatistic<uint64_t>("riscv_snn_backend_runtime_bridge");
+    stat_riscv_snn_firmware_started_count_ = registerStatistic<uint64_t>("riscv_snn_firmware_started_count");
+    stat_riscv_snn_submitted_commands_ = registerStatistic<uint64_t>("riscv_snn_submitted_commands");
+    stat_riscv_snn_accepted_commands_ = registerStatistic<uint64_t>("riscv_snn_accepted_commands");
+    stat_riscv_snn_completion_visible_count_ = registerStatistic<uint64_t>("riscv_snn_completion_visible_count");
+    stat_riscv_snn_completion_consumed_count_ = registerStatistic<uint64_t>("riscv_snn_completion_consumed_count");
+    stat_riscv_snn_fused_step_completion_count_ = registerStatistic<uint64_t>("riscv_snn_fused_step_completion_count");
+    stat_riscv_snn_fault_count_ = registerStatistic<uint64_t>("riscv_snn_fault_count");
+    stat_riscv_snn_last_completion_status_ = registerStatistic<uint64_t>("riscv_snn_last_completion_status");
+    stat_riscv_snn_last_fault_csr_ = registerStatistic<uint64_t>("riscv_snn_last_fault_csr");
+    stat_riscv_snn_backend_runtime_bridge_provider_bound_ =
+        registerStatistic<uint64_t>("riscv_snn_backend_runtime_bridge_provider_bound");
     // 边集合溢出计数（仅在容量保护触发时递增）
     stat_gas_edge_overflow_ = registerStatistic<uint64_t>("gas_edge_overflow");
     // Apply/Scatter端到端统计（Phase‑1）
@@ -2042,6 +3962,13 @@ void SnnPESubComponent::initializeStatistics() {
     stat_gas_acc_hwm_bytes_total_ = registerStatistic<uint64_t>("gas_acc_high_watermark_bytes_total");
     stat_gas_acc_spill_records_total_ = registerStatistic<uint64_t>("gas_acc_spill_records_total");
     stat_gas_acc_spilled_bytes_total_ = registerStatistic<uint64_t>("gas_acc_spilled_bytes_total");
+    stat_gas_retire_global_hol_cycles_total_ = registerStatistic<uint64_t>("gas_retire_global_hol_cycles_total");
+    stat_gas_retire_ready_but_blocked_edges_total_ = registerStatistic<uint64_t>("gas_retire_ready_but_blocked_edges_total");
+    stat_gas_retire_per_post_progress_total_ = registerStatistic<uint64_t>("gas_retire_per_post_progress_total");
+    stat_gas_retire_samepost_blocked_edges_total_ = registerStatistic<uint64_t>("gas_retire_samepost_blocked_edges_total");
+    stat_gas_retire_crosspost_blocked_edges_total_ = registerStatistic<uint64_t>("gas_retire_crosspost_blocked_edges_total");
+    stat_gas_retire_policy_loss_cycles_total_ = registerStatistic<uint64_t>("gas_retire_policy_loss_cycles_total");
+    stat_gas_retire_policy_loss_edges_total_ = registerStatistic<uint64_t>("gas_retire_policy_loss_edges_total");
     // GAS superstep durations（cycles@1GHz == ns）
     // 留空注册，默认不向 SST 统计输出；统一使用 stage_events_csv + 离线脚本聚合
     // Batch-A additions（若需要SST统计输出，可在后续版本开放）

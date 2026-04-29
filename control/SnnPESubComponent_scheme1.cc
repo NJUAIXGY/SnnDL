@@ -8,7 +8,7 @@
 #include <sst/core/sst_config.h>
 
 #include "SnnPESubComponent.h"
-#include "SpikeEvent.h"
+#include "events/SpikeEvent.h"
 
 #include <algorithm>
 

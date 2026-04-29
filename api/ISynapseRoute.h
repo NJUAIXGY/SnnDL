@@ -12,12 +12,25 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
+#include "MulticastLimits.h"
+
+namespace SST {
+class Output;
+namespace Statistics {
+template <typename T> class Statistic;
+}
+}
+
 namespace SST { namespace SnnDL {
+
+struct SynapseRouteBuildConfig;
 
 class ISynapseRoute {
 public:
@@ -26,9 +39,57 @@ public:
     struct FanoutEntry {
         uint32_t dest_global = 0;
         uint32_t dest_node = 0;
+        float weight = 1.0f;
+    };
+
+    struct BlockTarget final {
+        uint32_t block_id = 0;
+        uint32_t ingress_node = 0;
+        uint32_t block_z = 0;
+        uint32_t block_d = 1;
+        uint16_t cohort_id = 0;
+        uint16_t band_color = 0;
+        std::array<uint32_t, kMaxMulticastBlockCells> core_mask{};
+    };
+
+    struct RouteSemanticDescriptor final {
+        std::string source_semantics_authority = "legacy_provider";
+        std::string source_primary_kind = "legacy_only";
+        std::string route_topology = "mesh_2d";
+        std::string target_semantics_authority = "legacy_multicast_fallback";
+        bool real_synapse_inputs_available = false;
+        bool native_synapse_source_candidate = false;
+        bool native_source_fanout_active = false;
+        bool native_target_synthesis_active = false;
+        bool bootstrap_dependency_active = false;
+        std::string native_bootstrap_source{};
+    };
+
+    struct RouteRuntimeStatSinks final {
+        uint64_t* route3d_native_activation_total = nullptr;
+        uint64_t* route3d_native_gating_activation_total = nullptr;
+        uint64_t* route3d_native_direct_activation_total = nullptr;
+        uint64_t* route3d_native_unique_sources_total = nullptr;
+        SST::Statistics::Statistic<uint64_t>* stat_route3d_native_activation_total = nullptr;
+        SST::Statistics::Statistic<uint64_t>* stat_route3d_native_gating_activation_total = nullptr;
+        SST::Statistics::Statistic<uint64_t>* stat_route3d_native_direct_activation_total = nullptr;
+        SST::Statistics::Statistic<uint64_t>* stat_route3d_native_unique_sources_total = nullptr;
     };
 
     virtual ~ISynapseRoute() = default;
+
+    virtual void configure(const SynapseRouteBuildConfig& cfg) = 0;
+    virtual void configureGating(bool gating_event_mode,
+                                 uint64_t gating_ttl_cycles,
+                                 bool gating_scope_inputs_only) = 0;
+    virtual void bindRuntime(Output* log,
+                             uint32_t node_id,
+                             uint32_t core_id,
+                             uint32_t num_neurons,
+                             uint32_t neurons_per_pe_cfg,
+                             SST::Statistics::Statistic<uint64_t>* stat_routes_entries) = 0;
+    virtual void bindFanoutStat(SST::Statistics::Statistic<uint64_t>* stat_fanout_per_spike) = 0;
+    virtual void bindRouteRuntimeStats(const RouteRuntimeStatSinks& stats) = 0;
 
     // 初始化路由（幂等）。返回 true 表示权重驱动路由可用；false 表示应回退 fixed。
     virtual bool initRoutes() = 0;
@@ -53,6 +114,18 @@ public:
                                      const std::vector<uint32_t>& dest_pes,
                                      uint64_t current_cycle,
                                      uint64_t ttl_cycles) = 0;
+
+    virtual bool multicastEnabled() const = 0;
+    virtual uint32_t multicastBlockW() const = 0;
+    virtual uint32_t multicastBlockH() const = 0;
+    virtual uint32_t multicastBlockD() const = 0;
+    virtual uint32_t bcsrBlockCols() const = 0;
+    virtual RouteSemanticDescriptor describeRouteSemantics() const = 0;
+    virtual bool computeMulticastTargets(uint32_t source_global,
+                                         uint32_t neuron_idx,
+                                         uint64_t now_cycles,
+                                         std::vector<BlockTarget>& out_targets,
+                                         bool& applied_gating) const = 0;
 };
 
 }} // namespace SST::SnnDL

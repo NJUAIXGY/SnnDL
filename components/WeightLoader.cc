@@ -13,21 +13,15 @@
 #include <cctype>
 #include <iterator>
 #include <random>
+#include <limits>
 
-#include "WorkloadConfig.h"
+#include "WeightLoaderConfig.h"
+#include "LoaderDoneEvent.h"
+#include "SnnDLStringUtil.h"
+#include "synapse/common/BcsrMeta.h"
 
 using namespace SST;
 using namespace SST::SnnDL;
-
-namespace {
-static std::string lowerCopy_(const std::string& s) {
-    std::string out = s;
-    for (auto& ch : out) {
-        if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
-    }
-    return out;
-}
-} // namespace
 
 std::string WeightLoader::hexDump_(const std::vector<uint8_t>& buf, size_t max_bytes) {
     const size_t n = std::min(max_bytes, buf.size());
@@ -58,22 +52,13 @@ bool WeightLoader::readFileSlice_(const std::string& path, uint64_t off, size_t 
 }
 
 bool WeightLoader::parseMetaU64_(const std::string& meta_text, const char* key, uint64_t& out) {
-    auto pos = meta_text.find(key);
-    if (pos == std::string::npos) return false;
-    pos = meta_text.find(':', pos);
-    if (pos == std::string::npos) return false;
-    ++pos;
-    while (pos < meta_text.size() && (std::isspace(static_cast<unsigned char>(meta_text[pos])) || meta_text[pos] == '"')) ++pos;
-    size_t end = pos;
-    while (end < meta_text.size() && (std::isdigit(static_cast<unsigned char>(meta_text[end])) || meta_text[end] == 'x' || meta_text[end] == 'X')) ++end;
-    if (end <= pos) return false;
-    out = std::strtoull(meta_text.substr(pos, end - pos).c_str(), nullptr, 0);
-    return true;
+    return bcsrExtractUnsignedJson(meta_text, key, out);
 }
 
 bool WeightLoader::parseMetaU32_(const std::string& meta_text, const char* key, uint32_t& out) {
     uint64_t tmp = 0;
     if (!parseMetaU64_(meta_text, key, tmp)) return false;
+    if (tmp > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) return false;
     out = static_cast<uint32_t>(tmp);
     return true;
 }
@@ -98,7 +83,7 @@ std::string WeightLoader::resolveCorePath_(int core, bool meta) const {
 void WeightLoader::issueVerifyReadbacks_() {
     if (!verify_readback_enable_ || verify_readback_issued_ || verify_readback_done_) return;
     if (!memory_) return;
-    const std::string mode = lowerCopy_(verify_readback_mode_.empty() ? "raw_bcsr" : verify_readback_mode_);
+    const std::string mode = toLowerCopy(verify_readback_mode_.empty() ? "raw_bcsr" : verify_readback_mode_);
 
     // dense byte-exact: compare against deterministic expected bytes (no files involved).
     if (mode == "dense_rowcol_v1") {
@@ -419,66 +404,63 @@ void WeightLoader::pollVerifyReadbacks_() {
 
 WeightLoader::WeightLoader(ComponentId_t id, Params& params)
     : Component(id), output_(nullptr), memory_(nullptr), loaded_(false) {
-    verbose_ = params.find<int>("verbose", 0);
-    weight_file_ = params.find<std::string>("weight_file", "");
-    base_addr_start_ = params.find<uint64_t>("base_addr_start", 0);
-    per_core_stride_ = params.find<uint64_t>("per_core_stride", 0);
-    num_cores_ = params.find<int>("num_cores", 1);
-    neurons_per_core_ = params.find<uint32_t>("neurons_per_core", 64);
-    // 行/列可选参数：未提供或为0时退回到neurons_per_core_
-    rows_per_core_ = params.find<uint32_t>("rows_per_core", 0);
-    cols_per_core_ = params.find<uint32_t>("cols_per_core", 0);
-    if (rows_per_core_ == 0) rows_per_core_ = neurons_per_core_;
-    if (cols_per_core_ == 0) cols_per_core_ = neurons_per_core_;
-    fill_value_ = params.find<float>("fill_value", 0.5f);
-    weight_format_ = params.find<std::string>("weight_format", "bin");
-    raw_mode_ = (weight_format_ == "raw");
-    bcsr_enable_ = params.find<int>("bcsr_enable", 0) != 0 || (weight_format_ == "bcsr");
-    bcsr_br_ = params.find<uint32_t>("bcsr_block_rows", 16);
-    bcsr_bc_ = params.find<uint32_t>("bcsr_block_cols", 16);
-    bcsr_val_bytes_ = params.find<uint32_t>("bcsr_val_bytes", 4);
-    bcsr_idx_bytes_ = params.find<uint32_t>("bcsr_idx_bytes", 2);
-    bcsr_pattern_ = params.find<std::string>("bcsr_pattern", "diag");
-    per_core_files_ = params.find<int>("per_core_files", 0) != 0;
-    file_template_ = params.find<std::string>("file_template", "");
-    single_file_ = params.find<std::string>("single_file", "");
-    row_major_ = params.find<int>("row_major", 1) != 0;
-    chunk_size_bytes_ = params.find<uint32_t>("chunk_size_bytes", 64);
-    validate_length_ = params.find<int>("validate_length", 1) != 0;
-    file_core_offset_ = params.find<int>("file_core_offset", 0);
-    timed_seed_enable_ = params.find<int>("timed_seed_enable", 1) != 0;
-    timed_seed_count_ = params.find<uint32_t>("timed_seed_count", 1);
-    timed_seed_allow_cache_ = params.find<int>("timed_seed_allow_cache", 0) != 0;
-    timed_write_window_ = std::max<uint32_t>(timed_seed_count_, 256u);
-    loader_done_key_ = params.find<std::string>("loader_done_key", "");
-    verify_readback_enable_ = params.find<int>("verify_readback_enable", 0) != 0;
-    verify_readback_core_ = params.find<int>("verify_readback_core", 0);
-    verify_readback_bytes_ = params.find<uint32_t>("verify_readback_bytes", 64);
-    verify_readback_mode_ = params.find<std::string>("verify_readback_mode", "raw_bcsr");
-    verify_readback_samples_ = params.find<uint32_t>("verify_readback_samples", 16);
-    verify_readback_seed_ = params.find<uint32_t>("verify_readback_seed", 314159);
-    verify_colidx_start_index_ = params.find<uint32_t>("verify_colidx_start_index", 441);
-    strict_loader_done_ = params.find<int>("strict_loader_done", 0) != 0;
-    write_pattern_mode_ = params.find<std::string>("write_pattern_mode", "const");
-    write_pattern_row_scale_ = params.find<uint32_t>("write_pattern_row_scale", 1024);
-    min_raw_bcsr_chunk_bytes_ = params.find<uint32_t>("min_raw_bcsr_chunk_bytes", 4096);
-    if (min_raw_bcsr_chunk_bytes_ != 0 && min_raw_bcsr_chunk_bytes_ < 64) {
-        min_raw_bcsr_chunk_bytes_ = 64;
-    }
-    // strict_loader_done 仅对 raw+BCSR 有意义；其他模式直接忽略，避免误伤旧用例。
-    if (strict_loader_done_ && !(raw_mode_ && bcsr_enable_)) {
-        strict_loader_done_ = false;
-    }
-    if (strict_loader_done_) {
-        // strict 模式下必须启用写后读回校验；否则 loader_done 会在“写入不可见/丢写”时误放行，导致读回全0。
-        verify_readback_enable_ = true;
-    }
-    diag_runtime_read_enable_ = params.find<int>("diag_runtime_read_enable", 0) != 0;
-    diag_runtime_read_core_ = params.find<int>("diag_runtime_read_core", 0);
-    diag_runtime_read_offset_ = params.find<uint64_t>("diag_runtime_read_offset", 0);
-    diag_runtime_read_bytes_ = params.find<uint32_t>("diag_runtime_read_bytes", 64);
+    const WeightLoaderConfig cfg = parseWeightLoaderConfig(params);
+
+    verbose_ = cfg.verbose;
+    node_id_ = cfg.node_id;
+    weight_file_ = cfg.weight_file;
+    base_addr_start_ = cfg.base_addr_start;
+    per_core_stride_ = cfg.per_core_stride;
+    num_cores_ = cfg.num_cores;
+    neurons_per_core_ = cfg.neurons_per_core;
+    rows_per_core_ = cfg.rows_per_core;
+    cols_per_core_ = cfg.cols_per_core;
+    fill_value_ = cfg.fill_value;
+    weight_format_ = cfg.weight_format;
+    raw_mode_ = cfg.raw_mode;
+
+    bcsr_enable_ = cfg.bcsr_enable;
+    bcsr_br_ = cfg.bcsr_block_rows;
+    bcsr_bc_ = cfg.bcsr_block_cols;
+    bcsr_val_bytes_ = cfg.bcsr_val_bytes;
+    bcsr_idx_bytes_ = cfg.bcsr_idx_bytes;
+    bcsr_pattern_ = cfg.bcsr_pattern;
+
+    per_core_files_ = cfg.per_core_files;
+    file_template_ = cfg.file_template;
+    single_file_ = cfg.single_file;
+    row_major_ = cfg.row_major;
+    chunk_size_bytes_ = cfg.chunk_size_bytes;
+    validate_length_ = cfg.validate_length;
+    file_core_offset_ = cfg.file_core_offset;
+
+    timed_seed_enable_ = cfg.timed_seed_enable;
+    timed_seed_count_ = cfg.timed_seed_count;
+    timed_seed_allow_cache_ = cfg.timed_seed_allow_cache;
+    timed_write_window_ = cfg.timed_write_window;
+
+    loader_done_key_ = cfg.loader_done_key;
+    verify_readback_enable_ = cfg.verify_readback_enable;
+    verify_readback_core_ = cfg.verify_readback_core;
+    verify_readback_bytes_ = cfg.verify_readback_bytes;
+    verify_readback_mode_ = cfg.verify_readback_mode;
+    verify_readback_samples_ = cfg.verify_readback_samples;
+    verify_readback_seed_ = cfg.verify_readback_seed;
+    verify_colidx_start_index_ = cfg.verify_colidx_start_index;
+    strict_loader_done_ = cfg.strict_loader_done;
+
+    write_pattern_mode_ = cfg.write_pattern_mode;
+    write_pattern_row_scale_ = cfg.write_pattern_row_scale;
+    min_raw_bcsr_chunk_bytes_ = cfg.min_raw_bcsr_chunk_bytes;
+
+    diag_runtime_read_enable_ = cfg.diag_runtime_read_enable;
+    diag_runtime_read_core_ = cfg.diag_runtime_read_core;
+    diag_runtime_read_offset_ = cfg.diag_runtime_read_offset;
+    diag_runtime_read_bytes_ = cfg.diag_runtime_read_bytes;
 
     output_ = new Output("WeightLoader[@p:@l]: ", verbose_, 0, Output::STDOUT);
+    // Optional control-plane link (cross-rank loader_done bridge)
+    loader_done_link_ = configureLink("loader_done");
     // 无条件记录构造基本配置，便于确认是否实际创建
     output_->verbose(CALL_INFO, 2, 0,
         "[WL-diag-init] verbose=%d weight_file=%s file_tmpl=%s single_file=%s base=0x%llx stride=0x%llx num_cores=%d rows=%u cols=%u fill=%.3f raw=%d bcsr=%d pat=%s pat_row_scale=%u verify=%d verify_mode=%s verify_samples=%u verify_seed=%u\n",
@@ -488,23 +470,15 @@ WeightLoader::WeightLoader(ComponentId_t id, Params& params)
         write_pattern_mode_.c_str(), write_pattern_row_scale_,
         verify_readback_enable_ ? 1 : 0, verify_readback_mode_.c_str(), verify_readback_samples_, verify_readback_seed_);
 
-    // 通用 workload（例如 stream）下禁止 WeightLoader 写入任何权重数据，
-    // 否则会覆盖通用 workload 的内存测试区域并造成误判/误崩溃。
-    {
-        std::string workload_impl = params.find<std::string>("workload_impl", "");
-        if (workload_impl.empty()) {
-            if (const char* env = workloadImplFromEnvCached()) workload_impl = env;
-        }
-        if (!workload_impl.empty() && workload_impl != "snn") {
-            enabled_ = false;
-            loaded_ = true;
-            runtime_load_needed_ = false;
-            verify_readback_enable_ = false;
-            strict_loader_done_ = false;
-            output_->verbose(CALL_INFO, 1, 0,
-                "[WL-disabled] workload_impl=%s -> skip all weight writes\n",
-                workload_impl.c_str());
-        }
+    if (!cfg.enabled) {
+        enabled_ = false;
+        loaded_ = true;
+        runtime_load_needed_ = false;
+        verify_readback_enable_ = false;
+        strict_loader_done_ = false;
+        output_->verbose(CALL_INFO, 1, 0,
+            "[WL-disabled] workload_impl=%s -> skip all weight writes\n",
+            cfg.workload_impl.c_str());
     }
 
     if (!loader_done_key_.empty()) {
@@ -567,7 +541,7 @@ void WeightLoader::init(unsigned int phase) {
                 (unsigned long long)base_addr_start_, per_core_stride_, num_cores_);
         }
     }
-    if (phase == 1 && !loaded_) {
+    if (phase == 0 && !loaded_) {
         // 关键约束：BCSR 权重数据规模很大（每核 MB 级），若在 timed 仿真阶段通过 memHierarchy
         // 逐 cacheline 拆分写入，会消耗远超 100us 的模拟时间并导致核心侧长期 loader-not-ready。
         // 因此：无论是否开启 timed seed，都在 init 阶段完成一次性 untimed 加载（不计入模拟时间）。
@@ -594,6 +568,12 @@ void WeightLoader::setup() {
     if (memory_) {
         memory_->setup();
     }
+    // Cross-rank loader_done bridge: ensure a timed LoaderDoneEvent is emitted after setup,
+    // so the PE side can latch readiness even when SharedArray is not coherent across MPI ranks.
+    if (loader_done_link_ && loader_done_published_ && !loader_done_event_sent_) {
+        loader_done_link_->send(new LoaderDoneEvent(node_id_));
+        loader_done_event_sent_ = true;
+    }
     if (!enabled_) return;
     // output_->verbose(CALL_INFO, 1, 0, "✅ WeightLoader setup完成\n");
     
@@ -607,7 +587,7 @@ void WeightLoader::setup() {
     // the verification actually ran. We run readbacks in timed simulation (see onClockTick),
     // because some StandardMem backends do not return data for untimed ReadResp.
     if (verify_readback_enable_) {
-        const std::string mode = lowerCopy_(verify_readback_mode_.empty() ? "raw_bcsr" : verify_readback_mode_);
+        const std::string mode = toLowerCopy(verify_readback_mode_.empty() ? "raw_bcsr" : verify_readback_mode_);
         if (!verify_readback_done_ && verify_todo_.empty()) {
             output_->fatal(CALL_INFO, -1,
                 "❌ WeightLoader verify_readback_enable=1 但未准备任何读回校验样本（mode=%s）。"
@@ -736,7 +716,7 @@ void WeightLoader::handleMemoryResponse(SST::Interfaces::StandardMem::Request* r
                 if (verify_pending_.empty() && verify_readback_issued_) {
                     verify_readback_done_ = true;
                     if (!verify_failed_ && !verify_readback_pass_logged_ && output_) {
-                        const std::string mode = lowerCopy_(verify_readback_mode_.empty() ? "raw_bcsr" : verify_readback_mode_);
+                        const std::string mode = toLowerCopy(verify_readback_mode_.empty() ? "raw_bcsr" : verify_readback_mode_);
                         if (mode != "raw_bcsr") {
                             // Dense microbench (synthetic pattern): PASS marker only (no BCSR segment semantics).
                             output_->verbose(CALL_INFO, 0, 0,
@@ -895,7 +875,7 @@ void WeightLoader::issueWritesFill(float value) {
     const uint32_t R = rows_per_core_;
     const uint32_t C = cols_per_core_;
     const uint32_t chunk = std::max<uint32_t>(16, chunk_size_bytes_); // 下限保护
-    const std::string pat = lowerCopy_(write_pattern_mode_);
+    const std::string pat = toLowerCopy(write_pattern_mode_);
 
     uint64_t total_writes = 0;
     for (int core = 0; core < num_cores_; ++core) {
@@ -1505,6 +1485,11 @@ void WeightLoader::publishLoaderDone_() {
     loader_done_shared_.write(0, 1);
     loader_done_shared_.publish();
     loader_done_published_ = true;
+
+    if (loader_done_link_) {
+        // init/setup 阶段只能使用 untimed 通道；timed send 会触发 SST Core fatal。
+        loader_done_link_->sendUntimedData(new LoaderDoneEvent(node_id_));
+    }
 }
 
 bool WeightLoader::loadPerCoreFilesRuntime(const std::string& tmpl, const std::string& fmt) {

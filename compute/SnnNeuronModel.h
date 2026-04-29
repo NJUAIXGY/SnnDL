@@ -14,6 +14,8 @@
 #include <string>
 #include <vector>
 
+#include "SnnDLStringUtil.h"
+
 #ifndef SNNDL_PARAMS_STUB
 #include <sst/core/params.h>
 #else
@@ -310,8 +312,7 @@ private:
 
 // Factory helpers.
 inline NeuronModelType parseNeuronModel(const std::string& s_in) {
-    std::string s = s_in; // case-insensitive parse
-    for (auto& c : s) c = static_cast<char>(::tolower(c));
+    const std::string s = toLowerCopy(s_in); // case-insensitive parse
     if (s == "lif" || s.empty()) return NeuronModelType::LIF;
     if (s == "izhikevich" || s == "izh") return NeuronModelType::Izhikevich;
     if (s == "adex" || s == "aex" || s == "adaptive_exponential") return NeuronModelType::AdEx;

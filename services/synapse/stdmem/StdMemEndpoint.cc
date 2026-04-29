@@ -11,8 +11,8 @@
 #include <sst/core/output.h>
 
 #include "IGasStageSink.h"
+#include "IGasCreditGate.h"
 #include "IGasStepGate.h"
-#include "IManualWindowDrive.h"
 #include "memory/StandardMemAccess.h"
 #include "synapse/gas/GasCustomCmd.h"
 
@@ -38,7 +38,7 @@ void StdMemEndpoint::bindStdMem(SST::SubComponent* stdmem_subcomp) {
     // Reset previous bindings
     mem_access_ = nullptr;
     step_gate_ = nullptr;
-    manual_drive_ = nullptr;
+    credit_gate_ = nullptr;
     if (impl_) {
         impl_->stdmem = nullptr;
         impl_->stdmem_access.reset();
@@ -57,7 +57,7 @@ void StdMemEndpoint::bindStdMem(SST::SubComponent* stdmem_subcomp) {
 
     // Optional: query GAS step gate and manual window driver from downstream StandardMem front-end.
     step_gate_ = dynamic_cast<IGasStepGate*>(impl_->stdmem);
-    manual_drive_ = dynamic_cast<IManualWindowDrive*>(impl_->stdmem);
+    credit_gate_ = dynamic_cast<IGasCreditGate*>(impl_->stdmem);
 }
 
 void StdMemEndpoint::init(unsigned int phase) {
@@ -104,16 +104,7 @@ void StdMemEndpoint::handleResponseOpaque(void* req) {
         }
         if (auto* st = dynamic_cast<GasStatData*>(&data)) {
             if (rt_.gas_stage_sink) {
-                GasStatEvent sev{};
-                sev.unique_reads = st->unique_reads;
-                sev.unique_bytes = st->unique_bytes;
-                sev.rowwin_triggers = st->rowwin_triggers;
-                sev.rowwin_bytes = st->rowwin_bytes;
-                sev.bursts = st->bursts;
-                sev.payload_bytes = st->payload_bytes;
-                sev.window_inflight_peak = st->window_inflight_peak;
-                sev.window_buffer_max_bytes = st->window_buffer_max_bytes;
-                sev.gap_absorbed_bytes = st->gap_absorbed_bytes;
+                const GasStatEvent sev = toGasStatEvent(*st);
                 rt_.gas_stage_sink->onGasStatEvent(sev);
             }
             delete stdmem_req;

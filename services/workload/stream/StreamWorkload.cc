@@ -37,6 +37,74 @@ void StreamWorkload::configureFromParams(const SST::Params& params) {
     cfg_.mem_req_bytes = params.find<uint32_t>("stream_mem_req_bytes", cfg_.mem_req_bytes);
     cfg_.mem_stride_bytes = params.find<uint32_t>("stream_mem_stride_bytes", cfg_.mem_stride_bytes);
     cfg_.mem_max_outstanding = params.find<uint32_t>("stream_mem_max_outstanding", cfg_.mem_max_outstanding);
+    cfg_.semantic_memory_enable = params.find<int>("semantic_memory_enable", cfg_.semantic_memory_enable ? 1 : 0) != 0;
+    cfg_.semantic_memory_demand_driven_enable =
+        params.find<int>("semantic_memory_demand_driven_enable",
+                         cfg_.semantic_memory_demand_driven_enable ? 1 : 0) != 0;
+    cfg_.metadata_lookup.enable = params.find<int>(
+        "metadata_lookup_enable",
+        (cfg_.semantic_memory_enable && cfg_.mem_enable) ? 1 : 0) != 0;
+    cfg_.metadata_lookup.base_addr = params.find<uint64_t>("metadata_base_addr", 0);
+    cfg_.metadata_lookup.period_cycles = params.find<uint64_t>(
+        "metadata_lookup_period_cycles",
+        cfg_.mem_period_cycles);
+    cfg_.metadata_lookup.region_bytes = params.find<uint64_t>(
+        "metadata_region_bytes",
+        params.find<uint64_t>("memory_semantic_slot_bytes", cfg_.mem_region_bytes));
+    cfg_.metadata_lookup.req_bytes = params.find<uint32_t>(
+        "metadata_lookup_req_bytes",
+        std::min<uint32_t>(cfg_.mem_req_bytes, 16u));
+    cfg_.metadata_lookup.stride_bytes = params.find<uint32_t>(
+        "metadata_lookup_stride_bytes",
+        cfg_.metadata_lookup.req_bytes);
+    cfg_.synapse_gather.enable = params.find<int>(
+        "synapse_gather_enable",
+        (cfg_.semantic_memory_enable && cfg_.mem_enable) ? 1 : 0) != 0;
+    cfg_.synapse_gather.base_addr = params.find<uint64_t>("gather_base_addr", 0);
+    cfg_.synapse_gather.period_cycles = params.find<uint64_t>(
+        "synapse_gather_period_cycles",
+        cfg_.mem_period_cycles);
+    cfg_.synapse_gather.region_bytes = params.find<uint64_t>(
+        "gather_region_bytes",
+        params.find<uint64_t>("memory_semantic_slot_bytes", cfg_.mem_region_bytes));
+    cfg_.synapse_gather.req_bytes = params.find<uint32_t>(
+        "synapse_gather_req_bytes",
+        cfg_.mem_req_bytes);
+    cfg_.synapse_gather.stride_bytes = params.find<uint32_t>(
+        "synapse_gather_stride_bytes",
+        cfg_.mem_stride_bytes);
+    cfg_.stream_region.enable = params.find<int>(
+        "stream_region_enable",
+        (cfg_.semantic_memory_enable && cfg_.mem_enable) ? 1 : 0) != 0;
+    cfg_.stream_region.base_addr = params.find<uint64_t>("stream_base_addr", 0);
+    cfg_.stream_region.period_cycles = params.find<uint64_t>(
+        "stream_region_period_cycles",
+        cfg_.mem_period_cycles);
+    cfg_.stream_region.region_bytes = params.find<uint64_t>(
+        "stream_region_bytes",
+        params.find<uint64_t>("memory_semantic_slot_bytes", cfg_.mem_region_bytes));
+    cfg_.stream_region.req_bytes = params.find<uint32_t>(
+        "stream_region_req_bytes",
+        cfg_.mem_req_bytes);
+    cfg_.stream_region.stride_bytes = params.find<uint32_t>(
+        "stream_region_stride_bytes",
+        cfg_.mem_stride_bytes);
+    cfg_.writeback_region.enable = params.find<int>(
+        "writeback_region_enable",
+        (cfg_.semantic_memory_enable && cfg_.mem_enable) ? 1 : 0) != 0;
+    cfg_.writeback_region.base_addr = params.find<uint64_t>("writeback_base_addr", 0);
+    cfg_.writeback_region.period_cycles = params.find<uint64_t>(
+        "writeback_region_period_cycles",
+        cfg_.mem_period_cycles);
+    cfg_.writeback_region.region_bytes = params.find<uint64_t>(
+        "writeback_region_bytes",
+        params.find<uint64_t>("memory_semantic_slot_bytes", cfg_.mem_region_bytes));
+    cfg_.writeback_region.req_bytes = params.find<uint32_t>(
+        "writeback_region_req_bytes",
+        cfg_.mem_req_bytes);
+    cfg_.writeback_region.stride_bytes = params.find<uint32_t>(
+        "writeback_region_stride_bytes",
+        cfg_.mem_stride_bytes);
 
     cfg_.comm_enable = params.find<int>("stream_comm_enable", cfg_.comm_enable ? 1 : 0) != 0;
     cfg_.comm_period_cycles = params.find<uint64_t>("stream_comm_period_cycles", cfg_.comm_period_cycles);
@@ -50,6 +118,14 @@ void StreamWorkload::configureFromParams(const SST::Params& params) {
     if (cfg_.mem_req_bytes > (1024u * 1024u)) cfg_.mem_req_bytes = 1024u * 1024u;
     if (cfg_.mem_stride_bytes == 0) cfg_.mem_stride_bytes = 64;
     if (cfg_.mem_max_outstanding == 0) cfg_.mem_max_outstanding = 1;
+    if (cfg_.metadata_lookup.req_bytes == 0) cfg_.metadata_lookup.req_bytes = 16;
+    if (cfg_.metadata_lookup.stride_bytes == 0) cfg_.metadata_lookup.stride_bytes = cfg_.metadata_lookup.req_bytes;
+    if (cfg_.synapse_gather.req_bytes == 0) cfg_.synapse_gather.req_bytes = cfg_.mem_req_bytes;
+    if (cfg_.synapse_gather.stride_bytes == 0) cfg_.synapse_gather.stride_bytes = cfg_.synapse_gather.req_bytes;
+    if (cfg_.stream_region.req_bytes == 0) cfg_.stream_region.req_bytes = cfg_.mem_req_bytes;
+    if (cfg_.stream_region.stride_bytes == 0) cfg_.stream_region.stride_bytes = cfg_.stream_region.req_bytes;
+    if (cfg_.writeback_region.req_bytes == 0) cfg_.writeback_region.req_bytes = cfg_.mem_req_bytes;
+    if (cfg_.writeback_region.stride_bytes == 0) cfg_.writeback_region.stride_bytes = cfg_.writeback_region.req_bytes;
 }
 
 void StreamWorkload::bindRuntime(const Runtime& rt) {
@@ -58,6 +134,13 @@ void StreamWorkload::bindRuntime(const Runtime& rt) {
     if (mem_inflight_.size() > static_cast<size_t>(cfg_.mem_max_outstanding) * 4u) {
         mem_inflight_.clear();
     }
+}
+
+void StreamWorkload::enqueueSemanticDemand(const SemanticMemoryDemand& demand) {
+    pending_metadata_lookup_demands_ += demand.metadata_lookup_demands;
+    pending_synapse_gather_demands_ += demand.synapse_gather_demands;
+    pending_stream_region_demands_ += demand.stream_region_demands;
+    pending_writeback_region_demands_ += demand.writeback_region_demands;
 }
 
 uint32_t StreamWorkload::crc32_ieee_(const uint8_t* data, size_t len) {
@@ -112,12 +195,14 @@ bool StreamWorkload::check_expected_bytes_(uint64_t seed_base,
                                           uint32_t core_id,
                                           uint64_t addr,
                                           uint32_t seq,
+                                          SemanticMemoryKind kind,
                                           const std::vector<uint8_t>& got) {
     uint64_t rng = seed_base ^
                    (static_cast<uint64_t>(node_id) << 32) ^
                    (static_cast<uint64_t>(core_id) << 16) ^
                    addr ^
-                   static_cast<uint64_t>(seq);
+                   static_cast<uint64_t>(seq) ^
+                   (static_cast<uint64_t>(kind) << 48);
     size_t pos = 0;
     while (pos < got.size()) {
         const uint64_t v = splitmix64_next_(rng);
@@ -130,6 +215,318 @@ bool StreamWorkload::check_expected_bytes_(uint64_t seed_base,
         pos += n;
     }
     return true;
+}
+
+const char* StreamWorkload::semanticKindKey_(SemanticMemoryKind kind) {
+    switch (kind) {
+        case SemanticMemoryKind::MetadataLookup:
+            return "metadata_lookup";
+        case SemanticMemoryKind::SynapseGather:
+            return "synapse_gather";
+        case SemanticMemoryKind::StreamRegion:
+            return "stream_region";
+        case SemanticMemoryKind::WritebackRegion:
+            return "writeback_region";
+        case SemanticMemoryKind::Legacy:
+        default:
+            return "stream_mem";
+    }
+}
+
+void StreamWorkload::noteMemoryIssue_(SemanticMemoryKind kind, size_t bytes, bool is_read) {
+    reportMemIssue_(bytes);
+    memory_requests_++;
+    if (is_read) {
+        if (rt_.sinks.stat_mem_reads_issued_total) rt_.sinks.stat_mem_reads_issued_total->addData(1);
+        if (rt_.sinks.stat_mem_bytes_read_total) rt_.sinks.stat_mem_bytes_read_total->addData(bytes);
+        stream_mem_reads_issued_total_ += 1;
+        stream_mem_bytes_read_total_ += static_cast<uint64_t>(bytes);
+    } else {
+        if (rt_.sinks.stat_mem_writes_issued_total) rt_.sinks.stat_mem_writes_issued_total->addData(1);
+        if (rt_.sinks.stat_mem_bytes_written_total) rt_.sinks.stat_mem_bytes_written_total->addData(bytes);
+        stream_mem_writes_issued_total_ += 1;
+        stream_mem_bytes_written_total_ += static_cast<uint64_t>(bytes);
+    }
+
+    switch (kind) {
+        case SemanticMemoryKind::MetadataLookup:
+            if (is_read) {
+                metadata_lookup_reads_issued_total_ += 1;
+                metadata_lookup_bytes_read_total_ += static_cast<uint64_t>(bytes);
+            } else {
+                metadata_lookup_writes_issued_total_ += 1;
+                metadata_lookup_bytes_written_total_ += static_cast<uint64_t>(bytes);
+            }
+            break;
+        case SemanticMemoryKind::SynapseGather:
+            if (is_read) {
+                synapse_gather_reads_issued_total_ += 1;
+                synapse_gather_bytes_read_total_ += static_cast<uint64_t>(bytes);
+            } else {
+                synapse_gather_writes_issued_total_ += 1;
+                synapse_gather_bytes_written_total_ += static_cast<uint64_t>(bytes);
+            }
+            break;
+        case SemanticMemoryKind::StreamRegion:
+            if (is_read) {
+                stream_region_reads_issued_total_ += 1;
+                stream_region_bytes_read_total_ += static_cast<uint64_t>(bytes);
+            } else {
+                stream_region_writes_issued_total_ += 1;
+                stream_region_bytes_written_total_ += static_cast<uint64_t>(bytes);
+            }
+            break;
+        case SemanticMemoryKind::WritebackRegion:
+            if (is_read) {
+                writeback_region_reads_issued_total_ += 1;
+                writeback_region_bytes_read_total_ += static_cast<uint64_t>(bytes);
+            } else {
+                writeback_region_writes_issued_total_ += 1;
+                writeback_region_bytes_written_total_ += static_cast<uint64_t>(bytes);
+            }
+            break;
+        case SemanticMemoryKind::Legacy:
+        default:
+            break;
+    }
+}
+
+bool StreamWorkload::issueLegacyMemoryRequest_(uint64_t now_cycle) {
+    const uint32_t max_ostd = cfg_.mem_max_outstanding;
+    const bool time_ok =
+        (cfg_.mem_period_cycles == 0) ||
+        (now_cycle - last_mem_issue_cycle_ >= cfg_.mem_period_cycles);
+    if (!time_ok || mem_inflight_.size() >= static_cast<size_t>(max_ostd)) return false;
+    if (cfg_.mem_region_bytes < cfg_.mem_req_bytes) return false;
+
+    const uint32_t req_bytes = cfg_.mem_req_bytes;
+    uint64_t offset = next_offset_;
+    if (offset + req_bytes > cfg_.mem_region_bytes) offset = 0;
+    const uint64_t addr = rt_.base_addr + offset;
+    const uint32_t seq = mem_seq_++;
+
+    std::vector<uint8_t> data;
+    data.resize(req_bytes);
+    uint64_t rng = cfg_.seed_base ^
+                   (static_cast<uint64_t>(rt_.node_id) << 32) ^
+                   (static_cast<uint64_t>(rt_.core_id) << 16) ^
+                   addr ^
+                   static_cast<uint64_t>(seq);
+    size_t pos = 0;
+    while (pos < data.size()) {
+        const uint64_t v = splitmix64_next_(rng);
+        const size_t n = std::min<size_t>(8, data.size() - pos);
+        std::memcpy(&data[pos], &v, n);
+        pos += n;
+    }
+
+    noteMemoryIssue_(SemanticMemoryKind::Legacy, data.size(), /*is_read=*/false);
+    const auto w_id = rt_.mem->write(
+        addr, data,
+        [this, addr, seq, req_bytes](IMemoryAccess::RequestId req_id, uint64_t /*addr_cb*/) mutable {
+            if (req_id != 0) {
+                mem_inflight_.erase(static_cast<uint64_t>(req_id));
+            }
+            if (req_id == 0) {
+                if (rt_.sinks.mem_verify_fail) (*rt_.sinks.mem_verify_fail)++;
+                if (rt_.sinks.stat_mem_verify_fail_total) rt_.sinks.stat_mem_verify_fail_total->addData(1);
+                if (cfg_.strict && rt_.log) {
+                    rt_.log->fatal(CALL_INFO, -1,
+                                   "stream fatal: write failed (core=%u addr=0x%llx seq=%u bytes=%u)\n",
+                                   rt_.core_id, (unsigned long long)addr, seq, req_bytes);
+                }
+                return;
+            }
+
+            if (!rt_.mem) return;
+            noteMemoryIssue_(SemanticMemoryKind::Legacy, req_bytes, /*is_read=*/true);
+
+            const auto r_id = rt_.mem->read(
+                addr, req_bytes,
+                [this, addr, seq, req_bytes](IMemoryAccess::RequestId r_id,
+                                             uint64_t /*addr_cb*/,
+                                             std::vector<uint8_t>&& got) mutable {
+                    if (r_id != 0) {
+                        mem_inflight_.erase(static_cast<uint64_t>(r_id));
+                    }
+                    if (r_id == 0 || got.size() != req_bytes) {
+                        if (rt_.sinks.mem_verify_fail) (*rt_.sinks.mem_verify_fail)++;
+                        if (rt_.sinks.stat_mem_verify_fail_total) rt_.sinks.stat_mem_verify_fail_total->addData(1);
+                        if (cfg_.strict && rt_.log) {
+                            rt_.log->fatal(CALL_INFO, -1,
+                                           "stream fatal: read failed (core=%u addr=0x%llx seq=%u bytes=%u got=%zu)\n",
+                                           rt_.core_id, (unsigned long long)addr, seq, req_bytes, got.size());
+                        }
+                        return;
+                    }
+                    if (!check_expected_bytes_(
+                            cfg_.seed_base,
+                            rt_.node_id,
+                            rt_.core_id,
+                            addr,
+                            seq,
+                            SemanticMemoryKind::Legacy,
+                            got)) {
+                        if (rt_.sinks.mem_verify_fail) (*rt_.sinks.mem_verify_fail)++;
+                        if (rt_.sinks.stat_mem_verify_fail_total) rt_.sinks.stat_mem_verify_fail_total->addData(1);
+                        if (cfg_.strict && rt_.log) {
+                            rt_.log->fatal(CALL_INFO, -1,
+                                           "stream fatal: verify mismatch (core=%u addr=0x%llx seq=%u bytes=%u)\n",
+                                           rt_.core_id, (unsigned long long)addr, seq, req_bytes);
+                        }
+                        return;
+                    }
+                    if (rt_.sinks.mem_verify_pass) (*rt_.sinks.mem_verify_pass)++;
+                    if (rt_.sinks.stat_mem_verify_pass_total) rt_.sinks.stat_mem_verify_pass_total->addData(1);
+                });
+            if (r_id != 0) {
+                mem_inflight_[static_cast<uint64_t>(r_id)] = MemReq{
+                    addr, seq, req_bytes, true, SemanticMemoryKind::Legacy};
+            }
+        });
+
+    if (w_id != 0) {
+        mem_inflight_[static_cast<uint64_t>(w_id)] = MemReq{
+            addr, seq, req_bytes, false, SemanticMemoryKind::Legacy};
+    }
+
+    last_mem_issue_cycle_ = now_cycle;
+    next_offset_ = offset + static_cast<uint64_t>(std::max<uint32_t>(1, cfg_.mem_stride_bytes));
+    if (next_offset_ >= cfg_.mem_region_bytes) next_offset_ = 0;
+    return true;
+}
+
+bool StreamWorkload::issueSemanticMemoryRequest_(
+    uint64_t now_cycle,
+    SemanticMemoryKind kind,
+    const SemanticMemoryConfig& cfg,
+    SemanticMemoryState& state) {
+    if (!cfg.enable) return false;
+    if (cfg.region_bytes == 0 || cfg.req_bytes == 0) return false;
+    if (cfg.region_bytes < cfg.req_bytes) return false;
+    if (mem_inflight_.size() >= static_cast<size_t>(cfg_.mem_max_outstanding)) return false;
+
+    const bool time_ok =
+        (cfg.period_cycles == 0) ||
+        (now_cycle - state.last_issue_cycle >= cfg.period_cycles);
+    if (!time_ok) return false;
+
+    uint64_t offset = state.next_offset;
+    if (offset + cfg.req_bytes > cfg.region_bytes) offset = 0;
+    const uint64_t addr = cfg.base_addr + offset;
+    const uint32_t seq = state.seq++;
+    const uint32_t req_bytes = cfg.req_bytes;
+
+    std::vector<uint8_t> data;
+    data.resize(req_bytes);
+    uint64_t rng = cfg_.seed_base ^
+                   (static_cast<uint64_t>(rt_.node_id) << 32) ^
+                   (static_cast<uint64_t>(rt_.core_id) << 16) ^
+                   addr ^
+                   static_cast<uint64_t>(seq) ^
+                   (static_cast<uint64_t>(kind) << 48);
+    size_t pos = 0;
+    while (pos < data.size()) {
+        const uint64_t v = splitmix64_next_(rng);
+        const size_t n = std::min<size_t>(8, data.size() - pos);
+        std::memcpy(&data[pos], &v, n);
+        pos += n;
+    }
+
+    noteMemoryIssue_(kind, data.size(), /*is_read=*/false);
+    const auto w_id = rt_.mem->write(
+        addr, data,
+        [this, kind, addr, seq, req_bytes](IMemoryAccess::RequestId req_id, uint64_t /*addr_cb*/) mutable {
+            if (req_id != 0) {
+                mem_inflight_.erase(static_cast<uint64_t>(req_id));
+            }
+            if (req_id == 0) {
+                if (rt_.sinks.mem_verify_fail) (*rt_.sinks.mem_verify_fail)++;
+                if (rt_.sinks.stat_mem_verify_fail_total) rt_.sinks.stat_mem_verify_fail_total->addData(1);
+                if (cfg_.strict && rt_.log) {
+                    rt_.log->fatal(CALL_INFO, -1,
+                                   "stream fatal: semantic write failed kind=%s (core=%u addr=0x%llx seq=%u bytes=%u)\n",
+                                   semanticKindKey_(kind),
+                                   rt_.core_id, (unsigned long long)addr, seq, req_bytes);
+                }
+                return;
+            }
+
+            if (!rt_.mem) return;
+            noteMemoryIssue_(kind, req_bytes, /*is_read=*/true);
+            const auto r_id = rt_.mem->read(
+                addr, req_bytes,
+                [this, kind, addr, seq, req_bytes](IMemoryAccess::RequestId r_id,
+                                                   uint64_t /*addr_cb*/,
+                                                   std::vector<uint8_t>&& got) mutable {
+                    if (r_id != 0) {
+                        mem_inflight_.erase(static_cast<uint64_t>(r_id));
+                    }
+                    if (r_id == 0 || got.size() != req_bytes) {
+                        if (rt_.sinks.mem_verify_fail) (*rt_.sinks.mem_verify_fail)++;
+                        if (rt_.sinks.stat_mem_verify_fail_total) rt_.sinks.stat_mem_verify_fail_total->addData(1);
+                        if (cfg_.strict && rt_.log) {
+                            rt_.log->fatal(CALL_INFO, -1,
+                                           "stream fatal: semantic read failed kind=%s (core=%u addr=0x%llx seq=%u bytes=%u got=%zu)\n",
+                                           semanticKindKey_(kind),
+                                           rt_.core_id, (unsigned long long)addr, seq, req_bytes, got.size());
+                        }
+                        return;
+                    }
+                    if (!check_expected_bytes_(cfg_.seed_base, rt_.node_id, rt_.core_id, addr, seq, kind, got)) {
+                        if (rt_.sinks.mem_verify_fail) (*rt_.sinks.mem_verify_fail)++;
+                        if (rt_.sinks.stat_mem_verify_fail_total) rt_.sinks.stat_mem_verify_fail_total->addData(1);
+                        if (cfg_.strict && rt_.log) {
+                            rt_.log->fatal(CALL_INFO, -1,
+                                           "stream fatal: semantic verify mismatch kind=%s (core=%u addr=0x%llx seq=%u bytes=%u)\n",
+                                           semanticKindKey_(kind),
+                                           rt_.core_id, (unsigned long long)addr, seq, req_bytes);
+                        }
+                        return;
+                    }
+                    if (rt_.sinks.mem_verify_pass) (*rt_.sinks.mem_verify_pass)++;
+                    if (rt_.sinks.stat_mem_verify_pass_total) rt_.sinks.stat_mem_verify_pass_total->addData(1);
+                });
+            if (r_id != 0) {
+                mem_inflight_[static_cast<uint64_t>(r_id)] = MemReq{addr, seq, req_bytes, true, kind};
+            }
+        });
+
+    if (w_id != 0) {
+        mem_inflight_[static_cast<uint64_t>(w_id)] = MemReq{addr, seq, req_bytes, false, kind};
+    }
+
+    state.last_issue_cycle = now_cycle;
+    state.next_offset = offset + static_cast<uint64_t>(std::max<uint32_t>(1, cfg.stride_bytes));
+    if (state.next_offset >= cfg.region_bytes) state.next_offset = 0;
+    return true;
+}
+
+bool StreamWorkload::issueDemandDrivenSemanticMemoryRequest_(
+    uint64_t now_cycle,
+    SemanticMemoryKind kind,
+    const SemanticMemoryConfig& cfg,
+    SemanticMemoryState& state,
+    uint64_t& pending_demands) {
+    if (pending_demands == 0) return false;
+    if (!issueSemanticMemoryRequest_(now_cycle, kind, cfg, state)) return false;
+    pending_demands -= 1;
+    return true;
+}
+
+bool StreamWorkload::hasSemanticMemoryWork_() const {
+    return cfg_.semantic_memory_enable &&
+           ((cfg_.metadata_lookup.enable && cfg_.metadata_lookup.region_bytes > 0) ||
+            (cfg_.synapse_gather.enable && cfg_.synapse_gather.region_bytes > 0) ||
+            (cfg_.stream_region.enable && cfg_.stream_region.region_bytes > 0) ||
+            (cfg_.writeback_region.enable && cfg_.writeback_region.region_bytes > 0));
+}
+
+bool StreamWorkload::hasPendingSemanticDemand_() const {
+    return pending_metadata_lookup_demands_ > 0 ||
+           pending_synapse_gather_demands_ > 0 ||
+           pending_stream_region_demands_ > 0 ||
+           pending_writeback_region_demands_ > 0;
 }
 
 bool StreamWorkload::deliverPacket(NocPacketEvent* packet) {
@@ -193,113 +590,64 @@ bool StreamWorkload::onClockTick(uint64_t now_cycle) {
 
     // === Memory stream: write -> read -> verify ===
     if (cfg_.mem_enable && rt_.mem && cfg_.mem_region_bytes > 0 && cfg_.mem_req_bytes > 0) {
-        const uint32_t max_ostd = cfg_.mem_max_outstanding;
-        const bool time_ok =
-            (cfg_.mem_period_cycles == 0) ||
-            (now_cycle - last_mem_issue_cycle_ >= cfg_.mem_period_cycles);
-        if (time_ok && mem_inflight_.size() < static_cast<size_t>(max_ostd)) {
-            const uint32_t req_bytes = cfg_.mem_req_bytes;
-            if (cfg_.mem_region_bytes >= req_bytes) {
-                uint64_t offset = next_offset_;
-                if (offset + req_bytes > cfg_.mem_region_bytes) offset = 0;
-                const uint64_t addr = rt_.base_addr + offset;
-                const uint32_t seq = mem_seq_++;
-
-                std::vector<uint8_t> data;
-                data.resize(req_bytes);
-                uint64_t rng = cfg_.seed_base ^
-                               (static_cast<uint64_t>(rt_.node_id) << 32) ^
-                               (static_cast<uint64_t>(rt_.core_id) << 16) ^
-                               addr ^
-                               static_cast<uint64_t>(seq);
-                size_t pos = 0;
-                while (pos < data.size()) {
-                    const uint64_t v = splitmix64_next_(rng);
-                    const size_t n = std::min<size_t>(8, data.size() - pos);
-                    std::memcpy(&data[pos], &v, n);
-                    pos += n;
-                }
-
-                reportMemIssue_(data.size());
-                memory_requests_++;
-                if (rt_.sinks.stat_mem_writes_issued_total) rt_.sinks.stat_mem_writes_issued_total->addData(1);
-                if (rt_.sinks.stat_mem_bytes_written_total) rt_.sinks.stat_mem_bytes_written_total->addData(data.size());
-                stream_mem_writes_issued_total_ += 1;
-                stream_mem_bytes_written_total_ += static_cast<uint64_t>(data.size());
-
-                const auto w_id = rt_.mem->write(
-                    addr, data,
-                    [this, addr, seq, req_bytes](IMemoryAccess::RequestId req_id, uint64_t /*addr_cb*/) mutable {
-                        if (req_id != 0) {
-                            mem_inflight_.erase(static_cast<uint64_t>(req_id));
-                        }
-                        if (req_id == 0) {
-                            if (rt_.sinks.mem_verify_fail) (*rt_.sinks.mem_verify_fail)++;
-                            if (rt_.sinks.stat_mem_verify_fail_total) rt_.sinks.stat_mem_verify_fail_total->addData(1);
-                            if (cfg_.strict && rt_.log) {
-                                rt_.log->fatal(CALL_INFO, -1,
-                                               "stream fatal: write failed (core=%u addr=0x%llx seq=%u bytes=%u)\n",
-                                               rt_.core_id, (unsigned long long)addr, seq, req_bytes);
-                            }
-                            return;
-                        }
-
-                        if (!rt_.mem) return;
-                        reportMemIssue_(req_bytes);
-                        memory_requests_++;
-                        if (rt_.sinks.stat_mem_reads_issued_total) rt_.sinks.stat_mem_reads_issued_total->addData(1);
-                        if (rt_.sinks.stat_mem_bytes_read_total) rt_.sinks.stat_mem_bytes_read_total->addData(req_bytes);
-                        stream_mem_reads_issued_total_ += 1;
-                        stream_mem_bytes_read_total_ += static_cast<uint64_t>(req_bytes);
-
-                        const auto r_id = rt_.mem->read(
-                            addr, req_bytes,
-                            [this, addr, seq, req_bytes](IMemoryAccess::RequestId r_id,
-                                                         uint64_t /*addr_cb*/,
-                                                         std::vector<uint8_t>&& got) mutable {
-                                if (r_id != 0) {
-                                    mem_inflight_.erase(static_cast<uint64_t>(r_id));
-                                }
-                                if (r_id == 0 || got.size() != req_bytes) {
-                                    if (rt_.sinks.mem_verify_fail) (*rt_.sinks.mem_verify_fail)++;
-                                    if (rt_.sinks.stat_mem_verify_fail_total) rt_.sinks.stat_mem_verify_fail_total->addData(1);
-                                    if (cfg_.strict && rt_.log) {
-                                        rt_.log->fatal(CALL_INFO, -1,
-                                                       "stream fatal: read failed (core=%u addr=0x%llx seq=%u bytes=%u got=%zu)\n",
-                                                       rt_.core_id, (unsigned long long)addr, seq, req_bytes, got.size());
-                                    }
-                                    return;
-                                }
-                                if (!check_expected_bytes_(cfg_.seed_base, rt_.node_id, rt_.core_id, addr, seq, got)) {
-                                    if (rt_.sinks.mem_verify_fail) (*rt_.sinks.mem_verify_fail)++;
-                                    if (rt_.sinks.stat_mem_verify_fail_total) rt_.sinks.stat_mem_verify_fail_total->addData(1);
-                                    if (cfg_.strict && rt_.log) {
-                                        rt_.log->fatal(CALL_INFO, -1,
-                                                       "stream fatal: verify mismatch (core=%u addr=0x%llx seq=%u bytes=%u)\n",
-                                                       rt_.core_id, (unsigned long long)addr, seq, req_bytes);
-                                    }
-                                    return;
-                                }
-                                if (rt_.sinks.mem_verify_pass) (*rt_.sinks.mem_verify_pass)++;
-                                if (rt_.sinks.stat_mem_verify_pass_total) rt_.sinks.stat_mem_verify_pass_total->addData(1);
-                            });
-                        if (r_id != 0) {
-                            mem_inflight_[static_cast<uint64_t>(r_id)] = MemReq{addr, seq, req_bytes, true};
-                        }
-                    });
-
-                if (w_id != 0) {
-                    mem_inflight_[static_cast<uint64_t>(w_id)] = MemReq{addr, seq, req_bytes, false};
-                }
-
-                last_mem_issue_cycle_ = now_cycle;
-                next_offset_ = offset + static_cast<uint64_t>(std::max<uint32_t>(1, cfg_.mem_stride_bytes));
-                if (next_offset_ >= cfg_.mem_region_bytes) next_offset_ = 0;
-                did = true;
+        if (hasSemanticMemoryWork_()) {
+            bool metadata_did = false;
+            bool gather_did = false;
+            bool stream_region_did = false;
+            bool writeback_region_did = false;
+            if (cfg_.semantic_memory_demand_driven_enable) {
+                metadata_did = issueDemandDrivenSemanticMemoryRequest_(
+                    now_cycle,
+                    SemanticMemoryKind::MetadataLookup,
+                    cfg_.metadata_lookup,
+                    metadata_lookup_state_,
+                    pending_metadata_lookup_demands_);
+                gather_did = issueDemandDrivenSemanticMemoryRequest_(
+                    now_cycle,
+                    SemanticMemoryKind::SynapseGather,
+                    cfg_.synapse_gather,
+                    synapse_gather_state_,
+                    pending_synapse_gather_demands_);
+                stream_region_did = issueDemandDrivenSemanticMemoryRequest_(
+                    now_cycle,
+                    SemanticMemoryKind::StreamRegion,
+                    cfg_.stream_region,
+                    stream_region_state_,
+                    pending_stream_region_demands_);
+                writeback_region_did = issueDemandDrivenSemanticMemoryRequest_(
+                    now_cycle,
+                    SemanticMemoryKind::WritebackRegion,
+                    cfg_.writeback_region,
+                    writeback_region_state_,
+                    pending_writeback_region_demands_);
+            } else {
+                metadata_did = issueSemanticMemoryRequest_(
+                    now_cycle,
+                    SemanticMemoryKind::MetadataLookup,
+                    cfg_.metadata_lookup,
+                    metadata_lookup_state_);
+                gather_did = issueSemanticMemoryRequest_(
+                    now_cycle,
+                    SemanticMemoryKind::SynapseGather,
+                    cfg_.synapse_gather,
+                    synapse_gather_state_);
+                stream_region_did = issueSemanticMemoryRequest_(
+                    now_cycle,
+                    SemanticMemoryKind::StreamRegion,
+                    cfg_.stream_region,
+                    stream_region_state_);
+                writeback_region_did = issueSemanticMemoryRequest_(
+                    now_cycle,
+                    SemanticMemoryKind::WritebackRegion,
+                    cfg_.writeback_region,
+                    writeback_region_state_);
             }
+            did = metadata_did || gather_did || stream_region_did || writeback_region_did || did;
+        } else {
+            did = issueLegacyMemoryRequest_(now_cycle) || did;
         }
 
-        if (mem_inflight_.size() > static_cast<size_t>(max_ostd) * 4u) {
+        if (mem_inflight_.size() > static_cast<size_t>(cfg_.mem_max_outstanding) * 4u) {
             mem_inflight_.clear();
         }
     }
@@ -365,7 +713,16 @@ bool StreamWorkload::onClockTick(uint64_t now_cycle) {
 
 bool StreamWorkload::hasWork() const {
     if (!mem_inflight_.empty()) return true;
-    if (cfg_.mem_enable && rt_.mem && cfg_.mem_region_bytes > 0 && cfg_.mem_req_bytes > 0) return true;
+    if (cfg_.mem_enable && rt_.mem && hasSemanticMemoryWork_()) {
+        if (!cfg_.semantic_memory_demand_driven_enable || hasPendingSemanticDemand_()) return true;
+    }
+    if (cfg_.mem_enable &&
+        rt_.mem &&
+        !hasSemanticMemoryWork_() &&
+        cfg_.mem_region_bytes > 0 &&
+        cfg_.mem_req_bytes > 0) {
+        return true;
+    }
     if (cfg_.comm_enable && rt_.noc && cfg_.comm_period_cycles > 0) return true;
     return false;
 }
@@ -392,6 +749,22 @@ void StreamWorkload::getStatistics(std::map<std::string, uint64_t>& stats) const
     stats["stream_mem_reads_issued_total"] = stream_mem_reads_issued_total_;
     stats["stream_mem_bytes_written_total"] = stream_mem_bytes_written_total_;
     stats["stream_mem_bytes_read_total"] = stream_mem_bytes_read_total_;
+    stats["metadata_lookup_writes_issued_total"] = metadata_lookup_writes_issued_total_;
+    stats["metadata_lookup_reads_issued_total"] = metadata_lookup_reads_issued_total_;
+    stats["metadata_lookup_bytes_written_total"] = metadata_lookup_bytes_written_total_;
+    stats["metadata_lookup_bytes_read_total"] = metadata_lookup_bytes_read_total_;
+    stats["synapse_gather_writes_issued_total"] = synapse_gather_writes_issued_total_;
+    stats["synapse_gather_reads_issued_total"] = synapse_gather_reads_issued_total_;
+    stats["synapse_gather_bytes_written_total"] = synapse_gather_bytes_written_total_;
+    stats["synapse_gather_bytes_read_total"] = synapse_gather_bytes_read_total_;
+    stats["stream_region_writes_issued_total"] = stream_region_writes_issued_total_;
+    stats["stream_region_reads_issued_total"] = stream_region_reads_issued_total_;
+    stats["stream_region_bytes_written_total"] = stream_region_bytes_written_total_;
+    stats["stream_region_bytes_read_total"] = stream_region_bytes_read_total_;
+    stats["writeback_region_writes_issued_total"] = writeback_region_writes_issued_total_;
+    stats["writeback_region_reads_issued_total"] = writeback_region_reads_issued_total_;
+    stats["writeback_region_bytes_written_total"] = writeback_region_bytes_written_total_;
+    stats["writeback_region_bytes_read_total"] = writeback_region_bytes_read_total_;
     stats["stream_pkt_sent_total"] = rt_.sinks.pkt_sent ? *rt_.sinks.pkt_sent : 0;
     stats["stream_pkt_recv_total"] = rt_.sinks.pkt_recv ? *rt_.sinks.pkt_recv : 0;
     stats["stream_pkt_bad_crc_total"] = rt_.sinks.pkt_bad_crc ? *rt_.sinks.pkt_bad_crc : 0;

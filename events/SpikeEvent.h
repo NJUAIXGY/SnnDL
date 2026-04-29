@@ -115,6 +115,7 @@ public:
         Event::serialize_order(ser);  // 先序列化基类
         SST_SER(neuron_id);
         SST_SER(timestamp);
+        SST_SER(hop_count);
         SST_SER(dest_neuron); 
         SST_SER(dest_node);
         SST_SER(weight);

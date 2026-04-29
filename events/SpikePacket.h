@@ -3,7 +3,7 @@
 
 #include <cstdint>
 #include <vector>
-#include "SpikeEvent.h"
+#include "events/SpikeEvent.h"
 
 namespace SST { namespace SnnDL {
 

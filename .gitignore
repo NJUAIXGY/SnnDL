@@ -17,6 +17,7 @@
 *.log
 test_output.log
 weight_verification_test.log
+*.pyc
 
 # IDE files
 .vscode/
@@ -32,6 +33,9 @@ weight_verification_test.log
 
 # Temporary files
 /tmp/
+/tests/__pycache__/
+/a.out
+/test_*
 
 # Generated docs
 docs/*.pdf

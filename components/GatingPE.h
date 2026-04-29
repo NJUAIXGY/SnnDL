@@ -98,6 +98,10 @@ private:
     std::string nic_in_buf_ = "1KiB";
     std::string nic_out_buf_ = "1KiB";
 
+    // per-instance parse caches
+    std::vector<uint32_t> parsed_targets_;
+    std::vector<Transition> parsed_transitions_;
+
     // infra
     SST::Output* out_ = nullptr;
     class SnnInterface* nic_ = nullptr;

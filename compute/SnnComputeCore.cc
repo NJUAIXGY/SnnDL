@@ -3,9 +3,19 @@
 #include <cmath>
 #include <cstdio>
 #include <fstream>
+#include <limits>
 #include <sstream>
 
+#include "SnnDLStringUtil.h"
+
 namespace SST { namespace SnnDL {
+
+namespace {
+static inline uint64_t satAddU64Local(uint64_t a, uint64_t b) {
+    if (std::numeric_limits<uint64_t>::max() - a < b) return std::numeric_limits<uint64_t>::max();
+    return a + b;
+}
+} // namespace
 
 std::unique_ptr<ISnnComputeCore> createComputeCoreByName(const std::string& name) {
     if (name.empty() || name == "default" || name == "snn") {
@@ -65,6 +75,26 @@ void DefaultSnnComputeCore::configure(const ComputeCoreContext& ctx, const SST::
     // 兼容旧默认：未显式传入时（或传0）先暂存为0，待解析 BCSR 后再回填
     aosoa_block_rows_ = params.find<uint32_t>("aosoa_block_rows", 0);
     if (use_aosoa_state_) use_soa_state_ = true;
+    state_sram_enable_ = params.find<int>("state_sram_enable", 0) != 0;
+    {
+        VirtualSramLayoutConfig lcfg{};
+        lcfg.state_vmem_base = params.find<uint64_t>("state_sram_vmem_base", 0x300000000ull);
+        lcfg.state_refrac_base = params.find<uint64_t>("state_sram_refrac_base", 0x400000000ull);
+        lcfg.state_last_spike_base = params.find<uint64_t>("state_sram_last_spike_base", 0x500000000ull);
+        state_sram_layout_.configure(lcfg);
+
+        BankedSramConfig scfg{};
+        scfg.enable = state_sram_enable_;
+        scfg.name = "core_state_sram";
+        scfg.capacity_bytes = params.find<uint64_t>("state_sram_capacity_bytes", 0);
+        scfg.banks = params.find<uint32_t>("state_sram_banks", 16);
+        scfg.ports_per_bank = params.find<uint32_t>("state_sram_ports_per_bank", 1);
+        scfg.bank_interleave_bytes = params.find<uint64_t>("state_sram_bank_interleave_bytes", 4);
+        scfg.t_read_cycles = params.find<uint32_t>("state_sram_t_read_cycles", 1);
+        scfg.t_write_cycles = params.find<uint32_t>("state_sram_t_write_cycles", 1);
+        scfg.sample_log2 = params.find<uint32_t>("state_sram_sample_log2", 0);
+        state_sram_model_.configure(scfg);
+    }
 
     apply_acc_enable_ = params.find<int>("apply_acc_enable", 0) != 0;
     gas_window_mode_ = params.find<int>("gas_window_mode", 0) != 0;
@@ -146,6 +176,16 @@ void DefaultSnnComputeCore::initCoreEngineState_() {
     pending_dv_touched_.assign(num_neurons_, 0);
     pending_dv_list_.clear();
     pending_dv_list_.reserve(std::max<uint32_t>(8u, num_neurons_ / 10u));
+    if (state_sram_enable_) {
+        uint64_t resident_bytes = 0;
+        if (use_soa_state_) {
+            resident_bytes = static_cast<uint64_t>(num_neurons_) *
+                             static_cast<uint64_t>(sizeof(float) + sizeof(uint32_t) + sizeof(uint64_t));
+        } else {
+            resident_bytes = static_cast<uint64_t>(num_neurons_) * static_cast<uint64_t>(sizeof(SnnCoreNeuronState));
+        }
+        state_sram_model_.noteResidentBytes(resident_bytes);
+    }
 }
 
 void DefaultSnnComputeCore::initVerifyFile_() {
@@ -153,16 +193,8 @@ void DefaultSnnComputeCore::initVerifyFile_() {
     verify_file_buf_.clear();
     if (!(verify_against_file_ && !verify_file_template_.empty())) return;
     std::string path = verify_file_template_;
-    {
-        size_t pos = path.find("{pe:02d}");
-        if (pos != std::string::npos) {
-            char buf[16]; std::snprintf(buf, sizeof(buf), "%02u", ctx_.node_id);
-            path.replace(pos, 8, buf);
-        } else {
-            pos = path.find("{pe}");
-            if (pos != std::string::npos) path.replace(pos, 4, std::to_string(ctx_.node_id));
-        }
-    }
+    replaceAllIndexed(path, "{pe:02d}", ctx_.node_id, 2);
+    replaceAll(path, "{pe}", std::to_string(ctx_.node_id));
     std::ifstream fin(path, std::ios::binary);
     if (!fin.good()) return;
     fin.seekg(0, std::ios::end);
@@ -178,9 +210,27 @@ void DefaultSnnComputeCore::initVerifyFile_() {
 
 void DefaultSnnComputeCore::onInit(unsigned int) {}
 void DefaultSnnComputeCore::onSetup() {}
-void DefaultSnnComputeCore::onFinish() {}
+void DefaultSnnComputeCore::onFinish() {
+    if (state_sram_enable_) {
+        state_sram_model_.onClockTick(state_sram_current_cycle_ + 1);
+    }
+}
 
 void DefaultSnnComputeCore::onClockTick(uint64_t now_cycle) {
+    state_sram_current_cycle_ = now_cycle;
+    if (state_sram_enable_) {
+        state_sram_model_.onClockTick(now_cycle);
+        state_sram_stall_budget_ = satAddU64Local(
+            state_sram_stall_budget_,
+            state_sram_model_.consumeLastCyclePredictedExtraCycles());
+        // GAS window mode: endCycle() is not invoked every tick. To avoid dropping or silently
+        // ignoring the SRAM stall budget, consume it during idle gaps (post EndScatter) so the
+        // global-step drain policy can observe "real" stall time before declaring PE_DONE.
+        if (gas_window_mode_ && gas_stage_ == GasStage::Idle && state_sram_stall_budget_ > 0) {
+            --state_sram_stall_budget_;
+            state_sram_stall_cycles_total_ = satAddU64Local(state_sram_stall_cycles_total_, 1ull);
+        }
+    }
     total_cycles_++;
     if (hasWork()) active_cycles_++;
     performWeightVerificationTick_(now_cycle);
@@ -188,6 +238,11 @@ void DefaultSnnComputeCore::onClockTick(uint64_t now_cycle) {
 }
 
 void DefaultSnnComputeCore::endCycle(uint64_t now_cycle) {
+    if (state_sram_enable_ && !gas_window_mode_ && state_sram_stall_budget_ > 0) {
+        --state_sram_stall_budget_;
+        state_sram_stall_cycles_total_ = satAddU64Local(state_sram_stall_cycles_total_, 1ull);
+        return;
+    }
     // 诊断：观察 pending dv 列表与膜电位上限（限制次数）
     if (output_ && window_read_debug_ && output_->getVerboseLevel() >= 2) {
         static uint32_t diag_end_logs = 0;
@@ -220,6 +275,11 @@ void DefaultSnnComputeCore::endCycle(uint64_t now_cycle) {
 
 void DefaultSnnComputeCore::endCycleCandidates(uint64_t now_cycle,
                                                const std::vector<uint32_t>& candidates) {
+    if (state_sram_enable_ && !gas_window_mode_ && state_sram_stall_budget_ > 0) {
+        --state_sram_stall_budget_;
+        state_sram_stall_cycles_total_ = satAddU64Local(state_sram_stall_cycles_total_, 1ull);
+        return;
+    }
     // 与 endCycle() 保持一致的“先推进动力学，再判定发放”顺序。
     // candidates 允许控制层在 window/scatter 场景下仅检查触达的 post 集合。
     updateNeuronStates();
@@ -281,10 +341,24 @@ void DefaultSnnComputeCore::applySynapticDelta(uint32_t post_local, float dv) {
     core_engine_.addMem(post_local, dv);
 }
 
+void DefaultSnnComputeCore::noteStateSramRead_(uint64_t addr, uint64_t bytes) {
+    if (!state_sram_enable_) return;
+    state_sram_model_.noteRead(state_sram_current_cycle_, addr, bytes);
+}
+
+void DefaultSnnComputeCore::noteStateSramWrite_(uint64_t addr, uint64_t bytes) {
+    if (!state_sram_enable_) return;
+    state_sram_model_.noteWrite(state_sram_current_cycle_, addr, bytes);
+}
+
 void DefaultSnnComputeCore::applyPendingDeltas_() {
     if (pending_dv_list_.empty()) return;
     for (uint32_t post_local : pending_dv_list_) {
         if (post_local >= num_neurons_) continue;
+        if (state_sram_enable_) {
+            noteStateSramRead_(state_sram_layout_.stateVmemAddr(post_local), sizeof(float));
+            noteStateSramWrite_(state_sram_layout_.stateVmemAddr(post_local), sizeof(float));
+        }
         const float dv = (post_local < pending_dv_.size()) ? pending_dv_[post_local] : 0.0f;
         if (dv != 0.0f) {
             core_engine_.addMem(post_local, dv);
@@ -330,6 +404,14 @@ void DefaultSnnComputeCore::onSynapticEvent(const SynapticEvent& ev) {
 
 void DefaultSnnComputeCore::updateNeuronStates() {
     cycles_update_neuron_count_ += num_neurons_;
+    if (state_sram_enable_ && num_neurons_ > 0) {
+        for (uint32_t i = 0; i < num_neurons_; ++i) {
+            noteStateSramRead_(state_sram_layout_.stateVmemAddr(i), sizeof(float));
+            noteStateSramRead_(state_sram_layout_.stateRefracAddr(i), sizeof(uint32_t));
+            noteStateSramWrite_(state_sram_layout_.stateVmemAddr(i), sizeof(float));
+            noteStateSramWrite_(state_sram_layout_.stateRefracAddr(i), sizeof(uint32_t));
+        }
+    }
     if (neuron_model_) {
         if (use_soa_state_) {
             for (uint32_t i = 0; i < num_neurons_; ++i) {
@@ -375,8 +457,37 @@ bool DefaultSnnComputeCore::fire(uint32_t idx, uint64_t now_cycles, INeuronModel
         if (gas_stage_ != GasStage::Scatter) return false;
         if (idx < fired_this_window_.size() && fired_this_window_[idx]) return false;
     }
+
+    float state_vmem_before = 0.0f;
+    uint32_t state_refrac_before = 0;
+    uint64_t state_last_spike_before = 0;
+    if (state_sram_enable_ && idx < num_neurons_) {
+        noteStateSramRead_(state_sram_layout_.stateVmemAddr(idx), sizeof(float));
+        noteStateSramRead_(state_sram_layout_.stateRefracAddr(idx), sizeof(uint32_t));
+        noteStateSramRead_(state_sram_layout_.stateLastSpikeAddr(idx), sizeof(uint64_t));
+        state_vmem_before = core_engine_.getMem(idx);
+        state_refrac_before = core_engine_.getRefrac(idx);
+        state_last_spike_before = core_engine_.getLastSpike(idx);
+    }
+
     INeuronModel* use_model = model ? model : neuron_model_.get();
     bool fired = core_engine_.fire(idx, now_cycles, use_model, v_before, v_after);
+
+    if (state_sram_enable_ && idx < num_neurons_) {
+        const float state_vmem_after = core_engine_.getMem(idx);
+        const uint32_t state_refrac_after = core_engine_.getRefrac(idx);
+        const uint64_t state_last_spike_after = core_engine_.getLastSpike(idx);
+        if (fired || state_vmem_after != state_vmem_before) {
+            noteStateSramWrite_(state_sram_layout_.stateVmemAddr(idx), sizeof(float));
+        }
+        if (fired || state_refrac_after != state_refrac_before) {
+            noteStateSramWrite_(state_sram_layout_.stateRefracAddr(idx), sizeof(uint32_t));
+        }
+        if (fired || state_last_spike_after != state_last_spike_before) {
+            noteStateSramWrite_(state_sram_layout_.stateLastSpikeAddr(idx), sizeof(uint64_t));
+        }
+    }
+
     if (fired && apply_acc_enable_ && gas_window_mode_ && idx < fired_this_window_.size()) {
         fired_this_window_[idx] = 1;
     }
@@ -494,6 +605,8 @@ void DefaultSnnComputeCore::onSpikeDelivered(SpikeEvent* spike) {
 }
 
 bool DefaultSnnComputeCore::hasWork() const {
+    if (gas_window_mode_) return state_sram_stall_budget_ > 0;
+    if (state_sram_stall_budget_ > 0) return true;
     if (use_soa_state_) {
         return std::any_of(soa_v_mem_.begin(), soa_v_mem_.end(), [](float v){ return v > 0.1f; });
     }
@@ -520,6 +633,18 @@ void DefaultSnnComputeCore::getStatistics(std::map<std::string, uint64_t>& out) 
     out["core_verify_enabled"] = verify_weights_ ? 1ULL : 0ULL;
     out["core_verify_completed"] = static_cast<uint64_t>(verify_completed_);
     out["core_verify_mismatch_count"] = verify_mismatch_count_;
+    const auto& sram_stats = state_sram_model_.stats();
+    out["core_state_sram_reads_total"] = sram_stats.reads_total;
+    out["core_state_sram_writes_total"] = sram_stats.writes_total;
+    out["core_state_sram_bytes_read_total"] = sram_stats.bytes_read_total;
+    out["core_state_sram_bytes_write_total"] = sram_stats.bytes_write_total;
+    out["core_state_sram_bank_conflict_ticks_total"] = sram_stats.bank_conflict_ticks_total;
+    out["core_state_sram_predicted_extra_cycles_total"] = sram_stats.predicted_extra_cycles_total;
+    out["core_state_sram_resident_bytes_peak"] = sram_stats.resident_bytes_peak;
+    out["core_state_sram_bank_peak_accesses_per_tick"] = sram_stats.bank_peak_accesses_per_tick;
+    out["core_state_sram_energy_read_pj_total"] = static_cast<uint64_t>(sram_stats.energy_read_pj_total);
+    out["core_state_sram_energy_write_pj_total"] = static_cast<uint64_t>(sram_stats.energy_write_pj_total);
+    out["core_state_sram_stall_cycles_total"] = state_sram_stall_cycles_total_;
     if (learning_core_) {
         learning_core_->getStatistics(out);
     }

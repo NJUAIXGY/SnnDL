@@ -30,8 +30,10 @@ bool WeightAccessor::resolve(uint32_t pre_global, uint32_t post_local,
     } else {
         if (!allow_remap) return false;
         if (cfg_.num_neurons == 0) return false;
-        const uint64_t base = base_global - static_cast<uint64_t>(cfg_.core_id) * width;
-        const uint64_t diff = static_cast<uint64_t>(pre_global) - base;
+        const uint64_t core_span = static_cast<uint64_t>(cfg_.core_id) * width;
+        const uint64_t base = (base_global >= core_span) ? (base_global - core_span) : 0ULL;
+        const uint64_t pre_u64 = static_cast<uint64_t>(pre_global);
+        const uint64_t diff = (pre_u64 >= base) ? (pre_u64 - base) : (pre_u64 + width - (base % width));
         pre_local = static_cast<uint32_t>(diff % width);
     }
     cache_key = static_cast<uint64_t>(pre_local) *

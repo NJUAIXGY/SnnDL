@@ -15,6 +15,7 @@
 
 #include "NocPacketBatchEvent.h"
 #include "NocPacketEvent.h"
+#include "SnnNICConfig.h"
 #include "SnnDLLogging.h"
 
 using namespace SST;
@@ -67,21 +68,20 @@ SnnNIC::SnnNIC(ComponentId_t id, Params& params)
       packets_received_count(0),
       use_direct_link(false)
 {
+    const SnnNICConfig cfg = parseSnnNICConfig(params);
+
     // P2: 环境变量前端化 – 优先参数，其次回退到环境变量，保持兼容
-    {
-        // P2 Step3: 移除运行期 getenv 回退；仅由参数驱动（默认0=禁用）
-        int sent_param = params.find<int>("sentinel_enable", 0);
-        sentinel_enabled_ = (sent_param != 0);
-        if (sentinel_enabled_) {
-            NIC_LOG(2, "[[sentinel-nic-ctor]] enter\n");
-        }
+    sentinel_enabled_ = cfg.sentinel_enable;
+    if (sentinel_enabled_) {
+        NIC_LOG(2, "[[sentinel-nic-ctor]] enter\n");
     }
+
     // 获取参数
-    node_id = params.find<uint32_t>("node_id", 0);
-    link_bw = params.find<std::string>("link_bw", "40GiB/s");
-    input_buf_size = params.find<std::string>("input_buf_size", "1KiB");
-    output_buf_size = params.find<std::string>("output_buf_size", "1KiB");
-    use_direct_link = params.find<bool>("use_direct_link", false);  // 默认禁用直连，统一走SimpleNetwork
+    node_id = cfg.node_id;
+    link_bw = cfg.link_bw;
+    input_buf_size = cfg.input_buf_size;
+    output_buf_size = cfg.output_buf_size;
+    use_direct_link = cfg.use_direct_link;  // 默认禁用直连，统一走SimpleNetwork
     // 禁用direct_link实现，统一走SimpleNetwork，避免脚本依赖非标准直连模式
     if (use_direct_link) {
         NIC_LOG(1, "direct_link 模式已禁用，回退到 SimpleNetwork");
@@ -91,42 +91,36 @@ SnnNIC::SnnNIC(ComponentId_t id, Params& params)
     // 新增：虚拟通道与批处理参数（默认保持兼容）
     // Merlin hr_router 默认 num_vns=2：在高并发 spike 流量下，强制单VN容易导致 credit/backpressure 不收敛。
     // 因此这里允许脚本显式配置 VN 数；若不配置则默认 2。
-    virtual_channels_ = params.find<uint32_t>("virtual_channels", 2);
-    network_num_vns_ = params.find<uint32_t>("network_num_vns", 0);
-    auto_vn_fallback_ = params.find<bool>("auto_vn_fallback", true);
-    effective_num_vns_ = (network_num_vns_ > 0) ? std::min(virtual_channels_, network_num_vns_) : virtual_channels_;
+    virtual_channels_ = cfg.virtual_channels;
+    network_num_vns_ = cfg.network_num_vns;
+    auto_vn_fallback_ = cfg.auto_vn_fallback;
+    effective_num_vns_ = cfg.effective_num_vns;
     if (effective_num_vns_ == 0) effective_num_vns_ = 1;
     NIC_LOG(2, "VN配置: virtual_channels=%u, network_num_vns=%u, effective_num_vns=%u\n",
                  virtual_channels_, network_num_vns_, effective_num_vns_);
-    vn_spike_data_ = params.find<uint32_t>("vn_spike_data", 0);
-    vn_batch_data_ = params.find<uint32_t>("vn_batch_data", 1);
-    if (vn_spike_data_ >= effective_num_vns_) vn_spike_data_ = 0;
-    if (vn_batch_data_ >= effective_num_vns_) vn_batch_data_ = 0;
-    enable_batching_ = params.find<bool>("enable_batching", false);
-    flush_on_credit_ = params.find<bool>("flush_on_credit", true);
-    probe_vn_on_setup_ = params.find<bool>("probe_vn_on_setup", false);
-    batch_size_local_ = params.find<uint32_t>("batch_size_local", 8);
-    batch_size_remote_ = params.find<uint32_t>("batch_size_remote", 32);
-    batch_flush_window_ns_ = params.find<uint64_t>("batch_flush_window", 1000);
-    total_nodes_ = params.find<uint32_t>("total_nodes", 16);
+    vn_spike_data_ = cfg.vn_spike_data;
+    vn_batch_data_ = cfg.vn_batch_data;
+    enable_batching_ = cfg.enable_batching;
+    flush_on_credit_ = cfg.flush_on_credit;
+    probe_vn_on_setup_ = cfg.probe_vn_on_setup;
+    batch_size_local_ = cfg.batch_size_local;
+    batch_size_remote_ = cfg.batch_size_remote;
+    batch_flush_window_ns_ = cfg.batch_flush_window_ns;
+    total_nodes_ = cfg.total_nodes;
     // 控制VN（用于门控等控制事件）
-    vn_control_ = params.find<uint32_t>("vn_control", 1);
-    if (vn_control_ >= effective_num_vns_) vn_control_ = 0;
+    vn_control_ = cfg.vn_control;
 
     // 跨Rank代理聚合参数（默认关闭）
-    enable_inter_rank_batching_ = params.find<bool>("enable_inter_rank_batching", false);
-    inter_rank_batch_window_ns_ = params.find<uint64_t>("inter_rank_batch_window", 0);
-    nodes_per_rank_ = params.find<uint32_t>("nodes_per_rank", 0);
+    enable_inter_rank_batching_ = cfg.enable_inter_rank_batching;
+    inter_rank_batch_window_ns_ = cfg.inter_rank_batch_window_ns;
+    nodes_per_rank_ = cfg.nodes_per_rank;
     // 强制禁用跨Rank聚合
     enable_inter_rank_batching_ = false;
     inter_rank_batch_window_ns_ = 0;
     nodes_per_rank_ = 0;
     
-    int verbose = params.find<int>("verbose", 0);
-    if (sentinel_enabled_ && verbose == 0) verbose = 1;
-    
     // 初始化日志输出
-    output = new Output("SnnNIC[@p:@l]: ", verbose, 0, Output::STDOUT);
+    output = new Output("SnnNIC[@p:@l]: ", cfg.verbose, 0, Output::STDOUT);
     
     // 初始化每个VN的就绪标志
     vn_ready_.assign(effective_num_vns_, false);
@@ -145,7 +139,7 @@ SnnNIC::SnnNIC(ComponentId_t id, Params& params)
         if (!network) {
             // 创建默认的 linkcontrol
             Params net_params;
-            net_params.insert("port_name", params.find<std::string>("port_name", "network"));
+            net_params.insert("port_name", cfg.port_name);
             net_params.insert("link_bw", link_bw);
             net_params.insert("input_buf_size", input_buf_size);
             net_params.insert("output_buf_size", output_buf_size);
@@ -406,6 +400,7 @@ bool SnnNIC::handleIncoming(int vn)
                 pkt->dst_endpoint = p.dst_endpoint;
                 pkt->kind = p.kind;
                 pkt->hop_count = p.hop_count;
+                pkt->step_seq = p.step_seq;
                 pkt->timestamp = p.timestamp;
                 pkt->payload = std::move(p.payload);
                 deliverPacket(pkt);
@@ -705,6 +700,7 @@ void SnnNIC::flushBatchToNode_(uint32_t dest_node, bool is_timeout)
         pp.dst_endpoint = pkt->dst_endpoint;
         pp.kind = pkt->kind;
         pp.hop_count = pkt->hop_count;
+        pp.step_seq = pkt->step_seq;
         pp.timestamp = pkt->timestamp;
         pp.payload = std::move(pkt->payload);
         payload_sum += static_cast<uint64_t>(pp.payload.size());
@@ -761,6 +757,8 @@ bool SnnNIC::sendControl(SST::Event* ev, uint32_t dest_node)
         stat_packets_sent->addData(1);
         return true;
     }
+    // 失败：取回 payload，保持“失败时由调用方负责释放”的语义（避免 double free）
+    (void)req->takePayload();
     delete req;
     return false;
 }

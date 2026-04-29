@@ -131,6 +131,13 @@ void NocSubsystem::routeInternalPacket_(int src_core, int dst_core, NocPacketEve
 void NocSubsystem::onCoreSend(NocPacketEvent* packet) {
     if (!packet) return;
 
+    if (packet->step_seq == 0 && rt_.active_step_seq && *rt_.active_step_seq != 0) {
+        const auto k = packet->packetKind();
+        if (k == NocPacketKind::Spike || k == NocPacketKind::SpikeKey || k == NocPacketKind::SpikeTileKey) {
+            packet->step_seq = (*rt_.active_step_seq) + rt_.step_seq_offset;
+        }
+    }
+
     const bool is_local = (static_cast<int>(packet->dst_node) == rt_.node_id);
     if (is_local) {
         const int dst_core = static_cast<int>(packet->dst_endpoint);
@@ -155,10 +162,17 @@ void NocSubsystem::onCoreSend(NocPacketEvent* packet) {
 void NocSubsystem::sendFromCore(int src_core, NocPacketEvent* packet) {
     if (!packet) return;
 
-    // SpikeKey（原生多播）必须经过外部 router mesh，即便 ingress_node 恰好等于本节点：
+    if (packet->step_seq == 0 && rt_.active_step_seq && *rt_.active_step_seq != 0) {
+        const auto k = packet->packetKind();
+        if (k == NocPacketKind::Spike || k == NocPacketKind::SpikeKey || k == NocPacketKind::SpikeTileKey) {
+            packet->step_seq = (*rt_.active_step_seq) + rt_.step_seq_offset;
+        }
+    }
+
+    // SpikeKey/SpikeTileKey（原生多播）必须经过外部 router mesh，即便 ingress_node 恰好等于本节点：
     // 否则会走本地 ring 直投，导致跳过 MulticastRouter 的 INTER→INTRA 阶段切换与 block 内复制，
     // 从而出现“看似收到了包但不是真多播”的语义漂移。
-    if (packet->packetKind() == NocPacketKind::SpikeKey) {
+    if (packet->packetKind() == NocPacketKind::SpikeKey || packet->packetKind() == NocPacketKind::SpikeTileKey) {
         if (rt_.nic) {
             rt_.nic->sendToNode(packet->dst_node, packet);
             if (static_cast<int>(packet->dst_node) != rt_.node_id) {
@@ -192,6 +206,12 @@ void NocSubsystem::sendFromCore(int src_core, NocPacketEvent* packet) {
 
 void NocSubsystem::injectLocal(int dst_core, NocPacketEvent* packet) {
     if (!packet) return;
+    if (packet->step_seq == 0 && rt_.active_step_seq && *rt_.active_step_seq != 0) {
+        const auto k = packet->packetKind();
+        if (k == NocPacketKind::Spike || k == NocPacketKind::SpikeKey || k == NocPacketKind::SpikeTileKey) {
+            packet->step_seq = (*rt_.active_step_seq) + rt_.step_seq_offset;
+        }
+    }
     if (dst_core < 0 || dst_core >= rt_.num_cores) {
         delete packet;
         return;
@@ -201,6 +221,12 @@ void NocSubsystem::injectLocal(int dst_core, NocPacketEvent* packet) {
 }
 
 void NocSubsystem::sendExternal(NocPacketEvent* packet) {
+    if (packet && packet->step_seq == 0 && rt_.active_step_seq && *rt_.active_step_seq != 0) {
+        const auto k = packet->packetKind();
+        if (k == NocPacketKind::Spike || k == NocPacketKind::SpikeKey || k == NocPacketKind::SpikeTileKey) {
+            packet->step_seq = (*rt_.active_step_seq) + rt_.step_seq_offset;
+        }
+    }
     sendExternalPacket_(packet);
 }
 
@@ -220,6 +246,7 @@ void NocSubsystem::onNicReceiveEvent(SST::Event* event) {
             pkt->dst_endpoint = p.dst_endpoint;
             pkt->kind = p.kind;
             pkt->hop_count = p.hop_count;
+            pkt->step_seq = p.step_seq;
             pkt->timestamp = p.timestamp;
             pkt->payload = std::move(p.payload);
             onNicReceive(pkt);
@@ -247,6 +274,7 @@ void NocSubsystem::onExternalPortEvent(SST::Event* event) {
             pkt->dst_endpoint = p.dst_endpoint;
             pkt->kind = p.kind;
             pkt->hop_count = p.hop_count;
+            pkt->step_seq = p.step_seq;
             pkt->timestamp = p.timestamp;
             pkt->payload = std::move(p.payload);
             onExternalPortEvent(pkt);
@@ -261,7 +289,7 @@ void NocSubsystem::onExternalPortEvent(SST::Event* event) {
     }
 
     // hop/TTL 保护（保持旧语义：避免端口回送循环）
-    constexpr uint16_t kMaxHops = 10;
+    constexpr uint16_t kMaxHops = NocPacketEvent::kDefaultMaxHops;
     if (packet->hop_count >= kMaxHops) {
         delete packet;
         return;
@@ -303,6 +331,7 @@ void NocSubsystem::onDirectionalLinkEvent(SST::Event* event, const std::string& 
             pkt->dst_endpoint = p.dst_endpoint;
             pkt->kind = p.kind;
             pkt->hop_count = p.hop_count;
+            pkt->step_seq = p.step_seq;
             pkt->timestamp = p.timestamp;
             pkt->payload = std::move(p.payload);
             onNicReceive(pkt);

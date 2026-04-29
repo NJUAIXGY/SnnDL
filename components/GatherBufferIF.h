@@ -5,23 +5,24 @@
 
 #include <unordered_map>
 #include <unordered_set>
-#include <deque>
 #include <vector>
 #include <cstdint>
 #include <list>
 #include <fstream>
 #include <mutex>
+#include <functional>
 
 #include <sst/core/sst_config.h>
 #include <sst/core/output.h>
 #include <sst/core/interfaces/stdMem.h>
 
+#include "IGasCreditGate.h"
 #include "IGasStepGate.h"
 #include "synapse/gas/GasCustomCmd.h"
 
 namespace SST { namespace SnnDL {
 
-class GatherBufferIF : public SST::Interfaces::StandardMem, public IGasStepGate {
+class GatherBufferIF : public SST::Interfaces::StandardMem, public IGasStepGate, public IGasCreditGate {
 public:
     SST_ELI_REGISTER_SUBCOMPONENT(
         GatherBufferIF,
@@ -37,11 +38,20 @@ public:
         {"gap_merge_enable", "Enable fine-grained gap merge (0/1)", "1"},
         {"gap_merge_k_bytes", "Gap merge threshold k (bytes); 0=disable", "0"},
         {"burst_bytes_max", "Max burst size (bytes) when merging", "65536"},
+        {"vlf_enable", "Experimental: enable value-line fusion (cacheline-aligned, no-hole fusion) during staged segment build (0/1)", "0"},
+        {"vlf_run_enable", "Experimental: allow merging adjacent cachelines into contiguous runs under VLF (0/1)", "0"},
         {"bank_bits", "Number of bits in bank field (0=disable bank_row)", "0"},
         {"bank_shift", "LSB bit index of bank field", "0"},
         {"bank_auto_enable", "Enable heuristic bank bits/shift auto-detect when bank_bits=0", "1"},
         {"bank_auto_min_banks", "Heuristic: minimum distinct banks expected", "4"},
         {"bank_auto_max_banks", "Heuristic: maximum distinct banks expected", "32"},
+        {"apply_issue_policy", "Apply-stage issue policy: order", "order"},
+        {"apply_frags_per_issue", "Apply-stage max downstream fragments per issue step (0=unlimited)", "1"},
+        {"apply_bank_credit", "Apply-stage per-bank max active granules (0=unlimited)", "1"},
+        {"apply_age_fair_ns", "Apply-stage fairness threshold (ns): force-issue when age >= threshold (0=disable)", "2000"},
+        {"dram_cmd_cost_merge_enable", "Experimental: enable DRAM command-cost guided merge decisions at segment-build (0/1)", "0"},
+        {"dram_cmd_t_row_hit_ns", "Experimental: DRAM command-cost model row-hit service ns (per line)", "30"},
+        {"dram_cmd_t_row_miss_ns", "Experimental: DRAM command-cost model row-miss service ns (per line)", "120"},
         {"row_window_enable", "Enable coarse row-window merge (0/1)", "0"},
         {"row_window_bytes", "Row-window byte threshold to trigger burst", "0"},
         {"row_window_timeout_ns", "Row-window timeout to trigger burst (ns)", "0"},
@@ -64,14 +74,23 @@ public:
         {"window_cycles_scatter", "cycles of Scatter window", "0"},
         {"scatter_immediate_complete", "Scatter completes immediately (0/1)", "0"},
         {"clock", "subcomponent clock when window_auto=1", "1GHz"},
-        {"emit_stage_events", "Emit Begin/End Apply/Scatter events upstream (0/1)", "0"},
-        {"emit_stage_events_lenient", "Lenient emission: allow EndApply/Scatter even if inflight>0 at window boundary (0/1)", "0"},
+        {"emit_stage_events", "Emit Begin/End Apply/Scatter events upstream (0/1). Auto-enabled when step_gate_enable=1", "0"},
+        {"emit_stage_events_lenient", "Lenient emission: allow EndApply/Scatter even if inflight>0 at window boundary (0/1). Not allowed with step_gate_enable=1", "0"},
         {"stage_cycles_csv", "Optional CSV path to log per-window stage cycle counts", ""},
         {"probe_gas_csv", "(diagnostic) CSV path to dump probe-gas samples; empty to disable", ""},
         {"port", "shared port name for downstream standardInterface when loaded anonymously"},
         {"diag_enable", "启用诊断打印(0/1)", "0"},
         {"snndl_debug", "调试增强开关(0/1)", "0"},
         {"sentinel_enable", "启用 sentinel 调试输出(0/1)", "0"}
+        ,
+        // Experimental: step-gate progress watchdog (debugging only; disabled by default).
+        {"experimental_stepgate_progress_enable", "启用 step-gate 进度探针(0/1)", "0"},
+        {"experimental_stepgate_progress_period_cycles", "进度探针周期(cycles; 0=disable)", "0"},
+        {"experimental_stepgate_progress_max_reports", "最多打印次数(0=unbounded)", "0"},
+        {"experimental_stepgate_progress_dump_level", "打印信息等级(0=basic)", "0"},
+        {"experimental_stepgate_progress_owner_node", "仅对指定 node_id 打印(-1=all)", "-1"},
+        {"experimental_stepgate_progress_owner_core", "仅对指定 core_id 打印(-1=all)", "-1"},
+        {"experimental_stepgate_apply_finish_poll_period_cycles", "step_gate 回退 EndApply 的 finish 重试周期(cycles; 1=每cycle重试)", "1"}
         ,
         // Dense microbench correctness: byte-exact validation (off by default).
         {"byte_exact_verify_enable", "启用字节级校验(0/1)", "0"},
@@ -81,6 +100,9 @@ public:
         {"byte_exact_verify_base_addr", "dense_rowcol_v1 权重区基址（字节）", "0"},
         {"byte_exact_verify_rows", "dense_rowcol_v1 rows（用于范围约束）", "0"},
         {"byte_exact_verify_cols", "dense_rowcol_v1 cols（用于 row/col 反推）", "0"}
+        ,
+        {"byte_exact_dense_layout_mode", "dense_rowcol_v1 的 layout 解释: row_major|phys_v1（默认 row_major）", "row_major"},
+        {"byte_exact_dense_phys_dram_row_bytes", "phys_v1: DRAM row bytes（例如 8192）", "0"}
         ,
         // BCSR merge-read correctness (raw file slice compare; off by default).
         {"byte_exact_verify_file_path", "raw_bcsr_v1: raw bcsr.bin 文件路径", ""},
@@ -121,6 +143,14 @@ public:
         {"gas_gap_absorbed_bytes", "Gap bytes absorbed by fine-grained merge (sum)", "bytes", 1},
         {"gas_row_window_triggers", "Number of row-window bursts (coarse merge)", "count", 1},
         {"gas_row_window_bytes", "Bytes issued by row-window bursts (sum)", "bytes", 1},
+        {"gas_cmd_cost_veto", "Number of absorb attempts vetoed by cmd-cost model", "count", 1},
+        {"gas_cmd_cost_veto_fine_gap", "Number of fine-gap absorb attempts vetoed by cmd-cost model", "count", 1},
+        {"gas_cmd_cost_veto_row_window", "Number of row-window absorb attempts vetoed by cmd-cost model", "count", 1},
+        // Segment diagnostics.
+        {"gas_overfetch_bytes", "Overfetch bytes issued by segment merges (issued_bytes - payload_bytes)", "bytes", 1},
+        {"gas_unique_line_count", "Approx unique cacheline count touched by staged reads (per window)", "count", 1},
+        {"gas_covered_line_count", "Approx covered cacheline count by issued segments (per window)", "count", 1},
+        {"gas_apply_bank_credit_effective", "Apply credit diagnostics: effective bank credit per window", "count", 1},
         // Adaptive-k (C3) statistics (registered unconditionally; collection gated by params)
         {"gas_k_dyn_bytes", "Adaptive-k dynamic threshold (bytes)", "bytes", 1},
         {"gas_oeff_ns_avg", "Per-window average fixed overhead O_eff (ns)", "ns", 1},
@@ -156,32 +186,60 @@ public:
 
     // IGasStepGate: step-level window start (only used when step_gate_enable=1)
     void openStep(uint32_t seq) override;
+    // IGasCreditGate: set Apply-stage per-bank credit target for a specific step.
+    void setApplyBankCreditTarget(uint32_t seq, uint32_t apply_bank_credit) override;
 
 private:
     // P2: 参数化门控（仅参数，不再回退env）
     bool diag_enable_ = false;
     bool debug_enable_ = false;
     bool sentinel_enable_ = false;
+    // Experimental: step-gate progress watchdog (debugging only; disabled by default).
+    bool experimental_stepgate_progress_enable_ = false;
+    uint64_t experimental_stepgate_progress_period_cycles_ = 0;
+    uint32_t experimental_stepgate_progress_max_reports_ = 0;
+    uint32_t experimental_stepgate_progress_dump_level_ = 0;
+    int experimental_stepgate_progress_owner_node_ = -1;
+    int experimental_stepgate_progress_owner_core_ = -1;
+    uint32_t experimental_stepgate_progress_reports_ = 0;
+    uint64_t experimental_stepgate_progress_tick_ = 0;
+    uint64_t experimental_stepgate_apply_finish_poll_period_cycles_ = 1;
 
-    // Internal types
-    enum class Stage { Idle=0, Gather=1, Apply=2, Scatter=3 };
-    enum class Merge { None=0, Cacheline=1, Row=2, Auto=3 };
-    enum class Sort { Addr=0, Row=1, BankRow=2 };
+	    // Internal types
+	    enum class Stage { Idle=0, Gather=1, Apply=2, Scatter=3 };
+	    enum class Merge { None=0, Cacheline=1, Row=2, Auto=3 };
+	    enum class Sort { Addr=0, Row=1, BankRow=2 };
+	    enum class ApplyIssuePolicy { Order=0 };
+
+    struct GranuleKey {
+        uint64_t base;
+        uint32_t size;
+        bool operator==(const GranuleKey& other) const {
+            return base == other.base && size == other.size;
+        }
+    };
+    struct GranuleKeyHash {
+        size_t operator()(const GranuleKey& key) const noexcept {
+            const uint64_t h1 = std::hash<uint64_t>{}(key.base);
+            const uint64_t h2 = std::hash<uint32_t>{}(key.size);
+            return static_cast<size_t>(h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2)));
+        }
+    };
 
     struct SubReq {
         Request::id_t up_id;  // upstream Read ID
         uint64_t      offset; // offset within granule base
         uint32_t      size;   // bytes to return
     };
-    struct Granule {
-        uint64_t base; uint32_t size; std::vector<SubReq> subs;
-        bool issued=false; bool ready=false; uint64_t down_id=0;
-        uint64_t issue_ns=0; // adaptive k: time when issued downstream
-        uint64_t window_id=0; // gather/apply window ID for this granule
-        uint64_t payload_bytes = 0; // sum of upstream sub-request sizes (bytes)
-
-        // 下游分片：为兼容 memHierarchy.Cache（尤其 Incoherent L1），避免一次性发起 size>cache_line 的 GetS
-        // 导致 cache 在回包时越界拼 payload（表现为权重读脏/非确定性/发放归零）。
+	    struct Granule {
+	        uint64_t base; uint32_t size; std::vector<SubReq> subs;
+	        bool issued=false; bool ready=false; uint64_t down_id=0;
+	        uint64_t issue_ns=0; // adaptive k: time when issued downstream
+	        uint64_t window_id=0; // gather/apply window ID for this granule
+	        uint64_t payload_bytes = 0; // sum of upstream sub-request sizes (bytes)
+	        uint64_t min_arrival_ns = 0; // min arrival time across sub-reads (ns); used for Apply fairness
+	        // 下游分片：为兼容 memHierarchy.Cache（尤其 Incoherent L1），避免一次性发起 size>cache_line 的 GetS
+	        // 导致 cache 在回包时越界拼 payload（表现为权重读脏/非确定性/发放归零）。
         uint32_t frag_bytes = 0;   // 每片字节数（通常=cache line）
         uint32_t frags_total = 0;  // 总片数
         uint32_t frags_issued = 0; // 已发起片数
@@ -194,21 +252,33 @@ private:
 
     struct DownFrag {
         int buf = 0;
-        uint64_t key = 0;
+        GranuleKey key{};
         uint32_t off = 0;
         uint32_t size = 0;
     };
 
-    // Helpers
-    Merge parseMerge(const std::string& s) const;
-    Sort parseSort(const std::string& s) const;
+    enum class ReadAttachKind : uint8_t {
+        OpenStep,
+        ManualBeginGather,
+        QueuedImport,
+        ImmediateSend,
+    };
+
+	    // Helpers
+	    Merge parseMerge(const std::string& s) const;
+	    Sort parseSort(const std::string& s) const;
+	    ApplyIssuePolicy parseApplyIssuePolicy(const std::string& s) const;
     uint64_t alignDown(uint64_t addr, uint64_t bytes) const { return (addr/bytes)*bytes; }
     uint64_t granuleSize() const;
-    uint64_t rowIndex(uint64_t addr) const { return row_bytes_guess_? (addr / row_bytes_guess_) : 0; }
+    uint64_t rowIndex(uint64_t addr) const { return row_bytes_effective_? (addr / row_bytes_effective_) : 0; }
     uint64_t bankIndex(uint64_t addr) const { return bank_bits_ ? ((addr >> bank_shift_) & ((1ull<<bank_bits_)-1)) : 0; }
     uint64_t bankRowIndex(uint64_t addr) const { return (bankIndex(addr) << 32) | (uint32_t)rowIndex(addr); }
-    void issueGranuleBuf_(int buf, uint64_t key, Granule& g);
-    void onDownstreamResp_(Request* r);
+	    GranuleKey makeGranuleKey_(uint64_t base, uint32_t size) const;
+	    Granule& ensureGranule_(int buf, const GranuleKey& key);
+	    static bool granuleKeyLess_(const GranuleKey& a, const GranuleKey& b);
+	    void issueGranuleBuf_(int buf, const GranuleKey& key, Granule& g);
+	    void issueGranuleBufBudget_(int buf, const GranuleKey& key, Granule& g, uint32_t max_frags_to_issue);
+	    void onDownstreamResp_(Request* r);
     void maybeEnterApply_();
     void emitApplyResponsesBuf_(int buf);
     void doFlushBuf_(int buf);
@@ -227,9 +297,20 @@ private:
     void applyCtrlConfig_(uint64_t k, uint64_t rowwin_bytes, uint64_t timeout_ns);
     bool rebuildPendingAsGranules_(int buf);
     static std::vector<uint64_t> parseCsvU64_(const std::string& s);
-    uint64_t ensureSortKey_(Granule& g);
-    void rebuildIssueOrder_(int buf);
+    std::pair<uint64_t, uint64_t> cmdCostNsForBank_(uint32_t bank_idx) const;
+	    uint64_t ensureSortKey_(Granule& g);
+	    void rebuildIssueOrder_(int buf);
     void issueMoreUnissuedFromOrder_(int buf);
+    void issueUnissuedGranulesDeterministic_(int buf);
+    uint64_t countApplyIssuableGranules_(int buf) const;
+    bool attachReadToGranule_(int tgt_buf,
+                              SST::Interfaces::StandardMem::Read* rd,
+                              ReadAttachKind kind,
+                              bool issue_now,
+                              uint32_t seq,
+                              int stage,
+                              int buf);
+    bool drainQueuedNonGatherReadsToGather_(ReadAttachKind kind, uint32_t seq, int stage);
     bool byteExactVerifyEnabled_() const;
     void verifyByteExactDenseRowcol_(uint64_t addr, const std::vector<uint8_t>& data);
     void verifyByteExactRawBcsr_(uint64_t addr, const std::vector<uint8_t>& data);
@@ -247,28 +328,41 @@ private:
     Merge merge_ = Merge::Cacheline;
     Sort sort_ = Sort::Row;
     uint32_t row_bytes_guess_ = 8192;
+    uint32_t row_bytes_effective_ = 8192; // may be overridden by dram_row_bytes when dram-aware is enabled
     uint64_t sram_bytes_ = 256*1024;
     // Fine-grained merge knobs
     bool gap_merge_enable_ = true;
     uint64_t gap_k_bytes_ = 0;      // tolerated hole bytes; 0=disable gap merge
     uint64_t burst_bytes_max_ = 64*1024; // Lmax
+    // Experimental: GCSS value-line fusion (no-hole cacheline fusion in staged builder).
+    bool vlf_enable_ = false;
+    bool vlf_run_enable_ = false;
     uint32_t bank_bits_ = 0;        // bank field width; 0 disables bank_row sort
     uint32_t bank_shift_ = 0;       // bank bit LSB
     bool bank_auto_enable_ = true;  // allow heuristic detection if bits==0
-    uint32_t bank_auto_min_banks_ = 4;
-    uint32_t bank_auto_max_banks_ = 32;
-    bool bank_auto_done_ = false;
-    uint32_t sram_access_ns_ = 0;
+	    uint32_t bank_auto_min_banks_ = 4;
+	    uint32_t bank_auto_max_banks_ = 32;
+	    bool bank_auto_done_ = false;
+	    // Apply-stage issue scheduling.
+	    ApplyIssuePolicy apply_issue_policy_ = ApplyIssuePolicy::Order;
+    uint32_t apply_frags_per_issue_ = 1; // max frags per scheduling step (0=unlimited)
+    uint32_t apply_bank_credit_ = 1;     // max active granules per bank (0=unlimited)
+    uint64_t apply_age_fair_ns_ = 2000;  // age fairness threshold (ns), 0=disable
+    uint32_t apply_bank_credit_dyn_ = 1;
+    // External per-step credit control (disabled until setApplyBankCreditTarget() is called).
+    bool apply_credit_external_enable_ = false;
+    uint32_t apply_credit_external_pending_seq_ = 0;
+    uint32_t apply_credit_external_pending_credit_ = 0;
+		    uint32_t sram_access_ns_ = 0;
     uint32_t max_inflight_reads_ = 128;
     uint64_t tail_wait_timeout_ns_ = 0; // 0 = wait all
     bool allow_apply_miss_read_ = false;
     bool flush_after_scatter_ = true;
-    bool defer_issue_until_apply_ = true;
+    bool defer_issue_until_apply_ = false;
     bool strict_mode_ = true; // 非Gather阶段是否严格拦截读（默认开）
     bool double_buffer_enable_ = true; // 允许在Apply阶段在另一SB上并行Gather
     bool window_auto_ = false;
     bool step_gate_enable_ = false; // Step-level gate: pause after EndScatter until openStep()
-    bool manual_window_drive_ = false;
     uint64_t win_cyc_gather_ = 0, win_cyc_apply_ = 0, win_cyc_scatter_ = 0;
     bool apply_auto_end_enable_ = true;
     bool scatter_immediate_complete_ = false;
@@ -295,6 +389,8 @@ private:
     uint64_t byte_exact_base_addr_ = 0;
     uint32_t byte_exact_rows_ = 0;
     uint32_t byte_exact_cols_ = 0;
+    std::string byte_exact_dense_layout_mode_ = "row_major";
+    uint32_t byte_exact_dense_phys_dram_row_bytes_ = 0;
     // raw_bcsr_v1 (optional; byte_exact_* reused to avoid another config namespace)
     std::string byte_exact_file_path_;
     uint64_t byte_exact_file_size_ = 0;
@@ -332,10 +428,17 @@ private:
     uint64_t win_buffer_max_bytes_ = 0; // track per-window max buffer occupancy
     void exportWindowMetricsRow_(uint64_t window_id, uint64_t payload_bytes, uint64_t bursts,
                                  uint64_t inflight_peak, uint64_t buffer_max);
+    void latchApplyBacklogResiduals_();
+    void latchApplyBacklogPeakAfterDue_();
     // Coarse row-window knobs (skeleton; default disabled)
     bool row_window_enable_ = false;
     uint64_t row_window_bytes_ = 0;
     uint64_t row_window_timeout_ns_ = 0;
+
+    // Experimental: DRAM command-cost guided merge decisions during segment build (row-local only).
+    bool dram_cmd_cost_merge_enable_ = false;
+    uint32_t dram_cmd_t_row_hit_ns_ = 30;
+    uint32_t dram_cmd_t_row_miss_ns_ = 120;
     // Double-buffer indices
     int gather_buf_index_ = 0; // 当前接收/构建/发射（下轮）的SB
     int apply_buf_index_  = 1; // 当前用于Apply/回答上游的SB
@@ -359,24 +462,23 @@ private:
     // 双缓冲状态
     struct SBState {
         // LRU（RAII）：std::list + 迭代器，杜绝手工new/delete与悬挂指针
-        std::list<uint64_t> lru_list;  // front=最久未用, back=最近使用
-        std::unordered_map<uint64_t, std::list<uint64_t>::iterator> lru_map; // key -> it
+        std::list<GranuleKey> lru_list;  // front=最久未用, back=最近使用
+        std::unordered_map<GranuleKey, std::list<GranuleKey>::iterator, GranuleKeyHash> lru_map; // key -> it
 
-        std::unordered_map<uint64_t, Granule> granules; // key->granule
+        std::unordered_map<GranuleKey, Granule, GranuleKeyHash> granules; // key->granule
         std::unordered_map<Request::id_t, SST::Interfaces::StandardMem::Read*> pending_up_reads; // upstream read map
         std::vector<SST::Interfaces::StandardMem::Read*> staging_reads;
         std::unordered_map<Request::id_t, uint64_t> staged_arrival_ns; // arrival time
-        std::unordered_set<uint64_t> required_set; // required granules
+        std::unordered_set<GranuleKey, GranuleKeyHash> required_set; // required granules
         // Apply阶段的确定性发射序列（避免每次 ReadResp 都对 granules 做全量排序）：
         // - 用于 defer_issue_until_apply=1 时保证“inflight 限流下仍能持续补发未发 granule”，防止卡死。
         // - 也可用于 Apply 阶段 miss-read/late-read 进入后，统一补发。
-        std::vector<std::pair<uint64_t, uint64_t>> issue_order; // (sort_key, key)
+        std::vector<std::pair<uint64_t, GranuleKey>> issue_order; // (sort_key, key)
         size_t issue_cursor = 0;
         bool issue_order_dirty = true;
-
-        std::unordered_map<uint64_t, std::vector<uint8_t>> sram_blocks; // key->data
-        uint64_t bytes_in_sram = 0;
-        bool end_gather_seen = false;
+	        std::unordered_map<GranuleKey, std::vector<uint8_t>, GranuleKeyHash> sram_blocks; // key->data
+	        uint64_t bytes_in_sram = 0;
+	        bool end_gather_seen = false;
 
         // 构造函数：预分配容器空间（优化3）
         SBState() {
@@ -404,9 +506,17 @@ private:
     // not by fixed window_cycles_* caps. We latch EndScatter requests and let clockTick advance.
     bool end_scatter_req_pending_ = false;
     uint32_t end_scatter_req_seq_ = 0;
+    uint64_t end_scatter_early_count_ = 0;
+    bool warned_end_scatter_early_ = false;
+    uint64_t fallback_end_gather_count_ = 0;
+    uint64_t fallback_end_apply_count_ = 0;
+    uint64_t fallback_end_scatter_count_ = 0;
+    bool warned_fallback_end_gather_ = false;
+    bool warned_fallback_end_apply_ = false;
+    bool warned_fallback_end_scatter_ = false;
 
     // Utilities for LRU（带buf选择）
-    void touchLRU_(int buf, uint64_t key);
+    void touchLRU_(int buf, const GranuleKey& key);
     void ensureCapacity_(int buf, uint64_t need);
 
     // Stats
@@ -424,12 +534,24 @@ private:
     Statistic<uint64_t>* stat_gap_absorbed_bytes_ = nullptr; // total gap bytes absorbed by gap merge
     Statistic<uint64_t>* stat_row_window_triggers_ = nullptr; // number of row-window bursts
     Statistic<uint64_t>* stat_row_window_bytes_ = nullptr;    // bytes issued due to row-window
-    // 门控诊断：下发到下游的唯一granule读次数
-    Statistic<uint64_t>* stat_reads_issued_ = nullptr;
+    Statistic<uint64_t>* stat_cmd_cost_veto_ = nullptr;       // total cmd-cost veto decisions
+    Statistic<uint64_t>* stat_cmd_cost_veto_fine_gap_ = nullptr; // fine-gap veto decisions
+    Statistic<uint64_t>* stat_cmd_cost_veto_row_window_ = nullptr; // row-window veto decisions
+    // Segment diagnostics.
+    Statistic<uint64_t>* stat_overfetch_bytes_ = nullptr;     // issued_bytes - payload_bytes (sum over segments)
+    Statistic<uint64_t>* stat_unique_line_count_ = nullptr;   // approx unique lines touched (per window)
+    Statistic<uint64_t>* stat_covered_line_count_ = nullptr;  // approx covered lines by issued segments (per window)
+    Statistic<uint64_t>* stat_apply_bank_credit_effective_ = nullptr;
+	    // 门控诊断：下发到下游的唯一granule读次数
+	    Statistic<uint64_t>* stat_reads_issued_ = nullptr;
     // Adaptive k stats
     Statistic<uint64_t>* stat_k_dyn_bytes_ = nullptr;         // current k dynamic (bytes)
     Statistic<uint64_t>* stat_oeff_ns_avg_ = nullptr;         // average O_eff per window (ns)
-    Statistic<uint64_t>* stat_bw_eff_bytes_per_us_ = nullptr; // scaled bandwidth (bytes/us)
+	    Statistic<uint64_t>* stat_bw_eff_bytes_per_us_ = nullptr; // scaled bandwidth (bytes/us)
+	    // Control stats
+	    Statistic<uint64_t>* stat_ctrl_probes_ = nullptr;
+	    Statistic<uint64_t>* stat_ctrl_adopts_ = nullptr;
+	    Statistic<uint64_t>* stat_ctrl_reverts_ = nullptr;
 
     // Time tracking (ns) for non-window mode
     uint64_t last_stage_change_ns_ = 0;
@@ -440,9 +562,9 @@ private:
     uint64_t win_bursts_ = 0;          // number of bursts (granules) issued in this window
     uint64_t win_seg_latency_sum_ns_ = 0; // sum of segment latencies
     uint64_t win_seg_count_ = 0;       // number of segments measured
-    uint64_t win_inflight_peak_ = 0;   // inflight peak within window
-    uint64_t win_row_adj_same_ = 0;    // adjacent pairs mapped to same (row or bank_row)
-    uint64_t win_row_adj_total_ = 0;   // total adjacent pairs considered
+	    uint64_t win_inflight_peak_ = 0;   // inflight peak within window
+	    uint64_t win_row_adj_same_ = 0;    // adjacent pairs mapped to same (row or bank_row)
+	    uint64_t win_row_adj_total_ = 0;   // total adjacent pairs considered
 
     // --- Adaptive control state ---
     bool ctrl_enable_ = false;
@@ -463,13 +585,34 @@ private:
     double ctrl_last_score_ = 0.0; // reqs_per_mib of current cfg (lower better)
     double ctrl_last_lat_ = 0.0;   // avg segment latency ns
 
-    // Stats for control
-    Statistic<uint64_t>* stat_ctrl_probes_ = nullptr;
-    Statistic<uint64_t>* stat_ctrl_adopts_ = nullptr;
-    Statistic<uint64_t>* stat_ctrl_reverts_ = nullptr;
-    
-    bool warned_auto_custom_req_ = false;
-    bool warned_defer_issue_path_ = false;
+	    bool warned_auto_custom_req_ = false;
+	    bool warned_defer_issue_path_ = false;
+
+    // Apply observability: keep cumulative counters so instant retire does not hide progress.
+    uint64_t apply_begin_ns_ = 0;
+    uint64_t apply_first_down_issue_ns_ = 0;
+    uint64_t apply_first_down_resp_ns_ = 0;
+    uint64_t apply_first_granule_done_ns_ = 0;
+    uint64_t apply_first_up_resp_ns_ = 0;
+    uint64_t apply_down_resp_total_ = 0;
+    uint64_t apply_completed_granules_total_ = 0;
+    uint64_t apply_emitted_subreads_total_ = 0;
+    uint64_t apply_backlog_granules_residual_peak_ = 0;
+    uint64_t apply_backlog_pending_up_reads_residual_peak_ = 0;
+    uint64_t apply_backlog_inflight_residual_peak_ = 0;
+    uint64_t apply_backlog_granules_peak_after_due_ = 0;
+    uint64_t apply_backlog_pending_up_reads_peak_after_due_ = 0;
+    uint64_t apply_backlog_inflight_peak_after_due_ = 0;
+    uint64_t step_gate_wait_cycles_pending_ = 0;
+    uint64_t apply_issue_attempt_total_ = 0;
+    uint64_t apply_issue_success_total_ = 0;
+    uint64_t apply_issue_block_no_ready_total_ = 0;
+    uint64_t apply_issue_block_inflight_cap_total_ = 0;
+    uint64_t apply_issue_block_bank_credit_total_ = 0;
+    uint64_t apply_issue_block_downstream_busy_total_ = 0;
+    uint64_t apply_issue_block_retire_guard_total_ = 0;
+    uint64_t apply_ready_queue_peak_ = 0;
+    uint64_t apply_ready_queue_nonempty_cycles_total_ = 0;
 
     bool diagEnabled_(int level = 1) const;
 };

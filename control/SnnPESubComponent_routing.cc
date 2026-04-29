@@ -10,6 +10,7 @@
 #include "SnnPESubComponent.h"
 #include "api/ISnnSpikeCommWorkload.h"
 #include "synapse/weights/SnnBcsrWeightManager.h"
+#include "SnnDLStringUtil.h"
 
 #include <algorithm>
 #include <cctype>
@@ -27,29 +28,7 @@ using namespace SST::SnnDL;
 
 std::string SnnPESubComponent::resolveWeightTemplate(uint32_t pe, int core) const {
     if (weights_template_.empty()) return "";
-    std::string path = weights_template_;
-    auto replaceIndexed = [&](const std::string& marker, uint32_t value, int width) {
-        size_t pos = 0;
-        while ((pos = path.find(marker, pos)) != std::string::npos) {
-            char buf[32];
-            std::snprintf(buf, sizeof(buf), "%0*u", width, value);
-            path.replace(pos, marker.size(), buf);
-            pos += width;
-        }
-    };
-    auto replaceSimple = [&](const std::string& marker, uint32_t value) {
-        size_t pos = 0;
-        std::string text = std::to_string(value);
-        while ((pos = path.find(marker, pos)) != std::string::npos) {
-            path.replace(pos, marker.size(), text);
-            pos += text.size();
-        }
-    };
-    replaceIndexed("{pe:02d}", pe, 2);
-    replaceSimple("{pe}", pe);
-    replaceIndexed("{core:02d}", static_cast<uint32_t>(core), 2);
-    replaceSimple("{core}", static_cast<uint32_t>(core));
-    return path;
+    return resolvePeCoreTemplate(weights_template_, pe, static_cast<uint32_t>(core));
 }
 
 void SnnPESubComponent::applyGatingDecision(uint32_t src_global, const std::vector<uint32_t>& dest_pes,

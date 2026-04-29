@@ -12,6 +12,7 @@
 
 - `services/memory` 只做 `addr + size ↔ bytes`（不携带权重/突触语义），并默认按 memHierarchy 的 cacheline 事务模型理解“系统层流量”。
 - 若某子系统（例如 GAS 的内存前端）改变了合并粒度（可能引入 over-fetch），必须通过 `gas_unique_* / avg_granule_bytes` 等指标显式暴露，并在实验输出中标注有效参数（见 mesh 模板的 `effective_config.json`）。
+  - 建议最小口径：`unique_reads/unique_bytes` 及其派生指标（例如 `avg_granule_bytes`）。
 
 ---
 
@@ -21,7 +22,7 @@
   - 详见：`services/noc/README.md`
 - `services/memory/`：纯内存访问域（地址→字节块），实现 `api/IMemoryAccess.h`  
   - 详见：`services/memory/README.md`
-- `services/synapse/`：突触语义域（Synapse 事务闭环：weights/route/gas 的聚合域）  
+- `services/synapse/`：突触语义域（Synapse 事务闭环：weights/route/gas 的聚合域；阶段机业务动作在 workload=snn）  
   - 详见：`services/synapse/README.md`
 - `services/stimulus/`：Stimulus 刺激/注入域（Step 注入/外部刺激）  
   - 详见：`services/stimulus/README.md`

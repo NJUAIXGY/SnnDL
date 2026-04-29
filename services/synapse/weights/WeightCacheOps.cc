@@ -8,7 +8,7 @@
 
 namespace SST { namespace SnnDL {
 
-void WeightCacheOps::configure(const Config& cfg, std::function<void()> on_evict) {
+void WeightCacheOps::configure(const Config& cfg, std::function<void(uint64_t)> on_evict) {
     cfg_ = cfg;
     on_evict_ = std::move(on_evict);
 
@@ -40,6 +40,16 @@ void WeightCacheOps::reserve(size_t hint_entries) {
         return;
     }
     lru_map_.reserve(hint_entries);
+}
+
+bool WeightCacheOps::contains(uint64_t key) const {
+    if (cfg_.use_clock) return clock_index_.find(key) != clock_index_.end();
+    return lru_map_.find(key) != lru_map_.end();
+}
+
+size_t WeightCacheOps::entryCount() const {
+    if (cfg_.use_clock) return static_cast<size_t>(clock_size_);
+    return lru_map_.size();
 }
 
 bool WeightCacheOps::tryGet(uint64_t key, float& out) {
@@ -85,7 +95,7 @@ void WeightCacheOps::lruPut_(uint64_t key, float value) {
         uint64_t victim = lru_list_.back();
         lru_list_.pop_back();
         lru_map_.erase(victim);
-        if (on_evict_) on_evict_();
+        if (on_evict_) on_evict_(victim);
     }
 }
 
@@ -130,6 +140,7 @@ void WeightCacheOps::clockPut_(uint64_t key, float value) {
     uint32_t idx = clock_hand_;
     uint64_t victim = clock_keys_[idx];
     clock_index_.erase(victim);
+    if (on_evict_) on_evict_(victim);
     clock_keys_[idx] = key;
     clock_vals_[idx] = value;
     clock_access_[idx] = 1;

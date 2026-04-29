@@ -7,8 +7,11 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <string>
+
+#include "WorkloadConfig.h"
 
 namespace SST {
 class Params;
@@ -28,6 +31,7 @@ struct MultiCorePEConfig {
     int node_id = 0;
     int total_nodes = 1;
     uint64_t global_neuron_base = 0;
+    uint64_t base_addr = 0;
     uint64_t sim_stop_ns = 0;
 
     // Native multicast lab
@@ -42,6 +46,110 @@ struct MultiCorePEConfig {
 
     // Workload selector (for disabling StepActivation under non-SNN workloads)
     std::string workload_impl;  // normalized lowercase; empty means "snn"
+    WorkloadKind workload_kind = WorkloadKind::Snn;
+    // Optional workload stats modules (comma-separated). Empty -> auto from workload_impl.
+    std::string workload_stats_modules;
+    // Execution mode hint (experiment observability only)
+    // - gas: default SNN GAS/window pipeline
+    // - naive_raw: immediate per-spike reads (no GAS/window); still may use global step sync controller
+    std::string exec_mode;  // normalized lowercase; empty means "gas"
+
+    // PE-shared DMA (Phase 1: SNN workload runtime reads only)
+    bool dma_enable = false;
+    uint64_t dma_bytes_per_cycle = 0;
+    uint32_t dma_read_engines = 0;
+    uint32_t dma_max_inflight = 0;
+    uint32_t dma_queue_depth = 0;
+    std::string dma_overflow_policy = "block";
+    uint64_t dma_burst_bytes = 0;
+    uint32_t dma_setup_cycles = 0;
+    uint32_t dma_channels = 1;
+    uint64_t dma_channel_bytes_per_cycle = 0;
+    uint64_t dma_channel_interleave_bytes = 256;
+    std::array<std::array<uint16_t, 4>, 4> dma_stage_budget_permille{};
+
+    // Local storage hierarchy (Phase A: object registry / stats / compatibility aliases)
+    bool local_storage_enable = false;
+    bool pe_internal_cpe_enable = false;
+    bool pe_internal_pod_enable = false;
+    uint32_t pe_internal_pod_count = 0;
+    uint32_t pe_internal_pod_size = 0;
+    bool pe_internal_pod_metadata_enable = false;
+    uint64_t pe_internal_pod_metadata_capacity_bytes = 0;
+    uint32_t pe_internal_pod_metadata_banks = 1;
+    bool pe_internal_pod_owner_enable = false;
+    uint32_t pe_internal_pod_owner_entries = 0;
+    uint32_t pe_internal_pod_owner_entry_bytes = 16;
+    bool pe_internal_pod_join_enable = false;
+    uint32_t pe_internal_pod_join_entries = 0;
+    uint32_t pe_internal_pod_join_entry_bytes = 16;
+    bool pe_internal_pod_ready_enable = false;
+    uint32_t pe_internal_pod_ready_entries = 0;
+    bool pulse_enable = false;
+    bool pulse_osa_enable = false;
+    bool pulse_osa_shared_weight_owner_enable = false;
+    bool pulse_osa_shared_weight_owner_actual_enable = false;
+    bool pulse_osa_metadata_txn_enable = false;
+    bool pulse_osa_metadata_ready_lease_enable = false;
+    uint32_t pulse_osa_metadata_ready_lease_ttl = 0;
+    std::string pulse_osa_metadata_object_mask = "rowdescriptor";
+    bool pulse_observe_only = true;
+    bool pulse_ingress_enable = true;
+    bool pulse_agenda_observe_only = true;
+    bool pulse_harbor_enable = false;
+    bool pulse_descriptor_enable = false;
+    bool pulse_descriptor_actual_enable = false;
+    bool experimental_rowdescriptor_ready_join_dedup_enable = false;
+    bool pulse_domain_retire_enable = false;
+    bool pulse_domain_retire_observe_only = true;
+    std::string pulse_domain_retire_mode = "per_post";
+    uint32_t pulse_domain_retire_release_budget = 0;
+    uint32_t pulse_ingress_entries = 0;
+    uint32_t pulse_core_queue_entries = 0;
+    uint32_t pulse_descriptor_packet_min = 2;
+    uint32_t pulse_bypass_high_watermark_pct = 100;
+    std::string pulse_bypass_mode = "disabled";
+
+    bool ls_state_enable = false;
+    uint64_t ls_state_capacity_bytes = 0;
+    uint32_t ls_state_banks = 16;
+    uint32_t ls_state_read_ports = 1;
+    uint32_t ls_state_write_ports = 1;
+    uint32_t ls_state_update_ports = 1;
+    uint32_t ls_state_queue_depth = 0;
+
+    bool ls_weight_idx_enable = false;
+    uint64_t ls_weight_idx_capacity_bytes = 0;
+    uint32_t ls_weight_idx_banks = 16;
+    uint32_t ls_weight_idx_read_ports = 1;
+    uint32_t ls_weight_idx_write_ports = 1;
+    uint32_t ls_weight_idx_queue_depth = 0;
+
+    bool ls_weight_value_enable = false;
+    uint64_t ls_weight_value_capacity_bytes = 0;
+    uint32_t ls_weight_value_banks = 8;
+    uint32_t ls_weight_value_read_ports = 1;
+    uint32_t ls_weight_value_write_ports = 1;
+    uint32_t ls_weight_value_queue_depth = 0;
+
+    bool ls_activation_ingress_enable = false;
+    uint32_t ls_activation_ingress_entries = 0;
+    bool ls_activation_core_enable = false;
+    uint32_t ls_activation_core_entries = 0;
+
+    bool ls_acc_enable = false;
+    uint64_t ls_acc_capacity_bytes = 0;
+    uint32_t ls_acc_banks = 1;
+    uint32_t ls_acc_read_ports = 1;
+    uint32_t ls_acc_write_ports = 1;
+    uint32_t ls_acc_update_ports = 1;
+    uint32_t ls_acc_queue_depth = 0;
+
+    bool ls_rf_enable = false;
+    uint32_t ls_rf_entries = 0;
+    uint32_t ls_rf_entry_bytes = 4;
+    uint32_t ls_rf_read_ports = 1;
+    uint32_t ls_rf_write_ports = 1;
 
     // Files / toggles
     std::string weights_file;
@@ -56,6 +164,7 @@ struct MultiCorePEConfig {
 
     // Test traffic
     bool enable_test_traffic = false;
+    std::string test_traffic_packet_kind = "spike";
     int test_target_node = 0;
     int test_period = 100;
     int test_spikes_per_burst = 4;
@@ -107,6 +216,9 @@ struct MultiCorePEConfig {
     int step_activation_trigger_core = 0;
     bool step_reset_mem_each_step = false;
     double step_activation_event_weight = 0.0;
+    // StepActivation pre selection pattern (bernoulli/clustered)
+    std::string step_activation_pre_pattern; // normalized lowercase; empty => bernoulli
+    uint32_t step_activation_pre_cluster_len = 0; // clustered: contiguous pre length (neurons); 0 => auto (64)
     bool step_activation_use_bcsr_routes = false;
     std::string step_activation_bcsr_template;
     uint32_t step_activation_bcsr_rows_per_core = 0; // 0 => default to neurons_per_core

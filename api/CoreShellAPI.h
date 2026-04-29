@@ -14,7 +14,9 @@
 #include <sst/core/subcomponent.h>
 #include <sst/core/params.h>
 
+#include <cstdint>
 #include <map>
+#include <vector>
 
 namespace SST { namespace SnnDL {
 
@@ -38,6 +40,20 @@ public:
     // 返回 true 表示本 core 接管 packet 生命周期；返回 false 表示未处理、由调用方负责 delete。
     virtual bool deliverPacket(NocPacketEvent* /*packet*/) { return false; }
 
+    // Synthetic SNN source hook:
+    // - 仅供 MultiCorePE 的 isolated test traffic 使用；
+    // - 默认 no-op，非 SNN workload/未实现 core 不参与该路径。
+    virtual bool syntheticEmitNeuronFire(uint32_t neuron_idx, uint64_t now_cycle) {
+        (void)neuron_idx;
+        (void)now_cycle;
+        return false;
+    }
+    virtual uint64_t syntheticEmitNeuronFireBatch(const std::vector<uint32_t>& neuron_indices, uint64_t now_cycle) {
+        (void)neuron_indices;
+        (void)now_cycle;
+        return 0;
+    }
+
     // 统计/状态接口（用于 Mesh 汇聚）
     virtual void getStatistics(std::map<std::string, uint64_t>& stats) const = 0;
     virtual bool hasWork() const = 0;
@@ -50,4 +66,3 @@ protected:
 }} // namespace SST::SnnDL
 
 #endif // _CORESHELL_API_H
-

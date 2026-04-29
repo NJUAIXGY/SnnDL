@@ -18,12 +18,30 @@
 #include <sst/core/output.h>
 
 #include "synapse/common/BcsrMeta.h"
+#include "SnnDLStringUtil.h"
 
 namespace SST { namespace SnnDL {
 
 namespace {
 
 constexpr uint32_t kBcsrSentinelId = 0xFFFFFFFFu;
+
+inline void maybeStoreEdgeWeight(RouteWeightMap* route_weights_out,
+                                 uint32_t pre_global,
+                                 uint32_t post_global,
+                                 float weight) {
+    if (!route_weights_out) return;
+    const uint64_t key =
+        (static_cast<uint64_t>(pre_global) << 32) | static_cast<uint64_t>(post_global);
+    auto it = route_weights_out->find(key);
+    if (it == route_weights_out->end()) {
+        (*route_weights_out)[key] = weight;
+        return;
+    }
+    if (std::fabs(weight) > std::fabs(it->second)) {
+        it->second = weight;
+    }
+}
 
 } // namespace
 
@@ -52,29 +70,7 @@ bool parseBcsrMetaJson(const std::string& meta_path,
 
 std::string resolveBcsrTemplate(const std::string& tmpl, uint32_t pe, int core) {
     if (tmpl.empty()) return "";
-    std::string path = tmpl;
-    auto replaceIndexed = [&](const std::string& marker, uint32_t value, int width) {
-        size_t pos = 0;
-        while ((pos = path.find(marker, pos)) != std::string::npos) {
-            char buf[32];
-            std::snprintf(buf, sizeof(buf), "%0*u", width, value);
-            path.replace(pos, marker.size(), buf);
-            pos += static_cast<size_t>(width);
-        }
-    };
-    auto replaceSimple = [&](const std::string& marker, uint32_t value) {
-        size_t pos = 0;
-        std::string text = std::to_string(value);
-        while ((pos = path.find(marker, pos)) != std::string::npos) {
-            path.replace(pos, marker.size(), text);
-            pos += text.size();
-        }
-    };
-    replaceIndexed("{pe:02d}", pe, 2);
-    replaceSimple("{pe}", pe);
-    replaceIndexed("{core:02d}", static_cast<uint32_t>(core), 2);
-    replaceSimple("{core}", static_cast<uint32_t>(core));
-    return path;
+    return resolvePeCoreTemplate(tmpl, pe, static_cast<uint32_t>(core));
 }
 
 bool appendRoutesFromBcsrFile(const SynapseRouteBuildConfig& cfg,
@@ -84,7 +80,8 @@ bool appendRoutesFromBcsrFile(const SynapseRouteBuildConfig& cfg,
                               int core_index,
                               uint32_t rows_hint,
                               ISynapseRoute::RouteMap& routes_out,
-                              const BcsrAppendOptions& opt) {
+                              const BcsrAppendOptions& opt,
+                              RouteWeightMap* route_weights_out) {
     uint32_t rows = rows_hint;
     uint32_t cols = cfg.cols;
     uint32_t br = cfg.bcsr_br ? cfg.bcsr_br : 16;
@@ -96,6 +93,10 @@ bool appendRoutesFromBcsrFile(const SynapseRouteBuildConfig& cfg,
     uint64_t blockdata_off = (cfg.bcsr_blockdata_addr > cfg.base_addr) ? (cfg.bcsr_blockdata_addr - cfg.base_addr) : 0;
     uint64_t blockids_off = (cfg.bcsr_blockids_addr > cfg.base_addr) ? (cfg.bcsr_blockids_addr - cfg.base_addr) : 0;
     uint32_t total_blocks = 0;
+    std::string layout_mode;
+    uint32_t colidx_row_stride_bytes = 0;
+    uint32_t blockdata_row_stride_bytes = 0;
+    uint32_t blockids_row_stride_bytes = 0;
 
     // 注意：同一目录下不同 core 的 total_blocks 可能不同，导致 blockdata/blockids 的 offset 随文件变化。
     // 因此对于“读文件构建路由”的路径：优先使用每个文件自身的 .meta.json offsets/total_blocks，
@@ -115,9 +116,14 @@ bool appendRoutesFromBcsrFile(const SynapseRouteBuildConfig& cfg,
         blockdata_off = meta.blockdata_offset;
         blockids_off = meta.blockids_offset;
         if (meta.total_blocks) total_blocks = meta.total_blocks;
+        layout_mode = meta.layout_mode;
+        colidx_row_stride_bytes = meta.colidx_row_stride_bytes;
+        blockdata_row_stride_bytes = meta.blockdata_row_stride_bytes;
+        blockids_row_stride_bytes = meta.blockids_row_stride_bytes;
     } else {
         total_blocks = 0;
     }
+    if (layout_mode.empty()) layout_mode = "flat";
     if (rows == 0 || cols == 0) {
         if (out) out->verbose(CALL_INFO, 0, 0, "⚠️ BCSR路由: 元数据缺失 rows/cols %s\n", path.c_str());
         return false;
@@ -177,6 +183,10 @@ bool appendRoutesFromBcsrFile(const SynapseRouteBuildConfig& cfg,
         meta_for_check.blockdata_offset = blockdata_off;
         meta_for_check.blockids_offset = blockids_off;
         meta_for_check.total_blocks = total_blocks;
+        meta_for_check.layout_mode = layout_mode;
+        meta_for_check.colidx_row_stride_bytes = colidx_row_stride_bytes;
+        meta_for_check.blockdata_row_stride_bytes = blockdata_row_stride_bytes;
+        meta_for_check.blockids_row_stride_bytes = blockids_row_stride_bytes;
         std::string err;
         if (!validateBcsrMetaAgainstFile(meta_for_check, file_size, rows, &err)) {
             if (out) out->verbose(CALL_INFO, 0, 0,
@@ -194,21 +204,30 @@ bool appendRoutesFromBcsrFile(const SynapseRouteBuildConfig& cfg,
     }
     uint32_t derived_blocks = rowptr.back();
     if (total_blocks == 0) total_blocks = derived_blocks;
-    std::vector<uint32_t> block_cols(total_blocks, 0u);
-    fin.seekg(static_cast<std::streamoff>(colidx_off), std::ios::beg);
-    if (idx_bytes == 2) {
-        std::vector<uint16_t> tmp(total_blocks, 0);
-        fin.read(reinterpret_cast<char*>(tmp.data()), tmp.size() * sizeof(uint16_t));
-        if (!fin.good()) {
-            if (out) out->verbose(CALL_INFO, 0, 0, "⚠️ BCSR路由: 读取colidx失败 %s\n", path.c_str());
-            return false;
-        }
-        for (uint32_t i = 0; i < total_blocks; ++i) block_cols[i] = tmp[i];
-    } else {
-        fin.read(reinterpret_cast<char*>(block_cols.data()), block_cols.size() * sizeof(uint32_t));
-        if (!fin.good()) {
-            if (out) out->verbose(CALL_INFO, 0, 0, "⚠️ BCSR路由: 读取colidx失败 %s\n", path.c_str());
-            return false;
+
+    const bool rowpack_v1 =
+        (layout_mode == "rowpack_v1") &&
+        (colidx_row_stride_bytes >= (idx_bytes ? idx_bytes : 2)) &&
+        (blockdata_row_stride_bytes > 0);
+
+    std::vector<uint32_t> block_cols;
+    if (!rowpack_v1) {
+        block_cols.assign(total_blocks, 0u);
+        fin.seekg(static_cast<std::streamoff>(colidx_off), std::ios::beg);
+        if (idx_bytes == 2) {
+            std::vector<uint16_t> tmp(total_blocks, 0);
+            fin.read(reinterpret_cast<char*>(tmp.data()), tmp.size() * sizeof(uint16_t));
+            if (!fin.good()) {
+                if (out) out->verbose(CALL_INFO, 0, 0, "⚠️ BCSR路由: 读取colidx失败 %s\n", path.c_str());
+                return false;
+            }
+            for (uint32_t i = 0; i < total_blocks; ++i) block_cols[i] = tmp[i];
+        } else {
+            fin.read(reinterpret_cast<char*>(block_cols.data()), block_cols.size() * sizeof(uint32_t));
+            if (!fin.good()) {
+                if (out) out->verbose(CALL_INFO, 0, 0, "⚠️ BCSR路由: 读取colidx失败 %s\n", path.c_str());
+                return false;
+            }
         }
     }
     std::ifstream fdata(path, std::ios::binary);
@@ -222,40 +241,107 @@ bool appendRoutesFromBcsrFile(const SynapseRouteBuildConfig& cfg,
     std::vector<uint32_t> blockids(floats_per_block, kBcsrSentinelId);
     const uint64_t total_global_neurons =
         static_cast<uint64_t>(cfg.total_nodes) * (neurons_per_pe > 0 ? neurons_per_pe : 1ULL);
-    uint64_t block_counter = 0;
-    for (uint32_t block_row = 0; block_row < n_block_rows; ++block_row) {
-        uint32_t begin = rowptr[block_row];
-        uint32_t end = rowptr[block_row + 1];
-        for (uint32_t idx = begin; idx < end; ++idx, ++block_counter) {
-            if (block_counter >= block_cols.size()) break;
-            uint32_t block_col = block_cols[idx];
-            fdata.read(reinterpret_cast<char*>(blockdata.data()), blockdata.size() * sizeof(float));
-            if (blockids_off > 0) {
-                fids.read(reinterpret_cast<char*>(blockids.data()), blockids.size() * sizeof(uint32_t));
+    if (rowpack_v1) {
+        // rowpack_v1 layout:
+        // - colidx/blockdata are stored per block_row with fixed row strides (padding included).
+        // - blockids remains in legacy flat layout (generator contract), so we read it sequentially.
+        for (uint32_t block_row = 0; block_row < n_block_rows; ++block_row) {
+            uint32_t begin = rowptr[block_row];
+            uint32_t end = rowptr[block_row + 1];
+            const uint32_t row_blocks = (end > begin) ? (end - begin) : 0;
+            if (row_blocks == 0) continue;
+
+            // Load row colidx (only the used prefix; ignore padding).
+            std::vector<uint32_t> row_cols(row_blocks, 0u);
+            fin.seekg(static_cast<std::streamoff>(colidx_off + static_cast<uint64_t>(block_row) * colidx_row_stride_bytes),
+                      std::ios::beg);
+            if (idx_bytes == 2) {
+                std::vector<uint16_t> tmp(row_blocks, 0);
+                fin.read(reinterpret_cast<char*>(tmp.data()), tmp.size() * sizeof(uint16_t));
+                if (!fin.good()) {
+                    if (out) out->verbose(CALL_INFO, 0, 0, "⚠️ BCSR路由: 读取rowpack colidx失败 %s\n", path.c_str());
+                    return false;
+                }
+                for (uint32_t i = 0; i < row_blocks; ++i) row_cols[i] = tmp[i];
+            } else {
+                fin.read(reinterpret_cast<char*>(row_cols.data()), row_cols.size() * sizeof(uint32_t));
+                if (!fin.good()) {
+                    if (out) out->verbose(CALL_INFO, 0, 0, "⚠️ BCSR路由: 读取rowpack colidx失败 %s\n", path.c_str());
+                    return false;
+                }
             }
-            if (!fdata.good() || (blockids_off > 0 && !fids.good())) {
-                if (out) out->verbose(CALL_INFO, 0, 0, "⚠️ BCSR路由: 读取block数据失败 %s\n", path.c_str());
-                return false;
+
+            // Load row blockdata prefix (ignore padding).
+            fdata.seekg(static_cast<std::streamoff>(blockdata_off + static_cast<uint64_t>(block_row) * blockdata_row_stride_bytes),
+                        std::ios::beg);
+            for (uint32_t idx_in_row = 0; idx_in_row < row_blocks; ++idx_in_row) {
+                const uint32_t block_col = row_cols[idx_in_row];
+                fdata.read(reinterpret_cast<char*>(blockdata.data()), blockdata.size() * sizeof(float));
+                if (blockids_off > 0) {
+                    fids.read(reinterpret_cast<char*>(blockids.data()), blockids.size() * sizeof(uint32_t));
+                }
+                if (!fdata.good() || (blockids_off > 0 && !fids.good())) {
+                    if (out) out->verbose(CALL_INFO, 0, 0, "⚠️ BCSR路由: 读取rowpack block失败 %s\n", path.c_str());
+                    return false;
+                }
+                for (uint32_t rr = 0; rr < br; ++rr) {
+                    uint32_t post_local = block_row * br + rr;
+                    if (post_local >= rows) continue;
+                    for (uint32_t cc = 0; cc < bc; ++cc) {
+                        size_t off = static_cast<size_t>(rr) * bc + cc;
+                        float weight = blockdata[off];
+                        if (std::fabs(weight) <= cfg.routing_epsilon) continue;
+                        if (blockids_off > 0 && blockids[off] == kBcsrSentinelId) continue;
+                        const uint64_t post_global_64 =
+                            static_cast<uint64_t>(pe_index) * neurons_per_pe + core_offset_global + static_cast<uint64_t>(post_local);
+                        if (post_global_64 >= total_global_neurons) continue;
+                        const uint32_t post_global = static_cast<uint32_t>(post_global_64);
+                        uint32_t pre_global = block_col * bc + cc;
+                        if (pre_global >= cols) continue;
+                        if (pre_global < opt.pre_begin || pre_global >= opt.pre_end) continue;
+                        routes_out[pre_global].push_back(post_global);
+                        maybeStoreEdgeWeight(route_weights_out, pre_global, post_global, weight);
+                    }
+                }
             }
-            for (uint32_t rr = 0; rr < br; ++rr) {
-                uint32_t post_local = block_row * br + rr;
-                if (post_local >= rows) continue;
-                for (uint32_t cc = 0; cc < bc; ++cc) {
-                    size_t off = static_cast<size_t>(rr) * bc + cc;
-                    float weight = blockdata[off];
-                    if (std::fabs(weight) <= cfg.routing_epsilon) continue;
-                    // 重要语义：
-                    // - blockids 仅作为有效位/哨兵（0xFFFFFFFF 表示无边），不能作为 post_global。
-                    // - post_global 必须由 (pe, core, post_local) 计算，保证与 WeightMemorySubsystem 的寻址/落盘口径一致。
-                    if (blockids_off > 0 && blockids[off] == kBcsrSentinelId) continue;
-                    const uint64_t post_global_64 =
-                        static_cast<uint64_t>(pe_index) * neurons_per_pe + core_offset_global + static_cast<uint64_t>(post_local);
-                    if (post_global_64 >= total_global_neurons) continue;
-                    const uint32_t post_global = static_cast<uint32_t>(post_global_64);
-                    uint32_t pre_global = block_col * bc + cc;
-                    if (pre_global >= cols) continue;
-                    if (pre_global < opt.pre_begin || pre_global >= opt.pre_end) continue;
-                    routes_out[pre_global].push_back(post_global);
+        }
+    } else {
+        uint64_t block_counter = 0;
+        for (uint32_t block_row = 0; block_row < n_block_rows; ++block_row) {
+            uint32_t begin = rowptr[block_row];
+            uint32_t end = rowptr[block_row + 1];
+            for (uint32_t idx = begin; idx < end; ++idx, ++block_counter) {
+                if (block_counter >= block_cols.size()) break;
+                uint32_t block_col = block_cols[idx];
+                fdata.read(reinterpret_cast<char*>(blockdata.data()), blockdata.size() * sizeof(float));
+                if (blockids_off > 0) {
+                    fids.read(reinterpret_cast<char*>(blockids.data()), blockids.size() * sizeof(uint32_t));
+                }
+                if (!fdata.good() || (blockids_off > 0 && !fids.good())) {
+                    if (out) out->verbose(CALL_INFO, 0, 0, "⚠️ BCSR路由: 读取block数据失败 %s\n", path.c_str());
+                    return false;
+                }
+                for (uint32_t rr = 0; rr < br; ++rr) {
+                    uint32_t post_local = block_row * br + rr;
+                    if (post_local >= rows) continue;
+                    for (uint32_t cc = 0; cc < bc; ++cc) {
+                        size_t off = static_cast<size_t>(rr) * bc + cc;
+                        float weight = blockdata[off];
+                        if (std::fabs(weight) <= cfg.routing_epsilon) continue;
+                        // 重要语义：
+                        // - blockids 仅作为有效位/哨兵（0xFFFFFFFF 表示无边），不能作为 post_global。
+                        // - post_global 必须由 (pe, core, post_local) 计算，保证与 WeightMemorySubsystem 的寻址/落盘口径一致。
+                        if (blockids_off > 0 && blockids[off] == kBcsrSentinelId) continue;
+                        const uint64_t post_global_64 =
+                            static_cast<uint64_t>(pe_index) * neurons_per_pe + core_offset_global + static_cast<uint64_t>(post_local);
+                        if (post_global_64 >= total_global_neurons) continue;
+                        const uint32_t post_global = static_cast<uint32_t>(post_global_64);
+                        uint32_t pre_global = block_col * bc + cc;
+                        if (pre_global >= cols) continue;
+                        if (pre_global < opt.pre_begin || pre_global >= opt.pre_end) continue;
+                        routes_out[pre_global].push_back(post_global);
+                        maybeStoreEdgeWeight(route_weights_out, pre_global, post_global, weight);
+                    }
                 }
             }
         }

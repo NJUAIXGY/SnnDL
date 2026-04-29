@@ -40,6 +40,7 @@ Stimulus 只负责“注入时基/选源”，不定义权重读粒度；默认�
 - **运行时绑定**（`Runtime`）：
   - `const GlobalNeuronLayout* layout`：用于把 global neuron_id 映射到本 PE 内 core；
   - `INocTransport* noc`：通过 `injectLocal(dst_core, pkt)` 完成本地投递（接管 spike 生命周期；无法投递直接 delete）。
+  - `enabled`：workload-level stimulus gate；当前只允许 `snn` / `riscv_snn` 打开，`stream/traffic/traffic_mem/tensor` 侧会在装配点直接关闭并静默丢弃输入 spike。
 
 ---
 
