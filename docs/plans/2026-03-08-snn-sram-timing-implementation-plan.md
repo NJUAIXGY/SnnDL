@@ -4,7 +4,7 @@
 
 **Goal:** 将 observe-only SRAM 冲突统计转成真实 stall budget，并接入 `SnnComputeCore` 与 `WeightMemorySubsystem`。
 
-**Architecture:** 保持现有 `BankedSramModel` 为单一真源，新增“上一拍冲突导出”接口；compute/weight 两个消费者分别维护自己的 stall budget，在 clock 驱动路径上延迟状态推进与内存 issue。
+**Architecture:** 保持现有 `BankedSramModel` 为单一真源，新增“上一拍冲突导出”接口；snn/compute/weight 两个消费者分别维护自己的 stall budget，在 clock 驱动路径上延迟状态推进与内存 issue。
 
 **Tech Stack:** C++17、SST Element、轻量自包含测试（`g++` + `assert`）
 
@@ -13,8 +13,8 @@
 ### Task 1: 导出 SRAM 周期冲突预算
 
 **Files:**
-- Modify: `services/memory/sram_sim/model/BankedSramModel.h`
-- Modify: `services/memory/sram_sim/model/BankedSramModel.cc`
+- Modify: `platform/memory/sram_sim/model/BankedSramModel.h`
+- Modify: `platform/memory/sram_sim/model/BankedSramModel.cc`
 - Test: `tests/test_banked_sram_model.cc`
 
 **Step 1: Write the failing test**
@@ -23,7 +23,7 @@
 
 **Step 2: Run test to verify it fails**
 
-- Run: `g++ -std=c++17 -I . tests/test_banked_sram_model.cc services/memory/sram_sim/model/BankedSramModel.cc -o /tmp/test_banked_sram_model`
+- Run: `g++ -std=c++17 -I . tests/test_banked_sram_model.cc platform/memory/sram_sim/model/BankedSramModel.cc -o /tmp/test_banked_sram_model`
 - Expected: 编译失败，提示缺少新接口。
 
 **Step 3: Write minimal implementation**
@@ -39,8 +39,8 @@
 ### Task 2: 接入 compute state SRAM stall budget
 
 **Files:**
-- Modify: `compute/SnnComputeCore.h`
-- Modify: `compute/SnnComputeCore.cc`
+- Modify: `snn/compute/SnnComputeCore.h`
+- Modify: `snn/compute/SnnComputeCore.cc`
 
 **Step 1: Write the failing test**
 
@@ -54,14 +54,14 @@
 
 **Step 3: Run compile check**
 
-- Run: `g++ -std=c++17 -I . -c compute/SnnComputeCore.cc -o /tmp/test_snn_compute_core.o`
+- Run: `g++ -std=c++17 -I . -c snn/compute/SnnComputeCore.cc -o /tmp/test_snn_compute_core.o`
 - Expected: 编译通过。
 
 ### Task 3: 接入 weight SRAM stall budget
 
 **Files:**
-- Modify: `services/synapse/weights/WeightMemorySubsystem.h`
-- Modify: `services/synapse/weights/WeightMemorySubsystem.cc`
+- Modify: `snn/synapse/weights/WeightMemorySubsystem.h`
+- Modify: `snn/synapse/weights/WeightMemorySubsystem.cc`
 
 **Step 1: Write minimal implementation**
 
@@ -71,7 +71,7 @@
 
 **Step 2: Run compile check**
 
-- Run: `g++ -std=c++17 -I . -c services/synapse/weights/WeightMemorySubsystem.cc -o /tmp/test_weight_mem.o`
+- Run: `g++ -std=c++17 -I . -c snn/synapse/weights/WeightMemorySubsystem.cc -o /tmp/test_weight_mem.o`
 - Expected: 编译通过。
 
 ### Task 4: 文档与回归验证
@@ -87,7 +87,7 @@
 
 **Step 2: Run focused verification**
 
-- Run: `g++ -std=c++17 -I . tests/test_banked_sram_model.cc services/memory/sram_sim/model/BankedSramModel.cc -o /tmp/test_banked_sram_model && /tmp/test_banked_sram_model`
-- Run: `g++ -std=c++17 -I . -c compute/SnnComputeCore.cc -o /tmp/test_snn_compute_core.o`
-- Run: `g++ -std=c++17 -I . -c services/synapse/weights/WeightMemorySubsystem.cc -o /tmp/test_weight_mem.o`
+- Run: `g++ -std=c++17 -I . tests/test_banked_sram_model.cc platform/memory/sram_sim/model/BankedSramModel.cc -o /tmp/test_banked_sram_model && /tmp/test_banked_sram_model`
+- Run: `g++ -std=c++17 -I . -c snn/compute/SnnComputeCore.cc -o /tmp/test_snn_compute_core.o`
+- Run: `g++ -std=c++17 -I . -c snn/synapse/weights/WeightMemorySubsystem.cc -o /tmp/test_weight_mem.o`
 - Expected: 全部通过。

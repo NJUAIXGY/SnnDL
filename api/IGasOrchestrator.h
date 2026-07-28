@@ -3,8 +3,8 @@
 // IGasOrchestrator: GAS 阶段编排接口（供 GasPhaseController 调用）。
 //
 // 目的：
-// - services/GasPhaseController 不再 include control/SnnPESubComponent.h；
-// - 由控制层实现该接口，services 仅依赖 api/ 的窄接口。
+// - snn/synapse/gas/GasPhaseController 不再 include platform/core/SnnPESubComponent.h；
+// - 由控制层实现该接口，GAS 子系统仅依赖 api/ 的窄接口。
 //
 
 #pragma once
@@ -23,4 +23,3 @@ public:
 };
 
 }} // namespace SST::SnnDL
-

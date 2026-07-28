@@ -4,7 +4,7 @@
 
 **Goal:** 将 “`exec_mode=gas` 下 BCSR 级 cache/prefetch/populate 等优化全部禁用” 的约束从模板层下沉到 SnnDL 代码中，确保结论可归因于 GAS/window，避免外部脚本/模板漂移导致口径不一致。
 
-**Architecture:** 在配置注入点（`workload=snn` 与 legacy `control/SnnPESubComponent` 两条链路）统一做一次 BCSR 配置归一化：当启用 GAS/window 时，强制关闭 rowIndex cache/prefetch、block cache、populate；同时保留 window-read 推进所需的 inflight 合并（按真实读请求计数）。
+**Architecture:** 在配置注入点（`workload=snn` 与 legacy `platform/core/SnnPESubComponent` 两条链路）统一做一次 BCSR 配置归一化：当启用 GAS/window 时，强制关闭 rowIndex cache/prefetch、block cache、populate；同时保留 window-read 推进所需的 inflight 合并（按真实读请求计数）。
 
 **Tech Stack:** C++17（SST elements/SnnDL）、现有 params/find 配置注入、`WeightMemorySubsystem::OrchestratorConfig`。
 
@@ -23,8 +23,8 @@
 ## Task 1：梳理并统一 BCSR 配置归一化入口
 
 **Files:**
-- Modify: `sst_workspace/sst-elements/src/sst/elements/SnnDL/services/workload/snn/SnnWorkload.cc`
-- Modify: `sst_workspace/sst-elements/src/sst/elements/SnnDL/control/SnnPESubComponent.cc`
+- Modify: `sst_workspace/sst-elements/src/sst/elements/SnnDL/workloads/snn/SnnWorkload.cc`
+- Modify: `sst_workspace/sst-elements/src/sst/elements/SnnDL/platform/core/SnnPESubComponent.cc`
 
 **Step 1: 添加一个小的本地 helper（避免双处复制规则）**
 
@@ -43,11 +43,11 @@
 
 **Step 2: 在 `SnnWorkload::configureWeightSubsystem_` 注入点调用 helper**
 
-- 位置：`sst_workspace/sst-elements/src/sst/elements/SnnDL/services/workload/snn/SnnWorkload.cc`（`ocfg` 填充完成后，`wms->configureOrchestrator(...)` 前）
+- 位置：`sst_workspace/sst-elements/src/sst/elements/SnnDL/workloads/snn/SnnWorkload.cc`（`ocfg` 填充完成后，`wms->configureOrchestrator(...)` 前）
 
 **Step 3: 在 legacy `SnnPESubComponent` 注入点调用 helper**
 
-- 位置：`sst_workspace/sst-elements/src/sst/elements/SnnDL/control/SnnPESubComponent.cc`（构造 `ocfg` 并 `mem->configureOrchestrator(...)` 前）
+- 位置：`sst_workspace/sst-elements/src/sst/elements/SnnDL/platform/core/SnnPESubComponent.cc`（构造 `ocfg` 并 `mem->configureOrchestrator(...)` 前）
 
 **Step 4: 编译验证**
 
@@ -62,7 +62,7 @@ Expected: PASS
 ## Task 2：为 “gas 下禁用 BCSR 级优化” 增加可观察性（不增加热路径日志）
 
 **Files:**
-- Modify: `sst_workspace/sst-elements/src/sst/elements/SnnDL/services/synapse/weights/README.md`
+- Modify: `sst_workspace/sst-elements/src/sst/elements/SnnDL/snn/synapse/weights/README.md`
 - Modify: `sst_workspace/sst-elements/src/sst/elements/SnnDL/docs/SUBSYSTEM_MODULARIZATION_ROADMAP.md`（如已有相关小节则补一行即可）
 
 **Step 1: README 说明边界**

@@ -156,8 +156,8 @@ SnnDL 的默认内存建模语义与 `memHierarchy` 保持一致：**以 cacheli
 
 `SnnDL` 现已支持一版 **SNN 专用 SRAM timing 第一阶段**：当启用 `state_sram_*` / `weight_*_sram_*` 参数时，片上 SRAM 的 bank conflict 不再只是 observe-only 统计，而会转成下一拍的 **stall budget**，反馈到：
 
-- `compute/SnnComputeCore`：阻塞 neuron state sweep / fire 判定；
-- `services/synapse/weights/WeightMemorySubsystem`：阻塞新的 prefetch / deferred issue / direct drain。
+- `snn/compute/SnnComputeCore`：阻塞 neuron state sweep / fire 判定；
+- `snn/synapse/weights/WeightMemorySubsystem`：阻塞新的 prefetch / deferred issue / direct drain。
 
 当前口径仍是**分层代理**，不是逐请求 local SRAM 控制器：
 
@@ -170,7 +170,7 @@ SnnDL 的默认内存建模语义与 `memHierarchy` 保持一致：**以 cacheli
 ```bash
 cd "sst_workspace/sst-elements/src/sst/elements/SnnDL"
 g++ -std=c++17 -I . tests/test_banked_sram_model.cc \
-  services/memory/sram_sim/model/BankedSramModel.cc \
+  platform/memory/sram_sim/model/BankedSramModel.cc \
   -o /tmp/test_banked_sram_model && /tmp/test_banked_sram_model
 make -j4
 ```
@@ -190,9 +190,9 @@ make -j4
 
 - `api/IDmaTaggedAccess.h`
   - 在不破坏 `IMemoryAccess` 边界的前提下，为上层读请求附带 `tag + priority`。
-- `services/memory/DmaMemAccessProxy.{h,cc}`
+- `platform/memory/DmaMemAccessProxy.{h,cc}`
   - 每 core 一个代理；对外仍表现为 `IMemoryAccess`，对内把 tagged read 提交到共享调度器。
-- `services/memory/PeDmaScheduler.{h,cc}`
+- `platform/memory/PeDmaScheduler.{h,cc}`
   - 每 PE 一个共享 DMA 调度器；维护多优先级队列、按 core 轮转公平、burst 发射、阶段预算和统计。
 
 调度语义（当前口径）：
@@ -317,32 +317,19 @@ SnnDL 支持一条“原生多播（native multicast）”路径：以 `SpikeKey
 
 ```
 SnnDL/
-├── api/            # 跨层稳定接口（窄抽象）
-├── events/         # 事件与数据载体（Spike/Gating 等）
-├── components/     # SST 组件装配壳（ELI 注册对象）
-│   ├── gas/            # 全局 Step/GAS 同步控制面（barrier 等）
-│   ├── gather/         # GatherBufferIF 构造期参数解析收敛（不新增运行期组件）
-│   ├── multicore/      # MultiCorePE 构造期参数解析收敛（不新增运行期组件）
-│   ├── noc/            # 可选 NoC/多播相关组件（实验/高级用法）
-│   ├── stimulus/       # 可选 Stimulus 注入型组件（如 SpikeSource）
-│   ├── mpi/            # MPI 扩展（可选编译）
-│   └── workload_stats/ # workload 统计模块注册表与实现（tensor/stream 等）
-├── control/        # 通用 CoreShell（平台壳：clock/packet/stat + workload 运行时绑定）
-├── compute/        # 可替换 compute core（神经动力学/学习/验证）
-├── services/       # 可复用事务子系统（按子域拆分）
-│   ├── noc/        # NoC 传输域（send/recv/forward/本地投递）
-│   ├── memory/     # 纯内存访问域（地址→字节块）
-│   ├── synapse/    # 突触语义域（weights/route/gas 事务闭环）
-│   ├── stimulus/   # Stimulus 域（Step 注入/外部刺激）
-│   ├── workload/   # Workload 插件域（snn/stream/traffic/tensor）
-│   │   ├── snn/    # Spike/GAS/BCSR/Step 主链路
-│   │   ├── stream/ # packet-first + mem read-after-write 校验
-│   │   ├── traffic/ # 通信/多播验证负载（不建模动力学）
-│   │   ├── tensor/ # GEMM/systolic 类 compute+memory+NoC 压力
-│   │   └── layout/ # Workload neuron layout 口径归一化（num_neurons/neurons_per_pe/base）
-│   └── legacy/     # 历史遗留/参考实现（默认不进主链路）
-├── docs/           # 设计与阶段性方案文档
-└── tests/          # include 自检等轻量测试
+├── api/             # 跨域稳定接口与数据契约
+├── events/          # SST 事件和 packet 载体
+├── components/      # ELI 注册组件及系统装配壳
+├── platform/        # 通用 core、memory、NoC 与统计基础设施
+│   ├── core/        # CoreShell 生命周期与 workload 绑定
+│   ├── memory/      # 地址到字节的访问和 SRAM 模型
+│   ├── noc/         # packet 传输与内部互连
+│   └── stats/       # workload 统计模块
+├── workloads/       # snn/riscv_snn/stream/traffic/traffic_mem/tensor
+├── snn/             # compute、synapse、stimulus 与 profiling 语义
+├── research/        # GAS/local-storage/3D NoC 等实验机制
+├── docs/            # 当前架构说明与历史设计记录
+└── tests/           # C++ 契约和协议回归
 ```
 
 ---
@@ -350,14 +337,14 @@ SnnDL/
 ## 关键边界（控制 / 计算 / 路由 / 内存 / 权重）
 
 - `components/`：SST 对接与装配壳（端口、Link、Clock、Stat、生命周期）；尽量不写算法事务。
-- `control/`：通用 CoreShell（时钟驱动、packet 递送、统计汇聚）；**不承载 SNN 业务状态机**（但会保留 GAS/Step 控制面事件转发与 legacy 兼容残留，逐步下沉中）。
-- `services/workload/`：workload 插件（例如 `snn`/`stream`）；承载业务状态机与事务编排。
-- `services/workload/traffic`：通信/多播验证用 workload；不建模动力学，但可复用 `synapse/route` 的 fanout/multicast 事务。
-- `compute/`：神经动力学与学习等计算逻辑（`ISnnComputeCore`）；**不直接触碰 StandardMem/NoC**（通过 `IWeightReader`/workload 注入）。
-- `services/noc/`：纯传输（send/recv/forward/本地投递）；**不做 fanout/权重语义**。
-- `services/memory/`：纯地址/字节访问；**不出现权重/突触/路由语义**。
-- `services/synapse/`：权重语义/路由与 fanout/GAS 辅助（weights/route/gas 事务闭环）。
-- `services/stimulus/`：注入时基与选源（Step 等刺激）；通过 NoC/Route 完成投递与外发。
+- `platform/core/`：通用 CoreShell（时钟驱动、packet 递送、统计汇聚）；**不承载 SNN 业务状态机**（但会保留 GAS/Step 控制面事件转发与 legacy 兼容残留，逐步下沉中）。
+- `workloads/`：workload 插件（例如 `snn`/`stream`）；承载业务状态机与事务编排。
+- `workloads/traffic`：通信/多播验证用 workload；不建模动力学，但可复用 `synapse/route` 的 fanout/multicast 事务。
+- `snn/compute/`：神经动力学与学习等计算逻辑（`ISnnComputeCore`）；**不直接触碰 StandardMem/NoC**（通过 `IWeightReader`/workload 注入）。
+- `platform/noc/`：纯传输（send/recv/forward/本地投递）；**不做 fanout/权重语义**。
+- `platform/memory/`：纯地址/字节访问；**不出现权重/突触/路由语义**。
+- `snn/synapse/`：权重语义/路由与 fanout/GAS 辅助（weights/route/gas 事务闭环）。
+- `snn/stimulus/`：注入时基与选源（Step 等刺激）；通过 NoC/Route 完成投递与外发。
 
 ---
 
@@ -370,7 +357,7 @@ SnnDL/
   - 推荐：在 `sst_workspace/sst-elements/` 目录运行 `autoreconf -fi` 重生成 `Makefile.in`，再运行 `./config.status` 刷新各子目录 `Makefile`。
   - 若不方便跑 autotools：请同时手动更新 `Makefile.in`，并在 `sst_workspace/sst-elements/` 运行 `./config.status`。
 - `configure.m4` 提供 `--with-hdf5`（预留/占位）：当前代码未使用 `HAVE_HDF5`，且 `Makefile.am` 未链接 HDF5；如需启用需补齐实现/链接与验证。
-- Tier2-E：若 `workload=snn` 支持 `api/IWeightReaderAdopter.h`，CoreShell 会在 runtime 绑定后把已装配的 `IWeightReader`（通常为 `WeightMemorySubsystem`）**一次性移交所有权**给 workload，避免 control/workload 双实例装配（脚本参数与外部接口不变）。
+- Tier2-E：若 `workload=snn` 支持 `api/IWeightReaderAdopter.h`，CoreShell 会在 runtime 绑定后把已装配的 `IWeightReader`（通常为 `WeightMemorySubsystem`）**一次性移交所有权**给 workload，避免 platform/core/workload 双实例装配（脚本参数与外部接口不变）。
 - 回归建议：每个阶段至少跑一次 `MESH_MAX_STEPS="4"`，并对比 `essential_summary_mesh.json` 的关键字段（避免非确定性回归）。
 
 ---

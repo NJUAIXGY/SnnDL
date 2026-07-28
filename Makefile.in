@@ -186,71 +186,76 @@ am_libSnnDL_la_OBJECTS = events/SimpleTestEvent.lo \
 	components/gather/apply/DramAwareModel.lo \
 	components/GatingPE.lo components/MemKCalBench.lo \
 	components/multicore/MultiCorePEConfig.lo \
+	components/multicore/MultiCorePEObservability.lo \
 	components/MultiCorePE.lo components/SnnNIC.lo \
-	components/SnnPE.lo components/stimulus/SpikeSource.lo \
-	components/WeightLoader.lo \
-	components/workload_stats/WorkloadStatsRegistry.lo \
-	control/SnnPESubComponent.lo control/SnnPESubComponent_bcsr.lo \
-	control/SnnPESubComponent_routing.lo \
-	control/SnnPESubComponent_scheme1.lo \
-	control/SnnPESubComponent_spike.lo \
-	control/SnnPEApplyScatter.lo control/SnnPEOrchestrators.lo \
-	compute/SnnComputeCore.lo compute/SnnCoreEngine.lo \
-	compute/SnnLearningCore.lo \
-	services/synapse/gas/AccumulatorOps.lo \
-	services/synapse/gas/GasEdgeCollector.lo \
-	services/synapse/gas/GasPhaseController.lo \
-	services/synapse/stdmem/StdMemEndpoint.lo \
-	services/synapse/stdmem/SnnPESubComponent_mem.lo \
-	services/noc/OptimizedInternalRing.lo \
+	components/stimulus/SpikeSource.lo components/WeightLoader.lo \
+	platform/stats/WorkloadStatsRegistry.lo \
+	platform/core/SnnPESubComponent.lo \
+	platform/core/SnnPESubComponentStats.lo \
+	platform/core/SnnPESubComponent_bcsr.lo \
+	platform/core/SnnPESubComponent_routing.lo \
+	platform/core/SnnPEApplyScatter.lo \
+	platform/core/SnnPEOrchestrators.lo \
+	snn/compute/SnnComputeCore.lo snn/compute/SnnCoreEngine.lo \
+	snn/compute/SnnLearningCore.lo \
+	snn/synapse/gas/AccumulatorOps.lo \
+	snn/synapse/gas/GasEdgeCollector.lo \
+	snn/synapse/gas/GasPhaseController.lo \
+	snn/synapse/stdmem/StdMemEndpoint.lo \
+	snn/synapse/stdmem/SnnPESubComponent_mem.lo \
+	platform/noc/OptimizedInternalRing.lo \
 	components/noc/SimpleNetworkWrapper.lo \
-	services/synapse/weights/SnnBcsrWeightManager.lo \
-	services/synapse/weights/SnnWeightDiagnostics.lo \
+	snn/synapse/weights/SnnBcsrWeightManager.lo \
+	snn/synapse/weights/SnnWeightDiagnostics.lo \
 	components/noc/SnnNetworkAdapter.lo \
 	components/noc/MulticastRouter.lo \
-	components/noc3d/MulticastRouter3DNative.lo \
-	components/noc3d/Noc3DSmokeSource.lo \
-	components/noc3d/Noc3DSmokeSink.lo \
-	components/noc3d/HBMStackStub.lo \
-	components/noc/MulticastNIC.lo \
-	services/synapse/route/SnnRouteProvider.lo \
-	services/synapse/route/SpikeNocCodec.lo \
-	services/synapse/route/BcsrRouteBuilder.lo \
-	services/synapse/route/StepBcsrReachability.lo \
-	services/synapse/route/SynapseRouteSubsystem.lo \
-	services/synapse/route3d/SynapseRouteSubsystem3D.lo \
-	services/stimulus/StepActivationSubsystem.lo \
-	services/stimulus/ExternalSpikeInputSubsystem.lo \
-	services/noc/NocSubsystem.lo \
-	services/synapse/weights/WeightAccessor.lo \
-	services/synapse/weights/WeightCacheOps.lo \
-	services/synapse/weights/WeightMemorySubsystem.lo \
-	services/synapse/route/SpikeCommSubsystem.lo \
-	services/synapse/route/SpikePacketBridge.lo \
-	services/workload/CoreWorkloadFactory.lo \
-	services/workload/common/SnnAccelBackend.lo \
-	services/workload/layout/NormalizedNeuronLayout.lo \
-	services/workload/riscv_snn/RiscvSnnBootDriver.lo \
-	services/workload/riscv_snn/RiscvSnnFirmwareLoader.lo \
-	services/workload/riscv_snn/RiscvSnnHart.lo \
-	services/workload/riscv_snn/RiscvSnnIss.lo \
-	services/workload/riscv_snn/RiscvSnnRuntimeBridgeBackend.lo \
-	services/workload/riscv_snn/RiscvSnnShadowTransportExport.lo \
-	services/workload/riscv_snn/RiscvSnnShadowRuntimeServices.lo \
-	services/workload/riscv_snn/RiscvSnnWorkload.lo \
-	services/workload/snn/SnnWorkload.lo \
-	services/workload/stream/StreamWorkload.lo \
-	services/workload/traffic/TrafficWorkload.lo \
-	services/workload/traffic_mem/TrafficMemWorkload.lo \
-	services/workload/tensor/TensorWorkload.lo \
-	services/memory/sram_sim/model/BankedSramModel.lo \
-	services/local_storage/LocalStorageHierarchyController.lo \
-	services/local_storage/PeWeightObjectPlane.lo \
-	services/memory/DmaMemAccessProxy.lo \
-	services/pe_fabric/PulseAgendaScorer.lo \
-	services/pe_fabric/PeSharedCoreFabric.lo \
-	services/memory/PeDmaScheduler.lo \
-	services/memory/StandardMemAccess.lo
+	research/noc3d/MulticastRouter3DNative.lo \
+	research/noc3d/Noc3DSmokeSource.lo \
+	research/noc3d/Noc3DSmokeSink.lo \
+	research/noc3d/HBMStackStub.lo components/noc/MulticastNIC.lo \
+	snn/synapse/route/SnnRouteProvider.lo \
+	snn/synapse/route/SpikeNocCodec.lo \
+	snn/synapse/route/BcsrRouteBuilder.lo \
+	snn/synapse/route/StepBcsrReachability.lo \
+	snn/synapse/route/SynapseRouteSubsystem.lo \
+	research/route3d/SynapseRouteSubsystem3D.lo \
+	snn/stimulus/StepActivationSubsystem.lo \
+	snn/stimulus/ExternalSpikeInputSubsystem.lo \
+	platform/noc/NocSubsystem.lo \
+	snn/synapse/weights/WeightAccessor.lo \
+	snn/synapse/weights/WeightCacheOps.lo \
+	snn/synapse/weights/WeightMemorySubsystem.lo \
+	snn/synapse/weights/WeightMemorySubsystemVerification.lo \
+	snn/synapse/route/SpikeCommSubsystem.lo \
+	snn/synapse/route/SpikePacketBridge.lo \
+	workloads/CoreWorkloadFactory.lo \
+	workloads/common/SnnAccelBackend.lo \
+	workloads/layout/NormalizedNeuronLayout.lo \
+	workloads/riscv_snn/RiscvSnnBootDriver.lo \
+	workloads/riscv_snn/RiscvSnnFirmwareLoader.lo \
+	workloads/riscv_snn/RiscvSnnHart.lo \
+	workloads/riscv_snn/RiscvSnnIss.lo \
+	workloads/riscv_snn/RiscvSnnRuntimeBridgeBackend.lo \
+	workloads/riscv_snn/RiscvSnnShadowTransportExport.lo \
+	workloads/riscv_snn/RiscvSnnShadowRuntimeServices.lo \
+	workloads/riscv_snn/RiscvSnnWorkload.lo \
+	workloads/snn/SnnWorkload.lo \
+	workloads/stream/StreamWorkload.lo \
+	workloads/traffic/TrafficWorkload.lo \
+	workloads/traffic_mem/TrafficMemWorkload.lo \
+	workloads/tensor/TensorWorkload.lo \
+	workloads/tensor/TensorWorkloadCollective.lo \
+	workloads/tensor/TensorWorkloadConfig.lo \
+	workloads/tensor/TensorWorkloadProgram.lo \
+	workloads/tensor/TensorWorkloadStats.lo \
+	platform/memory/sram_sim/model/BankedSramModel.lo \
+	research/local_storage/LocalStorageHierarchyController.lo \
+	research/local_storage/PeWeightObjectPlane.lo \
+	platform/memory/DmaMemAccessProxy.lo \
+	research/pe_fabric/PulseAgendaScorer.lo \
+	research/pe_fabric/PeSharedCoreFabric.lo \
+	platform/memory/PeDmaScheduler.lo \
+	platform/memory/StandardMemAccess.lo
 libSnnDL_la_OBJECTS = $(am_libSnnDL_la_OBJECTS)
 AM_V_lt = $(am__v_lt_@AM_V@)
 am__v_lt_ = $(am__v_lt_@AM_DEFAULT_V@)
@@ -279,80 +284,85 @@ am__depfiles_remade = components/$(DEPDIR)/CachelineFragmentMemIF.Plo \
 	components/$(DEPDIR)/GatingPE.Plo \
 	components/$(DEPDIR)/MemKCalBench.Plo \
 	components/$(DEPDIR)/MultiCorePE.Plo \
-	components/$(DEPDIR)/SnnNIC.Plo components/$(DEPDIR)/SnnPE.Plo \
+	components/$(DEPDIR)/SnnNIC.Plo \
 	components/$(DEPDIR)/WeightLoader.Plo \
 	components/gas/$(DEPDIR)/GlobalGasStepController.Plo \
 	components/gather/$(DEPDIR)/GatherBufferIFConfig.Plo \
 	components/gather/apply/$(DEPDIR)/DramAwareModel.Plo \
 	components/multicore/$(DEPDIR)/MultiCorePEConfig.Plo \
+	components/multicore/$(DEPDIR)/MultiCorePEObservability.Plo \
 	components/noc/$(DEPDIR)/MulticastNIC.Plo \
 	components/noc/$(DEPDIR)/MulticastRouter.Plo \
 	components/noc/$(DEPDIR)/SimpleNetworkWrapper.Plo \
 	components/noc/$(DEPDIR)/SnnNetworkAdapter.Plo \
-	components/noc3d/$(DEPDIR)/HBMStackStub.Plo \
-	components/noc3d/$(DEPDIR)/MulticastRouter3DNative.Plo \
-	components/noc3d/$(DEPDIR)/Noc3DSmokeSink.Plo \
-	components/noc3d/$(DEPDIR)/Noc3DSmokeSource.Plo \
 	components/stimulus/$(DEPDIR)/SpikeSource.Plo \
-	components/workload_stats/$(DEPDIR)/WorkloadStatsRegistry.Plo \
-	compute/$(DEPDIR)/SnnComputeCore.Plo \
-	compute/$(DEPDIR)/SnnCoreEngine.Plo \
-	compute/$(DEPDIR)/SnnLearningCore.Plo \
-	control/$(DEPDIR)/SnnPEApplyScatter.Plo \
-	control/$(DEPDIR)/SnnPEOrchestrators.Plo \
-	control/$(DEPDIR)/SnnPESubComponent.Plo \
-	control/$(DEPDIR)/SnnPESubComponent_bcsr.Plo \
-	control/$(DEPDIR)/SnnPESubComponent_routing.Plo \
-	control/$(DEPDIR)/SnnPESubComponent_scheme1.Plo \
-	control/$(DEPDIR)/SnnPESubComponent_spike.Plo \
 	events/$(DEPDIR)/SimpleTestEvent.Plo \
 	events/$(DEPDIR)/SpikeEventWrapper.Plo \
-	services/local_storage/$(DEPDIR)/LocalStorageHierarchyController.Plo \
-	services/local_storage/$(DEPDIR)/PeWeightObjectPlane.Plo \
-	services/memory/$(DEPDIR)/DmaMemAccessProxy.Plo \
-	services/memory/$(DEPDIR)/PeDmaScheduler.Plo \
-	services/memory/$(DEPDIR)/StandardMemAccess.Plo \
-	services/memory/sram_sim/model/$(DEPDIR)/BankedSramModel.Plo \
-	services/noc/$(DEPDIR)/NocSubsystem.Plo \
-	services/noc/$(DEPDIR)/OptimizedInternalRing.Plo \
-	services/pe_fabric/$(DEPDIR)/PeSharedCoreFabric.Plo \
-	services/pe_fabric/$(DEPDIR)/PulseAgendaScorer.Plo \
-	services/stimulus/$(DEPDIR)/ExternalSpikeInputSubsystem.Plo \
-	services/stimulus/$(DEPDIR)/StepActivationSubsystem.Plo \
-	services/synapse/gas/$(DEPDIR)/AccumulatorOps.Plo \
-	services/synapse/gas/$(DEPDIR)/GasEdgeCollector.Plo \
-	services/synapse/gas/$(DEPDIR)/GasPhaseController.Plo \
-	services/synapse/route/$(DEPDIR)/BcsrRouteBuilder.Plo \
-	services/synapse/route/$(DEPDIR)/SnnRouteProvider.Plo \
-	services/synapse/route/$(DEPDIR)/SpikeCommSubsystem.Plo \
-	services/synapse/route/$(DEPDIR)/SpikeNocCodec.Plo \
-	services/synapse/route/$(DEPDIR)/SpikePacketBridge.Plo \
-	services/synapse/route/$(DEPDIR)/StepBcsrReachability.Plo \
-	services/synapse/route/$(DEPDIR)/SynapseRouteSubsystem.Plo \
-	services/synapse/route3d/$(DEPDIR)/SynapseRouteSubsystem3D.Plo \
-	services/synapse/stdmem/$(DEPDIR)/SnnPESubComponent_mem.Plo \
-	services/synapse/stdmem/$(DEPDIR)/StdMemEndpoint.Plo \
-	services/synapse/weights/$(DEPDIR)/SnnBcsrWeightManager.Plo \
-	services/synapse/weights/$(DEPDIR)/SnnWeightDiagnostics.Plo \
-	services/synapse/weights/$(DEPDIR)/WeightAccessor.Plo \
-	services/synapse/weights/$(DEPDIR)/WeightCacheOps.Plo \
-	services/synapse/weights/$(DEPDIR)/WeightMemorySubsystem.Plo \
-	services/workload/$(DEPDIR)/CoreWorkloadFactory.Plo \
-	services/workload/common/$(DEPDIR)/SnnAccelBackend.Plo \
-	services/workload/layout/$(DEPDIR)/NormalizedNeuronLayout.Plo \
-	services/workload/riscv_snn/$(DEPDIR)/RiscvSnnBootDriver.Plo \
-	services/workload/riscv_snn/$(DEPDIR)/RiscvSnnFirmwareLoader.Plo \
-	services/workload/riscv_snn/$(DEPDIR)/RiscvSnnHart.Plo \
-	services/workload/riscv_snn/$(DEPDIR)/RiscvSnnIss.Plo \
-	services/workload/riscv_snn/$(DEPDIR)/RiscvSnnRuntimeBridgeBackend.Plo \
-	services/workload/riscv_snn/$(DEPDIR)/RiscvSnnShadowRuntimeServices.Plo \
-	services/workload/riscv_snn/$(DEPDIR)/RiscvSnnShadowTransportExport.Plo \
-	services/workload/riscv_snn/$(DEPDIR)/RiscvSnnWorkload.Plo \
-	services/workload/snn/$(DEPDIR)/SnnWorkload.Plo \
-	services/workload/stream/$(DEPDIR)/StreamWorkload.Plo \
-	services/workload/tensor/$(DEPDIR)/TensorWorkload.Plo \
-	services/workload/traffic/$(DEPDIR)/TrafficWorkload.Plo \
-	services/workload/traffic_mem/$(DEPDIR)/TrafficMemWorkload.Plo
+	platform/core/$(DEPDIR)/SnnPEApplyScatter.Plo \
+	platform/core/$(DEPDIR)/SnnPEOrchestrators.Plo \
+	platform/core/$(DEPDIR)/SnnPESubComponent.Plo \
+	platform/core/$(DEPDIR)/SnnPESubComponentStats.Plo \
+	platform/core/$(DEPDIR)/SnnPESubComponent_bcsr.Plo \
+	platform/core/$(DEPDIR)/SnnPESubComponent_routing.Plo \
+	platform/memory/$(DEPDIR)/DmaMemAccessProxy.Plo \
+	platform/memory/$(DEPDIR)/PeDmaScheduler.Plo \
+	platform/memory/$(DEPDIR)/StandardMemAccess.Plo \
+	platform/memory/sram_sim/model/$(DEPDIR)/BankedSramModel.Plo \
+	platform/noc/$(DEPDIR)/NocSubsystem.Plo \
+	platform/noc/$(DEPDIR)/OptimizedInternalRing.Plo \
+	platform/stats/$(DEPDIR)/WorkloadStatsRegistry.Plo \
+	research/local_storage/$(DEPDIR)/LocalStorageHierarchyController.Plo \
+	research/local_storage/$(DEPDIR)/PeWeightObjectPlane.Plo \
+	research/noc3d/$(DEPDIR)/HBMStackStub.Plo \
+	research/noc3d/$(DEPDIR)/MulticastRouter3DNative.Plo \
+	research/noc3d/$(DEPDIR)/Noc3DSmokeSink.Plo \
+	research/noc3d/$(DEPDIR)/Noc3DSmokeSource.Plo \
+	research/pe_fabric/$(DEPDIR)/PeSharedCoreFabric.Plo \
+	research/pe_fabric/$(DEPDIR)/PulseAgendaScorer.Plo \
+	research/route3d/$(DEPDIR)/SynapseRouteSubsystem3D.Plo \
+	snn/compute/$(DEPDIR)/SnnComputeCore.Plo \
+	snn/compute/$(DEPDIR)/SnnCoreEngine.Plo \
+	snn/compute/$(DEPDIR)/SnnLearningCore.Plo \
+	snn/stimulus/$(DEPDIR)/ExternalSpikeInputSubsystem.Plo \
+	snn/stimulus/$(DEPDIR)/StepActivationSubsystem.Plo \
+	snn/synapse/gas/$(DEPDIR)/AccumulatorOps.Plo \
+	snn/synapse/gas/$(DEPDIR)/GasEdgeCollector.Plo \
+	snn/synapse/gas/$(DEPDIR)/GasPhaseController.Plo \
+	snn/synapse/route/$(DEPDIR)/BcsrRouteBuilder.Plo \
+	snn/synapse/route/$(DEPDIR)/SnnRouteProvider.Plo \
+	snn/synapse/route/$(DEPDIR)/SpikeCommSubsystem.Plo \
+	snn/synapse/route/$(DEPDIR)/SpikeNocCodec.Plo \
+	snn/synapse/route/$(DEPDIR)/SpikePacketBridge.Plo \
+	snn/synapse/route/$(DEPDIR)/StepBcsrReachability.Plo \
+	snn/synapse/route/$(DEPDIR)/SynapseRouteSubsystem.Plo \
+	snn/synapse/stdmem/$(DEPDIR)/SnnPESubComponent_mem.Plo \
+	snn/synapse/stdmem/$(DEPDIR)/StdMemEndpoint.Plo \
+	snn/synapse/weights/$(DEPDIR)/SnnBcsrWeightManager.Plo \
+	snn/synapse/weights/$(DEPDIR)/SnnWeightDiagnostics.Plo \
+	snn/synapse/weights/$(DEPDIR)/WeightAccessor.Plo \
+	snn/synapse/weights/$(DEPDIR)/WeightCacheOps.Plo \
+	snn/synapse/weights/$(DEPDIR)/WeightMemorySubsystem.Plo \
+	snn/synapse/weights/$(DEPDIR)/WeightMemorySubsystemVerification.Plo \
+	workloads/$(DEPDIR)/CoreWorkloadFactory.Plo \
+	workloads/common/$(DEPDIR)/SnnAccelBackend.Plo \
+	workloads/layout/$(DEPDIR)/NormalizedNeuronLayout.Plo \
+	workloads/riscv_snn/$(DEPDIR)/RiscvSnnBootDriver.Plo \
+	workloads/riscv_snn/$(DEPDIR)/RiscvSnnFirmwareLoader.Plo \
+	workloads/riscv_snn/$(DEPDIR)/RiscvSnnHart.Plo \
+	workloads/riscv_snn/$(DEPDIR)/RiscvSnnIss.Plo \
+	workloads/riscv_snn/$(DEPDIR)/RiscvSnnRuntimeBridgeBackend.Plo \
+	workloads/riscv_snn/$(DEPDIR)/RiscvSnnShadowRuntimeServices.Plo \
+	workloads/riscv_snn/$(DEPDIR)/RiscvSnnShadowTransportExport.Plo \
+	workloads/riscv_snn/$(DEPDIR)/RiscvSnnWorkload.Plo \
+	workloads/snn/$(DEPDIR)/SnnWorkload.Plo \
+	workloads/stream/$(DEPDIR)/StreamWorkload.Plo \
+	workloads/tensor/$(DEPDIR)/TensorWorkload.Plo \
+	workloads/tensor/$(DEPDIR)/TensorWorkloadCollective.Plo \
+	workloads/tensor/$(DEPDIR)/TensorWorkloadConfig.Plo \
+	workloads/tensor/$(DEPDIR)/TensorWorkloadProgram.Plo \
+	workloads/tensor/$(DEPDIR)/TensorWorkloadStats.Plo \
+	workloads/traffic/$(DEPDIR)/TrafficWorkload.Plo \
+	workloads/traffic_mem/$(DEPDIR)/TrafficMemWorkload.Plo
 am__mv = mv -f
 CXXCOMPILE = $(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) \
 	$(AM_CPPFLAGS) $(CPPFLAGS) $(AM_CXXFLAGS) $(CXXFLAGS)
@@ -423,8 +433,8 @@ AMTAR = @AMTAR@
 AM_CFLAGS = @AM_CFLAGS@
 AM_CPPFLAGS = @AM_CPPFLAGS@ -I$(top_srcdir)/src -I$(srcdir) \
 	-I$(srcdir)/api -I$(srcdir)/events -I$(srcdir)/components \
-	-I$(srcdir)/control -I$(srcdir)/compute -I$(srcdir)/services \
-	-I$(SST_PREFIX)/include
+	-I$(srcdir)/platform/core -I$(srcdir)/snn/compute \
+	-I$(srcdir)/snn/profiling -I$(SST_PREFIX)/include
 AM_CXXFLAGS = @AM_CXXFLAGS@
 AM_DEFAULT_VERBOSITY = @AM_DEFAULT_VERBOSITY@
 AM_LDFLAGS = @AM_LDFLAGS@
@@ -677,13 +687,10 @@ top_srcdir = @top_srcdir@
 compdir = $(pkglibdir)
 comp_LTLIBRARIES = libSnnDL.la
 libSnnDL_la_SOURCES = \
-	api/SnnCoreAPI.h \
 	api/CoreShellAPI.h \
 	api/SnnInterface.h \
-	api/SnnPEParentInterface.h \
 	api/ISpikeTransport.h \
 	api/INocTransport.h \
-	api/IManualWindowDrive.h \
 	api/GasOps.h \
 	api/IGasCmdSender.h \
 	api/IGasStageSink.h \
@@ -729,165 +736,168 @@ libSnnDL_la_SOURCES = \
 	components/MemKCalBench.h \
 	components/multicore/MultiCorePEConfig.cc \
 	components/multicore/MultiCorePEConfig.h \
+	components/multicore/MultiCorePEObservability.cc \
 	components/MultiCorePE.cc \
 	components/MultiCorePE.h \
 	components/SnnNIC.cc \
 	components/SnnNIC.h \
-	components/SnnPE.cc \
-	components/SnnPE.h \
 	components/stimulus/SpikeSource.cc \
 	components/stimulus/SpikeSource.h \
 	components/WeightLoader.cc \
 	components/WeightLoader.h \
-	components/workload_stats/IWorkloadStatsModule.h \
-	components/workload_stats/KeyedCounterStatsModule.h \
-	components/workload_stats/StreamWorkloadStatsModule.h \
-	components/workload_stats/TensorWorkloadStatsModule.h \
-	components/workload_stats/WorkloadStatsRegistry.cc \
-	components/workload_stats/WorkloadStatsRegistry.h \
-	control/SnnPESubComponent.cc \
-	control/SnnPESubComponent.h \
-	control/SnnPESubComponent_impl.h \
-	control/SnnPESubComponent_bcsr.cc \
-	control/SnnPESubComponent_routing.cc \
-	control/SnnPESubComponent_scheme1.cc \
-	control/SnnPESubComponent_spike.cc \
-	control/SnnPEApplyScatter.cc \
-	control/SnnPEOrchestrators.cc \
-	compute/SnnComputeCore.cc \
-	compute/SnnComputeCore.h \
-	compute/SnnCoreEngine.cc \
-	compute/SnnCoreEngine.h \
-	compute/SnnLearningCore.cc \
-	compute/SnnLearningCore.h \
-	compute/IWeightAwareComputeCore.h \
-	compute/SnnNeuronModel.h \
-	compute/SynapseManager.h \
-	services/synapse/gas/AccumulatorOps.cc \
-	services/synapse/gas/AccumulatorOps.h \
-	services/synapse/gas/GasCustomCmd.h \
-	services/synapse/gas/GasEdgeCollector.cc \
-	services/synapse/gas/GasEdgeCollector.h \
-	services/synapse/gas/GasPhaseController.cc \
-	services/synapse/gas/GasPhaseController.h \
-	services/synapse/stdmem/StdMemEndpoint.cc \
-	services/synapse/stdmem/StdMemEndpoint.h \
-	services/synapse/stdmem/SnnPESubComponent_mem.cc \
-	services/noc/OptimizedInternalRing.cc \
-	services/noc/OptimizedInternalRing.h \
+	platform/stats/IWorkloadStatsModule.h \
+	platform/stats/KeyedCounterStatsModule.h \
+	platform/stats/StreamWorkloadStatsModule.h \
+	platform/stats/TensorWorkloadStatsModule.h \
+	platform/stats/WorkloadStatsRegistry.cc \
+	platform/stats/WorkloadStatsRegistry.h \
+	platform/core/SnnPESubComponent.cc \
+	platform/core/SnnPESubComponentStats.cc \
+	platform/core/SnnPESubComponent.h \
+	platform/core/SnnPESubComponent_impl.h \
+	platform/core/SnnPESubComponent_bcsr.cc \
+	platform/core/SnnPESubComponent_routing.cc \
+	platform/core/SnnPEApplyScatter.cc \
+	platform/core/SnnPEOrchestrators.cc \
+	snn/compute/SnnComputeCore.cc \
+	snn/compute/SnnComputeCore.h \
+	snn/compute/SnnCoreEngine.cc \
+	snn/compute/SnnCoreEngine.h \
+	snn/compute/SnnLearningCore.cc \
+	snn/compute/SnnLearningCore.h \
+	snn/compute/IWeightAwareComputeCore.h \
+	snn/compute/SnnNeuronModel.h \
+	snn/compute/SynapseManager.h \
+	snn/synapse/gas/AccumulatorOps.cc \
+	snn/synapse/gas/AccumulatorOps.h \
+	snn/synapse/gas/GasCustomCmd.h \
+	snn/synapse/gas/GasEdgeCollector.cc \
+	snn/synapse/gas/GasEdgeCollector.h \
+	snn/synapse/gas/GasPhaseController.cc \
+	snn/synapse/gas/GasPhaseController.h \
+	snn/synapse/stdmem/StdMemEndpoint.cc \
+	snn/synapse/stdmem/StdMemEndpoint.h \
+	snn/synapse/stdmem/SnnPESubComponent_mem.cc \
+	platform/noc/OptimizedInternalRing.cc \
+	platform/noc/OptimizedInternalRing.h \
 	components/noc/SimpleNetworkWrapper.cc \
 	components/noc/SimpleNetworkWrapper.h \
-	services/synapse/weights/SnnBcsrWeightManager.cc \
-	services/synapse/weights/SnnBcsrWeightManager.h \
-	services/synapse/weights/SnnWeightDiagnostics.cc \
-	services/synapse/weights/SnnWeightDiagnostics.h \
+	snn/synapse/weights/SnnBcsrWeightManager.cc \
+	snn/synapse/weights/SnnBcsrWeightManager.h \
+	snn/synapse/weights/SnnWeightDiagnostics.cc \
+	snn/synapse/weights/SnnWeightDiagnostics.h \
 	components/noc/SnnNetworkAdapter.cc \
 	components/noc/SnnNetworkAdapter.h \
 	components/noc/MulticastRouter.cc \
 	components/noc/MulticastRouter.h \
-	components/noc3d/MulticastRouter3DNative.cc \
-	components/noc3d/MulticastRouter3DNative.h \
-	components/noc3d/MulticastRouter3DNativeConfig.h \
-	components/noc3d/Noc3DSmokeSource.cc \
-	components/noc3d/Noc3DSmokeSource.h \
-	components/noc3d/Noc3DSmokeSink.cc \
-	components/noc3d/Noc3DSmokeSink.h \
-	components/noc3d/HBMStackStub.cc \
-	components/noc3d/HBMStackStub.h \
+	research/noc3d/MulticastRouter3DNative.cc \
+	research/noc3d/MulticastRouter3DNative.h \
+	research/noc3d/MulticastRouter3DNativeConfig.h \
+	research/noc3d/Noc3DSmokeSource.cc \
+	research/noc3d/Noc3DSmokeSource.h \
+	research/noc3d/Noc3DSmokeSink.cc \
+	research/noc3d/Noc3DSmokeSink.h \
+	research/noc3d/HBMStackStub.cc \
+	research/noc3d/HBMStackStub.h \
 	components/noc/MulticastNIC.cc \
 	components/noc/MulticastNIC.h \
-	services/SnnProfiler.h \
-	services/synapse/route/SnnRouteProvider.cc \
-	services/synapse/route/SnnRouteProvider.h \
-	services/synapse/route/SpikeNocCodec.cc \
-	services/synapse/route/SpikeNocCodec.h \
-	services/synapse/route/BcsrRouteBuilder.cc \
-	services/synapse/route/BcsrRouteBuilder.h \
-	services/synapse/route/StepBcsrReachability.cc \
-	services/synapse/route/StepBcsrReachability.h \
-	services/synapse/route/SynapseRouteSubsystem.cc \
-	services/synapse/route/SynapseRouteSubsystem.h \
-	services/synapse/route3d/Route3DNodeMapper.h \
-	services/synapse/route3d/SynapseRouteSubsystem3D.cc \
-	services/synapse/route3d/SynapseRouteSubsystem3D.h \
-	services/stimulus/StepActivationSubsystem.cc \
-	services/stimulus/StepActivationSubsystem.h \
-	services/stimulus/ExternalSpikeInputSubsystem.cc \
-	services/stimulus/ExternalSpikeInputSubsystem.h \
-	services/noc/NocSubsystem.cc \
-	services/noc/NocSubsystem.h \
-	services/synapse/weights/WeightAccessor.cc \
-	services/synapse/weights/WeightAccessor.h \
-	services/synapse/weights/WeightCacheOps.cc \
-	services/synapse/weights/WeightCacheOps.h \
-	services/synapse/weights/WeightMemorySubsystem.cc \
-	services/synapse/weights/WeightMemorySubsystem.h \
-	services/synapse/route/SpikeCommSubsystem.cc \
-	services/synapse/route/SpikeCommSubsystem.h \
-	services/synapse/route/SpikePacketTransport.h \
-	services/synapse/route/SpikePacketBridge.cc \
-	services/synapse/route/SpikePacketBridge.h \
-	services/workload/CoreWorkloadFactory.cc \
-	services/workload/common/SnnAccelBackend.cc \
-	services/workload/common/SnnAccelBackend.h \
-	services/workload/common/SnnAccelBackendContract.h \
-	services/workload/layout/NormalizedNeuronLayout.cc \
-	services/workload/layout/NormalizedNeuronLayout.h \
-	services/workload/riscv_snn/RiscvSnnAbi.h \
-	services/workload/riscv_snn/RiscvSnnAsm.h \
-	services/workload/riscv_snn/RiscvSnnBootDriver.cc \
-	services/workload/riscv_snn/RiscvSnnBootDriver.h \
-	services/workload/riscv_snn/RiscvSnnElfWriter.h \
-	services/workload/riscv_snn/RiscvSnnFirmwareLoader.cc \
-	services/workload/riscv_snn/RiscvSnnFirmwareLoader.h \
-	services/workload/riscv_snn/RiscvSnnHart.cc \
-	services/workload/riscv_snn/RiscvSnnHart.h \
-	services/workload/riscv_snn/RiscvSnnIss.cc \
-	services/workload/riscv_snn/RiscvSnnIss.h \
-	services/workload/riscv_snn/RiscvSnnMemoryImage.h \
-	services/workload/riscv_snn/RiscvSnnQueueContract.h \
-	services/workload/riscv_snn/RiscvSnnRuntimeBridgeBackend.cc \
-	services/workload/riscv_snn/RiscvSnnRuntimeBridgeBackend.h \
-	services/workload/riscv_snn/RiscvSnnSampleFirmware.h \
-	services/workload/riscv_snn/RiscvSnnShadowTransportExport.cc \
-	services/workload/riscv_snn/RiscvSnnShadowTransportExport.h \
-	services/workload/riscv_snn/RiscvSnnShadowRuntimeServices.cc \
-	services/workload/riscv_snn/RiscvSnnShadowRuntimeServices.h \
-	services/workload/riscv_snn/RiscvSnnWorkload.cc \
-	services/workload/riscv_snn/RiscvSnnWorkload.h \
-	services/workload/snn/SnnWorkload.cc \
-	services/workload/snn/SnnWorkload.h \
-	services/workload/stream/StreamWorkload.cc \
-	services/workload/stream/StreamWorkload.h \
-	services/workload/traffic/TrafficWorkload.cc \
-	services/workload/traffic/TrafficWorkload.h \
-	services/workload/traffic_mem/TrafficMemWorkload.cc \
-	services/workload/traffic_mem/TrafficMemWorkload.h \
-	services/workload/tensor/TensorWorkload.cc \
-	services/workload/tensor/TensorWorkload.h \
-	services/memory/sram_sim/layout/VirtualSramLayout.h \
-	services/memory/sram_sim/model/BankedSramModel.cc \
-	services/memory/sram_sim/model/BankedSramModel.h \
-	services/local_storage/LocalStorageTypes.h \
-	services/local_storage/LocalStorageHierarchyController.cc \
-	services/local_storage/LocalStorageHierarchyController.h \
-	services/local_storage/PeWeightObjectPlane.cc \
-	services/local_storage/PeWeightObjectPlane.h \
-	services/memory/DmaMemAccessProxy.cc \
-	services/memory/DmaMemAccessProxy.h \
-	services/pe_fabric/PulseAgendaScorer.cc \
-	services/pe_fabric/PulseAgendaScorer.h \
-	services/pe_fabric/PulseDescriptor.h \
-	services/pe_fabric/PeSharedCoreFabric.cc \
-	services/pe_fabric/PeSharedCoreFabric.h \
-	services/memory/PeDmaScheduler.cc \
-	services/memory/PeDmaScheduler.h \
-	services/memory/StandardMemAccess.cc \
-	services/memory/StandardMemAccess.h
+	snn/profiling/SnnProfiler.h \
+	snn/synapse/route/SnnRouteProvider.cc \
+	snn/synapse/route/SnnRouteProvider.h \
+	snn/synapse/route/SpikeNocCodec.cc \
+	snn/synapse/route/SpikeNocCodec.h \
+	snn/synapse/route/BcsrRouteBuilder.cc \
+	snn/synapse/route/BcsrRouteBuilder.h \
+	snn/synapse/route/StepBcsrReachability.cc \
+	snn/synapse/route/StepBcsrReachability.h \
+	snn/synapse/route/SynapseRouteSubsystem.cc \
+	snn/synapse/route/SynapseRouteSubsystem.h \
+	research/route3d/Route3DNodeMapper.h \
+	research/route3d/SynapseRouteSubsystem3D.cc \
+	research/route3d/SynapseRouteSubsystem3D.h \
+	snn/stimulus/StepActivationSubsystem.cc \
+	snn/stimulus/StepActivationSubsystem.h \
+	snn/stimulus/ExternalSpikeInputSubsystem.cc \
+	snn/stimulus/ExternalSpikeInputSubsystem.h \
+	platform/noc/NocSubsystem.cc \
+	platform/noc/NocSubsystem.h \
+	snn/synapse/weights/WeightAccessor.cc \
+	snn/synapse/weights/WeightAccessor.h \
+	snn/synapse/weights/WeightCacheOps.cc \
+	snn/synapse/weights/WeightCacheOps.h \
+	snn/synapse/weights/WeightMemorySubsystem.cc \
+	snn/synapse/weights/WeightMemorySubsystemVerification.cc \
+	snn/synapse/weights/WeightMemorySubsystem.h \
+	snn/synapse/route/SpikeCommSubsystem.cc \
+	snn/synapse/route/SpikeCommSubsystem.h \
+	snn/synapse/route/SpikePacketTransport.h \
+	snn/synapse/route/SpikePacketBridge.cc \
+	snn/synapse/route/SpikePacketBridge.h \
+	workloads/CoreWorkloadFactory.cc \
+	workloads/common/SnnAccelBackend.cc \
+	workloads/common/SnnAccelBackend.h \
+	workloads/common/SnnAccelBackendContract.h \
+	workloads/layout/NormalizedNeuronLayout.cc \
+	workloads/layout/NormalizedNeuronLayout.h \
+	workloads/riscv_snn/RiscvSnnAbi.h \
+	workloads/riscv_snn/RiscvSnnAsm.h \
+	workloads/riscv_snn/RiscvSnnBootDriver.cc \
+	workloads/riscv_snn/RiscvSnnBootDriver.h \
+	workloads/riscv_snn/RiscvSnnElfWriter.h \
+	workloads/riscv_snn/RiscvSnnFirmwareLoader.cc \
+	workloads/riscv_snn/RiscvSnnFirmwareLoader.h \
+	workloads/riscv_snn/RiscvSnnHart.cc \
+	workloads/riscv_snn/RiscvSnnHart.h \
+	workloads/riscv_snn/RiscvSnnIss.cc \
+	workloads/riscv_snn/RiscvSnnIss.h \
+	workloads/riscv_snn/RiscvSnnMemoryImage.h \
+	workloads/riscv_snn/RiscvSnnQueueContract.h \
+	workloads/riscv_snn/RiscvSnnRuntimeBridgeBackend.cc \
+	workloads/riscv_snn/RiscvSnnRuntimeBridgeBackend.h \
+	workloads/riscv_snn/RiscvSnnSampleFirmware.h \
+	workloads/riscv_snn/RiscvSnnShadowTransportExport.cc \
+	workloads/riscv_snn/RiscvSnnShadowTransportExport.h \
+	workloads/riscv_snn/RiscvSnnShadowRuntimeServices.cc \
+	workloads/riscv_snn/RiscvSnnShadowRuntimeServices.h \
+	workloads/riscv_snn/RiscvSnnWorkload.cc \
+	workloads/riscv_snn/RiscvSnnWorkload.h \
+	workloads/snn/SnnWorkload.cc \
+	workloads/snn/SnnWorkload.h \
+	workloads/stream/StreamWorkload.cc \
+	workloads/stream/StreamWorkload.h \
+	workloads/traffic/TrafficWorkload.cc \
+	workloads/traffic/TrafficWorkload.h \
+	workloads/traffic_mem/TrafficMemWorkload.cc \
+	workloads/traffic_mem/TrafficMemWorkload.h \
+	workloads/tensor/TensorWorkload.cc \
+	workloads/tensor/TensorWorkloadCollective.cc \
+	workloads/tensor/TensorWorkloadConfig.cc \
+	workloads/tensor/TensorWorkloadProgram.cc \
+	workloads/tensor/TensorWorkloadStats.cc \
+	workloads/tensor/TensorWorkload.h \
+	platform/memory/sram_sim/layout/VirtualSramLayout.h \
+	platform/memory/sram_sim/model/BankedSramModel.cc \
+	platform/memory/sram_sim/model/BankedSramModel.h \
+	research/local_storage/LocalStorageTypes.h \
+	research/local_storage/LocalStorageHierarchyController.cc \
+	research/local_storage/LocalStorageHierarchyController.h \
+	research/local_storage/PeWeightObjectPlane.cc \
+	research/local_storage/PeWeightObjectPlane.h \
+	platform/memory/DmaMemAccessProxy.cc \
+	platform/memory/DmaMemAccessProxy.h \
+	research/pe_fabric/PulseAgendaScorer.cc \
+	research/pe_fabric/PulseAgendaScorer.h \
+	research/pe_fabric/PulseDescriptor.h \
+	research/pe_fabric/PeSharedCoreFabric.cc \
+	research/pe_fabric/PeSharedCoreFabric.h \
+	platform/memory/PeDmaScheduler.cc \
+	platform/memory/PeDmaScheduler.h \
+	platform/memory/StandardMemAccess.cc \
+	platform/memory/StandardMemAccess.h
 
 
 #
-# Note: sources above already include GatherBufferIF / MemKCalBench / MPI files.
+# Note: sources above include the production runtime and explicitly selected research modules.
 #
 libSnnDL_la_LDFLAGS = -module -avoid-version
 RISCV_SNN_TEST_LINK = $(CXXLD) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(CXXFLAGS)
@@ -1019,11 +1029,12 @@ components/multicore/$(DEPDIR)/$(am__dirstamp):
 components/multicore/MultiCorePEConfig.lo:  \
 	components/multicore/$(am__dirstamp) \
 	components/multicore/$(DEPDIR)/$(am__dirstamp)
+components/multicore/MultiCorePEObservability.lo:  \
+	components/multicore/$(am__dirstamp) \
+	components/multicore/$(DEPDIR)/$(am__dirstamp)
 components/MultiCorePE.lo: components/$(am__dirstamp) \
 	components/$(DEPDIR)/$(am__dirstamp)
 components/SnnNIC.lo: components/$(am__dirstamp) \
-	components/$(DEPDIR)/$(am__dirstamp)
-components/SnnPE.lo: components/$(am__dirstamp) \
 	components/$(DEPDIR)/$(am__dirstamp)
 components/stimulus/$(am__dirstamp):
 	@$(MKDIR_P) components/stimulus
@@ -1036,82 +1047,81 @@ components/stimulus/SpikeSource.lo:  \
 	components/stimulus/$(DEPDIR)/$(am__dirstamp)
 components/WeightLoader.lo: components/$(am__dirstamp) \
 	components/$(DEPDIR)/$(am__dirstamp)
-components/workload_stats/$(am__dirstamp):
-	@$(MKDIR_P) components/workload_stats
-	@: > components/workload_stats/$(am__dirstamp)
-components/workload_stats/$(DEPDIR)/$(am__dirstamp):
-	@$(MKDIR_P) components/workload_stats/$(DEPDIR)
-	@: > components/workload_stats/$(DEPDIR)/$(am__dirstamp)
-components/workload_stats/WorkloadStatsRegistry.lo:  \
-	components/workload_stats/$(am__dirstamp) \
-	components/workload_stats/$(DEPDIR)/$(am__dirstamp)
-control/$(am__dirstamp):
-	@$(MKDIR_P) control
-	@: > control/$(am__dirstamp)
-control/$(DEPDIR)/$(am__dirstamp):
-	@$(MKDIR_P) control/$(DEPDIR)
-	@: > control/$(DEPDIR)/$(am__dirstamp)
-control/SnnPESubComponent.lo: control/$(am__dirstamp) \
-	control/$(DEPDIR)/$(am__dirstamp)
-control/SnnPESubComponent_bcsr.lo: control/$(am__dirstamp) \
-	control/$(DEPDIR)/$(am__dirstamp)
-control/SnnPESubComponent_routing.lo: control/$(am__dirstamp) \
-	control/$(DEPDIR)/$(am__dirstamp)
-control/SnnPESubComponent_scheme1.lo: control/$(am__dirstamp) \
-	control/$(DEPDIR)/$(am__dirstamp)
-control/SnnPESubComponent_spike.lo: control/$(am__dirstamp) \
-	control/$(DEPDIR)/$(am__dirstamp)
-control/SnnPEApplyScatter.lo: control/$(am__dirstamp) \
-	control/$(DEPDIR)/$(am__dirstamp)
-control/SnnPEOrchestrators.lo: control/$(am__dirstamp) \
-	control/$(DEPDIR)/$(am__dirstamp)
-compute/$(am__dirstamp):
-	@$(MKDIR_P) compute
-	@: > compute/$(am__dirstamp)
-compute/$(DEPDIR)/$(am__dirstamp):
-	@$(MKDIR_P) compute/$(DEPDIR)
-	@: > compute/$(DEPDIR)/$(am__dirstamp)
-compute/SnnComputeCore.lo: compute/$(am__dirstamp) \
-	compute/$(DEPDIR)/$(am__dirstamp)
-compute/SnnCoreEngine.lo: compute/$(am__dirstamp) \
-	compute/$(DEPDIR)/$(am__dirstamp)
-compute/SnnLearningCore.lo: compute/$(am__dirstamp) \
-	compute/$(DEPDIR)/$(am__dirstamp)
-services/synapse/gas/$(am__dirstamp):
-	@$(MKDIR_P) services/synapse/gas
-	@: > services/synapse/gas/$(am__dirstamp)
-services/synapse/gas/$(DEPDIR)/$(am__dirstamp):
-	@$(MKDIR_P) services/synapse/gas/$(DEPDIR)
-	@: > services/synapse/gas/$(DEPDIR)/$(am__dirstamp)
-services/synapse/gas/AccumulatorOps.lo:  \
-	services/synapse/gas/$(am__dirstamp) \
-	services/synapse/gas/$(DEPDIR)/$(am__dirstamp)
-services/synapse/gas/GasEdgeCollector.lo:  \
-	services/synapse/gas/$(am__dirstamp) \
-	services/synapse/gas/$(DEPDIR)/$(am__dirstamp)
-services/synapse/gas/GasPhaseController.lo:  \
-	services/synapse/gas/$(am__dirstamp) \
-	services/synapse/gas/$(DEPDIR)/$(am__dirstamp)
-services/synapse/stdmem/$(am__dirstamp):
-	@$(MKDIR_P) services/synapse/stdmem
-	@: > services/synapse/stdmem/$(am__dirstamp)
-services/synapse/stdmem/$(DEPDIR)/$(am__dirstamp):
-	@$(MKDIR_P) services/synapse/stdmem/$(DEPDIR)
-	@: > services/synapse/stdmem/$(DEPDIR)/$(am__dirstamp)
-services/synapse/stdmem/StdMemEndpoint.lo:  \
-	services/synapse/stdmem/$(am__dirstamp) \
-	services/synapse/stdmem/$(DEPDIR)/$(am__dirstamp)
-services/synapse/stdmem/SnnPESubComponent_mem.lo:  \
-	services/synapse/stdmem/$(am__dirstamp) \
-	services/synapse/stdmem/$(DEPDIR)/$(am__dirstamp)
-services/noc/$(am__dirstamp):
-	@$(MKDIR_P) services/noc
-	@: > services/noc/$(am__dirstamp)
-services/noc/$(DEPDIR)/$(am__dirstamp):
-	@$(MKDIR_P) services/noc/$(DEPDIR)
-	@: > services/noc/$(DEPDIR)/$(am__dirstamp)
-services/noc/OptimizedInternalRing.lo: services/noc/$(am__dirstamp) \
-	services/noc/$(DEPDIR)/$(am__dirstamp)
+platform/stats/$(am__dirstamp):
+	@$(MKDIR_P) platform/stats
+	@: > platform/stats/$(am__dirstamp)
+platform/stats/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) platform/stats/$(DEPDIR)
+	@: > platform/stats/$(DEPDIR)/$(am__dirstamp)
+platform/stats/WorkloadStatsRegistry.lo:  \
+	platform/stats/$(am__dirstamp) \
+	platform/stats/$(DEPDIR)/$(am__dirstamp)
+platform/core/$(am__dirstamp):
+	@$(MKDIR_P) platform/core
+	@: > platform/core/$(am__dirstamp)
+platform/core/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) platform/core/$(DEPDIR)
+	@: > platform/core/$(DEPDIR)/$(am__dirstamp)
+platform/core/SnnPESubComponent.lo: platform/core/$(am__dirstamp) \
+	platform/core/$(DEPDIR)/$(am__dirstamp)
+platform/core/SnnPESubComponentStats.lo:  \
+	platform/core/$(am__dirstamp) \
+	platform/core/$(DEPDIR)/$(am__dirstamp)
+platform/core/SnnPESubComponent_bcsr.lo:  \
+	platform/core/$(am__dirstamp) \
+	platform/core/$(DEPDIR)/$(am__dirstamp)
+platform/core/SnnPESubComponent_routing.lo:  \
+	platform/core/$(am__dirstamp) \
+	platform/core/$(DEPDIR)/$(am__dirstamp)
+platform/core/SnnPEApplyScatter.lo: platform/core/$(am__dirstamp) \
+	platform/core/$(DEPDIR)/$(am__dirstamp)
+platform/core/SnnPEOrchestrators.lo: platform/core/$(am__dirstamp) \
+	platform/core/$(DEPDIR)/$(am__dirstamp)
+snn/compute/$(am__dirstamp):
+	@$(MKDIR_P) snn/compute
+	@: > snn/compute/$(am__dirstamp)
+snn/compute/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) snn/compute/$(DEPDIR)
+	@: > snn/compute/$(DEPDIR)/$(am__dirstamp)
+snn/compute/SnnComputeCore.lo: snn/compute/$(am__dirstamp) \
+	snn/compute/$(DEPDIR)/$(am__dirstamp)
+snn/compute/SnnCoreEngine.lo: snn/compute/$(am__dirstamp) \
+	snn/compute/$(DEPDIR)/$(am__dirstamp)
+snn/compute/SnnLearningCore.lo: snn/compute/$(am__dirstamp) \
+	snn/compute/$(DEPDIR)/$(am__dirstamp)
+snn/synapse/gas/$(am__dirstamp):
+	@$(MKDIR_P) snn/synapse/gas
+	@: > snn/synapse/gas/$(am__dirstamp)
+snn/synapse/gas/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) snn/synapse/gas/$(DEPDIR)
+	@: > snn/synapse/gas/$(DEPDIR)/$(am__dirstamp)
+snn/synapse/gas/AccumulatorOps.lo: snn/synapse/gas/$(am__dirstamp) \
+	snn/synapse/gas/$(DEPDIR)/$(am__dirstamp)
+snn/synapse/gas/GasEdgeCollector.lo: snn/synapse/gas/$(am__dirstamp) \
+	snn/synapse/gas/$(DEPDIR)/$(am__dirstamp)
+snn/synapse/gas/GasPhaseController.lo:  \
+	snn/synapse/gas/$(am__dirstamp) \
+	snn/synapse/gas/$(DEPDIR)/$(am__dirstamp)
+snn/synapse/stdmem/$(am__dirstamp):
+	@$(MKDIR_P) snn/synapse/stdmem
+	@: > snn/synapse/stdmem/$(am__dirstamp)
+snn/synapse/stdmem/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) snn/synapse/stdmem/$(DEPDIR)
+	@: > snn/synapse/stdmem/$(DEPDIR)/$(am__dirstamp)
+snn/synapse/stdmem/StdMemEndpoint.lo:  \
+	snn/synapse/stdmem/$(am__dirstamp) \
+	snn/synapse/stdmem/$(DEPDIR)/$(am__dirstamp)
+snn/synapse/stdmem/SnnPESubComponent_mem.lo:  \
+	snn/synapse/stdmem/$(am__dirstamp) \
+	snn/synapse/stdmem/$(DEPDIR)/$(am__dirstamp)
+platform/noc/$(am__dirstamp):
+	@$(MKDIR_P) platform/noc
+	@: > platform/noc/$(am__dirstamp)
+platform/noc/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) platform/noc/$(DEPDIR)
+	@: > platform/noc/$(DEPDIR)/$(am__dirstamp)
+platform/noc/OptimizedInternalRing.lo: platform/noc/$(am__dirstamp) \
+	platform/noc/$(DEPDIR)/$(am__dirstamp)
 components/noc/$(am__dirstamp):
 	@$(MKDIR_P) components/noc
 	@: > components/noc/$(am__dirstamp)
@@ -1121,246 +1131,253 @@ components/noc/$(DEPDIR)/$(am__dirstamp):
 components/noc/SimpleNetworkWrapper.lo:  \
 	components/noc/$(am__dirstamp) \
 	components/noc/$(DEPDIR)/$(am__dirstamp)
-services/synapse/weights/$(am__dirstamp):
-	@$(MKDIR_P) services/synapse/weights
-	@: > services/synapse/weights/$(am__dirstamp)
-services/synapse/weights/$(DEPDIR)/$(am__dirstamp):
-	@$(MKDIR_P) services/synapse/weights/$(DEPDIR)
-	@: > services/synapse/weights/$(DEPDIR)/$(am__dirstamp)
-services/synapse/weights/SnnBcsrWeightManager.lo:  \
-	services/synapse/weights/$(am__dirstamp) \
-	services/synapse/weights/$(DEPDIR)/$(am__dirstamp)
-services/synapse/weights/SnnWeightDiagnostics.lo:  \
-	services/synapse/weights/$(am__dirstamp) \
-	services/synapse/weights/$(DEPDIR)/$(am__dirstamp)
+snn/synapse/weights/$(am__dirstamp):
+	@$(MKDIR_P) snn/synapse/weights
+	@: > snn/synapse/weights/$(am__dirstamp)
+snn/synapse/weights/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) snn/synapse/weights/$(DEPDIR)
+	@: > snn/synapse/weights/$(DEPDIR)/$(am__dirstamp)
+snn/synapse/weights/SnnBcsrWeightManager.lo:  \
+	snn/synapse/weights/$(am__dirstamp) \
+	snn/synapse/weights/$(DEPDIR)/$(am__dirstamp)
+snn/synapse/weights/SnnWeightDiagnostics.lo:  \
+	snn/synapse/weights/$(am__dirstamp) \
+	snn/synapse/weights/$(DEPDIR)/$(am__dirstamp)
 components/noc/SnnNetworkAdapter.lo: components/noc/$(am__dirstamp) \
 	components/noc/$(DEPDIR)/$(am__dirstamp)
 components/noc/MulticastRouter.lo: components/noc/$(am__dirstamp) \
 	components/noc/$(DEPDIR)/$(am__dirstamp)
-components/noc3d/$(am__dirstamp):
-	@$(MKDIR_P) components/noc3d
-	@: > components/noc3d/$(am__dirstamp)
-components/noc3d/$(DEPDIR)/$(am__dirstamp):
-	@$(MKDIR_P) components/noc3d/$(DEPDIR)
-	@: > components/noc3d/$(DEPDIR)/$(am__dirstamp)
-components/noc3d/MulticastRouter3DNative.lo:  \
-	components/noc3d/$(am__dirstamp) \
-	components/noc3d/$(DEPDIR)/$(am__dirstamp)
-components/noc3d/Noc3DSmokeSource.lo:  \
-	components/noc3d/$(am__dirstamp) \
-	components/noc3d/$(DEPDIR)/$(am__dirstamp)
-components/noc3d/Noc3DSmokeSink.lo: components/noc3d/$(am__dirstamp) \
-	components/noc3d/$(DEPDIR)/$(am__dirstamp)
-components/noc3d/HBMStackStub.lo: components/noc3d/$(am__dirstamp) \
-	components/noc3d/$(DEPDIR)/$(am__dirstamp)
+research/noc3d/$(am__dirstamp):
+	@$(MKDIR_P) research/noc3d
+	@: > research/noc3d/$(am__dirstamp)
+research/noc3d/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) research/noc3d/$(DEPDIR)
+	@: > research/noc3d/$(DEPDIR)/$(am__dirstamp)
+research/noc3d/MulticastRouter3DNative.lo:  \
+	research/noc3d/$(am__dirstamp) \
+	research/noc3d/$(DEPDIR)/$(am__dirstamp)
+research/noc3d/Noc3DSmokeSource.lo: research/noc3d/$(am__dirstamp) \
+	research/noc3d/$(DEPDIR)/$(am__dirstamp)
+research/noc3d/Noc3DSmokeSink.lo: research/noc3d/$(am__dirstamp) \
+	research/noc3d/$(DEPDIR)/$(am__dirstamp)
+research/noc3d/HBMStackStub.lo: research/noc3d/$(am__dirstamp) \
+	research/noc3d/$(DEPDIR)/$(am__dirstamp)
 components/noc/MulticastNIC.lo: components/noc/$(am__dirstamp) \
 	components/noc/$(DEPDIR)/$(am__dirstamp)
-services/synapse/route/$(am__dirstamp):
-	@$(MKDIR_P) services/synapse/route
-	@: > services/synapse/route/$(am__dirstamp)
-services/synapse/route/$(DEPDIR)/$(am__dirstamp):
-	@$(MKDIR_P) services/synapse/route/$(DEPDIR)
-	@: > services/synapse/route/$(DEPDIR)/$(am__dirstamp)
-services/synapse/route/SnnRouteProvider.lo:  \
-	services/synapse/route/$(am__dirstamp) \
-	services/synapse/route/$(DEPDIR)/$(am__dirstamp)
-services/synapse/route/SpikeNocCodec.lo:  \
-	services/synapse/route/$(am__dirstamp) \
-	services/synapse/route/$(DEPDIR)/$(am__dirstamp)
-services/synapse/route/BcsrRouteBuilder.lo:  \
-	services/synapse/route/$(am__dirstamp) \
-	services/synapse/route/$(DEPDIR)/$(am__dirstamp)
-services/synapse/route/StepBcsrReachability.lo:  \
-	services/synapse/route/$(am__dirstamp) \
-	services/synapse/route/$(DEPDIR)/$(am__dirstamp)
-services/synapse/route/SynapseRouteSubsystem.lo:  \
-	services/synapse/route/$(am__dirstamp) \
-	services/synapse/route/$(DEPDIR)/$(am__dirstamp)
-services/synapse/route3d/$(am__dirstamp):
-	@$(MKDIR_P) services/synapse/route3d
-	@: > services/synapse/route3d/$(am__dirstamp)
-services/synapse/route3d/$(DEPDIR)/$(am__dirstamp):
-	@$(MKDIR_P) services/synapse/route3d/$(DEPDIR)
-	@: > services/synapse/route3d/$(DEPDIR)/$(am__dirstamp)
-services/synapse/route3d/SynapseRouteSubsystem3D.lo:  \
-	services/synapse/route3d/$(am__dirstamp) \
-	services/synapse/route3d/$(DEPDIR)/$(am__dirstamp)
-services/stimulus/$(am__dirstamp):
-	@$(MKDIR_P) services/stimulus
-	@: > services/stimulus/$(am__dirstamp)
-services/stimulus/$(DEPDIR)/$(am__dirstamp):
-	@$(MKDIR_P) services/stimulus/$(DEPDIR)
-	@: > services/stimulus/$(DEPDIR)/$(am__dirstamp)
-services/stimulus/StepActivationSubsystem.lo:  \
-	services/stimulus/$(am__dirstamp) \
-	services/stimulus/$(DEPDIR)/$(am__dirstamp)
-services/stimulus/ExternalSpikeInputSubsystem.lo:  \
-	services/stimulus/$(am__dirstamp) \
-	services/stimulus/$(DEPDIR)/$(am__dirstamp)
-services/noc/NocSubsystem.lo: services/noc/$(am__dirstamp) \
-	services/noc/$(DEPDIR)/$(am__dirstamp)
-services/synapse/weights/WeightAccessor.lo:  \
-	services/synapse/weights/$(am__dirstamp) \
-	services/synapse/weights/$(DEPDIR)/$(am__dirstamp)
-services/synapse/weights/WeightCacheOps.lo:  \
-	services/synapse/weights/$(am__dirstamp) \
-	services/synapse/weights/$(DEPDIR)/$(am__dirstamp)
-services/synapse/weights/WeightMemorySubsystem.lo:  \
-	services/synapse/weights/$(am__dirstamp) \
-	services/synapse/weights/$(DEPDIR)/$(am__dirstamp)
-services/synapse/route/SpikeCommSubsystem.lo:  \
-	services/synapse/route/$(am__dirstamp) \
-	services/synapse/route/$(DEPDIR)/$(am__dirstamp)
-services/synapse/route/SpikePacketBridge.lo:  \
-	services/synapse/route/$(am__dirstamp) \
-	services/synapse/route/$(DEPDIR)/$(am__dirstamp)
-services/workload/$(am__dirstamp):
-	@$(MKDIR_P) services/workload
-	@: > services/workload/$(am__dirstamp)
-services/workload/$(DEPDIR)/$(am__dirstamp):
-	@$(MKDIR_P) services/workload/$(DEPDIR)
-	@: > services/workload/$(DEPDIR)/$(am__dirstamp)
-services/workload/CoreWorkloadFactory.lo:  \
-	services/workload/$(am__dirstamp) \
-	services/workload/$(DEPDIR)/$(am__dirstamp)
-services/workload/common/$(am__dirstamp):
-	@$(MKDIR_P) services/workload/common
-	@: > services/workload/common/$(am__dirstamp)
-services/workload/common/$(DEPDIR)/$(am__dirstamp):
-	@$(MKDIR_P) services/workload/common/$(DEPDIR)
-	@: > services/workload/common/$(DEPDIR)/$(am__dirstamp)
-services/workload/common/SnnAccelBackend.lo:  \
-	services/workload/common/$(am__dirstamp) \
-	services/workload/common/$(DEPDIR)/$(am__dirstamp)
-services/workload/layout/$(am__dirstamp):
-	@$(MKDIR_P) services/workload/layout
-	@: > services/workload/layout/$(am__dirstamp)
-services/workload/layout/$(DEPDIR)/$(am__dirstamp):
-	@$(MKDIR_P) services/workload/layout/$(DEPDIR)
-	@: > services/workload/layout/$(DEPDIR)/$(am__dirstamp)
-services/workload/layout/NormalizedNeuronLayout.lo:  \
-	services/workload/layout/$(am__dirstamp) \
-	services/workload/layout/$(DEPDIR)/$(am__dirstamp)
-services/workload/riscv_snn/$(am__dirstamp):
-	@$(MKDIR_P) services/workload/riscv_snn
-	@: > services/workload/riscv_snn/$(am__dirstamp)
-services/workload/riscv_snn/$(DEPDIR)/$(am__dirstamp):
-	@$(MKDIR_P) services/workload/riscv_snn/$(DEPDIR)
-	@: > services/workload/riscv_snn/$(DEPDIR)/$(am__dirstamp)
-services/workload/riscv_snn/RiscvSnnBootDriver.lo:  \
-	services/workload/riscv_snn/$(am__dirstamp) \
-	services/workload/riscv_snn/$(DEPDIR)/$(am__dirstamp)
-services/workload/riscv_snn/RiscvSnnFirmwareLoader.lo:  \
-	services/workload/riscv_snn/$(am__dirstamp) \
-	services/workload/riscv_snn/$(DEPDIR)/$(am__dirstamp)
-services/workload/riscv_snn/RiscvSnnHart.lo:  \
-	services/workload/riscv_snn/$(am__dirstamp) \
-	services/workload/riscv_snn/$(DEPDIR)/$(am__dirstamp)
-services/workload/riscv_snn/RiscvSnnIss.lo:  \
-	services/workload/riscv_snn/$(am__dirstamp) \
-	services/workload/riscv_snn/$(DEPDIR)/$(am__dirstamp)
-services/workload/riscv_snn/RiscvSnnRuntimeBridgeBackend.lo:  \
-	services/workload/riscv_snn/$(am__dirstamp) \
-	services/workload/riscv_snn/$(DEPDIR)/$(am__dirstamp)
-services/workload/riscv_snn/RiscvSnnShadowTransportExport.lo:  \
-	services/workload/riscv_snn/$(am__dirstamp) \
-	services/workload/riscv_snn/$(DEPDIR)/$(am__dirstamp)
-services/workload/riscv_snn/RiscvSnnShadowRuntimeServices.lo:  \
-	services/workload/riscv_snn/$(am__dirstamp) \
-	services/workload/riscv_snn/$(DEPDIR)/$(am__dirstamp)
-services/workload/riscv_snn/RiscvSnnWorkload.lo:  \
-	services/workload/riscv_snn/$(am__dirstamp) \
-	services/workload/riscv_snn/$(DEPDIR)/$(am__dirstamp)
-services/workload/snn/$(am__dirstamp):
-	@$(MKDIR_P) services/workload/snn
-	@: > services/workload/snn/$(am__dirstamp)
-services/workload/snn/$(DEPDIR)/$(am__dirstamp):
-	@$(MKDIR_P) services/workload/snn/$(DEPDIR)
-	@: > services/workload/snn/$(DEPDIR)/$(am__dirstamp)
-services/workload/snn/SnnWorkload.lo:  \
-	services/workload/snn/$(am__dirstamp) \
-	services/workload/snn/$(DEPDIR)/$(am__dirstamp)
-services/workload/stream/$(am__dirstamp):
-	@$(MKDIR_P) services/workload/stream
-	@: > services/workload/stream/$(am__dirstamp)
-services/workload/stream/$(DEPDIR)/$(am__dirstamp):
-	@$(MKDIR_P) services/workload/stream/$(DEPDIR)
-	@: > services/workload/stream/$(DEPDIR)/$(am__dirstamp)
-services/workload/stream/StreamWorkload.lo:  \
-	services/workload/stream/$(am__dirstamp) \
-	services/workload/stream/$(DEPDIR)/$(am__dirstamp)
-services/workload/traffic/$(am__dirstamp):
-	@$(MKDIR_P) services/workload/traffic
-	@: > services/workload/traffic/$(am__dirstamp)
-services/workload/traffic/$(DEPDIR)/$(am__dirstamp):
-	@$(MKDIR_P) services/workload/traffic/$(DEPDIR)
-	@: > services/workload/traffic/$(DEPDIR)/$(am__dirstamp)
-services/workload/traffic/TrafficWorkload.lo:  \
-	services/workload/traffic/$(am__dirstamp) \
-	services/workload/traffic/$(DEPDIR)/$(am__dirstamp)
-services/workload/traffic_mem/$(am__dirstamp):
-	@$(MKDIR_P) services/workload/traffic_mem
-	@: > services/workload/traffic_mem/$(am__dirstamp)
-services/workload/traffic_mem/$(DEPDIR)/$(am__dirstamp):
-	@$(MKDIR_P) services/workload/traffic_mem/$(DEPDIR)
-	@: > services/workload/traffic_mem/$(DEPDIR)/$(am__dirstamp)
-services/workload/traffic_mem/TrafficMemWorkload.lo:  \
-	services/workload/traffic_mem/$(am__dirstamp) \
-	services/workload/traffic_mem/$(DEPDIR)/$(am__dirstamp)
-services/workload/tensor/$(am__dirstamp):
-	@$(MKDIR_P) services/workload/tensor
-	@: > services/workload/tensor/$(am__dirstamp)
-services/workload/tensor/$(DEPDIR)/$(am__dirstamp):
-	@$(MKDIR_P) services/workload/tensor/$(DEPDIR)
-	@: > services/workload/tensor/$(DEPDIR)/$(am__dirstamp)
-services/workload/tensor/TensorWorkload.lo:  \
-	services/workload/tensor/$(am__dirstamp) \
-	services/workload/tensor/$(DEPDIR)/$(am__dirstamp)
-services/memory/sram_sim/model/$(am__dirstamp):
-	@$(MKDIR_P) services/memory/sram_sim/model
-	@: > services/memory/sram_sim/model/$(am__dirstamp)
-services/memory/sram_sim/model/$(DEPDIR)/$(am__dirstamp):
-	@$(MKDIR_P) services/memory/sram_sim/model/$(DEPDIR)
-	@: > services/memory/sram_sim/model/$(DEPDIR)/$(am__dirstamp)
-services/memory/sram_sim/model/BankedSramModel.lo:  \
-	services/memory/sram_sim/model/$(am__dirstamp) \
-	services/memory/sram_sim/model/$(DEPDIR)/$(am__dirstamp)
-services/local_storage/$(am__dirstamp):
-	@$(MKDIR_P) services/local_storage
-	@: > services/local_storage/$(am__dirstamp)
-services/local_storage/$(DEPDIR)/$(am__dirstamp):
-	@$(MKDIR_P) services/local_storage/$(DEPDIR)
-	@: > services/local_storage/$(DEPDIR)/$(am__dirstamp)
-services/local_storage/LocalStorageHierarchyController.lo:  \
-	services/local_storage/$(am__dirstamp) \
-	services/local_storage/$(DEPDIR)/$(am__dirstamp)
-services/local_storage/PeWeightObjectPlane.lo:  \
-	services/local_storage/$(am__dirstamp) \
-	services/local_storage/$(DEPDIR)/$(am__dirstamp)
-services/memory/$(am__dirstamp):
-	@$(MKDIR_P) services/memory
-	@: > services/memory/$(am__dirstamp)
-services/memory/$(DEPDIR)/$(am__dirstamp):
-	@$(MKDIR_P) services/memory/$(DEPDIR)
-	@: > services/memory/$(DEPDIR)/$(am__dirstamp)
-services/memory/DmaMemAccessProxy.lo: services/memory/$(am__dirstamp) \
-	services/memory/$(DEPDIR)/$(am__dirstamp)
-services/pe_fabric/$(am__dirstamp):
-	@$(MKDIR_P) services/pe_fabric
-	@: > services/pe_fabric/$(am__dirstamp)
-services/pe_fabric/$(DEPDIR)/$(am__dirstamp):
-	@$(MKDIR_P) services/pe_fabric/$(DEPDIR)
-	@: > services/pe_fabric/$(DEPDIR)/$(am__dirstamp)
-services/pe_fabric/PulseAgendaScorer.lo:  \
-	services/pe_fabric/$(am__dirstamp) \
-	services/pe_fabric/$(DEPDIR)/$(am__dirstamp)
-services/pe_fabric/PeSharedCoreFabric.lo:  \
-	services/pe_fabric/$(am__dirstamp) \
-	services/pe_fabric/$(DEPDIR)/$(am__dirstamp)
-services/memory/PeDmaScheduler.lo: services/memory/$(am__dirstamp) \
-	services/memory/$(DEPDIR)/$(am__dirstamp)
-services/memory/StandardMemAccess.lo: services/memory/$(am__dirstamp) \
-	services/memory/$(DEPDIR)/$(am__dirstamp)
+snn/synapse/route/$(am__dirstamp):
+	@$(MKDIR_P) snn/synapse/route
+	@: > snn/synapse/route/$(am__dirstamp)
+snn/synapse/route/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) snn/synapse/route/$(DEPDIR)
+	@: > snn/synapse/route/$(DEPDIR)/$(am__dirstamp)
+snn/synapse/route/SnnRouteProvider.lo:  \
+	snn/synapse/route/$(am__dirstamp) \
+	snn/synapse/route/$(DEPDIR)/$(am__dirstamp)
+snn/synapse/route/SpikeNocCodec.lo: snn/synapse/route/$(am__dirstamp) \
+	snn/synapse/route/$(DEPDIR)/$(am__dirstamp)
+snn/synapse/route/BcsrRouteBuilder.lo:  \
+	snn/synapse/route/$(am__dirstamp) \
+	snn/synapse/route/$(DEPDIR)/$(am__dirstamp)
+snn/synapse/route/StepBcsrReachability.lo:  \
+	snn/synapse/route/$(am__dirstamp) \
+	snn/synapse/route/$(DEPDIR)/$(am__dirstamp)
+snn/synapse/route/SynapseRouteSubsystem.lo:  \
+	snn/synapse/route/$(am__dirstamp) \
+	snn/synapse/route/$(DEPDIR)/$(am__dirstamp)
+research/route3d/$(am__dirstamp):
+	@$(MKDIR_P) research/route3d
+	@: > research/route3d/$(am__dirstamp)
+research/route3d/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) research/route3d/$(DEPDIR)
+	@: > research/route3d/$(DEPDIR)/$(am__dirstamp)
+research/route3d/SynapseRouteSubsystem3D.lo:  \
+	research/route3d/$(am__dirstamp) \
+	research/route3d/$(DEPDIR)/$(am__dirstamp)
+snn/stimulus/$(am__dirstamp):
+	@$(MKDIR_P) snn/stimulus
+	@: > snn/stimulus/$(am__dirstamp)
+snn/stimulus/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) snn/stimulus/$(DEPDIR)
+	@: > snn/stimulus/$(DEPDIR)/$(am__dirstamp)
+snn/stimulus/StepActivationSubsystem.lo: snn/stimulus/$(am__dirstamp) \
+	snn/stimulus/$(DEPDIR)/$(am__dirstamp)
+snn/stimulus/ExternalSpikeInputSubsystem.lo:  \
+	snn/stimulus/$(am__dirstamp) \
+	snn/stimulus/$(DEPDIR)/$(am__dirstamp)
+platform/noc/NocSubsystem.lo: platform/noc/$(am__dirstamp) \
+	platform/noc/$(DEPDIR)/$(am__dirstamp)
+snn/synapse/weights/WeightAccessor.lo:  \
+	snn/synapse/weights/$(am__dirstamp) \
+	snn/synapse/weights/$(DEPDIR)/$(am__dirstamp)
+snn/synapse/weights/WeightCacheOps.lo:  \
+	snn/synapse/weights/$(am__dirstamp) \
+	snn/synapse/weights/$(DEPDIR)/$(am__dirstamp)
+snn/synapse/weights/WeightMemorySubsystem.lo:  \
+	snn/synapse/weights/$(am__dirstamp) \
+	snn/synapse/weights/$(DEPDIR)/$(am__dirstamp)
+snn/synapse/weights/WeightMemorySubsystemVerification.lo:  \
+	snn/synapse/weights/$(am__dirstamp) \
+	snn/synapse/weights/$(DEPDIR)/$(am__dirstamp)
+snn/synapse/route/SpikeCommSubsystem.lo:  \
+	snn/synapse/route/$(am__dirstamp) \
+	snn/synapse/route/$(DEPDIR)/$(am__dirstamp)
+snn/synapse/route/SpikePacketBridge.lo:  \
+	snn/synapse/route/$(am__dirstamp) \
+	snn/synapse/route/$(DEPDIR)/$(am__dirstamp)
+workloads/$(am__dirstamp):
+	@$(MKDIR_P) workloads
+	@: > workloads/$(am__dirstamp)
+workloads/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) workloads/$(DEPDIR)
+	@: > workloads/$(DEPDIR)/$(am__dirstamp)
+workloads/CoreWorkloadFactory.lo: workloads/$(am__dirstamp) \
+	workloads/$(DEPDIR)/$(am__dirstamp)
+workloads/common/$(am__dirstamp):
+	@$(MKDIR_P) workloads/common
+	@: > workloads/common/$(am__dirstamp)
+workloads/common/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) workloads/common/$(DEPDIR)
+	@: > workloads/common/$(DEPDIR)/$(am__dirstamp)
+workloads/common/SnnAccelBackend.lo: workloads/common/$(am__dirstamp) \
+	workloads/common/$(DEPDIR)/$(am__dirstamp)
+workloads/layout/$(am__dirstamp):
+	@$(MKDIR_P) workloads/layout
+	@: > workloads/layout/$(am__dirstamp)
+workloads/layout/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) workloads/layout/$(DEPDIR)
+	@: > workloads/layout/$(DEPDIR)/$(am__dirstamp)
+workloads/layout/NormalizedNeuronLayout.lo:  \
+	workloads/layout/$(am__dirstamp) \
+	workloads/layout/$(DEPDIR)/$(am__dirstamp)
+workloads/riscv_snn/$(am__dirstamp):
+	@$(MKDIR_P) workloads/riscv_snn
+	@: > workloads/riscv_snn/$(am__dirstamp)
+workloads/riscv_snn/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) workloads/riscv_snn/$(DEPDIR)
+	@: > workloads/riscv_snn/$(DEPDIR)/$(am__dirstamp)
+workloads/riscv_snn/RiscvSnnBootDriver.lo:  \
+	workloads/riscv_snn/$(am__dirstamp) \
+	workloads/riscv_snn/$(DEPDIR)/$(am__dirstamp)
+workloads/riscv_snn/RiscvSnnFirmwareLoader.lo:  \
+	workloads/riscv_snn/$(am__dirstamp) \
+	workloads/riscv_snn/$(DEPDIR)/$(am__dirstamp)
+workloads/riscv_snn/RiscvSnnHart.lo:  \
+	workloads/riscv_snn/$(am__dirstamp) \
+	workloads/riscv_snn/$(DEPDIR)/$(am__dirstamp)
+workloads/riscv_snn/RiscvSnnIss.lo:  \
+	workloads/riscv_snn/$(am__dirstamp) \
+	workloads/riscv_snn/$(DEPDIR)/$(am__dirstamp)
+workloads/riscv_snn/RiscvSnnRuntimeBridgeBackend.lo:  \
+	workloads/riscv_snn/$(am__dirstamp) \
+	workloads/riscv_snn/$(DEPDIR)/$(am__dirstamp)
+workloads/riscv_snn/RiscvSnnShadowTransportExport.lo:  \
+	workloads/riscv_snn/$(am__dirstamp) \
+	workloads/riscv_snn/$(DEPDIR)/$(am__dirstamp)
+workloads/riscv_snn/RiscvSnnShadowRuntimeServices.lo:  \
+	workloads/riscv_snn/$(am__dirstamp) \
+	workloads/riscv_snn/$(DEPDIR)/$(am__dirstamp)
+workloads/riscv_snn/RiscvSnnWorkload.lo:  \
+	workloads/riscv_snn/$(am__dirstamp) \
+	workloads/riscv_snn/$(DEPDIR)/$(am__dirstamp)
+workloads/snn/$(am__dirstamp):
+	@$(MKDIR_P) workloads/snn
+	@: > workloads/snn/$(am__dirstamp)
+workloads/snn/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) workloads/snn/$(DEPDIR)
+	@: > workloads/snn/$(DEPDIR)/$(am__dirstamp)
+workloads/snn/SnnWorkload.lo: workloads/snn/$(am__dirstamp) \
+	workloads/snn/$(DEPDIR)/$(am__dirstamp)
+workloads/stream/$(am__dirstamp):
+	@$(MKDIR_P) workloads/stream
+	@: > workloads/stream/$(am__dirstamp)
+workloads/stream/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) workloads/stream/$(DEPDIR)
+	@: > workloads/stream/$(DEPDIR)/$(am__dirstamp)
+workloads/stream/StreamWorkload.lo: workloads/stream/$(am__dirstamp) \
+	workloads/stream/$(DEPDIR)/$(am__dirstamp)
+workloads/traffic/$(am__dirstamp):
+	@$(MKDIR_P) workloads/traffic
+	@: > workloads/traffic/$(am__dirstamp)
+workloads/traffic/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) workloads/traffic/$(DEPDIR)
+	@: > workloads/traffic/$(DEPDIR)/$(am__dirstamp)
+workloads/traffic/TrafficWorkload.lo:  \
+	workloads/traffic/$(am__dirstamp) \
+	workloads/traffic/$(DEPDIR)/$(am__dirstamp)
+workloads/traffic_mem/$(am__dirstamp):
+	@$(MKDIR_P) workloads/traffic_mem
+	@: > workloads/traffic_mem/$(am__dirstamp)
+workloads/traffic_mem/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) workloads/traffic_mem/$(DEPDIR)
+	@: > workloads/traffic_mem/$(DEPDIR)/$(am__dirstamp)
+workloads/traffic_mem/TrafficMemWorkload.lo:  \
+	workloads/traffic_mem/$(am__dirstamp) \
+	workloads/traffic_mem/$(DEPDIR)/$(am__dirstamp)
+workloads/tensor/$(am__dirstamp):
+	@$(MKDIR_P) workloads/tensor
+	@: > workloads/tensor/$(am__dirstamp)
+workloads/tensor/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) workloads/tensor/$(DEPDIR)
+	@: > workloads/tensor/$(DEPDIR)/$(am__dirstamp)
+workloads/tensor/TensorWorkload.lo: workloads/tensor/$(am__dirstamp) \
+	workloads/tensor/$(DEPDIR)/$(am__dirstamp)
+workloads/tensor/TensorWorkloadCollective.lo:  \
+	workloads/tensor/$(am__dirstamp) \
+	workloads/tensor/$(DEPDIR)/$(am__dirstamp)
+workloads/tensor/TensorWorkloadConfig.lo:  \
+	workloads/tensor/$(am__dirstamp) \
+	workloads/tensor/$(DEPDIR)/$(am__dirstamp)
+workloads/tensor/TensorWorkloadProgram.lo:  \
+	workloads/tensor/$(am__dirstamp) \
+	workloads/tensor/$(DEPDIR)/$(am__dirstamp)
+workloads/tensor/TensorWorkloadStats.lo:  \
+	workloads/tensor/$(am__dirstamp) \
+	workloads/tensor/$(DEPDIR)/$(am__dirstamp)
+platform/memory/sram_sim/model/$(am__dirstamp):
+	@$(MKDIR_P) platform/memory/sram_sim/model
+	@: > platform/memory/sram_sim/model/$(am__dirstamp)
+platform/memory/sram_sim/model/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) platform/memory/sram_sim/model/$(DEPDIR)
+	@: > platform/memory/sram_sim/model/$(DEPDIR)/$(am__dirstamp)
+platform/memory/sram_sim/model/BankedSramModel.lo:  \
+	platform/memory/sram_sim/model/$(am__dirstamp) \
+	platform/memory/sram_sim/model/$(DEPDIR)/$(am__dirstamp)
+research/local_storage/$(am__dirstamp):
+	@$(MKDIR_P) research/local_storage
+	@: > research/local_storage/$(am__dirstamp)
+research/local_storage/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) research/local_storage/$(DEPDIR)
+	@: > research/local_storage/$(DEPDIR)/$(am__dirstamp)
+research/local_storage/LocalStorageHierarchyController.lo:  \
+	research/local_storage/$(am__dirstamp) \
+	research/local_storage/$(DEPDIR)/$(am__dirstamp)
+research/local_storage/PeWeightObjectPlane.lo:  \
+	research/local_storage/$(am__dirstamp) \
+	research/local_storage/$(DEPDIR)/$(am__dirstamp)
+platform/memory/$(am__dirstamp):
+	@$(MKDIR_P) platform/memory
+	@: > platform/memory/$(am__dirstamp)
+platform/memory/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) platform/memory/$(DEPDIR)
+	@: > platform/memory/$(DEPDIR)/$(am__dirstamp)
+platform/memory/DmaMemAccessProxy.lo: platform/memory/$(am__dirstamp) \
+	platform/memory/$(DEPDIR)/$(am__dirstamp)
+research/pe_fabric/$(am__dirstamp):
+	@$(MKDIR_P) research/pe_fabric
+	@: > research/pe_fabric/$(am__dirstamp)
+research/pe_fabric/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) research/pe_fabric/$(DEPDIR)
+	@: > research/pe_fabric/$(DEPDIR)/$(am__dirstamp)
+research/pe_fabric/PulseAgendaScorer.lo:  \
+	research/pe_fabric/$(am__dirstamp) \
+	research/pe_fabric/$(DEPDIR)/$(am__dirstamp)
+research/pe_fabric/PeSharedCoreFabric.lo:  \
+	research/pe_fabric/$(am__dirstamp) \
+	research/pe_fabric/$(DEPDIR)/$(am__dirstamp)
+platform/memory/PeDmaScheduler.lo: platform/memory/$(am__dirstamp) \
+	platform/memory/$(DEPDIR)/$(am__dirstamp)
+platform/memory/StandardMemAccess.lo: platform/memory/$(am__dirstamp) \
+	platform/memory/$(DEPDIR)/$(am__dirstamp)
 
 libSnnDL.la: $(libSnnDL_la_OBJECTS) $(libSnnDL_la_DEPENDENCIES) $(EXTRA_libSnnDL_la_DEPENDENCIES) 
 	$(AM_V_CXXLD)$(libSnnDL_la_LINK) -rpath $(compdir) $(libSnnDL_la_OBJECTS) $(libSnnDL_la_LIBADD) $(LIBS)
@@ -1379,58 +1396,58 @@ mostlyclean-compile:
 	-rm -f components/multicore/*.lo
 	-rm -f components/noc/*.$(OBJEXT)
 	-rm -f components/noc/*.lo
-	-rm -f components/noc3d/*.$(OBJEXT)
-	-rm -f components/noc3d/*.lo
 	-rm -f components/stimulus/*.$(OBJEXT)
 	-rm -f components/stimulus/*.lo
-	-rm -f components/workload_stats/*.$(OBJEXT)
-	-rm -f components/workload_stats/*.lo
-	-rm -f compute/*.$(OBJEXT)
-	-rm -f compute/*.lo
-	-rm -f control/*.$(OBJEXT)
-	-rm -f control/*.lo
 	-rm -f events/*.$(OBJEXT)
 	-rm -f events/*.lo
-	-rm -f services/local_storage/*.$(OBJEXT)
-	-rm -f services/local_storage/*.lo
-	-rm -f services/memory/*.$(OBJEXT)
-	-rm -f services/memory/*.lo
-	-rm -f services/memory/sram_sim/model/*.$(OBJEXT)
-	-rm -f services/memory/sram_sim/model/*.lo
-	-rm -f services/noc/*.$(OBJEXT)
-	-rm -f services/noc/*.lo
-	-rm -f services/pe_fabric/*.$(OBJEXT)
-	-rm -f services/pe_fabric/*.lo
-	-rm -f services/stimulus/*.$(OBJEXT)
-	-rm -f services/stimulus/*.lo
-	-rm -f services/synapse/gas/*.$(OBJEXT)
-	-rm -f services/synapse/gas/*.lo
-	-rm -f services/synapse/route/*.$(OBJEXT)
-	-rm -f services/synapse/route/*.lo
-	-rm -f services/synapse/route3d/*.$(OBJEXT)
-	-rm -f services/synapse/route3d/*.lo
-	-rm -f services/synapse/stdmem/*.$(OBJEXT)
-	-rm -f services/synapse/stdmem/*.lo
-	-rm -f services/synapse/weights/*.$(OBJEXT)
-	-rm -f services/synapse/weights/*.lo
-	-rm -f services/workload/*.$(OBJEXT)
-	-rm -f services/workload/*.lo
-	-rm -f services/workload/common/*.$(OBJEXT)
-	-rm -f services/workload/common/*.lo
-	-rm -f services/workload/layout/*.$(OBJEXT)
-	-rm -f services/workload/layout/*.lo
-	-rm -f services/workload/riscv_snn/*.$(OBJEXT)
-	-rm -f services/workload/riscv_snn/*.lo
-	-rm -f services/workload/snn/*.$(OBJEXT)
-	-rm -f services/workload/snn/*.lo
-	-rm -f services/workload/stream/*.$(OBJEXT)
-	-rm -f services/workload/stream/*.lo
-	-rm -f services/workload/tensor/*.$(OBJEXT)
-	-rm -f services/workload/tensor/*.lo
-	-rm -f services/workload/traffic/*.$(OBJEXT)
-	-rm -f services/workload/traffic/*.lo
-	-rm -f services/workload/traffic_mem/*.$(OBJEXT)
-	-rm -f services/workload/traffic_mem/*.lo
+	-rm -f platform/core/*.$(OBJEXT)
+	-rm -f platform/core/*.lo
+	-rm -f platform/memory/*.$(OBJEXT)
+	-rm -f platform/memory/*.lo
+	-rm -f platform/memory/sram_sim/model/*.$(OBJEXT)
+	-rm -f platform/memory/sram_sim/model/*.lo
+	-rm -f platform/noc/*.$(OBJEXT)
+	-rm -f platform/noc/*.lo
+	-rm -f platform/stats/*.$(OBJEXT)
+	-rm -f platform/stats/*.lo
+	-rm -f research/local_storage/*.$(OBJEXT)
+	-rm -f research/local_storage/*.lo
+	-rm -f research/noc3d/*.$(OBJEXT)
+	-rm -f research/noc3d/*.lo
+	-rm -f research/pe_fabric/*.$(OBJEXT)
+	-rm -f research/pe_fabric/*.lo
+	-rm -f research/route3d/*.$(OBJEXT)
+	-rm -f research/route3d/*.lo
+	-rm -f snn/compute/*.$(OBJEXT)
+	-rm -f snn/compute/*.lo
+	-rm -f snn/stimulus/*.$(OBJEXT)
+	-rm -f snn/stimulus/*.lo
+	-rm -f snn/synapse/gas/*.$(OBJEXT)
+	-rm -f snn/synapse/gas/*.lo
+	-rm -f snn/synapse/route/*.$(OBJEXT)
+	-rm -f snn/synapse/route/*.lo
+	-rm -f snn/synapse/stdmem/*.$(OBJEXT)
+	-rm -f snn/synapse/stdmem/*.lo
+	-rm -f snn/synapse/weights/*.$(OBJEXT)
+	-rm -f snn/synapse/weights/*.lo
+	-rm -f workloads/*.$(OBJEXT)
+	-rm -f workloads/*.lo
+	-rm -f workloads/common/*.$(OBJEXT)
+	-rm -f workloads/common/*.lo
+	-rm -f workloads/layout/*.$(OBJEXT)
+	-rm -f workloads/layout/*.lo
+	-rm -f workloads/riscv_snn/*.$(OBJEXT)
+	-rm -f workloads/riscv_snn/*.lo
+	-rm -f workloads/snn/*.$(OBJEXT)
+	-rm -f workloads/snn/*.lo
+	-rm -f workloads/stream/*.$(OBJEXT)
+	-rm -f workloads/stream/*.lo
+	-rm -f workloads/tensor/*.$(OBJEXT)
+	-rm -f workloads/tensor/*.lo
+	-rm -f workloads/traffic/*.$(OBJEXT)
+	-rm -f workloads/traffic/*.lo
+	-rm -f workloads/traffic_mem/*.$(OBJEXT)
+	-rm -f workloads/traffic_mem/*.lo
 
 distclean-compile:
 	-rm -f *.tab.c
@@ -1441,80 +1458,84 @@ distclean-compile:
 @AMDEP_TRUE@@am__include@ @am__quote@components/$(DEPDIR)/MemKCalBench.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@components/$(DEPDIR)/MultiCorePE.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@components/$(DEPDIR)/SnnNIC.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@components/$(DEPDIR)/SnnPE.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@components/$(DEPDIR)/WeightLoader.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@components/gas/$(DEPDIR)/GlobalGasStepController.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@components/gather/$(DEPDIR)/GatherBufferIFConfig.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@components/gather/apply/$(DEPDIR)/DramAwareModel.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@components/multicore/$(DEPDIR)/MultiCorePEConfig.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@components/multicore/$(DEPDIR)/MultiCorePEObservability.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@components/noc/$(DEPDIR)/MulticastNIC.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@components/noc/$(DEPDIR)/MulticastRouter.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@components/noc/$(DEPDIR)/SimpleNetworkWrapper.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@components/noc/$(DEPDIR)/SnnNetworkAdapter.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@components/noc3d/$(DEPDIR)/HBMStackStub.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@components/noc3d/$(DEPDIR)/MulticastRouter3DNative.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@components/noc3d/$(DEPDIR)/Noc3DSmokeSink.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@components/noc3d/$(DEPDIR)/Noc3DSmokeSource.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@components/stimulus/$(DEPDIR)/SpikeSource.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@components/workload_stats/$(DEPDIR)/WorkloadStatsRegistry.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@compute/$(DEPDIR)/SnnComputeCore.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@compute/$(DEPDIR)/SnnCoreEngine.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@compute/$(DEPDIR)/SnnLearningCore.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@control/$(DEPDIR)/SnnPEApplyScatter.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@control/$(DEPDIR)/SnnPEOrchestrators.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@control/$(DEPDIR)/SnnPESubComponent.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@control/$(DEPDIR)/SnnPESubComponent_bcsr.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@control/$(DEPDIR)/SnnPESubComponent_routing.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@control/$(DEPDIR)/SnnPESubComponent_scheme1.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@control/$(DEPDIR)/SnnPESubComponent_spike.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@events/$(DEPDIR)/SimpleTestEvent.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@events/$(DEPDIR)/SpikeEventWrapper.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/local_storage/$(DEPDIR)/LocalStorageHierarchyController.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/local_storage/$(DEPDIR)/PeWeightObjectPlane.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/memory/$(DEPDIR)/DmaMemAccessProxy.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/memory/$(DEPDIR)/PeDmaScheduler.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/memory/$(DEPDIR)/StandardMemAccess.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/memory/sram_sim/model/$(DEPDIR)/BankedSramModel.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/noc/$(DEPDIR)/NocSubsystem.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/noc/$(DEPDIR)/OptimizedInternalRing.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/pe_fabric/$(DEPDIR)/PeSharedCoreFabric.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/pe_fabric/$(DEPDIR)/PulseAgendaScorer.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/stimulus/$(DEPDIR)/ExternalSpikeInputSubsystem.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/stimulus/$(DEPDIR)/StepActivationSubsystem.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/synapse/gas/$(DEPDIR)/AccumulatorOps.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/synapse/gas/$(DEPDIR)/GasEdgeCollector.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/synapse/gas/$(DEPDIR)/GasPhaseController.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/synapse/route/$(DEPDIR)/BcsrRouteBuilder.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/synapse/route/$(DEPDIR)/SnnRouteProvider.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/synapse/route/$(DEPDIR)/SpikeCommSubsystem.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/synapse/route/$(DEPDIR)/SpikeNocCodec.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/synapse/route/$(DEPDIR)/SpikePacketBridge.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/synapse/route/$(DEPDIR)/StepBcsrReachability.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/synapse/route/$(DEPDIR)/SynapseRouteSubsystem.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/synapse/route3d/$(DEPDIR)/SynapseRouteSubsystem3D.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/synapse/stdmem/$(DEPDIR)/SnnPESubComponent_mem.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/synapse/stdmem/$(DEPDIR)/StdMemEndpoint.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/synapse/weights/$(DEPDIR)/SnnBcsrWeightManager.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/synapse/weights/$(DEPDIR)/SnnWeightDiagnostics.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/synapse/weights/$(DEPDIR)/WeightAccessor.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/synapse/weights/$(DEPDIR)/WeightCacheOps.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/synapse/weights/$(DEPDIR)/WeightMemorySubsystem.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/workload/$(DEPDIR)/CoreWorkloadFactory.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/workload/common/$(DEPDIR)/SnnAccelBackend.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/workload/layout/$(DEPDIR)/NormalizedNeuronLayout.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/workload/riscv_snn/$(DEPDIR)/RiscvSnnBootDriver.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/workload/riscv_snn/$(DEPDIR)/RiscvSnnFirmwareLoader.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/workload/riscv_snn/$(DEPDIR)/RiscvSnnHart.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/workload/riscv_snn/$(DEPDIR)/RiscvSnnIss.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/workload/riscv_snn/$(DEPDIR)/RiscvSnnRuntimeBridgeBackend.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/workload/riscv_snn/$(DEPDIR)/RiscvSnnShadowRuntimeServices.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/workload/riscv_snn/$(DEPDIR)/RiscvSnnShadowTransportExport.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/workload/riscv_snn/$(DEPDIR)/RiscvSnnWorkload.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/workload/snn/$(DEPDIR)/SnnWorkload.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/workload/stream/$(DEPDIR)/StreamWorkload.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/workload/tensor/$(DEPDIR)/TensorWorkload.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/workload/traffic/$(DEPDIR)/TrafficWorkload.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@services/workload/traffic_mem/$(DEPDIR)/TrafficMemWorkload.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@platform/core/$(DEPDIR)/SnnPEApplyScatter.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@platform/core/$(DEPDIR)/SnnPEOrchestrators.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@platform/core/$(DEPDIR)/SnnPESubComponent.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@platform/core/$(DEPDIR)/SnnPESubComponentStats.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@platform/core/$(DEPDIR)/SnnPESubComponent_bcsr.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@platform/core/$(DEPDIR)/SnnPESubComponent_routing.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@platform/memory/$(DEPDIR)/DmaMemAccessProxy.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@platform/memory/$(DEPDIR)/PeDmaScheduler.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@platform/memory/$(DEPDIR)/StandardMemAccess.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@platform/memory/sram_sim/model/$(DEPDIR)/BankedSramModel.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@platform/noc/$(DEPDIR)/NocSubsystem.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@platform/noc/$(DEPDIR)/OptimizedInternalRing.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@platform/stats/$(DEPDIR)/WorkloadStatsRegistry.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@research/local_storage/$(DEPDIR)/LocalStorageHierarchyController.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@research/local_storage/$(DEPDIR)/PeWeightObjectPlane.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@research/noc3d/$(DEPDIR)/HBMStackStub.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@research/noc3d/$(DEPDIR)/MulticastRouter3DNative.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@research/noc3d/$(DEPDIR)/Noc3DSmokeSink.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@research/noc3d/$(DEPDIR)/Noc3DSmokeSource.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@research/pe_fabric/$(DEPDIR)/PeSharedCoreFabric.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@research/pe_fabric/$(DEPDIR)/PulseAgendaScorer.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@research/route3d/$(DEPDIR)/SynapseRouteSubsystem3D.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@snn/compute/$(DEPDIR)/SnnComputeCore.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@snn/compute/$(DEPDIR)/SnnCoreEngine.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@snn/compute/$(DEPDIR)/SnnLearningCore.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@snn/stimulus/$(DEPDIR)/ExternalSpikeInputSubsystem.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@snn/stimulus/$(DEPDIR)/StepActivationSubsystem.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@snn/synapse/gas/$(DEPDIR)/AccumulatorOps.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@snn/synapse/gas/$(DEPDIR)/GasEdgeCollector.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@snn/synapse/gas/$(DEPDIR)/GasPhaseController.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@snn/synapse/route/$(DEPDIR)/BcsrRouteBuilder.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@snn/synapse/route/$(DEPDIR)/SnnRouteProvider.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@snn/synapse/route/$(DEPDIR)/SpikeCommSubsystem.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@snn/synapse/route/$(DEPDIR)/SpikeNocCodec.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@snn/synapse/route/$(DEPDIR)/SpikePacketBridge.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@snn/synapse/route/$(DEPDIR)/StepBcsrReachability.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@snn/synapse/route/$(DEPDIR)/SynapseRouteSubsystem.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@snn/synapse/stdmem/$(DEPDIR)/SnnPESubComponent_mem.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@snn/synapse/stdmem/$(DEPDIR)/StdMemEndpoint.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@snn/synapse/weights/$(DEPDIR)/SnnBcsrWeightManager.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@snn/synapse/weights/$(DEPDIR)/SnnWeightDiagnostics.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@snn/synapse/weights/$(DEPDIR)/WeightAccessor.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@snn/synapse/weights/$(DEPDIR)/WeightCacheOps.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@snn/synapse/weights/$(DEPDIR)/WeightMemorySubsystem.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@snn/synapse/weights/$(DEPDIR)/WeightMemorySubsystemVerification.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@workloads/$(DEPDIR)/CoreWorkloadFactory.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@workloads/common/$(DEPDIR)/SnnAccelBackend.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@workloads/layout/$(DEPDIR)/NormalizedNeuronLayout.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@workloads/riscv_snn/$(DEPDIR)/RiscvSnnBootDriver.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@workloads/riscv_snn/$(DEPDIR)/RiscvSnnFirmwareLoader.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@workloads/riscv_snn/$(DEPDIR)/RiscvSnnHart.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@workloads/riscv_snn/$(DEPDIR)/RiscvSnnIss.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@workloads/riscv_snn/$(DEPDIR)/RiscvSnnRuntimeBridgeBackend.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@workloads/riscv_snn/$(DEPDIR)/RiscvSnnShadowRuntimeServices.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@workloads/riscv_snn/$(DEPDIR)/RiscvSnnShadowTransportExport.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@workloads/riscv_snn/$(DEPDIR)/RiscvSnnWorkload.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@workloads/snn/$(DEPDIR)/SnnWorkload.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@workloads/stream/$(DEPDIR)/StreamWorkload.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@workloads/tensor/$(DEPDIR)/TensorWorkload.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@workloads/tensor/$(DEPDIR)/TensorWorkloadCollective.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@workloads/tensor/$(DEPDIR)/TensorWorkloadConfig.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@workloads/tensor/$(DEPDIR)/TensorWorkloadProgram.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@workloads/tensor/$(DEPDIR)/TensorWorkloadStats.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@workloads/traffic/$(DEPDIR)/TrafficWorkload.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@workloads/traffic_mem/$(DEPDIR)/TrafficMemWorkload.Plo@am__quote@ # am--include-marker
 
 $(am__depfiles_remade):
 	@$(MKDIR_P) $(@D)
@@ -1557,32 +1578,32 @@ clean-libtool:
 	-rm -rf components/gather/apply/.libs components/gather/apply/_libs
 	-rm -rf components/multicore/.libs components/multicore/_libs
 	-rm -rf components/noc/.libs components/noc/_libs
-	-rm -rf components/noc3d/.libs components/noc3d/_libs
 	-rm -rf components/stimulus/.libs components/stimulus/_libs
-	-rm -rf components/workload_stats/.libs components/workload_stats/_libs
-	-rm -rf compute/.libs compute/_libs
-	-rm -rf control/.libs control/_libs
 	-rm -rf events/.libs events/_libs
-	-rm -rf services/local_storage/.libs services/local_storage/_libs
-	-rm -rf services/memory/.libs services/memory/_libs
-	-rm -rf services/memory/sram_sim/model/.libs services/memory/sram_sim/model/_libs
-	-rm -rf services/noc/.libs services/noc/_libs
-	-rm -rf services/pe_fabric/.libs services/pe_fabric/_libs
-	-rm -rf services/stimulus/.libs services/stimulus/_libs
-	-rm -rf services/synapse/gas/.libs services/synapse/gas/_libs
-	-rm -rf services/synapse/route/.libs services/synapse/route/_libs
-	-rm -rf services/synapse/route3d/.libs services/synapse/route3d/_libs
-	-rm -rf services/synapse/stdmem/.libs services/synapse/stdmem/_libs
-	-rm -rf services/synapse/weights/.libs services/synapse/weights/_libs
-	-rm -rf services/workload/.libs services/workload/_libs
-	-rm -rf services/workload/common/.libs services/workload/common/_libs
-	-rm -rf services/workload/layout/.libs services/workload/layout/_libs
-	-rm -rf services/workload/riscv_snn/.libs services/workload/riscv_snn/_libs
-	-rm -rf services/workload/snn/.libs services/workload/snn/_libs
-	-rm -rf services/workload/stream/.libs services/workload/stream/_libs
-	-rm -rf services/workload/tensor/.libs services/workload/tensor/_libs
-	-rm -rf services/workload/traffic/.libs services/workload/traffic/_libs
-	-rm -rf services/workload/traffic_mem/.libs services/workload/traffic_mem/_libs
+	-rm -rf platform/core/.libs platform/core/_libs
+	-rm -rf platform/memory/.libs platform/memory/_libs
+	-rm -rf platform/memory/sram_sim/model/.libs platform/memory/sram_sim/model/_libs
+	-rm -rf platform/noc/.libs platform/noc/_libs
+	-rm -rf platform/stats/.libs platform/stats/_libs
+	-rm -rf research/local_storage/.libs research/local_storage/_libs
+	-rm -rf research/noc3d/.libs research/noc3d/_libs
+	-rm -rf research/pe_fabric/.libs research/pe_fabric/_libs
+	-rm -rf research/route3d/.libs research/route3d/_libs
+	-rm -rf snn/compute/.libs snn/compute/_libs
+	-rm -rf snn/stimulus/.libs snn/stimulus/_libs
+	-rm -rf snn/synapse/gas/.libs snn/synapse/gas/_libs
+	-rm -rf snn/synapse/route/.libs snn/synapse/route/_libs
+	-rm -rf snn/synapse/stdmem/.libs snn/synapse/stdmem/_libs
+	-rm -rf snn/synapse/weights/.libs snn/synapse/weights/_libs
+	-rm -rf workloads/.libs workloads/_libs
+	-rm -rf workloads/common/.libs workloads/common/_libs
+	-rm -rf workloads/layout/.libs workloads/layout/_libs
+	-rm -rf workloads/riscv_snn/.libs workloads/riscv_snn/_libs
+	-rm -rf workloads/snn/.libs workloads/snn/_libs
+	-rm -rf workloads/stream/.libs workloads/stream/_libs
+	-rm -rf workloads/tensor/.libs workloads/tensor/_libs
+	-rm -rf workloads/traffic/.libs workloads/traffic/_libs
+	-rm -rf workloads/traffic_mem/.libs workloads/traffic_mem/_libs
 snippets-local: 
 
 ID: $(am__tagged_files)
@@ -1714,58 +1735,58 @@ distclean-generic:
 	-rm -f components/multicore/$(am__dirstamp)
 	-rm -f components/noc/$(DEPDIR)/$(am__dirstamp)
 	-rm -f components/noc/$(am__dirstamp)
-	-rm -f components/noc3d/$(DEPDIR)/$(am__dirstamp)
-	-rm -f components/noc3d/$(am__dirstamp)
 	-rm -f components/stimulus/$(DEPDIR)/$(am__dirstamp)
 	-rm -f components/stimulus/$(am__dirstamp)
-	-rm -f components/workload_stats/$(DEPDIR)/$(am__dirstamp)
-	-rm -f components/workload_stats/$(am__dirstamp)
-	-rm -f compute/$(DEPDIR)/$(am__dirstamp)
-	-rm -f compute/$(am__dirstamp)
-	-rm -f control/$(DEPDIR)/$(am__dirstamp)
-	-rm -f control/$(am__dirstamp)
 	-rm -f events/$(DEPDIR)/$(am__dirstamp)
 	-rm -f events/$(am__dirstamp)
-	-rm -f services/local_storage/$(DEPDIR)/$(am__dirstamp)
-	-rm -f services/local_storage/$(am__dirstamp)
-	-rm -f services/memory/$(DEPDIR)/$(am__dirstamp)
-	-rm -f services/memory/$(am__dirstamp)
-	-rm -f services/memory/sram_sim/model/$(DEPDIR)/$(am__dirstamp)
-	-rm -f services/memory/sram_sim/model/$(am__dirstamp)
-	-rm -f services/noc/$(DEPDIR)/$(am__dirstamp)
-	-rm -f services/noc/$(am__dirstamp)
-	-rm -f services/pe_fabric/$(DEPDIR)/$(am__dirstamp)
-	-rm -f services/pe_fabric/$(am__dirstamp)
-	-rm -f services/stimulus/$(DEPDIR)/$(am__dirstamp)
-	-rm -f services/stimulus/$(am__dirstamp)
-	-rm -f services/synapse/gas/$(DEPDIR)/$(am__dirstamp)
-	-rm -f services/synapse/gas/$(am__dirstamp)
-	-rm -f services/synapse/route/$(DEPDIR)/$(am__dirstamp)
-	-rm -f services/synapse/route/$(am__dirstamp)
-	-rm -f services/synapse/route3d/$(DEPDIR)/$(am__dirstamp)
-	-rm -f services/synapse/route3d/$(am__dirstamp)
-	-rm -f services/synapse/stdmem/$(DEPDIR)/$(am__dirstamp)
-	-rm -f services/synapse/stdmem/$(am__dirstamp)
-	-rm -f services/synapse/weights/$(DEPDIR)/$(am__dirstamp)
-	-rm -f services/synapse/weights/$(am__dirstamp)
-	-rm -f services/workload/$(DEPDIR)/$(am__dirstamp)
-	-rm -f services/workload/$(am__dirstamp)
-	-rm -f services/workload/common/$(DEPDIR)/$(am__dirstamp)
-	-rm -f services/workload/common/$(am__dirstamp)
-	-rm -f services/workload/layout/$(DEPDIR)/$(am__dirstamp)
-	-rm -f services/workload/layout/$(am__dirstamp)
-	-rm -f services/workload/riscv_snn/$(DEPDIR)/$(am__dirstamp)
-	-rm -f services/workload/riscv_snn/$(am__dirstamp)
-	-rm -f services/workload/snn/$(DEPDIR)/$(am__dirstamp)
-	-rm -f services/workload/snn/$(am__dirstamp)
-	-rm -f services/workload/stream/$(DEPDIR)/$(am__dirstamp)
-	-rm -f services/workload/stream/$(am__dirstamp)
-	-rm -f services/workload/tensor/$(DEPDIR)/$(am__dirstamp)
-	-rm -f services/workload/tensor/$(am__dirstamp)
-	-rm -f services/workload/traffic/$(DEPDIR)/$(am__dirstamp)
-	-rm -f services/workload/traffic/$(am__dirstamp)
-	-rm -f services/workload/traffic_mem/$(DEPDIR)/$(am__dirstamp)
-	-rm -f services/workload/traffic_mem/$(am__dirstamp)
+	-rm -f platform/core/$(DEPDIR)/$(am__dirstamp)
+	-rm -f platform/core/$(am__dirstamp)
+	-rm -f platform/memory/$(DEPDIR)/$(am__dirstamp)
+	-rm -f platform/memory/$(am__dirstamp)
+	-rm -f platform/memory/sram_sim/model/$(DEPDIR)/$(am__dirstamp)
+	-rm -f platform/memory/sram_sim/model/$(am__dirstamp)
+	-rm -f platform/noc/$(DEPDIR)/$(am__dirstamp)
+	-rm -f platform/noc/$(am__dirstamp)
+	-rm -f platform/stats/$(DEPDIR)/$(am__dirstamp)
+	-rm -f platform/stats/$(am__dirstamp)
+	-rm -f research/local_storage/$(DEPDIR)/$(am__dirstamp)
+	-rm -f research/local_storage/$(am__dirstamp)
+	-rm -f research/noc3d/$(DEPDIR)/$(am__dirstamp)
+	-rm -f research/noc3d/$(am__dirstamp)
+	-rm -f research/pe_fabric/$(DEPDIR)/$(am__dirstamp)
+	-rm -f research/pe_fabric/$(am__dirstamp)
+	-rm -f research/route3d/$(DEPDIR)/$(am__dirstamp)
+	-rm -f research/route3d/$(am__dirstamp)
+	-rm -f snn/compute/$(DEPDIR)/$(am__dirstamp)
+	-rm -f snn/compute/$(am__dirstamp)
+	-rm -f snn/stimulus/$(DEPDIR)/$(am__dirstamp)
+	-rm -f snn/stimulus/$(am__dirstamp)
+	-rm -f snn/synapse/gas/$(DEPDIR)/$(am__dirstamp)
+	-rm -f snn/synapse/gas/$(am__dirstamp)
+	-rm -f snn/synapse/route/$(DEPDIR)/$(am__dirstamp)
+	-rm -f snn/synapse/route/$(am__dirstamp)
+	-rm -f snn/synapse/stdmem/$(DEPDIR)/$(am__dirstamp)
+	-rm -f snn/synapse/stdmem/$(am__dirstamp)
+	-rm -f snn/synapse/weights/$(DEPDIR)/$(am__dirstamp)
+	-rm -f snn/synapse/weights/$(am__dirstamp)
+	-rm -f workloads/$(DEPDIR)/$(am__dirstamp)
+	-rm -f workloads/$(am__dirstamp)
+	-rm -f workloads/common/$(DEPDIR)/$(am__dirstamp)
+	-rm -f workloads/common/$(am__dirstamp)
+	-rm -f workloads/layout/$(DEPDIR)/$(am__dirstamp)
+	-rm -f workloads/layout/$(am__dirstamp)
+	-rm -f workloads/riscv_snn/$(DEPDIR)/$(am__dirstamp)
+	-rm -f workloads/riscv_snn/$(am__dirstamp)
+	-rm -f workloads/snn/$(DEPDIR)/$(am__dirstamp)
+	-rm -f workloads/snn/$(am__dirstamp)
+	-rm -f workloads/stream/$(DEPDIR)/$(am__dirstamp)
+	-rm -f workloads/stream/$(am__dirstamp)
+	-rm -f workloads/tensor/$(DEPDIR)/$(am__dirstamp)
+	-rm -f workloads/tensor/$(am__dirstamp)
+	-rm -f workloads/traffic/$(DEPDIR)/$(am__dirstamp)
+	-rm -f workloads/traffic/$(am__dirstamp)
+	-rm -f workloads/traffic_mem/$(DEPDIR)/$(am__dirstamp)
+	-rm -f workloads/traffic_mem/$(am__dirstamp)
 
 maintainer-clean-generic:
 	@echo "This command is intended for maintainers to use"
@@ -1782,80 +1803,84 @@ distclean: distclean-am
 	-rm -f components/$(DEPDIR)/MemKCalBench.Plo
 	-rm -f components/$(DEPDIR)/MultiCorePE.Plo
 	-rm -f components/$(DEPDIR)/SnnNIC.Plo
-	-rm -f components/$(DEPDIR)/SnnPE.Plo
 	-rm -f components/$(DEPDIR)/WeightLoader.Plo
 	-rm -f components/gas/$(DEPDIR)/GlobalGasStepController.Plo
 	-rm -f components/gather/$(DEPDIR)/GatherBufferIFConfig.Plo
 	-rm -f components/gather/apply/$(DEPDIR)/DramAwareModel.Plo
 	-rm -f components/multicore/$(DEPDIR)/MultiCorePEConfig.Plo
+	-rm -f components/multicore/$(DEPDIR)/MultiCorePEObservability.Plo
 	-rm -f components/noc/$(DEPDIR)/MulticastNIC.Plo
 	-rm -f components/noc/$(DEPDIR)/MulticastRouter.Plo
 	-rm -f components/noc/$(DEPDIR)/SimpleNetworkWrapper.Plo
 	-rm -f components/noc/$(DEPDIR)/SnnNetworkAdapter.Plo
-	-rm -f components/noc3d/$(DEPDIR)/HBMStackStub.Plo
-	-rm -f components/noc3d/$(DEPDIR)/MulticastRouter3DNative.Plo
-	-rm -f components/noc3d/$(DEPDIR)/Noc3DSmokeSink.Plo
-	-rm -f components/noc3d/$(DEPDIR)/Noc3DSmokeSource.Plo
 	-rm -f components/stimulus/$(DEPDIR)/SpikeSource.Plo
-	-rm -f components/workload_stats/$(DEPDIR)/WorkloadStatsRegistry.Plo
-	-rm -f compute/$(DEPDIR)/SnnComputeCore.Plo
-	-rm -f compute/$(DEPDIR)/SnnCoreEngine.Plo
-	-rm -f compute/$(DEPDIR)/SnnLearningCore.Plo
-	-rm -f control/$(DEPDIR)/SnnPEApplyScatter.Plo
-	-rm -f control/$(DEPDIR)/SnnPEOrchestrators.Plo
-	-rm -f control/$(DEPDIR)/SnnPESubComponent.Plo
-	-rm -f control/$(DEPDIR)/SnnPESubComponent_bcsr.Plo
-	-rm -f control/$(DEPDIR)/SnnPESubComponent_routing.Plo
-	-rm -f control/$(DEPDIR)/SnnPESubComponent_scheme1.Plo
-	-rm -f control/$(DEPDIR)/SnnPESubComponent_spike.Plo
 	-rm -f events/$(DEPDIR)/SimpleTestEvent.Plo
 	-rm -f events/$(DEPDIR)/SpikeEventWrapper.Plo
-	-rm -f services/local_storage/$(DEPDIR)/LocalStorageHierarchyController.Plo
-	-rm -f services/local_storage/$(DEPDIR)/PeWeightObjectPlane.Plo
-	-rm -f services/memory/$(DEPDIR)/DmaMemAccessProxy.Plo
-	-rm -f services/memory/$(DEPDIR)/PeDmaScheduler.Plo
-	-rm -f services/memory/$(DEPDIR)/StandardMemAccess.Plo
-	-rm -f services/memory/sram_sim/model/$(DEPDIR)/BankedSramModel.Plo
-	-rm -f services/noc/$(DEPDIR)/NocSubsystem.Plo
-	-rm -f services/noc/$(DEPDIR)/OptimizedInternalRing.Plo
-	-rm -f services/pe_fabric/$(DEPDIR)/PeSharedCoreFabric.Plo
-	-rm -f services/pe_fabric/$(DEPDIR)/PulseAgendaScorer.Plo
-	-rm -f services/stimulus/$(DEPDIR)/ExternalSpikeInputSubsystem.Plo
-	-rm -f services/stimulus/$(DEPDIR)/StepActivationSubsystem.Plo
-	-rm -f services/synapse/gas/$(DEPDIR)/AccumulatorOps.Plo
-	-rm -f services/synapse/gas/$(DEPDIR)/GasEdgeCollector.Plo
-	-rm -f services/synapse/gas/$(DEPDIR)/GasPhaseController.Plo
-	-rm -f services/synapse/route/$(DEPDIR)/BcsrRouteBuilder.Plo
-	-rm -f services/synapse/route/$(DEPDIR)/SnnRouteProvider.Plo
-	-rm -f services/synapse/route/$(DEPDIR)/SpikeCommSubsystem.Plo
-	-rm -f services/synapse/route/$(DEPDIR)/SpikeNocCodec.Plo
-	-rm -f services/synapse/route/$(DEPDIR)/SpikePacketBridge.Plo
-	-rm -f services/synapse/route/$(DEPDIR)/StepBcsrReachability.Plo
-	-rm -f services/synapse/route/$(DEPDIR)/SynapseRouteSubsystem.Plo
-	-rm -f services/synapse/route3d/$(DEPDIR)/SynapseRouteSubsystem3D.Plo
-	-rm -f services/synapse/stdmem/$(DEPDIR)/SnnPESubComponent_mem.Plo
-	-rm -f services/synapse/stdmem/$(DEPDIR)/StdMemEndpoint.Plo
-	-rm -f services/synapse/weights/$(DEPDIR)/SnnBcsrWeightManager.Plo
-	-rm -f services/synapse/weights/$(DEPDIR)/SnnWeightDiagnostics.Plo
-	-rm -f services/synapse/weights/$(DEPDIR)/WeightAccessor.Plo
-	-rm -f services/synapse/weights/$(DEPDIR)/WeightCacheOps.Plo
-	-rm -f services/synapse/weights/$(DEPDIR)/WeightMemorySubsystem.Plo
-	-rm -f services/workload/$(DEPDIR)/CoreWorkloadFactory.Plo
-	-rm -f services/workload/common/$(DEPDIR)/SnnAccelBackend.Plo
-	-rm -f services/workload/layout/$(DEPDIR)/NormalizedNeuronLayout.Plo
-	-rm -f services/workload/riscv_snn/$(DEPDIR)/RiscvSnnBootDriver.Plo
-	-rm -f services/workload/riscv_snn/$(DEPDIR)/RiscvSnnFirmwareLoader.Plo
-	-rm -f services/workload/riscv_snn/$(DEPDIR)/RiscvSnnHart.Plo
-	-rm -f services/workload/riscv_snn/$(DEPDIR)/RiscvSnnIss.Plo
-	-rm -f services/workload/riscv_snn/$(DEPDIR)/RiscvSnnRuntimeBridgeBackend.Plo
-	-rm -f services/workload/riscv_snn/$(DEPDIR)/RiscvSnnShadowRuntimeServices.Plo
-	-rm -f services/workload/riscv_snn/$(DEPDIR)/RiscvSnnShadowTransportExport.Plo
-	-rm -f services/workload/riscv_snn/$(DEPDIR)/RiscvSnnWorkload.Plo
-	-rm -f services/workload/snn/$(DEPDIR)/SnnWorkload.Plo
-	-rm -f services/workload/stream/$(DEPDIR)/StreamWorkload.Plo
-	-rm -f services/workload/tensor/$(DEPDIR)/TensorWorkload.Plo
-	-rm -f services/workload/traffic/$(DEPDIR)/TrafficWorkload.Plo
-	-rm -f services/workload/traffic_mem/$(DEPDIR)/TrafficMemWorkload.Plo
+	-rm -f platform/core/$(DEPDIR)/SnnPEApplyScatter.Plo
+	-rm -f platform/core/$(DEPDIR)/SnnPEOrchestrators.Plo
+	-rm -f platform/core/$(DEPDIR)/SnnPESubComponent.Plo
+	-rm -f platform/core/$(DEPDIR)/SnnPESubComponentStats.Plo
+	-rm -f platform/core/$(DEPDIR)/SnnPESubComponent_bcsr.Plo
+	-rm -f platform/core/$(DEPDIR)/SnnPESubComponent_routing.Plo
+	-rm -f platform/memory/$(DEPDIR)/DmaMemAccessProxy.Plo
+	-rm -f platform/memory/$(DEPDIR)/PeDmaScheduler.Plo
+	-rm -f platform/memory/$(DEPDIR)/StandardMemAccess.Plo
+	-rm -f platform/memory/sram_sim/model/$(DEPDIR)/BankedSramModel.Plo
+	-rm -f platform/noc/$(DEPDIR)/NocSubsystem.Plo
+	-rm -f platform/noc/$(DEPDIR)/OptimizedInternalRing.Plo
+	-rm -f platform/stats/$(DEPDIR)/WorkloadStatsRegistry.Plo
+	-rm -f research/local_storage/$(DEPDIR)/LocalStorageHierarchyController.Plo
+	-rm -f research/local_storage/$(DEPDIR)/PeWeightObjectPlane.Plo
+	-rm -f research/noc3d/$(DEPDIR)/HBMStackStub.Plo
+	-rm -f research/noc3d/$(DEPDIR)/MulticastRouter3DNative.Plo
+	-rm -f research/noc3d/$(DEPDIR)/Noc3DSmokeSink.Plo
+	-rm -f research/noc3d/$(DEPDIR)/Noc3DSmokeSource.Plo
+	-rm -f research/pe_fabric/$(DEPDIR)/PeSharedCoreFabric.Plo
+	-rm -f research/pe_fabric/$(DEPDIR)/PulseAgendaScorer.Plo
+	-rm -f research/route3d/$(DEPDIR)/SynapseRouteSubsystem3D.Plo
+	-rm -f snn/compute/$(DEPDIR)/SnnComputeCore.Plo
+	-rm -f snn/compute/$(DEPDIR)/SnnCoreEngine.Plo
+	-rm -f snn/compute/$(DEPDIR)/SnnLearningCore.Plo
+	-rm -f snn/stimulus/$(DEPDIR)/ExternalSpikeInputSubsystem.Plo
+	-rm -f snn/stimulus/$(DEPDIR)/StepActivationSubsystem.Plo
+	-rm -f snn/synapse/gas/$(DEPDIR)/AccumulatorOps.Plo
+	-rm -f snn/synapse/gas/$(DEPDIR)/GasEdgeCollector.Plo
+	-rm -f snn/synapse/gas/$(DEPDIR)/GasPhaseController.Plo
+	-rm -f snn/synapse/route/$(DEPDIR)/BcsrRouteBuilder.Plo
+	-rm -f snn/synapse/route/$(DEPDIR)/SnnRouteProvider.Plo
+	-rm -f snn/synapse/route/$(DEPDIR)/SpikeCommSubsystem.Plo
+	-rm -f snn/synapse/route/$(DEPDIR)/SpikeNocCodec.Plo
+	-rm -f snn/synapse/route/$(DEPDIR)/SpikePacketBridge.Plo
+	-rm -f snn/synapse/route/$(DEPDIR)/StepBcsrReachability.Plo
+	-rm -f snn/synapse/route/$(DEPDIR)/SynapseRouteSubsystem.Plo
+	-rm -f snn/synapse/stdmem/$(DEPDIR)/SnnPESubComponent_mem.Plo
+	-rm -f snn/synapse/stdmem/$(DEPDIR)/StdMemEndpoint.Plo
+	-rm -f snn/synapse/weights/$(DEPDIR)/SnnBcsrWeightManager.Plo
+	-rm -f snn/synapse/weights/$(DEPDIR)/SnnWeightDiagnostics.Plo
+	-rm -f snn/synapse/weights/$(DEPDIR)/WeightAccessor.Plo
+	-rm -f snn/synapse/weights/$(DEPDIR)/WeightCacheOps.Plo
+	-rm -f snn/synapse/weights/$(DEPDIR)/WeightMemorySubsystem.Plo
+	-rm -f snn/synapse/weights/$(DEPDIR)/WeightMemorySubsystemVerification.Plo
+	-rm -f workloads/$(DEPDIR)/CoreWorkloadFactory.Plo
+	-rm -f workloads/common/$(DEPDIR)/SnnAccelBackend.Plo
+	-rm -f workloads/layout/$(DEPDIR)/NormalizedNeuronLayout.Plo
+	-rm -f workloads/riscv_snn/$(DEPDIR)/RiscvSnnBootDriver.Plo
+	-rm -f workloads/riscv_snn/$(DEPDIR)/RiscvSnnFirmwareLoader.Plo
+	-rm -f workloads/riscv_snn/$(DEPDIR)/RiscvSnnHart.Plo
+	-rm -f workloads/riscv_snn/$(DEPDIR)/RiscvSnnIss.Plo
+	-rm -f workloads/riscv_snn/$(DEPDIR)/RiscvSnnRuntimeBridgeBackend.Plo
+	-rm -f workloads/riscv_snn/$(DEPDIR)/RiscvSnnShadowRuntimeServices.Plo
+	-rm -f workloads/riscv_snn/$(DEPDIR)/RiscvSnnShadowTransportExport.Plo
+	-rm -f workloads/riscv_snn/$(DEPDIR)/RiscvSnnWorkload.Plo
+	-rm -f workloads/snn/$(DEPDIR)/SnnWorkload.Plo
+	-rm -f workloads/stream/$(DEPDIR)/StreamWorkload.Plo
+	-rm -f workloads/tensor/$(DEPDIR)/TensorWorkload.Plo
+	-rm -f workloads/tensor/$(DEPDIR)/TensorWorkloadCollective.Plo
+	-rm -f workloads/tensor/$(DEPDIR)/TensorWorkloadConfig.Plo
+	-rm -f workloads/tensor/$(DEPDIR)/TensorWorkloadProgram.Plo
+	-rm -f workloads/tensor/$(DEPDIR)/TensorWorkloadStats.Plo
+	-rm -f workloads/traffic/$(DEPDIR)/TrafficWorkload.Plo
+	-rm -f workloads/traffic_mem/$(DEPDIR)/TrafficMemWorkload.Plo
 	-rm -f Makefile
 distclean-am: clean-am distclean-compile distclean-generic \
 	distclean-tags
@@ -1907,80 +1932,84 @@ maintainer-clean: maintainer-clean-am
 	-rm -f components/$(DEPDIR)/MemKCalBench.Plo
 	-rm -f components/$(DEPDIR)/MultiCorePE.Plo
 	-rm -f components/$(DEPDIR)/SnnNIC.Plo
-	-rm -f components/$(DEPDIR)/SnnPE.Plo
 	-rm -f components/$(DEPDIR)/WeightLoader.Plo
 	-rm -f components/gas/$(DEPDIR)/GlobalGasStepController.Plo
 	-rm -f components/gather/$(DEPDIR)/GatherBufferIFConfig.Plo
 	-rm -f components/gather/apply/$(DEPDIR)/DramAwareModel.Plo
 	-rm -f components/multicore/$(DEPDIR)/MultiCorePEConfig.Plo
+	-rm -f components/multicore/$(DEPDIR)/MultiCorePEObservability.Plo
 	-rm -f components/noc/$(DEPDIR)/MulticastNIC.Plo
 	-rm -f components/noc/$(DEPDIR)/MulticastRouter.Plo
 	-rm -f components/noc/$(DEPDIR)/SimpleNetworkWrapper.Plo
 	-rm -f components/noc/$(DEPDIR)/SnnNetworkAdapter.Plo
-	-rm -f components/noc3d/$(DEPDIR)/HBMStackStub.Plo
-	-rm -f components/noc3d/$(DEPDIR)/MulticastRouter3DNative.Plo
-	-rm -f components/noc3d/$(DEPDIR)/Noc3DSmokeSink.Plo
-	-rm -f components/noc3d/$(DEPDIR)/Noc3DSmokeSource.Plo
 	-rm -f components/stimulus/$(DEPDIR)/SpikeSource.Plo
-	-rm -f components/workload_stats/$(DEPDIR)/WorkloadStatsRegistry.Plo
-	-rm -f compute/$(DEPDIR)/SnnComputeCore.Plo
-	-rm -f compute/$(DEPDIR)/SnnCoreEngine.Plo
-	-rm -f compute/$(DEPDIR)/SnnLearningCore.Plo
-	-rm -f control/$(DEPDIR)/SnnPEApplyScatter.Plo
-	-rm -f control/$(DEPDIR)/SnnPEOrchestrators.Plo
-	-rm -f control/$(DEPDIR)/SnnPESubComponent.Plo
-	-rm -f control/$(DEPDIR)/SnnPESubComponent_bcsr.Plo
-	-rm -f control/$(DEPDIR)/SnnPESubComponent_routing.Plo
-	-rm -f control/$(DEPDIR)/SnnPESubComponent_scheme1.Plo
-	-rm -f control/$(DEPDIR)/SnnPESubComponent_spike.Plo
 	-rm -f events/$(DEPDIR)/SimpleTestEvent.Plo
 	-rm -f events/$(DEPDIR)/SpikeEventWrapper.Plo
-	-rm -f services/local_storage/$(DEPDIR)/LocalStorageHierarchyController.Plo
-	-rm -f services/local_storage/$(DEPDIR)/PeWeightObjectPlane.Plo
-	-rm -f services/memory/$(DEPDIR)/DmaMemAccessProxy.Plo
-	-rm -f services/memory/$(DEPDIR)/PeDmaScheduler.Plo
-	-rm -f services/memory/$(DEPDIR)/StandardMemAccess.Plo
-	-rm -f services/memory/sram_sim/model/$(DEPDIR)/BankedSramModel.Plo
-	-rm -f services/noc/$(DEPDIR)/NocSubsystem.Plo
-	-rm -f services/noc/$(DEPDIR)/OptimizedInternalRing.Plo
-	-rm -f services/pe_fabric/$(DEPDIR)/PeSharedCoreFabric.Plo
-	-rm -f services/pe_fabric/$(DEPDIR)/PulseAgendaScorer.Plo
-	-rm -f services/stimulus/$(DEPDIR)/ExternalSpikeInputSubsystem.Plo
-	-rm -f services/stimulus/$(DEPDIR)/StepActivationSubsystem.Plo
-	-rm -f services/synapse/gas/$(DEPDIR)/AccumulatorOps.Plo
-	-rm -f services/synapse/gas/$(DEPDIR)/GasEdgeCollector.Plo
-	-rm -f services/synapse/gas/$(DEPDIR)/GasPhaseController.Plo
-	-rm -f services/synapse/route/$(DEPDIR)/BcsrRouteBuilder.Plo
-	-rm -f services/synapse/route/$(DEPDIR)/SnnRouteProvider.Plo
-	-rm -f services/synapse/route/$(DEPDIR)/SpikeCommSubsystem.Plo
-	-rm -f services/synapse/route/$(DEPDIR)/SpikeNocCodec.Plo
-	-rm -f services/synapse/route/$(DEPDIR)/SpikePacketBridge.Plo
-	-rm -f services/synapse/route/$(DEPDIR)/StepBcsrReachability.Plo
-	-rm -f services/synapse/route/$(DEPDIR)/SynapseRouteSubsystem.Plo
-	-rm -f services/synapse/route3d/$(DEPDIR)/SynapseRouteSubsystem3D.Plo
-	-rm -f services/synapse/stdmem/$(DEPDIR)/SnnPESubComponent_mem.Plo
-	-rm -f services/synapse/stdmem/$(DEPDIR)/StdMemEndpoint.Plo
-	-rm -f services/synapse/weights/$(DEPDIR)/SnnBcsrWeightManager.Plo
-	-rm -f services/synapse/weights/$(DEPDIR)/SnnWeightDiagnostics.Plo
-	-rm -f services/synapse/weights/$(DEPDIR)/WeightAccessor.Plo
-	-rm -f services/synapse/weights/$(DEPDIR)/WeightCacheOps.Plo
-	-rm -f services/synapse/weights/$(DEPDIR)/WeightMemorySubsystem.Plo
-	-rm -f services/workload/$(DEPDIR)/CoreWorkloadFactory.Plo
-	-rm -f services/workload/common/$(DEPDIR)/SnnAccelBackend.Plo
-	-rm -f services/workload/layout/$(DEPDIR)/NormalizedNeuronLayout.Plo
-	-rm -f services/workload/riscv_snn/$(DEPDIR)/RiscvSnnBootDriver.Plo
-	-rm -f services/workload/riscv_snn/$(DEPDIR)/RiscvSnnFirmwareLoader.Plo
-	-rm -f services/workload/riscv_snn/$(DEPDIR)/RiscvSnnHart.Plo
-	-rm -f services/workload/riscv_snn/$(DEPDIR)/RiscvSnnIss.Plo
-	-rm -f services/workload/riscv_snn/$(DEPDIR)/RiscvSnnRuntimeBridgeBackend.Plo
-	-rm -f services/workload/riscv_snn/$(DEPDIR)/RiscvSnnShadowRuntimeServices.Plo
-	-rm -f services/workload/riscv_snn/$(DEPDIR)/RiscvSnnShadowTransportExport.Plo
-	-rm -f services/workload/riscv_snn/$(DEPDIR)/RiscvSnnWorkload.Plo
-	-rm -f services/workload/snn/$(DEPDIR)/SnnWorkload.Plo
-	-rm -f services/workload/stream/$(DEPDIR)/StreamWorkload.Plo
-	-rm -f services/workload/tensor/$(DEPDIR)/TensorWorkload.Plo
-	-rm -f services/workload/traffic/$(DEPDIR)/TrafficWorkload.Plo
-	-rm -f services/workload/traffic_mem/$(DEPDIR)/TrafficMemWorkload.Plo
+	-rm -f platform/core/$(DEPDIR)/SnnPEApplyScatter.Plo
+	-rm -f platform/core/$(DEPDIR)/SnnPEOrchestrators.Plo
+	-rm -f platform/core/$(DEPDIR)/SnnPESubComponent.Plo
+	-rm -f platform/core/$(DEPDIR)/SnnPESubComponentStats.Plo
+	-rm -f platform/core/$(DEPDIR)/SnnPESubComponent_bcsr.Plo
+	-rm -f platform/core/$(DEPDIR)/SnnPESubComponent_routing.Plo
+	-rm -f platform/memory/$(DEPDIR)/DmaMemAccessProxy.Plo
+	-rm -f platform/memory/$(DEPDIR)/PeDmaScheduler.Plo
+	-rm -f platform/memory/$(DEPDIR)/StandardMemAccess.Plo
+	-rm -f platform/memory/sram_sim/model/$(DEPDIR)/BankedSramModel.Plo
+	-rm -f platform/noc/$(DEPDIR)/NocSubsystem.Plo
+	-rm -f platform/noc/$(DEPDIR)/OptimizedInternalRing.Plo
+	-rm -f platform/stats/$(DEPDIR)/WorkloadStatsRegistry.Plo
+	-rm -f research/local_storage/$(DEPDIR)/LocalStorageHierarchyController.Plo
+	-rm -f research/local_storage/$(DEPDIR)/PeWeightObjectPlane.Plo
+	-rm -f research/noc3d/$(DEPDIR)/HBMStackStub.Plo
+	-rm -f research/noc3d/$(DEPDIR)/MulticastRouter3DNative.Plo
+	-rm -f research/noc3d/$(DEPDIR)/Noc3DSmokeSink.Plo
+	-rm -f research/noc3d/$(DEPDIR)/Noc3DSmokeSource.Plo
+	-rm -f research/pe_fabric/$(DEPDIR)/PeSharedCoreFabric.Plo
+	-rm -f research/pe_fabric/$(DEPDIR)/PulseAgendaScorer.Plo
+	-rm -f research/route3d/$(DEPDIR)/SynapseRouteSubsystem3D.Plo
+	-rm -f snn/compute/$(DEPDIR)/SnnComputeCore.Plo
+	-rm -f snn/compute/$(DEPDIR)/SnnCoreEngine.Plo
+	-rm -f snn/compute/$(DEPDIR)/SnnLearningCore.Plo
+	-rm -f snn/stimulus/$(DEPDIR)/ExternalSpikeInputSubsystem.Plo
+	-rm -f snn/stimulus/$(DEPDIR)/StepActivationSubsystem.Plo
+	-rm -f snn/synapse/gas/$(DEPDIR)/AccumulatorOps.Plo
+	-rm -f snn/synapse/gas/$(DEPDIR)/GasEdgeCollector.Plo
+	-rm -f snn/synapse/gas/$(DEPDIR)/GasPhaseController.Plo
+	-rm -f snn/synapse/route/$(DEPDIR)/BcsrRouteBuilder.Plo
+	-rm -f snn/synapse/route/$(DEPDIR)/SnnRouteProvider.Plo
+	-rm -f snn/synapse/route/$(DEPDIR)/SpikeCommSubsystem.Plo
+	-rm -f snn/synapse/route/$(DEPDIR)/SpikeNocCodec.Plo
+	-rm -f snn/synapse/route/$(DEPDIR)/SpikePacketBridge.Plo
+	-rm -f snn/synapse/route/$(DEPDIR)/StepBcsrReachability.Plo
+	-rm -f snn/synapse/route/$(DEPDIR)/SynapseRouteSubsystem.Plo
+	-rm -f snn/synapse/stdmem/$(DEPDIR)/SnnPESubComponent_mem.Plo
+	-rm -f snn/synapse/stdmem/$(DEPDIR)/StdMemEndpoint.Plo
+	-rm -f snn/synapse/weights/$(DEPDIR)/SnnBcsrWeightManager.Plo
+	-rm -f snn/synapse/weights/$(DEPDIR)/SnnWeightDiagnostics.Plo
+	-rm -f snn/synapse/weights/$(DEPDIR)/WeightAccessor.Plo
+	-rm -f snn/synapse/weights/$(DEPDIR)/WeightCacheOps.Plo
+	-rm -f snn/synapse/weights/$(DEPDIR)/WeightMemorySubsystem.Plo
+	-rm -f snn/synapse/weights/$(DEPDIR)/WeightMemorySubsystemVerification.Plo
+	-rm -f workloads/$(DEPDIR)/CoreWorkloadFactory.Plo
+	-rm -f workloads/common/$(DEPDIR)/SnnAccelBackend.Plo
+	-rm -f workloads/layout/$(DEPDIR)/NormalizedNeuronLayout.Plo
+	-rm -f workloads/riscv_snn/$(DEPDIR)/RiscvSnnBootDriver.Plo
+	-rm -f workloads/riscv_snn/$(DEPDIR)/RiscvSnnFirmwareLoader.Plo
+	-rm -f workloads/riscv_snn/$(DEPDIR)/RiscvSnnHart.Plo
+	-rm -f workloads/riscv_snn/$(DEPDIR)/RiscvSnnIss.Plo
+	-rm -f workloads/riscv_snn/$(DEPDIR)/RiscvSnnRuntimeBridgeBackend.Plo
+	-rm -f workloads/riscv_snn/$(DEPDIR)/RiscvSnnShadowRuntimeServices.Plo
+	-rm -f workloads/riscv_snn/$(DEPDIR)/RiscvSnnShadowTransportExport.Plo
+	-rm -f workloads/riscv_snn/$(DEPDIR)/RiscvSnnWorkload.Plo
+	-rm -f workloads/snn/$(DEPDIR)/SnnWorkload.Plo
+	-rm -f workloads/stream/$(DEPDIR)/StreamWorkload.Plo
+	-rm -f workloads/tensor/$(DEPDIR)/TensorWorkload.Plo
+	-rm -f workloads/tensor/$(DEPDIR)/TensorWorkloadCollective.Plo
+	-rm -f workloads/tensor/$(DEPDIR)/TensorWorkloadConfig.Plo
+	-rm -f workloads/tensor/$(DEPDIR)/TensorWorkloadProgram.Plo
+	-rm -f workloads/tensor/$(DEPDIR)/TensorWorkloadStats.Plo
+	-rm -f workloads/traffic/$(DEPDIR)/TrafficWorkload.Plo
+	-rm -f workloads/traffic_mem/$(DEPDIR)/TrafficMemWorkload.Plo
 	-rm -f Makefile
 maintainer-clean-am: distclean-am maintainer-clean-generic
 
@@ -2038,48 +2067,48 @@ test-riscv-snn-stimulus-gating:
 		-o $(builddir)/test_riscv_snn_stimulus_gating$(EXEEXT) && \
 		$(builddir)/test_riscv_snn_stimulus_gating$(EXEEXT) && \
 		rg -q "ex_rt\\.enabled = workloadAllowsSnnStimulus\\(cfg\\.workload_kind\\);" $(srcdir)/components/MultiCorePE.cc && \
-		rg -q "if \\(!rt_\\.enabled\\)" $(srcdir)/services/stimulus/ExternalSpikeInputSubsystem.cc
+		rg -q "if \\(!rt_\\.enabled\\)" $(srcdir)/snn/stimulus/ExternalSpikeInputSubsystem.cc
 
 test-riscv-snn-backend-timing-contract:
 	$(RISCV_SNN_TEST_LINK) $(srcdir)/tests/test_riscv_snn_backend_timing_contract.cc \
-		$(srcdir)/services/workload/common/SnnAccelBackend.cc \
-		$(srcdir)/services/workload/riscv_snn/RiscvSnnRuntimeBridgeBackend.cc \
-		$(srcdir)/services/workload/riscv_snn/RiscvSnnHart.cc \
-		$(srcdir)/services/workload/riscv_snn/RiscvSnnIss.cc \
+		$(srcdir)/workloads/common/SnnAccelBackend.cc \
+		$(srcdir)/workloads/riscv_snn/RiscvSnnRuntimeBridgeBackend.cc \
+		$(srcdir)/workloads/riscv_snn/RiscvSnnHart.cc \
+		$(srcdir)/workloads/riscv_snn/RiscvSnnIss.cc \
 		-o $(builddir)/test_riscv_snn_backend_timing_contract$(EXEEXT) && \
 		$(builddir)/test_riscv_snn_backend_timing_contract$(EXEEXT)
 
 test-riscv-snn-runtime-service-provider:
 	$(RISCV_SNN_TEST_LINK) $(srcdir)/tests/test_riscv_snn_runtime_service_provider.cc \
-		$(srcdir)/services/workload/common/SnnAccelBackend.cc \
-		$(srcdir)/services/workload/riscv_snn/RiscvSnnRuntimeBridgeBackend.cc \
-		$(srcdir)/services/workload/riscv_snn/RiscvSnnShadowTransportExport.cc \
+		$(srcdir)/workloads/common/SnnAccelBackend.cc \
+		$(srcdir)/workloads/riscv_snn/RiscvSnnRuntimeBridgeBackend.cc \
+		$(srcdir)/workloads/riscv_snn/RiscvSnnShadowTransportExport.cc \
 		-o $(builddir)/test_riscv_snn_runtime_service_provider$(EXEEXT) && \
 		$(builddir)/test_riscv_snn_runtime_service_provider$(EXEEXT)
 
 test-riscv-snn-runtime-bridge-backend:
 	$(RISCV_SNN_TEST_LINK) $(srcdir)/tests/test_riscv_snn_runtime_bridge_backend.cc \
-		$(srcdir)/services/workload/common/SnnAccelBackend.cc \
-		$(srcdir)/services/workload/riscv_snn/RiscvSnnRuntimeBridgeBackend.cc \
+		$(srcdir)/workloads/common/SnnAccelBackend.cc \
+		$(srcdir)/workloads/riscv_snn/RiscvSnnRuntimeBridgeBackend.cc \
 		-o $(builddir)/test_riscv_snn_runtime_bridge_backend$(EXEEXT) && \
 		$(builddir)/test_riscv_snn_runtime_bridge_backend$(EXEEXT)
 
 test-riscv-snn-firmware-protocol:
 	$(RISCV_SNN_TEST_LINK) $(srcdir)/tests/test_riscv_snn_firmware_protocol.cc \
-		$(srcdir)/services/workload/common/SnnAccelBackend.cc \
-		$(srcdir)/services/workload/riscv_snn/RiscvSnnRuntimeBridgeBackend.cc \
-		$(srcdir)/services/workload/riscv_snn/RiscvSnnHart.cc \
-		$(srcdir)/services/workload/riscv_snn/RiscvSnnIss.cc \
+		$(srcdir)/workloads/common/SnnAccelBackend.cc \
+		$(srcdir)/workloads/riscv_snn/RiscvSnnRuntimeBridgeBackend.cc \
+		$(srcdir)/workloads/riscv_snn/RiscvSnnHart.cc \
+		$(srcdir)/workloads/riscv_snn/RiscvSnnIss.cc \
 		-o $(builddir)/test_riscv_snn_firmware_protocol$(EXEEXT) && \
 		$(builddir)/test_riscv_snn_firmware_protocol$(EXEEXT)
 
 test-riscv-snn-toolchain-firmware-protocol:
 	$(RISCV_SNN_TEST_LINK) $(srcdir)/tests/test_riscv_snn_toolchain_firmware_protocol.cc \
-		$(srcdir)/services/workload/common/SnnAccelBackend.cc \
-		$(srcdir)/services/workload/riscv_snn/RiscvSnnRuntimeBridgeBackend.cc \
-		$(srcdir)/services/workload/riscv_snn/RiscvSnnHart.cc \
-		$(srcdir)/services/workload/riscv_snn/RiscvSnnIss.cc \
-		$(srcdir)/services/workload/riscv_snn/RiscvSnnFirmwareLoader.cc \
+		$(srcdir)/workloads/common/SnnAccelBackend.cc \
+		$(srcdir)/workloads/riscv_snn/RiscvSnnRuntimeBridgeBackend.cc \
+		$(srcdir)/workloads/riscv_snn/RiscvSnnHart.cc \
+		$(srcdir)/workloads/riscv_snn/RiscvSnnIss.cc \
+		$(srcdir)/workloads/riscv_snn/RiscvSnnFirmwareLoader.cc \
 		-o $(builddir)/test_riscv_snn_toolchain_firmware_protocol$(EXEEXT) && \
 		$(builddir)/test_riscv_snn_toolchain_firmware_protocol$(EXEEXT)
 

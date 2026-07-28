@@ -1,7 +1,7 @@
 // -*- c++ -*-
 
-#include "workload/riscv_snn/RiscvSnnElfWriter.h"
-#include "workload/riscv_snn/RiscvSnnSampleFirmware.h"
+#include "workloads/riscv_snn/RiscvSnnElfWriter.h"
+#include "workloads/riscv_snn/RiscvSnnSampleFirmware.h"
 
 #include <filesystem>
 #include <iostream>

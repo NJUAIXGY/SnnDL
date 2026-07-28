@@ -67,9 +67,9 @@
   - 在 `ICoreWorkload::Reporting` 增加两个可选回调：
     - `request_gas_end_gather(ctx, seq)`
     - `request_gas_end_scatter(ctx, seq)`
-- `sst_workspace/sst-elements/src/sst/elements/SnnDL/control/SnnPESubComponent.cc`
+- `sst_workspace/sst-elements/src/sst/elements/SnnDL/platform/core/SnnPESubComponent.cc`
   - 在 bindRuntime 时绑定上述回调，内部实现为 `stdmem_ep_->sendGasCmd(GasOp::EndGather/EndScatter, seq, ...)`
-- `sst_workspace/sst-elements/src/sst/elements/SnnDL/services/workload/snn/SnnWorkload.cc`
+- `sst_workspace/sst-elements/src/sst/elements/SnnDL/workloads/snn/SnnWorkload.cc`
   - BeginScatter 完成后请求 EndScatter（使 barrier 不再被固定 scatter 周期拖慢）
   - Gather：在 Gather 阶段采用“静默收敛（quiesce）”策略请求 EndGather（默认一个保守阈值；可后续再加参数化）
 

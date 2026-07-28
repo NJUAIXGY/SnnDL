@@ -10,7 +10,7 @@
 #include <sst/core/params.h>
 
 #include "WorkloadConfig.h"
-#include "services/memory/PeDmaScheduler.h"
+#include "platform/memory/PeDmaScheduler.h"
 
 namespace SST { namespace SnnDL {
 
@@ -27,6 +27,7 @@ MultiCorePEConfig parseMultiCorePEConfig(const SST::Params& params) {
     c.total_nodes = params.find<int>("total_nodes", 1);
     c.global_neuron_base = params.find<uint64_t>("global_neuron_base", 0);
     c.base_addr = params.find<uint64_t>("base_addr", 0);
+    c.per_core_stride = params.find<uint64_t>("per_core_stride", 0);
     c.sim_stop_ns = params.find<uint64_t>("sim_stop_ns", 0);
 
     c.noc_lat_hist_max = params.find<uint32_t>("noc_lat_hist_max", 131072);

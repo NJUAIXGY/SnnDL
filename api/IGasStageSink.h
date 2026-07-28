@@ -1,7 +1,7 @@
 // -*- c++ -*-
 //
 // IGasStageSink: GAS 控制面阶段事件/统计汇聚入口（StdMem glue → Control）
-// - 目的：让 control/ 不解析 StandardMem::CustomResp，也不依赖 GasOpData/StandardMem 类型
+// - 目的：让 platform/core/ 不解析 StandardMem::CustomResp，也不依赖 GasOpData/StandardMem 类型
 //
 
 #pragma once

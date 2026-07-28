@@ -4,11 +4,11 @@
 #include <string>
 
 #include "api/IPeWeightObjectPlaneProvider.h"
-#include "services/local_storage/LocalStorageHierarchyController.h"
-#include "services/local_storage/PeLocalServiceObjectTable.h"
-#include "services/local_storage/PodMetadataObjectPlane.h"
-#include "services/local_storage/PodOwnerServiceTable.h"
-#include "services/local_storage/PeWeightObjectPlane.h"
+#include "research/local_storage/LocalStorageHierarchyController.h"
+#include "research/local_storage/PeLocalServiceObjectTable.h"
+#include "research/local_storage/PodMetadataObjectPlane.h"
+#include "research/local_storage/PodOwnerServiceTable.h"
+#include "research/local_storage/PeWeightObjectPlane.h"
 
 using SST::SnnDL::IPeWeightObjectPlaneProvider;
 using SST::SnnDL::LocalStorageHierarchyController;

@@ -9,17 +9,17 @@
 #include <vector>
 
 #define private public
-#include "services/synapse/weights/WeightMemorySubsystem.h"
+#include "snn/synapse/weights/WeightMemorySubsystem.h"
 #undef private
 
 #include <sst/core/output.h>
 
-#include "services/synapse/weights/PulseMetadataFrontierObserveRegistry.h"
-#include "services/synapse/weights/SnnBcsrWeightManager.h"
-#include "services/local_storage/PeLocalServiceObjectTable.h"
-#include "services/local_storage/PodMetadataObjectPlane.h"
-#include "services/local_storage/PodOwnerServiceTable.h"
-#include "services/pe_fabric/PeSharedCoreFabric.h"
+#include "snn/synapse/weights/PulseMetadataFrontierObserveRegistry.h"
+#include "snn/synapse/weights/SnnBcsrWeightManager.h"
+#include "research/local_storage/PeLocalServiceObjectTable.h"
+#include "research/local_storage/PodMetadataObjectPlane.h"
+#include "research/local_storage/PodOwnerServiceTable.h"
+#include "research/pe_fabric/PeSharedCoreFabric.h"
 
 using SST::SnnDL::PeLocalServiceObjectTable;
 using SST::SnnDL::PeSharedCoreFabric;

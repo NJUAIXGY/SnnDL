@@ -2,7 +2,7 @@
 #include <cstdint>
 
 #include "api/IPeSharedCoreFabricProvider.h"
-#include "services/pe_fabric/PeSharedCoreFabric.h"
+#include "research/pe_fabric/PeSharedCoreFabric.h"
 
 using SST::SnnDL::IPeSharedCoreFabricProvider;
 using SST::SnnDL::PeSharedCoreFabric;

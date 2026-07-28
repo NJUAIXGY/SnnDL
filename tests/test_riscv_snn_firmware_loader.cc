@@ -1,9 +1,9 @@
 // -*- c++ -*-
 
-#include "workload/riscv_snn/RiscvSnnAsm.h"
-#include "workload/riscv_snn/RiscvSnnElfWriter.h"
-#include "workload/riscv_snn/RiscvSnnFirmwareLoader.h"
-#include "workload/riscv_snn/RiscvSnnMemoryImage.h"
+#include "workloads/riscv_snn/RiscvSnnAsm.h"
+#include "workloads/riscv_snn/RiscvSnnElfWriter.h"
+#include "workloads/riscv_snn/RiscvSnnFirmwareLoader.h"
+#include "workloads/riscv_snn/RiscvSnnMemoryImage.h"
 
 #include <cassert>
 #include <cstdint>

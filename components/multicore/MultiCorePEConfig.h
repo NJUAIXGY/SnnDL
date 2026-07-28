@@ -32,6 +32,7 @@ struct MultiCorePEConfig {
     int total_nodes = 1;
     uint64_t global_neuron_base = 0;
     uint64_t base_addr = 0;
+    uint64_t per_core_stride = 0;
     uint64_t sim_stop_ns = 0;
 
     // Native multicast lab

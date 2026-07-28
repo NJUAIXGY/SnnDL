@@ -89,4 +89,4 @@ GatherBufferIF 在 Apply 阶段向下游发起 granule 读时，可通过 `apply
 
 验证要点（看趋势，不要求完全一致）：
 - 校准后 `apply_issue_policy=bank_rr_row_sticky_age` 通常应不劣于 `order`；若出现明显退化，优先怀疑映射参数不匹配，或被 `apply_bank_credit` 节流。
-- 需要解释 DRAM traffic 时，以 `memHierarchy MemController requests_received_*` 为主口径；用 `gas_unique_*` 解释 granule/overfetch 形态（见 `services/synapse/gas/README.md`）。
+- 需要解释 DRAM traffic 时，以 `memHierarchy MemController requests_received_*` 为主口径；用 `gas_unique_*` 解释 granule/overfetch 形态（见 `snn/synapse/gas/README.md`）。

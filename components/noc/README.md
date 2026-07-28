@@ -1,6 +1,6 @@
 # components/noc/（ELI 可加载 NoC/拓扑适配组件）
 
-本目录存放 **与网络拓扑实验相关的 ELI 可加载子组件**。它们属于“组件层装配壳”的范畴，因此放在 `components/` 而不是 `services/`。
+本目录存放 **与网络拓扑实验相关的 ELI 可加载子组件**。它们属于组件装配壳；通用 packet 传输实现位于 `platform/noc/`。
 
 > 重要：主链路默认推荐使用 `components/SnnNIC.*`（SimpleNetwork/linkcontrol 路径）。本目录的适配器用于更高级/实验性的“拓扑适配/直连端口”场景。
 
@@ -48,5 +48,5 @@
 
 ## 与 NoC 子系统的关系
 
-- `services/noc/NocSubsystem` 的主目标是“传输事务下沉 + 冻结接口（`api/INocTransport.h`）”，并以 `events/NocPacketEvent` 作为 payload。
+- `platform/noc/NocSubsystem` 的主目标是“传输事务下沉 + 冻结接口（`api/INocTransport.h`）”，并以 `events/NocPacketEvent` 作为 payload。
 - 本目录组件属于“网络后端/适配层工具”，用于与路由器/链路端口进行对接；是否启用取决于具体实验脚本与装配方式。

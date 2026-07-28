@@ -1,6 +1,8 @@
 # 通用控制子核设计：Compute Core 可替换 + 内存/通信子系统化
 
-> 目标：将 `control/SnnPESubComponent` 收敛为**通用控制壳（control plane sub-core）**；将可替换计算范式下沉到 `compute/ISnnComputeCore`；将**内存访问**与**通信/路由**各自收敛为独立且完整的子系统，避免控制层继续膨胀，同时保持现有仿真口径与回归行为不变。
+> 历史说明：本文记录 CoreShell 演进方案，部分路径已迁移。当前实现以 `platform/`、`workloads/`、`snn/` 和 `research/` 的 README 为准。
+
+> 目标：将 `platform/core/SnnPESubComponent` 收敛为**通用控制壳（control plane sub-core）**；将可替换计算范式下沉到 `snn/compute/ISnnComputeCore`；将**内存访问**与**通信/路由**各自收敛为独立且完整的子系统，避免控制层继续膨胀，同时保持现有仿真口径与回归行为不变。
 
 ## 1. 范围与约束
 
@@ -39,8 +41,8 @@
 当前 SnnDL 已按职责拆分为：
 
 - `api/`：对外/跨层接口（例如 `IWeightReader`）。
-- `control/`：控制层（`SnnPESubComponent` 及按功能拆分的 `.cc`）。
-- `compute/`：计算核心（`ISnnComputeCore` + 默认实现）。
+- `platform/core/`：控制层（`SnnPESubComponent` 及按功能拆分的 `.cc`）。
+- `snn/compute/`：计算核心（`ISnnComputeCore` + 默认实现）。
 - `services/`：可复用服务（权重地址解析、缓存策略、GAS 辅助等）。
 - `components/`：顶层组件（MultiCorePE、NIC、Loader 等）。
 
@@ -49,20 +51,20 @@
 - `api/IWeightReader`：权重读取语义接口（屏蔽 StandardMem/缓存细节）
   - `requestDense/requestBCSR/tryCache/putCache`
   - 文件：`api/SnnWeightReader.h`
-- `compute/ISnnComputeCore + ComputeCoreContext`：
+- `snn/compute/ISnnComputeCore + ComputeCoreContext`：
   - 控制层注入 `log`、`weight_reader`、`writeback_fn` 等
-  - 文件：`compute/SnnComputeCore.h`
-- `api/SnnPEParentInterface`：
-  - 父组件承担 `sendSpike()` 与其它系统资源
-  - 文件：`api/SnnPEParentInterface.h`
+  - 文件：`snn/compute/SnnComputeCore.h`
+- `api/CoreShellAPI + ICoreWorkload::Runtime`：
+  - 父组件下发权威拓扑，并注入 NoC、内存和统计资源
+  - 文件：`api/CoreShellAPI.h`、`api/ICoreWorkload.h`
 
 ### 2.3 当前仍需进一步收敛的问题
 
-- **内存事务仍分散**：`StandardMem` 请求派发、pending 跟踪、合并策略、BCSR 读取路径等仍主要散落在 `control/*_mem.cc`、`control/*_bcsr.cc` 与若干辅助模块中。
+- **内存事务仍分散**：`StandardMem` 请求派发、pending 跟踪、合并策略、BCSR 读取路径等仍主要散落在 `platform/core/*_mem.cc`、`platform/core/*_bcsr.cc` 与若干辅助模块中。
 - **通信事务仍分散**：路由构建与发送路径仍部分存在于控制层，导致控制层难以保持“通用壳”定位。
 - **Compute Core 接口收敛仍需保持一致性**：
   - 已在 Phase5.4 完成主接口收敛：`ISnnComputeCore` 不再包含 `requestWeight/resolveWeightKey/weightCacheTryGet...`；
-  - 若某 compute 需要权重/缓存语义，改为实现可选扩展接口 `compute/IWeightAwareComputeCore`；
+  - 若某 compute 需要权重/缓存语义，改为实现可选扩展接口 `snn/compute/IWeightAwareComputeCore`；
   - 主链路依赖 `ComputeCoreContext.weight_reader (IWeightReader)` 注入，避免接口层暴露内存语义。
 
 ## 3. 目标架构（最终形态）
@@ -74,19 +76,19 @@ components/* (PE/NIC/Network/Ring)
         ^
         | (transport/backends)
         |
-control/SnnPESubComponent  —— 通用控制子核（control plane）
+platform/core/SnnPESubComponent  —— 通用控制子核（control plane）
   | holds: IComputeCore
   | holds: IMemorySubsystem
   | holds: ICommSubsystem
   v
-compute/* (IComputeCore impls)      services/* (Memory/Comm subsystems)
+snn/compute/* (IComputeCore impls)      services/* (Memory/Comm subsystems)
 ```
 
 **依赖规则**
 
-- `compute/` 不依赖 `control/`、`components/`、`StandardMem`。
-- `services/` 不依赖 `control/` 私有成员；只依赖 `api/`、`events/`、标准库与少量 SST 基础类型（Output/Params）。
-- `control/` 只依赖 `compute/` 与 `services/` 的公开接口，不窥探子系统内部容器。
+- `snn/compute/` 不依赖 `platform/core/`、`components/`、`StandardMem`。
+- `services/` 不依赖 `platform/core/` 私有成员；只依赖 `api/`、`events/`、标准库与少量 SST 基础类型（Output/Params）。
+- `platform/core/` 只依赖 `snn/compute/` 与 `services/` 的公开接口，不窥探子系统内部容器。
 
 ### 3.2 控制子核（SnnPESubComponent）职责边界
 
@@ -112,7 +114,7 @@ compute/* (IComputeCore impls)      services/* (Memory/Comm subsystems)
 
 ### 4.1 Compute Core 契约（IComputeCore）
 
-现阶段继续复用 `compute/ISnnComputeCore`（见 `ISnnComputeCore_SPEC.md`），并明确两类接口：
+现阶段继续复用 `snn/compute/ISnnComputeCore`（见 `ISnnComputeCore_SPEC.md`），并明确两类接口：
 
 - **必须接口（稳定核心）**
   - `configure/onInit/onSetup/onFinish`
@@ -132,11 +134,11 @@ compute/* (IComputeCore impls)      services/* (Memory/Comm subsystems)
 当前主链路使用 `api/IMemoryAccess`（纯 addr→bytes）作为跨域唯一入口：
 
 - 语义：只做**按地址读写 + 回调**，不关心权重 key/BCSR/cache。
-- 典型实现：`services/memory/StandardMemAccess`（内部持有 `SST::Interfaces::StandardMem*` 与 pending 跟踪）。
+- 典型实现：`platform/memory/StandardMemAccess`（内部持有 `SST::Interfaces::StandardMem*` 与 pending 跟踪）。
 
 #### 4.2.2 WeightMemorySubsystem（语义服务：实现 IWeightReader）
 
-主链路实现位于 `services/synapse/weights/WeightMemorySubsystem`：
+主链路实现位于 `snn/synapse/weights/WeightMemorySubsystem`：
 
 - 内部组合（现有模块复用）：
   - `WeightAccessor`：key/地址解析、index_mode/weights_cols
@@ -165,12 +167,12 @@ compute/* (IComputeCore impls)      services/* (Memory/Comm subsystems)
 
 #### 4.3.1 ISpikeTransport（后端：发送能力）
 
-- 典型实现：`ParentSpikeTransport`，内部调用 `SnnPEParentInterface::sendSpike()`。
+- 当前实现通过 `INocTransport` 注入发送能力，不回调具体父组件类型。
 - 若未来需要 NIC/环网/其它路径，可替换 transport 实现，不改控制层与 compute core。
 
 #### 4.3.2 SpikeCommSubsystem（语义服务：路由/封包/发送）
 
-主链路实现位于 `services/synapse/route/SpikeCommSubsystem`：
+主链路实现位于 `snn/synapse/route/SpikeCommSubsystem`：
 
 - 内部组合：
   - `SynapseRouteSubsystem`（route table / fanout / gating）
@@ -209,7 +211,7 @@ compute/* (IComputeCore impls)      services/* (Memory/Comm subsystems)
 
 ### 5.3 内存响应路径（StandardMem）
 
-- `services/memory/StandardMemAccess` 负责：
+- `platform/memory/StandardMemAccess` 负责：
   - request-id 分配、pending map、回调分发；
   - 合并读/按行读等“物理策略”（可选上移到 WeightMemorySubsystem，但建议后端至少负责 pending/回调）。
 - WeightMemorySubsystem 负责：
@@ -221,7 +223,7 @@ compute/* (IComputeCore impls)      services/* (Memory/Comm subsystems)
 
 ### Phase A：内存子系统对象化（先形成“独立完整体系”）
 
-1. 引入 `IMemoryAccess` 与 `services/memory/StandardMemAccess`：
+1. 引入 `IMemoryAccess` 与 `platform/memory/StandardMemAccess`：
    - 从控制层搬迁 pending map、req id、回调派发代码到纯内存访问层（addr→bytes）。
 2. 引入 `WeightMemorySubsystem`：
    - 组合 `WeightAccessor/WeightCacheOps/BcsrWeightManager/IMemoryAccess`；
@@ -264,8 +266,8 @@ compute/* (IComputeCore impls)      services/* (Memory/Comm subsystems)
 
 ## 9. 下一步行动清单（建议）
 
-- [x] 定义 `IMemoryAccess` 接口与 `services/memory/StandardMemAccess` 位置（纯 addr→bytes）
-- [x] 定义并落地 `services/synapse/weights/WeightMemorySubsystem`（实现 `IWeightReader` + 窗口接口）
+- [x] 定义 `IMemoryAccess` 接口与 `platform/memory/StandardMemAccess` 位置（纯 addr→bytes）
+- [x] 定义并落地 `snn/synapse/weights/WeightMemorySubsystem`（实现 `IWeightReader` + 窗口接口）
 - [x] 从 control 迁出 StandardMem 回包与 pending/req-id/回调派发到 `StandardMemAccess`/stdmem endpoint
 - [ ] 将“窗口读集合/边记录/发起读编排”从 control 迁入 Memory Subsystem（控制层仅发窗口边界与 record 请求）
 - [ ] 定义 `ISpikeTransport` 与 `SpikeCommSubsystem`（路由/发送闭环）

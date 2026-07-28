@@ -1,8 +1,8 @@
 // -*- c++ -*-
 
-#include "workload/riscv_snn/RiscvSnnBootDriver.h"
-#include "workload/riscv_snn/RiscvSnnHart.h"
-#include "workload/riscv_snn/RiscvSnnQueueContract.h"
+#include "workloads/riscv_snn/RiscvSnnBootDriver.h"
+#include "workloads/riscv_snn/RiscvSnnHart.h"
+#include "workloads/riscv_snn/RiscvSnnQueueContract.h"
 
 #include <cassert>
 

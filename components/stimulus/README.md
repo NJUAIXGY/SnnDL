@@ -2,7 +2,7 @@
 
 本目录存放 **Stimulus 域的 SST 组件实现**：以“数据源/刺激源”的形式在仿真中注入 Spike 事件。
 
-> 边界原则：该目录只放 *SST 可加载组件*（ELI 注册对象），具体注入策略/事务编排应优先放到 `services/stimulus/`，组件层只做装配与时序驱动。
+> 边界原则：该目录只放 *SST 可加载组件*（ELI 注册对象），具体注入策略/事务编排应优先放到 `snn/stimulus/`，组件层只做装配与时序驱动。
 
 ## 内存粒度口径（默认：cacheline）
 
@@ -29,7 +29,7 @@ Stimulus 域只负责“产生/注入事件”，不直接参与内存事务；�
 
 ---
 
-## 与 services/stimulus 的关系
+## 与 snn/stimulus 的关系
 
 - `components/stimulus/`：**组件层**（SST 生命周期 + 时钟驱动 + 端口输出）。
-- `services/stimulus/`：**事务层**（例如 Step 注入的 timebase/选源/注入编排）。
+- `snn/stimulus/`：**事务层**（例如 Step 注入的 timebase/选源/注入编排）。

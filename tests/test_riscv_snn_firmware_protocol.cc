@@ -1,12 +1,12 @@
 // -*- c++ -*-
 
-#include "workload/common/SnnAccelBackend.h"
-#include "workload/riscv_snn/RiscvSnnAbi.h"
-#include "workload/riscv_snn/RiscvSnnHart.h"
-#include "workload/riscv_snn/RiscvSnnIss.h"
-#include "workload/riscv_snn/RiscvSnnMemoryImage.h"
-#include "workload/riscv_snn/RiscvSnnQueueContract.h"
-#include "workload/riscv_snn/RiscvSnnSampleFirmware.h"
+#include "workloads/common/SnnAccelBackend.h"
+#include "workloads/riscv_snn/RiscvSnnAbi.h"
+#include "workloads/riscv_snn/RiscvSnnHart.h"
+#include "workloads/riscv_snn/RiscvSnnIss.h"
+#include "workloads/riscv_snn/RiscvSnnMemoryImage.h"
+#include "workloads/riscv_snn/RiscvSnnQueueContract.h"
+#include "workloads/riscv_snn/RiscvSnnSampleFirmware.h"
 
 #include <cassert>
 #include <cstdint>

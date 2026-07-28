@@ -2,7 +2,7 @@
 #include <cstdint>
 #include <vector>
 
-#include "services/synapse/weights/PulseGatherPrebandCollector.h"
+#include "snn/synapse/weights/PulseGatherPrebandCollector.h"
 
 using SST::SnnDL::PulseGatherPrebandCollector;
 

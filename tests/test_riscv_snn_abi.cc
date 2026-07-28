@@ -1,10 +1,10 @@
 // -*- c++ -*-
 
-#include "workload/common/SnnAccelBackend.h"
-#include "workload/common/SnnAccelBackendContract.h"
-#include "workload/riscv_snn/RiscvSnnAbi.h"
-#include "workload/riscv_snn/RiscvSnnMemoryImage.h"
-#include "workload/riscv_snn/RiscvSnnQueueContract.h"
+#include "workloads/common/SnnAccelBackend.h"
+#include "workloads/common/SnnAccelBackendContract.h"
+#include "workloads/riscv_snn/RiscvSnnAbi.h"
+#include "workloads/riscv_snn/RiscvSnnMemoryImage.h"
+#include "workloads/riscv_snn/RiscvSnnQueueContract.h"
 #include "WorkloadConfig.h"
 
 #include <cstddef>

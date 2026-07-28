@@ -10,7 +10,7 @@
 ## 主要内容
 
 - `MultiCorePE.{h,cc}`
-  - 处理单元（PE）顶层组件：挂接多个 **CoreShell** 子核（接口：`api/CoreShellAPI.h`，默认实现：`control/SnnPESubComponent`）。
+  - 处理单元（PE）顶层组件：挂接多个 **CoreShell** 子核（接口：`api/CoreShellAPI.h`，默认实现：`platform/core/SnnPESubComponent`）。
   - 负责装配并驱动平台面子系统（NoC/Mem/Stimulus），以及对 PE 内多 core 的统计汇聚（写出到 `mesh_stats.csv`）。
   - 支持可插拔 workload：通过参数 `workload_impl` 或环境变量 `SNNDL_WORKLOAD_IMPL` 选择（默认 `snn`）。
 - `multicore/MultiCorePEConfig.{h,cc}`
@@ -29,9 +29,6 @@
   - 可选 spike 源（在部分实验脚本中可能禁用）。
 - `MemKCalBench.{h,cc}`
   - micro-benchmark：用于 K 校准或 memory 访问特征测试。
-- `SnnPE.{h,cc}`
-  - 旧架构兼容组件（deprecated/compat），新功能优先在 MultiCorePE 体系演进。
-
 ---
 
 ## 内存建模口径（默认 cacheline）
@@ -58,18 +55,18 @@ mesh 模板会在每次运行目录写出 `effective_config.json`（并汇总进
 - `components/gas/`：全局 Step/GAS 同步组件（Mesh barrier 控制面）。
 - `components/multicore/`：MultiCorePE 参数解析收敛模块（纯编译期组织，不新增 ELI 对象）。
 - `components/gather/`：GatherBufferIF 参数解析收敛模块（纯编译期组织，不新增 ELI 对象）。
-- `components/workload_stats/`：workload 统计模块注册表与实现（tensor/stream 等）。
+- `platform/stats/`：workload 统计模块注册表与实现（tensor/stream 等）。
 
 ## 依赖边界（建议）
 
-- `components/` 可以依赖 `api/`、`events/`、`control/`、`services/`、`compute/`。
+- `components/` 可以依赖 `api/`、`events/`、`platform/`、`workloads/` 和 `snn/`。
 - 避免把业务语义写进组件层：
-  - 动力学/学习应下沉到 `compute/`；
-  - SNN/Step/GAS/BCSR 等事务应下沉到 `services/workload/snn` 与 `services/synapse/*`；
+  - 动力学/学习应下沉到 `snn/compute/`；
+  - SNN/Step/GAS/BCSR 等事务应下沉到 `workloads/snn` 与 `snn/synapse/*`；
   - NoC/Mem 在组件层只做“装配与调度壳”。
 
 ## 扩展指南
 
 - 新增 SST 组件时：
   - 保持 ELI 注册信息（库名/组件名/参数文档）与现有脚本兼容；
-  - 业务逻辑尽量委托给 `control/` 或 `compute/`，组件层只做装配与资源管理。
+  - 业务逻辑尽量委托给 `platform/core/` 或 `snn/compute/`，组件层只做装配与资源管理。

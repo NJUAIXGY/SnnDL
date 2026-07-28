@@ -2,7 +2,7 @@
 #include <string>
 
 #include "api/IGasStageSink.h"
-#include "services/synapse/gas/GasCustomCmd.h"
+#include "snn/synapse/gas/GasCustomCmd.h"
 
 using SST::SnnDL::GasStatData;
 using SST::SnnDL::GasStatEvent;

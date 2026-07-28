@@ -12,8 +12,8 @@
 
 #include "GasStepBarrierEvent.h"
 #include "GatingDecisionEvent.h"
-#include "gas/experimental/P0BCreditPolicy.h"
-#include "gas/experimental/StepActivationPredictor.h"
+#include "research/gas/P0BCreditPolicy.h"
+#include "research/gas/StepActivationPredictor.h"
 #include "gas/GlobalGasStepControllerConfig.h"
 
 namespace SST { namespace SnnDL {

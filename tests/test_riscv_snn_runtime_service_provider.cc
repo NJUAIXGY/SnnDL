@@ -2,9 +2,9 @@
 
 #include "api/ICoreWorkload.h"
 #include "api/ISnnAccelRuntimeServices.h"
-#include "workload/common/SnnAccelBackend.h"
-#include "workload/riscv_snn/RiscvSnnAbi.h"
-#include "workload/riscv_snn/RiscvSnnShadowTransportExport.h"
+#include "workloads/common/SnnAccelBackend.h"
+#include "workloads/riscv_snn/RiscvSnnAbi.h"
+#include "workloads/riscv_snn/RiscvSnnShadowTransportExport.h"
 
 #include <cassert>
 #include <cstdint>

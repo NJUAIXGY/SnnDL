@@ -4,7 +4,7 @@
 
 ## 背景
 
-当前 `services/memory/sram_sim/model/BankedSramModel` 只负责记录 bank conflict、predicted extra cycles 与容量峰值，不会把冲突成本反馈回 `compute/SnnComputeCore` 或 `services/synapse/weights/WeightMemorySubsystem` 的执行路径。
+当前 `platform/memory/sram_sim/model/BankedSramModel` 只负责记录 bank conflict、predicted extra cycles 与容量峰值，不会把冲突成本反馈回 `snn/compute/SnnComputeCore` 或 `snn/synapse/weights/WeightMemorySubsystem` 的执行路径。
 
 这会导致：
 
@@ -25,7 +25,7 @@
 
 - **KISS**：先把“统计 -> 时序”闭环打通，不一次性引入新的请求结构体或替换策略框架。
 - **兼容优先**：保留 `BankedSramModel` 原有统计语义与 mesh 配置字段；旧实验在关闭 SRAM 模型时行为不变。
-- **边界清晰**：不把 SNN 业务语义塞回 `services/memory/`；compute 与 weight 只消费 stall budget。
+- **边界清晰**：不把 SNN 业务语义塞回 `platform/memory/`；compute 与 weight 只消费 stall budget。
 - **可验证**：先为 `BankedSramModel` 增加独立测试，验证冲突周期导出行为，再接入上层。
 
 ## 非目标
@@ -37,9 +37,9 @@
 
 ## 预计改动点
 
-- `services/memory/sram_sim/model/BankedSramModel.{h,cc}`
-- `compute/SnnComputeCore.{h,cc}`
-- `services/synapse/weights/WeightMemorySubsystem.{h,cc}`
+- `platform/memory/sram_sim/model/BankedSramModel.{h,cc}`
+- `snn/compute/SnnComputeCore.{h,cc}`
+- `snn/synapse/weights/WeightMemorySubsystem.{h,cc}`
 - `tests/test_banked_sram_model.cc`
 
 ## 后续阶段

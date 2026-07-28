@@ -320,6 +320,17 @@ void SnnNIC::setNodeId(uint32_t id)
     node_id = id;
 }
 
+void SnnNIC::setTopology(uint32_t id, uint32_t total_nodes)
+{
+    if (total_nodes == 0 || id >= total_nodes) {
+        output->fatal(CALL_INFO, -1,
+                      "SnnNIC fatal: invalid platform topology node_id=%u total_nodes=%u\n",
+                      id, total_nodes);
+    }
+    total_nodes_ = total_nodes;
+    setNodeId(id);
+}
+
 uint32_t SnnNIC::getNodeId() const
 {
     return node_id;

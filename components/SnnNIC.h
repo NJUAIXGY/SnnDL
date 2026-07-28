@@ -66,7 +66,7 @@ public:
         {"batch_size_local", "邻居节点批量大小阈值", "8"},
         {"batch_size_remote", "远程节点批量大小阈值", "32"},
         {"batch_flush_window", "批处理刷新窗口(ns)", "1000"},
-        {"total_nodes", "网络总节点数(用于邻居判定)", "16"},
+        {"total_nodes", "网络总节点数(由父PE拓扑覆盖)", "1"},
         {"enable_inter_rank_batching", "[已禁用] 启用跨Rank代理聚合(0/1)", "0"},
         {"inter_rank_batch_window", "[已禁用] 跨Rank批量窗口(ns)", "0"},
         {"nodes_per_rank", "[已禁用] 每个rank的节点数(用于简化映射)", "0"},
@@ -136,6 +136,7 @@ public:
     void setReceiveHandler(ReceiveHandler handler) override;
     void sendToNode(uint32_t dest_node, SST::Event* event) override;
     void setNodeId(uint32_t node_id) override;
+    void setTopology(uint32_t node_id, uint32_t total_nodes) override;
     uint32_t getNodeId() const override;
     std::string getNetworkStatus() const override;
     size_t pendingSendCount() const override;
@@ -190,7 +191,7 @@ private:
     uint32_t batch_size_local_ = 8;            ///< 邻居批大小
     uint32_t batch_size_remote_ = 32;          ///< 远程批大小
     uint64_t batch_flush_window_ns_ = 1000;    ///< 刷新窗口
-    uint32_t total_nodes_ = 16;                ///< 节点总数(网格尺寸推断)
+    uint32_t total_nodes_ = 1;                 ///< 节点总数(网格尺寸推断)
     uint32_t mesh_size_ = 4;                   ///< Mesh网格边长（用于Manhattan距离计算）
     bool vn_guard_warned_ = false;             ///< VN越界回退仅提示一次
     

@@ -18,7 +18,7 @@
 
 #include "IGasCreditGate.h"
 #include "IGasStepGate.h"
-#include "synapse/gas/GasCustomCmd.h"
+#include "snn/synapse/gas/GasCustomCmd.h"
 
 namespace SST { namespace SnnDL {
 

@@ -1,7 +1,7 @@
 #include <cassert>
 #include <cstdint>
 
-#include "services/synapse/weights/PulseMetadataSeedRegistry.h"
+#include "snn/synapse/weights/PulseMetadataSeedRegistry.h"
 
 using SST::SnnDL::PulseMetadataSeedRegistry;
 

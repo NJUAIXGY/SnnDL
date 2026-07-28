@@ -1,8 +1,10 @@
 # SnnDL 子系统化终局路线图（Memory / Synapse+Route / Stimulus / NoC / NeuralCompute）
 
+> 历史说明：本文记录迁移过程，包含已删除的旧路径。当前目录与依赖边界以根级 `README.md` 和 `docs/SNNDL_PROJECT_OVERVIEW.md` 为准。
+
 > 主人目标（最终态）：**MultiCorePE 变“纯控制壳”**，SNN 事务全部下沉到子系统；  
 > 路由归入 **Synapse/Route**（而不是 NoC）；Stimulus（Step 注入/外部刺激）独立成域并依赖 Synapse/Route + NoC；  
-> 内存子系统 **彻底不出现“权重/突触”语义**，只提供“地址→字节块”的访问能力喵 (..•˘_˘•..)
+> 内存子系统 **彻底不出现“权重/突触”语义**，只提供“地址→字节块”的访问能力。
 
 本路线图在 `docs/UNIVERSAL_CONTROL_CORE_DESIGN.md` 的基础上进一步“收紧边界”，用于指导后续多阶段重构推进。  
 推进原则：**每一步都必须能跑通 `MESH_SIM_TIME=100us` 回归**，并保持关键统计口径稳定（允许极小浮动，但禁止出现 `neurons_fired_total=0` 的非确定性回归）。
@@ -22,7 +24,7 @@
   - **Synapse/Route**：权重/BCSR 语义、窗口边集合、ΔV 累加、路由构建与 fanout 查询（不负责注入时基）
   - **Stimulus**：Step 注入/外部刺激；选源 +（可选）调用路由 fanout 生成 spikes；通过 NoC 投递/外发
   - **NoC**：send/recv/forward（消息传输与本地转发），不做 fanout 选择，不解析权重
-  - **NeuralCompute**：神经动力学与发放判定（已由 `compute/ISnnComputeCore` 实现）
+  - **NeuralCompute**：神经动力学与发放判定（已由 `snn/compute/ISnnComputeCore` 实现）
 - **MultiCorePE**：只负责装配/调度/统计汇聚/端口连接；不包含“step 选源、BCSR 解析、fanout 选择、ΔV 计算”等 SNN 事务逻辑。
 
 ### 0.2 非目标（Out-of-scope）
@@ -66,22 +68,22 @@
 ## 1. 现状审阅（对照目标边界）
 
 ### 1.1 已具备的良好地基
-- **compute 已模块化**：`compute/ISnnComputeCore.h` + `ISnnComputeCore_SPEC.md`
-- **通信子系统雏形已存在**：`services/synapse/route/SpikeCommSubsystem.{h,cc}` + `api/ISpikeTransport.h`
-- **权重/窗口相关已开始子系统化**：`services/synapse/weights/WeightMemorySubsystem.{h,cc}`、`services/synapse/weights/SnnBcsrWeightManager.{h,cc}`、`components/GatherBufferIF.{h,cc}`
+- **compute 已模块化**：`snn/compute/ISnnComputeCore.h` + `ISnnComputeCore_SPEC.md`
+- **通信子系统雏形已存在**：`snn/synapse/route/SpikeCommSubsystem.{h,cc}` + `api/ISpikeTransport.h`
+- **权重/窗口相关已开始子系统化**：`snn/synapse/weights/WeightMemorySubsystem.{h,cc}`、`snn/synapse/weights/SnnBcsrWeightManager.{h,cc}`、`components/GatherBufferIF.{h,cc}`
 
 ### 1.2 仍违反目标边界的关键点（需要收敛）
 1) **Memory 后端夹带权重语义**
    - 历史问题：旧 `StandardMemBackend` 的 `MemRequestMeta` 含 `is_weight` 与大量 `bcsr_*` 字段（与 Memory 去语义化边界冲突）。
-   - 现状：该 legacy 实现已在 Phase5.5 清理删除；主链路统一使用 `services/memory/StandardMemAccess.*`（纯 addr→bytes）。
+   - 现状：该 legacy 实现已在 Phase5.5 清理删除；主链路统一使用 `platform/memory/StandardMemAccess.*`（纯 addr→bytes）。
    - 这使得“内存模块”不可复用，也无法称为“纯地址/字节模块”。
 2) **Synapse/Weight 与 Memory 编排缠在一起**
-   - 旧实现曾同时承担 pending/解码/缓存/统计（历史问题）；当前主链路已由 `services/memory/StandardMemAccess.*`（纯内存）+ `services/synapse/weights/WeightMemorySubsystem.*`（权重语义）闭环承载。
+   - 旧实现曾同时承担 pending/解码/缓存/统计（历史问题）；当前主链路已由 `platform/memory/StandardMemAccess.*`（纯内存）+ `snn/synapse/weights/WeightMemorySubsystem.*`（权重语义）闭环承载。
 3) **NoC 与 Route/Synapse 的职责尚未严格分离**
-   - Phase2/Phase3 已将“路由构建 + fanout/gating”收敛到 `services/synapse/route/SynapseRouteSubsystem.*`（Synapse/Route 域）。
+   - Phase2/Phase3 已将“路由构建 + fanout/gating”收敛到 `snn/synapse/route/SynapseRouteSubsystem.*`（Synapse/Route 域）。
    - 但 **send/recv/forward/本地投递** 仍主要落在 `components/MultiCorePE.*`，NoC 尚未形成“独立闭环子系统”（Phase4-A1 的核心目标）。
 4) **MultiCorePE 仍承载部分 SNN 事务（需要下沉）**
-   - Phase3 已将 Step 注入（调度 + BCSR reachability 解析 + 注入）下沉为 `services/stimulus/StepActivationSubsystem.*`（事务域归入 Stimulus；路由依赖 Synapse/Route）。
+   - Phase3 已将 Step 注入（调度 + BCSR reachability 解析 + 注入）下沉为 `snn/stimulus/StepActivationSubsystem.*`（事务域归入 Stimulus；路由依赖 Synapse/Route）。
    - 下一步需要把 **NoC 事务**（send/recv/forward/本地投递 + ring tick）从 `MultiCorePE` 迁出，进一步把 MultiCorePE 收敛为纯装配/调度壳。
 
 ### 1.3 目录结构“职责表”（现状）
@@ -91,9 +93,9 @@
 
 | 目录 | 当前主职责 | 代表文件/模块 |
 |---|---|---|
-| `api/` | 跨层稳定接口与最小抽象 | `SnnCoreAPI.h`、`SnnPEParentInterface.h`、`ISpikeTransport.h`、`SnnWeightReader.h` |
-| `compute/` | 神经动力学/学习/发放判定（可替换 compute core） | `ISnnComputeCore.h`、`SnnComputeCore.*`、`SnnCoreEngine.*` |
-| `control/` | 控制/编排层：GAS/窗口、事务调度、统计汇总 | `SnnPESubComponent*`、`SnnPEApplyScatter.cc`、`SnnPESubComponent_impl.h` |
+| `api/` | 跨层稳定接口与最小抽象 | `CoreShellAPI.h`、`ICoreWorkload.h`、`ISpikeTransport.h`、`SnnWeightReader.h` |
+| `snn/compute/` | 神经动力学/学习/发放判定（可替换 compute core） | `ISnnComputeCore.h`、`SnnComputeCore.*`、`SnnCoreEngine.*` |
+| `platform/core/` | 控制/编排层：GAS/窗口、事务调度、统计汇总 | `SnnPESubComponent*`、`SnnPEApplyScatter.cc`、`SnnPESubComponent_impl.h` |
 | `services/` | 可复用服务与子系统（按域拆分，legacy 不进主链路） | `synapse/weights/*`、`synapse/route/*`、`noc/*`、`memory/*`、`legacy/*` |
 | `components/` | SST 可加载组件：装配端口/clock/stat；NIC/Loader/内存前端等 | `MultiCorePE.*`、`SnnNIC.*`、`WeightLoader.*`、`GatherBufferIF.*` |
 | `events/` | SST Event 类型（Spike、门控等） | `SpikeEvent.*`、`GatingDecisionEvent.*` 等 |
@@ -111,39 +113,39 @@
   - `components/GatherBufferIF.*`：作为 Memory 的一种实现/前端（窗口化/聚合属于实现细节）。
 - **最终放哪里**（建议）：
   - 接口：`api/IMemoryAccess.h`
-  - 实现：`services/memory/StandardMemAccess.*`
+  - 实现：`platform/memory/StandardMemAccess.*`
   - GatherBufferIF：仍可留在 `components/`（它是可加载 StandardMem 子组件），但其对外边界必须是 `IMemoryAccess`/StandardMem，不得出现权重术语。
 
 #### (B) Synapse/Route（权重/BCSR/ΔV/路由/Step）应该“合并收敛”
 - **合并对象（同域）**：
-  - 权重语义与缓存：`services/synapse/weights/WeightMemorySubsystem.*`、`services/synapse/weights/WeightCacheOps.*`、`services/synapse/weights/WeightAccessor.*`
-  - BCSR 元数据与缓存：`services/synapse/weights/SnnBcsrWeightManager.*`
-  - 窗口边集合/累加器：`services/synapse/gas/GasEdgeCollector.*`、`services/synapse/gas/AccumulatorOps.*`
-  - 路由构建（从权重导出）：`services/synapse/route/SnnRouteProvider.*`（归入 Synapse/Route，而不是 NoC）
-  - Step 注入：已迁移为 `services/stimulus/StepActivationSubsystem.*`（事务域归入 Stimulus；后续可与 `SynapseRouteSubsystem` 共享 BCSR 元信息/数据源以避免口径漂移）
+  - 权重语义与缓存：`snn/synapse/weights/WeightMemorySubsystem.*`、`snn/synapse/weights/WeightCacheOps.*`、`snn/synapse/weights/WeightAccessor.*`
+  - BCSR 元数据与缓存：`snn/synapse/weights/SnnBcsrWeightManager.*`
+  - 窗口边集合/累加器：`snn/synapse/gas/GasEdgeCollector.*`、`snn/synapse/gas/AccumulatorOps.*`
+  - 路由构建（从权重导出）：`snn/synapse/route/SnnRouteProvider.*`（归入 Synapse/Route，而不是 NoC）
+  - Step 注入：已迁移为 `snn/stimulus/StepActivationSubsystem.*`（事务域归入 Stimulus；后续可与 `SynapseRouteSubsystem` 共享 BCSR 元信息/数据源以避免口径漂移）
 - **最终放哪里**（建议）：
-  - `services/synapse/`（或 `services/synapse_route/`）作为“权重+路由”同域模块
+  - `snn/synapse/`（或 `services/synapse_route/`）作为“权重+路由”同域模块
   - 对 control 暴露：`api/ISynapseRoute.h`（后续 Phase 2 冻结）
-  - 依赖：只能依赖 `api/IMemoryAccess` 与 `compute/ISnnComputeCore`（通过控制层注入回调/接口），不得直接触碰 StandardMem 细节
+  - 依赖：只能依赖 `api/IMemoryAccess` 与 `snn/compute/ISnnComputeCore`（通过控制层注入回调/接口），不得直接触碰 StandardMem 细节
 
 #### (C) NoC（send/recv/forward）应该“做减法”
 - **从哪里拆**：
   - `components/SnnNIC.*`：作为 NoC 的一个 backend（merlin/simpleNetwork）
   - `components/noc/SimpleNetworkWrapper.*`、`components/noc/SnnNetworkAdapter.*`：作为 backend/适配层工具
-  - `services/synapse/route/SpikeCommSubsystem.*`：建议保留为 NoC façade，但必须把“路由构建/解析权重”移走，仅保留“封包+发送+门控缓存+本地转发策略”
+  - `snn/synapse/route/SpikeCommSubsystem.*`：建议保留为 NoC façade，但必须把“路由构建/解析权重”移走，仅保留“封包+发送+门控缓存+本地转发策略”
 - **最终放哪里**（建议）：
   - 接口：`api/INocTransport.h`（send/recv/forward）
-  - 实现：`services/noc/NocSubsystem.*`（内部组合 SnnNIC、InternalRing、本地投递）
+  - 实现：`platform/noc/NocSubsystem.*`（内部组合 SnnNIC、InternalRing、本地投递）
   - 约束：NoC 不得读取 BCSR/权重；fanout 输入必须来自 Synapse/Route
 
 #### (D) NeuralCompute（动力学）保持独立，不与 Memory/NoC 互相污染
-- **保持位置**：`compute/`
+- **保持位置**：`snn/compute/`
 - **交互方式**：
   - 输入：由 control 或 Synapse/Route 通过 `applySynapticDelta/onSynapticEvent` 喂入
   - 输出：`drainOutputs` → Synapse/Route 决策 fanout → NoC 发送
 
 #### (E) Control 与 Components 的最终收口
-- `control/SnnPESubComponent`：只保留“窗口/GAS 编排 + 调用子系统 + 统计汇总”
+- `platform/core/SnnPESubComponent`：只保留“窗口/GAS 编排 + 调用子系统 + 统计汇总”
 - `components/MultiCorePE`：只保留“装配/调度/端口连接/统计汇聚”；Step/路由/权重解析全部迁出
 
 ---
@@ -154,8 +156,8 @@
 
 ```
 components/MultiCorePE (装配/调度/统计汇聚)
-  ├─ control/SnnPESubComponent (通用控制子核：GAS 编排/事务调度)
-  │    ├─ NeuralCompute (compute/ISnnComputeCore)
+  ├─ platform/core/SnnPESubComponent (通用控制子核：GAS 编排/事务调度)
+  │    ├─ NeuralCompute (snn/compute/ISnnComputeCore)
   │    ├─ Synapse+Route Subsystem (权重/BCSR/ΔV/路由)
   │    ├─ Stimulus Subsystem (Step 注入/外部刺激)
   │    ├─ NoC Subsystem (send/recv/forward)
@@ -217,12 +219,12 @@ components/MultiCorePE (装配/调度/统计汇聚)
 - 目标：把“地址/字节读写 + pending”从权重语义中剥离
 - 动作（建议最小实现）：
   1. 新增 `api/IMemoryAccess.h`
-  2. 新增 `services/memory/StandardMemAccess.{h,cc}`（实现 IMemoryAccess；内部持有 `StandardMem` 指针与 pending map）
+  2. 新增 `platform/memory/StandardMemAccess.{h,cc}`（实现 IMemoryAccess；内部持有 `StandardMem` 指针与 pending map）
   3. 让现有 `WeightMemorySubsystem` **通过 IMemoryAccess 发起读**，而不是直接依赖 `StandardMemBackend/MemRequestMeta(bcsr_*)`
   4. legacy：旧 `StandardMemBackend` 已在 Phase5.5 删除；避免保留“带权重语义”的 Memory 后端参考实现
 - 验收：
   - 100us 回归通过
-  - 主路径统一为 `services/memory/StandardMemAccess.*`（并保持 fail-fast 断言式诊断）
+  - 主路径统一为 `platform/memory/StandardMemAccess.*`（并保持 fail-fast 断言式诊断）
 
 #### Phase 1 任务清单（可执行，建议按顺序）
 1) **冻结纯内存接口（不引入权重语义）**
@@ -232,7 +234,7 @@ components/MultiCorePE (装配/调度/统计汇聚)
      - `uint64_t write(uint64_t addr, const std::vector<uint8_t>& data, std::function<void(uint64_t)> cb);`
      - 约束：`bytes>0`；失败语义按 5.2 冻结
 2) **实现 StandardMemAccess（pending 与回包分发归一处）**
-   - [ ] 新增 `services/memory/StandardMemAccess.h/.cc`：
+   - [ ] 新增 `platform/memory/StandardMemAccess.h/.cc`：
      - 仅记录 `addr/size +（可选）对齐/切片信息 + 回调`
     - 允许内部自建 pending map（主链路已不再依赖 legacy `StandardMemBackend`）
      - **不得**出现任何 `weight/synapse/bcsr` 字段或命名
@@ -253,14 +255,14 @@ components/MultiCorePE (装配/调度/统计汇聚)
 - 目标：形成一个“闭环”的 Synapse/Route 子系统，对 control 提供稳定入口
 - 动作：
   1. 将 `WeightMemorySubsystem` 重命名/重定位为 `SynapseRouteSubsystem`（或拆成 `SynapseWeightSubsystem + RouteSubsystem` 两个类，但仍同模块目录）
-  2. 路由构建/共享缓存从 `services/synapse/route/SpikeCommSubsystem` 下移到 `services/synapse/route/SynapseRouteSubsystem`
-  3. `services/synapse/weights/SnnBcsrWeightManager` 的 rowptr/colidx/block 缓存由 Synapse/Route 统一调度
+  2. 路由构建/共享缓存从 `snn/synapse/route/SpikeCommSubsystem` 下移到 `snn/synapse/route/SynapseRouteSubsystem`
+  3. `snn/synapse/weights/SnnBcsrWeightManager` 的 rowptr/colidx/block 缓存由 Synapse/Route 统一调度
 - 回归：100us ×3，关键字段一致
 
 ### Phase 3：已完成（fanout/gating 下沉 + Step 注入下沉）
 - 目标：进一步压缩 MultiCorePE 的“事务逻辑面”，为 NoC 子系统化铺路。
 - 达成：
-  - `services/synapse/route/SpikeCommSubsystem` 已退化为 transport façade（fanout/gating 委托 `services/synapse/route/SynapseRouteSubsystem`）；
+  - `snn/synapse/route/SpikeCommSubsystem` 已退化为 transport façade（fanout/gating 委托 `snn/synapse/route/SynapseRouteSubsystem`）；
   - Step 注入已下沉为 `StepActivationSubsystem`，MultiCorePE 仅转发 tick/阶段事件与注入回调；
   - 10us/100us 回归确定性通过（见 6.4）。
 
@@ -268,7 +270,7 @@ components/MultiCorePE (装配/调度/统计汇聚)
 - 目标：NoC 形成独立闭环子系统，覆盖：外发/收包/转发 + 本地投递 + ring tick/receive；MultiCorePE 仅保留“后端装配 + 生命周期/统计聚合”。
 - 设计：`docs/NOC_SUBSYSTEM_DESIGN.md`
 - 动作（建议两段式，先适配器再搬迁）：
-  1. 新增 `services/noc/NocSubsystem.{h,cc}`（先做编排层）：统一收敛输入队列与解包，并通过回调调用 MultiCorePE 的 backend 能力（低风险、易回归）。
+  1. 新增 `platform/noc/NocSubsystem.{h,cc}`（先做编排层）：统一收敛输入队列与解包，并通过回调调用 MultiCorePE 的 backend 能力（低风险、易回归）。
   2. 稳定后把 ring tick/receive、NIC 外发等后端逻辑逐步迁入 NoC 子系统，并精简 `MultiCorePE` 内相关函数与状态。
 - 回归：每一步 10us→100us；同配置 100us 至少 2 次关键字段完全一致。
 
@@ -332,7 +334,7 @@ components/MultiCorePE (装配/调度/统计汇聚)
 - 规划：以 `docs/UNIVERSAL_CONTROL_CORE_DESIGN.md`、`docs/plans/2026-01-03-universal-core-completion.md` 与 `sst_dram_si/TECH_PROGRESS.md` 的落地记录为准
 - OpenSpec：`openspec/changes/refactor-snndl-phase2-synapse-route/`
 - 关键改动：
-  - 新增 `services/synapse/route/SynapseRouteSubsystem.{h,cc}`：接管“路由构建/共享缓存/BCSR route 解析”
+  - 新增 `snn/synapse/route/SynapseRouteSubsystem.{h,cc}`：接管“路由构建/共享缓存/BCSR route 解析”
   - `SpikeCommSubsystem::initRouting()` 仅委托 `synapse_route_->initRoutes()` 并消费 routes
 - 回归验证（seed=314159）：
   - baseline 100us：`sst_dram_si/outputs_large/paper2/dram_mesh_4x4/20251223-172019`
@@ -341,19 +343,19 @@ components/MultiCorePE (装配/调度/统计汇聚)
 
 ### 6.4 已完成：Phase3（fanout/gating 下沉 + Step 注入下沉）
 - 关键改动（摘要）：
-  - fanout/gating 下沉至 `services/synapse/route/SynapseRouteSubsystem.*`；`services/synapse/route/SpikeCommSubsystem.*` 退化为 transport façade。
-  - Step 注入下沉至 `services/stimulus/StepActivationSubsystem.*`；MultiCorePE 仅转发 tick/阶段事件。
+  - fanout/gating 下沉至 `snn/synapse/route/SynapseRouteSubsystem.*`；`snn/synapse/route/SpikeCommSubsystem.*` 退化为 transport façade。
+  - Step 注入下沉至 `snn/stimulus/StepActivationSubsystem.*`；MultiCorePE 仅转发 tick/阶段事件。
 - 回归验证（seed=314159，use_bcsr_routes=1）：
   - 10us：`sst_dram_si/outputs_large/paper2/dram_mesh_4x4/20251224-000114`
   - 100us：`sst_dram_si/outputs_large/paper2/dram_mesh_4x4/20251224-000249`
   - 100us（同配置重复 1 次完全一致）：`sst_dram_si/outputs_large/paper2/dram_mesh_4x4/20251224-000446`
 
 ### 6.5 已完成：Phase4（NoC 子系统全覆盖 + INocTransport 接口化）
-- Phase4-A1.1（NoC 编排层）：`services/noc/NocSubsystem` 统一收敛 send/recv/forward + 本地投递（后端仍可复用 MultiCorePE 现有能力）。
+- Phase4-A1.1（NoC 编排层）：`platform/noc/NocSubsystem` 统一收敛 send/recv/forward + 本地投递（后端仍可复用 MultiCorePE 现有能力）。
   - 10us：`sst_dram_si/outputs_large/paper2/dram_mesh_4x4/20251224-093307`（`neurons_fired_total=5`）
   - 100us：`sst_dram_si/outputs_large/paper2/dram_mesh_4x4/20251224-093407`
   - 100us（同配置重复 1 次完全一致）：`sst_dram_si/outputs_large/paper2/dram_mesh_4x4/20251224-093512`
-- Phase4-A1.2（NoC 后端实现搬迁，真正闭环）：ring tick/receive + 外发/中继逻辑迁入 `services/noc/NocSubsystem`，MultiCorePE 更壳化。
+- Phase4-A1.2（NoC 后端实现搬迁，真正闭环）：ring tick/receive + 外发/中继逻辑迁入 `platform/noc/NocSubsystem`，MultiCorePE 更壳化。
   - 10us：`sst_dram_si/outputs_large/paper2/dram_mesh_4x4/20251224-103032`（`neurons_fired_total=5`）
   - 100us：`sst_dram_si/outputs_large/paper2/dram_mesh_4x4/20251224-103128`
   - 100us（同配置重复 1 次完全一致）：`sst_dram_si/outputs_large/paper2/dram_mesh_4x4/20251224-103231`
@@ -365,13 +367,13 @@ components/MultiCorePE (装配/调度/统计汇聚)
     - `neurons_fired_total=12854`、`gas_scatter_spikes_emitted_total=406`、`window_spikes_total=812`、`step_activation.invocations=51`
 
 ### 6.6 已完成：Phase6（Stimulus 域：StepActivationSubsystem 目录归位）
-- 关键改动：将 Step 子系统从 `services/StepActivationSubsystem.*` 移动到 `services/stimulus/StepActivationSubsystem.*`，并补齐 Makefile 对子目录的 depfiles/dirstamp 支持，确保 `make -j4` 稳定可复现。
+- 关键改动：将 Step 子系统从 `services/StepActivationSubsystem.*` 移动到 `snn/stimulus/StepActivationSubsystem.*`，并补齐 Makefile 对子目录的 depfiles/dirstamp 支持，确保 `make -j4` 稳定可复现。
 - 回归验证（100us）：`sst_dram_si/outputs_large/paper2/dram_mesh_4x4/20251224-145051`
   - `neurons_fired_total=12854`、`gas_scatter_spikes_emitted_total=406`、`window_spikes_total=812`、`step_activation.invocations=51`
 
 ### 6.7 已完成：Phase7（MultiCorePE 进一步壳化：外部 SpikeEvent 直注入下沉 Stimulus + 禁止 legacy requestMemoryAccess）
 - 关键改动：
-  - 新增 `services/stimulus/ExternalSpikeInputSubsystem.{h,cc}`：兼容 `external_spike_input` 端口直接注入 `SpikeEvent*` 的 legacy 语义（**仅本地投递**；不 relay/forward）。
+  - 新增 `snn/stimulus/ExternalSpikeInputSubsystem.{h,cc}`：兼容 `external_spike_input` 端口直接注入 `SpikeEvent*` 的 legacy 语义（**仅本地投递**；不 relay/forward）。
   - `components/MultiCorePE`：`handleExternalSpikeEvent()` 的 SpikeEvent 分支改为委托 `ExternalSpikeInputSubsystem::onSpike()`；MultiCorePE 只保留装配/转发。
   - `components/MultiCorePE`：删除未挂接的 `handleMemoryResponse/pending_memory_requests_` 旧壳；`requestMemoryAccess()` 改为 fail-fast `fatal`（强制走 `IMemoryAccess`+`synapse/weights` 链路，避免边界回退）。
 - 回归验证：
@@ -392,16 +394,16 @@ components/MultiCorePE (装配/调度/统计汇聚)
 
 ### 6.9 已完成：Phase9（9.1–9.4：CoreShellAPI 槽位 + packet-first 注入 + 退役 deliverSpikeToCore）
 - 目标（一次性完成 9.1–9.4）：
-  - 9.1：核心槽位 API 切换为 `CoreShellAPI`（平台层不再直接依赖 `SnnCoreAPI`）
+  - 9.1：核心槽位统一为 `CoreShellAPI`，旧核心 API 已删除。
   - 9.2：ExternalSpikeInputSubsystem 注入改为 packet-first（走 `INocTransport`）
   - 9.3：StepActivationSubsystem 注入改为 packet-first（走 `INocTransport`）
   - 9.4：退役 `deliverSpikeToCore()`（主链路不再走 `deliverSpike` 回退）
 - 关键改动：
   - `components/MultiCorePE.*`：`coreX` 槽位按 `CoreShellAPI` 加载；为“core 未加载/不匹配 API”加入 fail-fast `fatal`，避免静默归零。
-  - `control/SnnPESubComponent.h`：ELI 注册父接口改为 `CoreShellAPI`，确保能被 `loadAnonymousSubComponent<CoreShellAPI>` 正确加载（修复 Phase9 初版导致 core 为空→Step 不触发→全链路归零的问题）。
-  - `services/stimulus/ExternalSpikeInputSubsystem.*`：`SpikeEvent*` → `SpikeNocCodec::encode` → `noc->injectLocal/sendExternal`。
-  - `services/stimulus/StepActivationSubsystem.*`：同上，注入链路完全 packet-first。
-  - `components/MultiCorePE.*`：删除 `deliverSpikeToCore()` 及其绑定；仅保留 legacy-only 入口通过 `dynamic_cast<SnnCoreAPI*>` 调用（用于 reset/forceEndGather）。
+  - `platform/core/SnnPESubComponent.h`：ELI 注册父接口改为 `CoreShellAPI`，确保能被 `loadAnonymousSubComponent<CoreShellAPI>` 正确加载（修复 Phase9 初版导致 core 为空→Step 不触发→全链路归零的问题）。
+  - `snn/stimulus/ExternalSpikeInputSubsystem.*`：`SpikeEvent*` → `SpikeNocCodec::encode` → `noc->injectLocal/sendExternal`。
+  - `snn/stimulus/StepActivationSubsystem.*`：同上，注入链路完全 packet-first。
+  - `components/MultiCorePE.*`：已删除 legacy spike/reset API；复位通过 `IGlobalStepHooks` 注入。
 - 回归验证（脚本保持不改，按模板启动；stream 通过环境变量选择）：
   - SNN 10us：`sst_dram_si/outputs_large/paper2/dram_mesh_4x4/20260103-050427`（`neurons_fired_total=1`；非 0）
   - SNN 100us：`sst_dram_si/outputs_large/paper2/dram_mesh_4x4/20260103-050009`（`neurons_fired_total=2220`；与稳定基线量级一致）

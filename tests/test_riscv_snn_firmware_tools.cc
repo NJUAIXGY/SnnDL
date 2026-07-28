@@ -1,10 +1,10 @@
 // -*- c++ -*-
 
-#include "workload/riscv_snn/RiscvSnnAbi.h"
-#include "workload/riscv_snn/RiscvSnnAsm.h"
-#include "workload/riscv_snn/RiscvSnnElfWriter.h"
-#include "workload/riscv_snn/RiscvSnnFirmwareLoader.h"
-#include "workload/riscv_snn/RiscvSnnSampleFirmware.h"
+#include "workloads/riscv_snn/RiscvSnnAbi.h"
+#include "workloads/riscv_snn/RiscvSnnAsm.h"
+#include "workloads/riscv_snn/RiscvSnnElfWriter.h"
+#include "workloads/riscv_snn/RiscvSnnFirmwareLoader.h"
+#include "workloads/riscv_snn/RiscvSnnSampleFirmware.h"
 
 #include <cassert>
 #include <cstdio>

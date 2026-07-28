@@ -1,7 +1,7 @@
 // -*- c++ -*-
 
 #include "api/WorkloadConfig.h"
-#include "services/stimulus/ExternalSpikeInputSubsystem.h"
+#include "snn/stimulus/ExternalSpikeInputSubsystem.h"
 
 #include <cassert>
 

@@ -4,7 +4,7 @@
 
 **Goal:** 为 SnnDL 落地 Phase A 的片上本地存储平台骨架，先打通 `LocalStorageHierarchyController`、`MultiCorePE` 装配与参数/对象注册，保持默认关闭兼容。
 
-**Architecture:** 新增 `services/local_storage/` 平台层，定义统一对象类型与 controller；`MultiCorePE` 在 `local_storage_enable=1` 且 `workload_impl=snn` 时构造 per-PE controller，并基于新参数与旧参数 alias 注册 `state/weight/activation/accumulator/register file` 对象。第一阶段不改变现有 compute/weight/activation/accumulator 行为，只提供稳定的对象注册、统计与后续迁移挂点。
+**Architecture:** 新增 `research/local_storage/` 平台层，定义统一对象类型与 controller；`MultiCorePE` 在 `local_storage_enable=1` 且 `workload_impl=snn` 时构造 per-PE controller，并基于新参数与旧参数 alias 注册 `state/weight/activation/accumulator/register file` 对象。第一阶段不改变现有 snn/compute/weight/activation/accumulator 行为，只提供稳定的对象注册、统计与后续迁移挂点。
 
 **Tech Stack:** C++17、SST Element、轻量自包含测试（`g++` + `assert`）
 
@@ -13,9 +13,9 @@
 ### Task 1: 新增 local storage 平台类型与控制器骨架
 
 **Files:**
-- Create: `services/local_storage/LocalStorageTypes.h`
-- Create: `services/local_storage/LocalStorageHierarchyController.h`
-- Create: `services/local_storage/LocalStorageHierarchyController.cc`
+- Create: `research/local_storage/LocalStorageTypes.h`
+- Create: `research/local_storage/LocalStorageHierarchyController.h`
+- Create: `research/local_storage/LocalStorageHierarchyController.cc`
 - Test: `tests/test_local_storage_hierarchy.cc`
 
 **Step 1: Write the failing test**
@@ -27,7 +27,7 @@
 
 **Step 2: Run test to verify it fails**
 
-- Run: `g++ -std=c++17 -I . tests/test_local_storage_hierarchy.cc services/local_storage/LocalStorageHierarchyController.cc -o /tmp/test_local_storage_hierarchy`
+- Run: `g++ -std=c++17 -I . tests/test_local_storage_hierarchy.cc research/local_storage/LocalStorageHierarchyController.cc -o /tmp/test_local_storage_hierarchy`
 - Expected: 编译失败，提示缺少新头/新实现。
 
 **Step 3: Write minimal implementation**
@@ -83,7 +83,7 @@
 
 **Step 2: Run test to verify it fails**
 
-- Run: `g++ -std=c++17 -I . tests/test_local_storage_hierarchy.cc services/local_storage/LocalStorageHierarchyController.cc -o /tmp/test_local_storage_hierarchy`
+- Run: `g++ -std=c++17 -I . tests/test_local_storage_hierarchy.cc research/local_storage/LocalStorageHierarchyController.cc -o /tmp/test_local_storage_hierarchy`
 - Expected: 测试失败，提示缺少默认对象注册辅助逻辑。
 
 **Step 3: Write minimal implementation**
@@ -125,7 +125,7 @@
 
 **Step 2: Run focused verification**
 
-- Run: `g++ -std=c++17 -I . tests/test_local_storage_hierarchy.cc services/local_storage/LocalStorageHierarchyController.cc -o /tmp/test_local_storage_hierarchy && /tmp/test_local_storage_hierarchy`
+- Run: `g++ -std=c++17 -I . tests/test_local_storage_hierarchy.cc research/local_storage/LocalStorageHierarchyController.cc -o /tmp/test_local_storage_hierarchy && /tmp/test_local_storage_hierarchy`
 - Run: `cd /home/xgy/remote/sst_workspace/sst-elements/src/sst/elements/SnnDL && make test-compile`
 - Run: `g++ -std=c++17 -I . -c components/multicore/MultiCorePEConfig.cc -o /tmp/test_multicore_cfg.o`
 - Run: `g++ -std=c++17 -I . -c components/MultiCorePE.cc -o /tmp/test_multicore_pe.o`

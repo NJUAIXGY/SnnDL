@@ -2,7 +2,7 @@
 #include <cstdint>
 #include <limits>
 
-#include "services/pe_fabric/PulseAgendaScorer.h"
+#include "research/pe_fabric/PulseAgendaScorer.h"
 
 using SST::SnnDL::PulseAgendaScorer;
 

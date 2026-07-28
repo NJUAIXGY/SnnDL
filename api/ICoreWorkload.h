@@ -1,7 +1,7 @@
 // -*- c++ -*-
 //
 // ICoreWorkload: 通用 workload 插件接口（Phase6/Phase3）
-// - 由 CoreShell（当前为 control/SnnPESubComponent）装配运行时依赖（NoC + Memory + 统计 sinks）
+// - 由 CoreShell（当前为 platform/core/SnnPESubComponent）装配运行时依赖（NoC + Memory + 统计 sinks）
 // - workload 本身不应假设 SNN 语义存在；SNN 将在后续 Phase 中迁为 workload=snn
 //
 
@@ -118,6 +118,10 @@ public:
         uint32_t node_id = 0;
         uint32_t core_id = 0;
         uint32_t total_nodes = 1;
+        uint32_t total_cores = 1;
+        uint32_t neurons_per_core = 1;
+        uint32_t neurons_per_pe = 1;
+        uint64_t global_neuron_base = 0;
         uint64_t base_addr = 0;
 
         IMemoryAccess* mem = nullptr;

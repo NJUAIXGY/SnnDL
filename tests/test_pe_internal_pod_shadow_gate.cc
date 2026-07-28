@@ -1,10 +1,10 @@
 #include <cassert>
 #include <cstdint>
 
-#include "services/local_storage/PeInternalPodShadowGate.h"
-#include "services/local_storage/PodMetadataObjectPlane.h"
-#include "services/local_storage/PodOwnerServiceTable.h"
-#include "services/pe_fabric/PeSharedCoreFabric.h"
+#include "research/local_storage/PeInternalPodShadowGate.h"
+#include "research/local_storage/PodMetadataObjectPlane.h"
+#include "research/local_storage/PodOwnerServiceTable.h"
+#include "research/pe_fabric/PeSharedCoreFabric.h"
 
 using SST::SnnDL::PeInternalPodShadowGate;
 using SST::SnnDL::PeInternalPodShadowGateBindings;

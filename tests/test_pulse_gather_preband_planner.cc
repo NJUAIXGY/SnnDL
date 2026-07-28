@@ -6,8 +6,8 @@
 #include <string>
 #include <vector>
 
-#include "components/workload_stats/SnnWorkloadStatsModule.h"
-#include "services/synapse/weights/WeightMemorySubsystem.h"
+#include "platform/stats/SnnWorkloadStatsModule.h"
+#include "snn/synapse/weights/WeightMemorySubsystem.h"
 
 using SST::SnnDL::IWorkloadStatRegistrar;
 using SST::SnnDL::SnnWorkloadStatsModule;

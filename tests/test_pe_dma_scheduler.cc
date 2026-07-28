@@ -6,8 +6,8 @@
 #include <vector>
 
 #include "api/IDmaTaggedAccess.h"
-#include "services/memory/DmaMemAccessProxy.h"
-#include "services/memory/PeDmaScheduler.h"
+#include "platform/memory/DmaMemAccessProxy.h"
+#include "platform/memory/PeDmaScheduler.h"
 
 using SST::SnnDL::DmaMemAccessProxy;
 using SST::SnnDL::IDmaTaggedAccess;

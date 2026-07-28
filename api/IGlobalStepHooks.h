@@ -18,7 +18,7 @@ class IGlobalStepHooks {
 public:
     virtual ~IGlobalStepHooks() = default;
     virtual void onGlobalStepStart(uint32_t seq) = 0;
+    virtual void resetMembraneState(float v_rest) = 0;
 };
 
 }} // namespace SST::SnnDL
-

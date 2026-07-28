@@ -1,8 +1,8 @@
 // -*- c++ -*-
 
-#include "workload/common/SnnAccelBackend.h"
-#include "workload/common/SnnAccelBackendContract.h"
-#include "workload/riscv_snn/RiscvSnnAbi.h"
+#include "workloads/common/SnnAccelBackend.h"
+#include "workloads/common/SnnAccelBackendContract.h"
+#include "workloads/riscv_snn/RiscvSnnAbi.h"
 
 #include <cassert>
 #include <cstdint>

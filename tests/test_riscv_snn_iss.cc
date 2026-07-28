@@ -1,10 +1,10 @@
 // -*- c++ -*-
 
-#include "workload/riscv_snn/RiscvSnnAbi.h"
-#include "workload/riscv_snn/RiscvSnnAsm.h"
-#include "workload/riscv_snn/RiscvSnnHart.h"
-#include "workload/riscv_snn/RiscvSnnIss.h"
-#include "workload/riscv_snn/RiscvSnnMemoryImage.h"
+#include "workloads/riscv_snn/RiscvSnnAbi.h"
+#include "workloads/riscv_snn/RiscvSnnAsm.h"
+#include "workloads/riscv_snn/RiscvSnnHart.h"
+#include "workloads/riscv_snn/RiscvSnnIss.h"
+#include "workloads/riscv_snn/RiscvSnnMemoryImage.h"
 
 #include <cassert>
 #include <cstdint>

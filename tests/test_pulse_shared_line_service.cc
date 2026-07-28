@@ -3,7 +3,7 @@
 #include <cstring>
 #include <vector>
 
-#include "services/synapse/weights/PulseSharedLineService.h"
+#include "snn/synapse/weights/PulseSharedLineService.h"
 
 using SST::SnnDL::PulseSharedLineService;
 

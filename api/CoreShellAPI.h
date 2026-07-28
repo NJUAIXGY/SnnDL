@@ -16,12 +16,26 @@
 
 #include <cstdint>
 #include <map>
+#include <string>
 #include <vector>
 
 namespace SST { namespace SnnDL {
 
 class IPeAggregation;
 class NocPacketEvent;
+
+struct CorePlatformConfig {
+    uint32_t node_id = 0;
+    uint32_t core_id = 0;
+    uint32_t total_nodes = 1;
+    uint32_t total_cores = 1;
+    uint32_t neurons_per_core = 1;
+    uint32_t neurons_per_pe = 1;
+    uint64_t global_neuron_base = 0;
+    uint64_t base_addr = 0;
+    std::string workload_impl = "snn";
+    std::string exec_mode = "gas";
+};
 
 class CoreShellAPI : public SST::SubComponent {
 public:
@@ -35,6 +49,9 @@ public:
 
     // 与父组件通信（仅统计/阶段事件汇聚接口；不包含 Spike/路由语义）
     virtual void setParentInterface(IPeAggregation* parent) = 0;
+
+    virtual bool applyPlatformConfig(const CorePlatformConfig& config,
+                                     std::string& error) = 0;
 
     // 通用 NoC packet 输入（payload-agnostic；Spike packet 由 workload 解释）
     // 返回 true 表示本 core 接管 packet 生命周期；返回 false 表示未处理、由调用方负责 delete。

@@ -1,7 +1,7 @@
 // -*- c++ -*-
 //
 // IGasCmdSender: GAS 控制面命令发送接口（Control → 下游 StandardMem 前端）
-// - 目的：让 control/ 不直接 new StandardMem::CustomReq，也不依赖 GasOpData/StandardMem 类型
+// - 目的：让 platform/core/ 不直接 new StandardMem::CustomReq，也不依赖 GasOpData/StandardMem 类型
 //
 
 #pragma once

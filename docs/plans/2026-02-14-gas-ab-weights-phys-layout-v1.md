@@ -54,10 +54,10 @@ addr = base_addr
 - `base_addr % dense_phys_dram_row_bytes == 0`
 
 实现位置：
-- `services/synapse/weights/DenseWeightLayout.h`
-- `services/synapse/weights/WeightMemorySubsystem.{h,cc}`（dense 读寻址）
-- `services/synapse/stdmem/SnnPESubComponent_mem.cc`（naive/legacy 的 direct read/write 也一致）
-- `control/SnnPESubComponent.{h,cc}`、`control/SnnPESubComponentConfig.h`、`services/workload/snn/SnnWorkload.cc`（参数解析 + weight_region_end 计算）
+- `snn/synapse/weights/DenseWeightLayout.h`
+- `snn/synapse/weights/WeightMemorySubsystem.{h,cc}`（dense 读寻址）
+- `snn/synapse/stdmem/SnnPESubComponent_mem.cc`（naive/legacy 的 direct read/write 也一致）
+- `platform/core/SnnPESubComponent.{h,cc}`、`platform/core/SnnPESubComponentConfig.h`、`workloads/snn/SnnWorkload.cc`（参数解析 + weight_region_end 计算）
 
 ---
 

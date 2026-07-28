@@ -10,7 +10,7 @@
 #include "ISpikeTransport.h"
 #include "GlobalNeuronLayout.h"
 #include "NocPacketEvent.h"
-#include "synapse/route/SpikeNocCodec.h"
+#include "snn/synapse/route/SpikeNocCodec.h"
 
 namespace SST { namespace SnnDL {
 

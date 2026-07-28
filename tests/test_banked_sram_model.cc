@@ -1,7 +1,7 @@
 #include <cassert>
 #include <cstdint>
 
-#include "services/memory/sram_sim/model/BankedSramModel.h"
+#include "platform/memory/sram_sim/model/BankedSramModel.h"
 
 using SST::SnnDL::BankedSramConfig;
 using SST::SnnDL::BankedSramModel;

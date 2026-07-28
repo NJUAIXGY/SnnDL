@@ -4,9 +4,9 @@ AM_CPPFLAGS += \
 	-I$(srcdir)/api \
 	-I$(srcdir)/events \
 	-I$(srcdir)/components \
-	-I$(srcdir)/control \
-	-I$(srcdir)/compute \
-	-I$(srcdir)/services \
+	-I$(srcdir)/platform/core \
+	-I$(srcdir)/snn/compute \
+	-I$(srcdir)/snn/profiling \
 	-I$(SST_PREFIX)/include
 
 # 可选的MPI支持 - 不影响现有构建
@@ -18,13 +18,10 @@ AM_CPPFLAGS += \
 compdir = $(pkglibdir)
 comp_LTLIBRARIES = libSnnDL.la
 libSnnDL_la_SOURCES = \
-	api/SnnCoreAPI.h \
 	api/CoreShellAPI.h \
 	api/SnnInterface.h \
-	api/SnnPEParentInterface.h \
 	api/ISpikeTransport.h \
 	api/INocTransport.h \
-	api/IManualWindowDrive.h \
 	api/GasOps.h \
 	api/IGasCmdSender.h \
 	api/IGasStageSink.h \
@@ -70,164 +67,167 @@ libSnnDL_la_SOURCES = \
 	components/MemKCalBench.h \
 	components/multicore/MultiCorePEConfig.cc \
 	components/multicore/MultiCorePEConfig.h \
+	components/multicore/MultiCorePEObservability.cc \
 	components/MultiCorePE.cc \
 	components/MultiCorePE.h \
 	components/SnnNIC.cc \
 	components/SnnNIC.h \
-	components/SnnPE.cc \
-	components/SnnPE.h \
 	components/stimulus/SpikeSource.cc \
 	components/stimulus/SpikeSource.h \
 	components/WeightLoader.cc \
 	components/WeightLoader.h \
-	components/workload_stats/IWorkloadStatsModule.h \
-	components/workload_stats/KeyedCounterStatsModule.h \
-	components/workload_stats/StreamWorkloadStatsModule.h \
-	components/workload_stats/TensorWorkloadStatsModule.h \
-	components/workload_stats/WorkloadStatsRegistry.cc \
-	components/workload_stats/WorkloadStatsRegistry.h \
-	control/SnnPESubComponent.cc \
-	control/SnnPESubComponent.h \
-	control/SnnPESubComponent_impl.h \
-	control/SnnPESubComponent_bcsr.cc \
-	control/SnnPESubComponent_routing.cc \
-	control/SnnPESubComponent_scheme1.cc \
-	control/SnnPESubComponent_spike.cc \
-	control/SnnPEApplyScatter.cc \
-	control/SnnPEOrchestrators.cc \
-	compute/SnnComputeCore.cc \
-	compute/SnnComputeCore.h \
-	compute/SnnCoreEngine.cc \
-	compute/SnnCoreEngine.h \
-	compute/SnnLearningCore.cc \
-	compute/SnnLearningCore.h \
-	compute/IWeightAwareComputeCore.h \
-	compute/SnnNeuronModel.h \
-	compute/SynapseManager.h \
-	services/synapse/gas/AccumulatorOps.cc \
-	services/synapse/gas/AccumulatorOps.h \
-	services/synapse/gas/GasCustomCmd.h \
-	services/synapse/gas/GasEdgeCollector.cc \
-	services/synapse/gas/GasEdgeCollector.h \
-	services/synapse/gas/GasPhaseController.cc \
-	services/synapse/gas/GasPhaseController.h \
-	services/synapse/stdmem/StdMemEndpoint.cc \
-	services/synapse/stdmem/StdMemEndpoint.h \
-	services/synapse/stdmem/SnnPESubComponent_mem.cc \
-	services/noc/OptimizedInternalRing.cc \
-	services/noc/OptimizedInternalRing.h \
+	platform/stats/IWorkloadStatsModule.h \
+	platform/stats/KeyedCounterStatsModule.h \
+	platform/stats/StreamWorkloadStatsModule.h \
+	platform/stats/TensorWorkloadStatsModule.h \
+	platform/stats/WorkloadStatsRegistry.cc \
+	platform/stats/WorkloadStatsRegistry.h \
+	platform/core/SnnPESubComponent.cc \
+	platform/core/SnnPESubComponentStats.cc \
+	platform/core/SnnPESubComponent.h \
+	platform/core/SnnPESubComponent_impl.h \
+	platform/core/SnnPESubComponent_bcsr.cc \
+	platform/core/SnnPESubComponent_routing.cc \
+	platform/core/SnnPEApplyScatter.cc \
+	platform/core/SnnPEOrchestrators.cc \
+	snn/compute/SnnComputeCore.cc \
+	snn/compute/SnnComputeCore.h \
+	snn/compute/SnnCoreEngine.cc \
+	snn/compute/SnnCoreEngine.h \
+	snn/compute/SnnLearningCore.cc \
+	snn/compute/SnnLearningCore.h \
+	snn/compute/IWeightAwareComputeCore.h \
+	snn/compute/SnnNeuronModel.h \
+	snn/compute/SynapseManager.h \
+	snn/synapse/gas/AccumulatorOps.cc \
+	snn/synapse/gas/AccumulatorOps.h \
+	snn/synapse/gas/GasCustomCmd.h \
+	snn/synapse/gas/GasEdgeCollector.cc \
+	snn/synapse/gas/GasEdgeCollector.h \
+	snn/synapse/gas/GasPhaseController.cc \
+	snn/synapse/gas/GasPhaseController.h \
+	snn/synapse/stdmem/StdMemEndpoint.cc \
+	snn/synapse/stdmem/StdMemEndpoint.h \
+	snn/synapse/stdmem/SnnPESubComponent_mem.cc \
+	platform/noc/OptimizedInternalRing.cc \
+	platform/noc/OptimizedInternalRing.h \
 	components/noc/SimpleNetworkWrapper.cc \
 	components/noc/SimpleNetworkWrapper.h \
-	services/synapse/weights/SnnBcsrWeightManager.cc \
-	services/synapse/weights/SnnBcsrWeightManager.h \
-	services/synapse/weights/SnnWeightDiagnostics.cc \
-	services/synapse/weights/SnnWeightDiagnostics.h \
+	snn/synapse/weights/SnnBcsrWeightManager.cc \
+	snn/synapse/weights/SnnBcsrWeightManager.h \
+	snn/synapse/weights/SnnWeightDiagnostics.cc \
+	snn/synapse/weights/SnnWeightDiagnostics.h \
 	components/noc/SnnNetworkAdapter.cc \
 	components/noc/SnnNetworkAdapter.h \
 	components/noc/MulticastRouter.cc \
 	components/noc/MulticastRouter.h \
-	components/noc3d/MulticastRouter3DNative.cc \
-	components/noc3d/MulticastRouter3DNative.h \
-	components/noc3d/MulticastRouter3DNativeConfig.h \
-	components/noc3d/Noc3DSmokeSource.cc \
-	components/noc3d/Noc3DSmokeSource.h \
-	components/noc3d/Noc3DSmokeSink.cc \
-	components/noc3d/Noc3DSmokeSink.h \
-	components/noc3d/HBMStackStub.cc \
-	components/noc3d/HBMStackStub.h \
+	research/noc3d/MulticastRouter3DNative.cc \
+	research/noc3d/MulticastRouter3DNative.h \
+	research/noc3d/MulticastRouter3DNativeConfig.h \
+	research/noc3d/Noc3DSmokeSource.cc \
+	research/noc3d/Noc3DSmokeSource.h \
+	research/noc3d/Noc3DSmokeSink.cc \
+	research/noc3d/Noc3DSmokeSink.h \
+	research/noc3d/HBMStackStub.cc \
+	research/noc3d/HBMStackStub.h \
 	components/noc/MulticastNIC.cc \
 	components/noc/MulticastNIC.h \
-	services/SnnProfiler.h \
-	services/synapse/route/SnnRouteProvider.cc \
-	services/synapse/route/SnnRouteProvider.h \
-	services/synapse/route/SpikeNocCodec.cc \
-	services/synapse/route/SpikeNocCodec.h \
-	services/synapse/route/BcsrRouteBuilder.cc \
-	services/synapse/route/BcsrRouteBuilder.h \
-	services/synapse/route/StepBcsrReachability.cc \
-	services/synapse/route/StepBcsrReachability.h \
-	services/synapse/route/SynapseRouteSubsystem.cc \
-	services/synapse/route/SynapseRouteSubsystem.h \
-	services/synapse/route3d/Route3DNodeMapper.h \
-	services/synapse/route3d/SynapseRouteSubsystem3D.cc \
-	services/synapse/route3d/SynapseRouteSubsystem3D.h \
-	services/stimulus/StepActivationSubsystem.cc \
-	services/stimulus/StepActivationSubsystem.h \
-	services/stimulus/ExternalSpikeInputSubsystem.cc \
-	services/stimulus/ExternalSpikeInputSubsystem.h \
-	services/noc/NocSubsystem.cc \
-	services/noc/NocSubsystem.h \
-	services/synapse/weights/WeightAccessor.cc \
-	services/synapse/weights/WeightAccessor.h \
-	services/synapse/weights/WeightCacheOps.cc \
-	services/synapse/weights/WeightCacheOps.h \
-	services/synapse/weights/WeightMemorySubsystem.cc \
-	services/synapse/weights/WeightMemorySubsystem.h \
-	services/synapse/route/SpikeCommSubsystem.cc \
-	services/synapse/route/SpikeCommSubsystem.h \
-	services/synapse/route/SpikePacketTransport.h \
-	services/synapse/route/SpikePacketBridge.cc \
-	services/synapse/route/SpikePacketBridge.h \
-	services/workload/CoreWorkloadFactory.cc \
-	services/workload/common/SnnAccelBackend.cc \
-	services/workload/common/SnnAccelBackend.h \
-	services/workload/common/SnnAccelBackendContract.h \
-	services/workload/layout/NormalizedNeuronLayout.cc \
-	services/workload/layout/NormalizedNeuronLayout.h \
-	services/workload/riscv_snn/RiscvSnnAbi.h \
-	services/workload/riscv_snn/RiscvSnnAsm.h \
-	services/workload/riscv_snn/RiscvSnnBootDriver.cc \
-	services/workload/riscv_snn/RiscvSnnBootDriver.h \
-	services/workload/riscv_snn/RiscvSnnElfWriter.h \
-	services/workload/riscv_snn/RiscvSnnFirmwareLoader.cc \
-	services/workload/riscv_snn/RiscvSnnFirmwareLoader.h \
-	services/workload/riscv_snn/RiscvSnnHart.cc \
-	services/workload/riscv_snn/RiscvSnnHart.h \
-	services/workload/riscv_snn/RiscvSnnIss.cc \
-	services/workload/riscv_snn/RiscvSnnIss.h \
-	services/workload/riscv_snn/RiscvSnnMemoryImage.h \
-	services/workload/riscv_snn/RiscvSnnQueueContract.h \
-	services/workload/riscv_snn/RiscvSnnRuntimeBridgeBackend.cc \
-	services/workload/riscv_snn/RiscvSnnRuntimeBridgeBackend.h \
-	services/workload/riscv_snn/RiscvSnnSampleFirmware.h \
-	services/workload/riscv_snn/RiscvSnnShadowTransportExport.cc \
-	services/workload/riscv_snn/RiscvSnnShadowTransportExport.h \
-	services/workload/riscv_snn/RiscvSnnShadowRuntimeServices.cc \
-	services/workload/riscv_snn/RiscvSnnShadowRuntimeServices.h \
-	services/workload/riscv_snn/RiscvSnnWorkload.cc \
-	services/workload/riscv_snn/RiscvSnnWorkload.h \
-	services/workload/snn/SnnWorkload.cc \
-	services/workload/snn/SnnWorkload.h \
-	services/workload/stream/StreamWorkload.cc \
-	services/workload/stream/StreamWorkload.h \
-	services/workload/traffic/TrafficWorkload.cc \
-	services/workload/traffic/TrafficWorkload.h \
-	services/workload/traffic_mem/TrafficMemWorkload.cc \
-	services/workload/traffic_mem/TrafficMemWorkload.h \
-	services/workload/tensor/TensorWorkload.cc \
-	services/workload/tensor/TensorWorkload.h \
-	services/memory/sram_sim/layout/VirtualSramLayout.h \
-	services/memory/sram_sim/model/BankedSramModel.cc \
-	services/memory/sram_sim/model/BankedSramModel.h \
-	services/local_storage/LocalStorageTypes.h \
-	services/local_storage/LocalStorageHierarchyController.cc \
-	services/local_storage/LocalStorageHierarchyController.h \
-	services/local_storage/PeWeightObjectPlane.cc \
-	services/local_storage/PeWeightObjectPlane.h \
-	services/memory/DmaMemAccessProxy.cc \
-	services/memory/DmaMemAccessProxy.h \
-	services/pe_fabric/PulseAgendaScorer.cc \
-	services/pe_fabric/PulseAgendaScorer.h \
-	services/pe_fabric/PulseDescriptor.h \
-	services/pe_fabric/PeSharedCoreFabric.cc \
-	services/pe_fabric/PeSharedCoreFabric.h \
-	services/memory/PeDmaScheduler.cc \
-	services/memory/PeDmaScheduler.h \
-	services/memory/StandardMemAccess.cc \
-	services/memory/StandardMemAccess.h
+	snn/profiling/SnnProfiler.h \
+	snn/synapse/route/SnnRouteProvider.cc \
+	snn/synapse/route/SnnRouteProvider.h \
+	snn/synapse/route/SpikeNocCodec.cc \
+	snn/synapse/route/SpikeNocCodec.h \
+	snn/synapse/route/BcsrRouteBuilder.cc \
+	snn/synapse/route/BcsrRouteBuilder.h \
+	snn/synapse/route/StepBcsrReachability.cc \
+	snn/synapse/route/StepBcsrReachability.h \
+	snn/synapse/route/SynapseRouteSubsystem.cc \
+	snn/synapse/route/SynapseRouteSubsystem.h \
+	research/route3d/Route3DNodeMapper.h \
+	research/route3d/SynapseRouteSubsystem3D.cc \
+	research/route3d/SynapseRouteSubsystem3D.h \
+	snn/stimulus/StepActivationSubsystem.cc \
+	snn/stimulus/StepActivationSubsystem.h \
+	snn/stimulus/ExternalSpikeInputSubsystem.cc \
+	snn/stimulus/ExternalSpikeInputSubsystem.h \
+	platform/noc/NocSubsystem.cc \
+	platform/noc/NocSubsystem.h \
+	snn/synapse/weights/WeightAccessor.cc \
+	snn/synapse/weights/WeightAccessor.h \
+	snn/synapse/weights/WeightCacheOps.cc \
+	snn/synapse/weights/WeightCacheOps.h \
+	snn/synapse/weights/WeightMemorySubsystem.cc \
+	snn/synapse/weights/WeightMemorySubsystemVerification.cc \
+	snn/synapse/weights/WeightMemorySubsystem.h \
+	snn/synapse/route/SpikeCommSubsystem.cc \
+	snn/synapse/route/SpikeCommSubsystem.h \
+	snn/synapse/route/SpikePacketTransport.h \
+	snn/synapse/route/SpikePacketBridge.cc \
+	snn/synapse/route/SpikePacketBridge.h \
+	workloads/CoreWorkloadFactory.cc \
+	workloads/common/SnnAccelBackend.cc \
+	workloads/common/SnnAccelBackend.h \
+	workloads/common/SnnAccelBackendContract.h \
+	workloads/layout/NormalizedNeuronLayout.cc \
+	workloads/layout/NormalizedNeuronLayout.h \
+	workloads/riscv_snn/RiscvSnnAbi.h \
+	workloads/riscv_snn/RiscvSnnAsm.h \
+	workloads/riscv_snn/RiscvSnnBootDriver.cc \
+	workloads/riscv_snn/RiscvSnnBootDriver.h \
+	workloads/riscv_snn/RiscvSnnElfWriter.h \
+	workloads/riscv_snn/RiscvSnnFirmwareLoader.cc \
+	workloads/riscv_snn/RiscvSnnFirmwareLoader.h \
+	workloads/riscv_snn/RiscvSnnHart.cc \
+	workloads/riscv_snn/RiscvSnnHart.h \
+	workloads/riscv_snn/RiscvSnnIss.cc \
+	workloads/riscv_snn/RiscvSnnIss.h \
+	workloads/riscv_snn/RiscvSnnMemoryImage.h \
+	workloads/riscv_snn/RiscvSnnQueueContract.h \
+	workloads/riscv_snn/RiscvSnnRuntimeBridgeBackend.cc \
+	workloads/riscv_snn/RiscvSnnRuntimeBridgeBackend.h \
+	workloads/riscv_snn/RiscvSnnSampleFirmware.h \
+	workloads/riscv_snn/RiscvSnnShadowTransportExport.cc \
+	workloads/riscv_snn/RiscvSnnShadowTransportExport.h \
+	workloads/riscv_snn/RiscvSnnShadowRuntimeServices.cc \
+	workloads/riscv_snn/RiscvSnnShadowRuntimeServices.h \
+	workloads/riscv_snn/RiscvSnnWorkload.cc \
+	workloads/riscv_snn/RiscvSnnWorkload.h \
+	workloads/snn/SnnWorkload.cc \
+	workloads/snn/SnnWorkload.h \
+	workloads/stream/StreamWorkload.cc \
+	workloads/stream/StreamWorkload.h \
+	workloads/traffic/TrafficWorkload.cc \
+	workloads/traffic/TrafficWorkload.h \
+	workloads/traffic_mem/TrafficMemWorkload.cc \
+	workloads/traffic_mem/TrafficMemWorkload.h \
+	workloads/tensor/TensorWorkload.cc \
+	workloads/tensor/TensorWorkloadCollective.cc \
+	workloads/tensor/TensorWorkloadConfig.cc \
+	workloads/tensor/TensorWorkloadProgram.cc \
+	workloads/tensor/TensorWorkloadStats.cc \
+	workloads/tensor/TensorWorkload.h \
+	platform/memory/sram_sim/layout/VirtualSramLayout.h \
+	platform/memory/sram_sim/model/BankedSramModel.cc \
+	platform/memory/sram_sim/model/BankedSramModel.h \
+	research/local_storage/LocalStorageTypes.h \
+	research/local_storage/LocalStorageHierarchyController.cc \
+	research/local_storage/LocalStorageHierarchyController.h \
+	research/local_storage/PeWeightObjectPlane.cc \
+	research/local_storage/PeWeightObjectPlane.h \
+	platform/memory/DmaMemAccessProxy.cc \
+	platform/memory/DmaMemAccessProxy.h \
+	research/pe_fabric/PulseAgendaScorer.cc \
+	research/pe_fabric/PulseAgendaScorer.h \
+	research/pe_fabric/PulseDescriptor.h \
+	research/pe_fabric/PeSharedCoreFabric.cc \
+	research/pe_fabric/PeSharedCoreFabric.h \
+	platform/memory/PeDmaScheduler.cc \
+	platform/memory/PeDmaScheduler.h \
+	platform/memory/StandardMemAccess.cc \
+	platform/memory/StandardMemAccess.h
 
 #
-# Note: sources above already include GatherBufferIF / MemKCalBench / MPI files.
+# Note: sources above include the production runtime and explicitly selected research modules.
 #
 
 libSnnDL_la_LDFLAGS = -module -avoid-version
@@ -247,48 +247,48 @@ test-riscv-snn-stimulus-gating:
 		-o $(builddir)/test_riscv_snn_stimulus_gating$(EXEEXT) && \
 		$(builddir)/test_riscv_snn_stimulus_gating$(EXEEXT) && \
 		rg -q "ex_rt\\.enabled = workloadAllowsSnnStimulus\\(cfg\\.workload_kind\\);" $(srcdir)/components/MultiCorePE.cc && \
-		rg -q "if \\(!rt_\\.enabled\\)" $(srcdir)/services/stimulus/ExternalSpikeInputSubsystem.cc
+		rg -q "if \\(!rt_\\.enabled\\)" $(srcdir)/snn/stimulus/ExternalSpikeInputSubsystem.cc
 
 test-riscv-snn-backend-timing-contract:
 	$(RISCV_SNN_TEST_LINK) $(srcdir)/tests/test_riscv_snn_backend_timing_contract.cc \
-		$(srcdir)/services/workload/common/SnnAccelBackend.cc \
-		$(srcdir)/services/workload/riscv_snn/RiscvSnnRuntimeBridgeBackend.cc \
-		$(srcdir)/services/workload/riscv_snn/RiscvSnnHart.cc \
-		$(srcdir)/services/workload/riscv_snn/RiscvSnnIss.cc \
+		$(srcdir)/workloads/common/SnnAccelBackend.cc \
+		$(srcdir)/workloads/riscv_snn/RiscvSnnRuntimeBridgeBackend.cc \
+		$(srcdir)/workloads/riscv_snn/RiscvSnnHart.cc \
+		$(srcdir)/workloads/riscv_snn/RiscvSnnIss.cc \
 		-o $(builddir)/test_riscv_snn_backend_timing_contract$(EXEEXT) && \
 		$(builddir)/test_riscv_snn_backend_timing_contract$(EXEEXT)
 
 test-riscv-snn-runtime-service-provider:
 	$(RISCV_SNN_TEST_LINK) $(srcdir)/tests/test_riscv_snn_runtime_service_provider.cc \
-		$(srcdir)/services/workload/common/SnnAccelBackend.cc \
-		$(srcdir)/services/workload/riscv_snn/RiscvSnnRuntimeBridgeBackend.cc \
-		$(srcdir)/services/workload/riscv_snn/RiscvSnnShadowTransportExport.cc \
+		$(srcdir)/workloads/common/SnnAccelBackend.cc \
+		$(srcdir)/workloads/riscv_snn/RiscvSnnRuntimeBridgeBackend.cc \
+		$(srcdir)/workloads/riscv_snn/RiscvSnnShadowTransportExport.cc \
 		-o $(builddir)/test_riscv_snn_runtime_service_provider$(EXEEXT) && \
 		$(builddir)/test_riscv_snn_runtime_service_provider$(EXEEXT)
 
 test-riscv-snn-runtime-bridge-backend:
 	$(RISCV_SNN_TEST_LINK) $(srcdir)/tests/test_riscv_snn_runtime_bridge_backend.cc \
-		$(srcdir)/services/workload/common/SnnAccelBackend.cc \
-		$(srcdir)/services/workload/riscv_snn/RiscvSnnRuntimeBridgeBackend.cc \
+		$(srcdir)/workloads/common/SnnAccelBackend.cc \
+		$(srcdir)/workloads/riscv_snn/RiscvSnnRuntimeBridgeBackend.cc \
 		-o $(builddir)/test_riscv_snn_runtime_bridge_backend$(EXEEXT) && \
 		$(builddir)/test_riscv_snn_runtime_bridge_backend$(EXEEXT)
 
 test-riscv-snn-firmware-protocol:
 	$(RISCV_SNN_TEST_LINK) $(srcdir)/tests/test_riscv_snn_firmware_protocol.cc \
-		$(srcdir)/services/workload/common/SnnAccelBackend.cc \
-		$(srcdir)/services/workload/riscv_snn/RiscvSnnRuntimeBridgeBackend.cc \
-		$(srcdir)/services/workload/riscv_snn/RiscvSnnHart.cc \
-		$(srcdir)/services/workload/riscv_snn/RiscvSnnIss.cc \
+		$(srcdir)/workloads/common/SnnAccelBackend.cc \
+		$(srcdir)/workloads/riscv_snn/RiscvSnnRuntimeBridgeBackend.cc \
+		$(srcdir)/workloads/riscv_snn/RiscvSnnHart.cc \
+		$(srcdir)/workloads/riscv_snn/RiscvSnnIss.cc \
 		-o $(builddir)/test_riscv_snn_firmware_protocol$(EXEEXT) && \
 		$(builddir)/test_riscv_snn_firmware_protocol$(EXEEXT)
 
 test-riscv-snn-toolchain-firmware-protocol:
 	$(RISCV_SNN_TEST_LINK) $(srcdir)/tests/test_riscv_snn_toolchain_firmware_protocol.cc \
-		$(srcdir)/services/workload/common/SnnAccelBackend.cc \
-		$(srcdir)/services/workload/riscv_snn/RiscvSnnRuntimeBridgeBackend.cc \
-		$(srcdir)/services/workload/riscv_snn/RiscvSnnHart.cc \
-		$(srcdir)/services/workload/riscv_snn/RiscvSnnIss.cc \
-		$(srcdir)/services/workload/riscv_snn/RiscvSnnFirmwareLoader.cc \
+		$(srcdir)/workloads/common/SnnAccelBackend.cc \
+		$(srcdir)/workloads/riscv_snn/RiscvSnnRuntimeBridgeBackend.cc \
+		$(srcdir)/workloads/riscv_snn/RiscvSnnHart.cc \
+		$(srcdir)/workloads/riscv_snn/RiscvSnnIss.cc \
+		$(srcdir)/workloads/riscv_snn/RiscvSnnFirmwareLoader.cc \
 		-o $(builddir)/test_riscv_snn_toolchain_firmware_protocol$(EXEEXT) && \
 		$(builddir)/test_riscv_snn_toolchain_firmware_protocol$(EXEEXT)
 

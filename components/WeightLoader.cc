@@ -18,7 +18,7 @@
 #include "WeightLoaderConfig.h"
 #include "LoaderDoneEvent.h"
 #include "SnnDLStringUtil.h"
-#include "synapse/common/BcsrMeta.h"
+#include "snn/synapse/common/BcsrMeta.h"
 
 using namespace SST;
 using namespace SST::SnnDL;

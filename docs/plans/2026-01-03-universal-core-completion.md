@@ -24,12 +24,12 @@
 1) **平台面 packet-first**
    - NoC 输入统一为 `events/NocPacketEvent`；core 侧入口为 `deliverPacket()`（禁止主链路走 `deliverSpike()`）。
 2) **NoC/Mem 语义隔离**
-   - `services/noc/**` 不依赖 `SpikeEvent`（NoC 只处理 packet，不解析突触语义）。
-   - `services/memory/**` 只承诺 `addr↔bytes`（不出现 weight/synapse/bcsr/route 字段）。
+   - `platform/noc/**` 不依赖 `SpikeEvent`（NoC 只处理 packet，不解析突触语义）。
+   - `platform/memory/**` 只承诺 `addr↔bytes`（不出现 weight/synapse/bcsr/route 字段）。
 3) **workload 可插拔**
    - 通过参数 `workload_impl` 或环境变量 `SNNDL_WORKLOAD_IMPL` 在不改脚本的前提下切换 `snn/stream`。
 4) **SNN 语义收敛到 workload**
-   - CoreShell（`control/`）不再承载 SNN 业务状态机（GAS/window、weights、route/fanout、Step 注入等）。
+   - CoreShell（`platform/core/`）不再承载 SNN 业务状态机（GAS/window、weights、route/fanout、Step 注入等）。
 5) **fail-fast**
    - 出现 `stdmem-untracked`、回包截断、歧义匹配等严重错误时直接 `fatal`，避免“静默归零”。
 
@@ -59,12 +59,12 @@
 
 ## 2) 目录与边界索引（快速跳转）
 
-- CoreShell：`control/README.md`
-- 平台 NoC：`services/noc/README.md`
-- 平台 Memory：`services/memory/README.md`
-- Workload 插件：`services/workload/README.md`
-  - SNN：`services/workload/snn/README.md`
-  - Stream：`services/workload/stream/README.md`
-- Synapse 语义域：`services/synapse/README.md`
-- Stimulus：`services/stimulus/README.md`
+- CoreShell：`platform/core/README.md`
+- 平台 NoC：`platform/noc/README.md`
+- 平台 Memory：`platform/memory/README.md`
+- Workload 插件：`workloads/README.md`
+  - SNN：`workloads/snn/README.md`
+  - Stream：`workloads/stream/README.md`
+- Synapse 语义域：`snn/synapse/README.md`
+- Stimulus：`snn/stimulus/README.md`
 

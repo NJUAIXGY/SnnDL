@@ -74,6 +74,11 @@ public:
      */
     virtual void setNodeId(uint32_t node_id) = 0;
 
+    virtual void setTopology(uint32_t node_id, uint32_t total_nodes) {
+        (void)total_nodes;
+        setNodeId(node_id);
+    }
+
     /**
      * @brief 获取网络节点ID
      * @return 当前节点ID

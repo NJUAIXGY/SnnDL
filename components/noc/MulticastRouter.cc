@@ -20,9 +20,9 @@
 
 #include "SnnDLStringUtil.h"
 #include "NocPacketEvent.h"
-#include "synapse/route/SpikeInterBundleCodec.h"
-#include "synapse/route/SpikeNocCodec.h"
-#include "synapse/route/SpikeTileNocCodec.h"
+#include "snn/synapse/route/SpikeInterBundleCodec.h"
+#include "snn/synapse/route/SpikeNocCodec.h"
+#include "snn/synapse/route/SpikeTileNocCodec.h"
 
 namespace SST { namespace SnnDL {
 

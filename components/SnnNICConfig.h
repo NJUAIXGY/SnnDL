@@ -40,7 +40,7 @@ struct SnnNICConfig {
     uint32_t batch_size_remote = 32;
     uint64_t batch_flush_window_ns = 1000;
 
-    uint32_t total_nodes = 16;
+    uint32_t total_nodes = 1;
 
     // Inter-rank proxy batching (currently forced off by SnnNIC; keep parsed for compatibility)
     bool enable_inter_rank_batching = false;
@@ -82,7 +82,7 @@ inline SnnNICConfig parseSnnNICConfig(const SST::Params& params) {
     c.batch_size_local = params.find<uint32_t>("batch_size_local", 8);
     c.batch_size_remote = params.find<uint32_t>("batch_size_remote", 32);
     c.batch_flush_window_ns = params.find<uint64_t>("batch_flush_window", 1000);
-    c.total_nodes = params.find<uint32_t>("total_nodes", 16);
+    c.total_nodes = params.find<uint32_t>("total_nodes", 1);
 
     c.enable_inter_rank_batching = params.find<bool>("enable_inter_rank_batching", false);
     c.inter_rank_batch_window_ns = params.find<uint64_t>("inter_rank_batch_window", 0);
@@ -95,4 +95,3 @@ inline SnnNICConfig parseSnnNICConfig(const SST::Params& params) {
 }
 
 }} // namespace SST::SnnDL
-

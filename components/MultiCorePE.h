@@ -34,7 +34,6 @@
 #include "events/SpikeEvent.h"
 #include "events/NocPacketEvent.h"
 #include "SnnInterface.h"
-#include "SnnPEParentInterface.h"
 #include "IPeAggregation.h"
 #include "ExperimentalNocPrefetchPeStats.h"
 #include "CoreShellAPI.h"
@@ -44,13 +43,13 @@
 #include "../api/IPeSharedCoreFabricProvider.h"
 #include "../api/IPeWeightObjectPlaneProvider.h"
 #include "../api/GlobalNeuronLayout.h"
-#include "noc/OptimizedInternalRing.h"
-#include "stimulus/ExternalSpikeInputSubsystem.h"
-#include "stimulus/StepActivationSubsystem.h"
-#include "noc/NocSubsystem.h"
-#include "synapse/route/SpikePacketBridge.h"
-#include "synapse/weights/WeightMemorySubsystem.h"
-#include "workload_stats/IWorkloadStatsModule.h"
+#include "platform/noc/OptimizedInternalRing.h"
+#include "snn/stimulus/ExternalSpikeInputSubsystem.h"
+#include "snn/stimulus/StepActivationSubsystem.h"
+#include "platform/noc/NocSubsystem.h"
+#include "snn/synapse/route/SpikePacketBridge.h"
+#include "snn/synapse/weights/WeightMemorySubsystem.h"
+#include "platform/stats/IWorkloadStatsModule.h"
 #include "../api/IGasStageSink.h"
 
 namespace SST {
@@ -92,7 +91,6 @@ struct ProcessingUnitState {
  * 集成多个ProcessingUnit、共享L2缓存、内部互连网络
  */
 class MultiCorePE : public SST::Component,
-                    public SnnPEParentInterface,
                     public IPeAggregation,
                     public IWorkloadStatRegistrar,
                     public IDmaSchedulerProvider,
@@ -123,6 +121,7 @@ public:
         {"verbose",          "日志详细级别", "0"},
         {"node_id",          "网络节点ID", "0"},
         {"base_addr",        "全局内存基地址", "0"},
+        {"per_core_stride",  "每个核心权重区域的地址跨度（字节）", "0"},
         {"sim_stop_ns",      "组件主控结束仿真（纳秒）。>0时注册为primary并在达到该时间点时OKToEndSim", "0"},
         {"weights_file",     "权重文件路径", ""},
         {"enable_numa",      "启用NUMA优化", "1"},
@@ -185,7 +184,7 @@ public:
         {"pulse_agenda_observe_only", "启用 PULSE agenda observe-only 统计占位", "1"},
         {"pulse_harbor_enable", "启用 PULSE Gather-Harbor observe-only bucket 统计", "0"},
         {"pulse_descriptor_enable", "启用 PULSE Descriptor Lifter observe-only 统计", "0"},
-        {"pulse_descriptor_actual_enable", "启用 PULSE descriptor actual service（core-side WMS，默认关闭）", "0"},
+        {"pulse_descriptor_actual_enable", "启用 PULSE descriptor core-side WMS service（PE fabric不提供该能力）", "0"},
         {"experimental_rowdescriptor_ready_join_dedup_enable", "启用 PULSE rowdescriptor ready-join dedup actual shortcut（实验特性，默认关闭）", "0"},
         {"pulse_domain_retire_enable", "启用 PULSE domain-local retire 轨道（实验特性，默认关闭）", "0"},
         {"pulse_domain_retire_observe_only", "PULSE domain-local retire 保持 observe-only/shadow 模式", "1"},
@@ -1601,34 +1600,6 @@ public:
         return stat_compute_active_cycles_total_;
     }
 
-    // ===== SnnPEParentInterface 实现 =====
-    
-    /**
-     * @brief 向父级组件发送脉冲（从SnnPE SubComponent调用）
-     */
-    void sendSpike(SpikeEvent* event) override;
-    
-    /**
-     * @brief 向父级组件请求内存访问（从SnnPE SubComponent调用）
-     */
-    void requestMemoryAccess(uint64_t address, size_t size, 
-                                    std::function<void(const void*)> callback) override;
-    
-    /**
-     * @brief 获取当前仿真周期
-     */
-    uint64_t getCurrentCycle() const override { return current_cycle_; }
-    
-    /**
-     * @brief 获取本PE的节点ID
-     */
-    int getNodeId() const override { return node_id_; }
-    
-    /**
-     * @brief 获取本PE管理的神经元总数
-     */
-    int getTotalNeurons() const override { return total_neurons_; }
-
     SST::Statistics::Statistic<uint64_t>* registerU64(const std::string& stat_name) override {
         return registerStatistic<uint64_t>(stat_name);
     }
@@ -1678,6 +1649,9 @@ private:
     bool primary_registered_ = false;
     uint64_t global_neuron_base_;
     uint64_t base_addr_ = 0;
+    uint64_t per_core_stride_ = 0;
+    SST::Params core_params_template_;
+    std::string workload_impl_ = "snn";
     int verbose_;
     std::string clock_freq_ = "1GHz";
     std::string weights_file_;

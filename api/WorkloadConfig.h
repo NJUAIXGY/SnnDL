@@ -88,16 +88,6 @@ inline std::string workloadImplFromParamsOrEnv(const SST::Params& params, const 
     return w;
 }
 
-// Compatibility path: env overrides params when SNNDL_WORKLOAD_IMPL is set.
-// Use this only where legacy scripts relied on global env to switch workload_impl without editing configs.
-inline std::string workloadImplFromParamsOrEnvOverride(const SST::Params& params, const std::string& default_impl = "snn") {
-    std::string w = params.find<std::string>("workload_impl", default_impl);
-    if (const char* env = workloadImplFromEnvCached()) w = std::string(env);
-    w = toLowerCopy(std::move(w));
-    if (w.empty()) w = default_impl;
-    return w;
-}
-
 inline std::string execModeFromParams(const SST::Params& params, const std::string& default_mode = "gas") {
     std::string e = params.find<std::string>("exec_mode", "");
     e = toLowerCopy(std::move(e));

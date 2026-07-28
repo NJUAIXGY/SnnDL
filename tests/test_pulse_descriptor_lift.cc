@@ -1,8 +1,8 @@
 #include <cassert>
 #include <cstdint>
 
-#include "services/pe_fabric/PeSharedCoreFabric.h"
-#include "services/pe_fabric/PulseDescriptor.h"
+#include "research/pe_fabric/PeSharedCoreFabric.h"
+#include "research/pe_fabric/PulseDescriptor.h"
 
 using SST::SnnDL::PeSharedCoreFabric;
 using SST::SnnDL::PulseActivationDescriptor;

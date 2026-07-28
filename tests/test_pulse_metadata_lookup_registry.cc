@@ -1,4 +1,4 @@
-#include "services/synapse/weights/PulseMetadataLookupRegistry.h"
+#include "snn/synapse/weights/PulseMetadataLookupRegistry.h"
 
 #include <cassert>
 #include <cstdint>

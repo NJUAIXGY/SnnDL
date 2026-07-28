@@ -2,7 +2,7 @@
 
 本目录存放 **SnnDL 各层共享的“稳定接口”与最小抽象**，用于：
 
-- 降低编译耦合（避免 `components/control/services/compute` 互相 include 实现头）；
+- 降低编译耦合（避免 `components/platform/workloads/snn` 互相 include 实现头）；
 - 固化模块边界（NoC/Mem 平台面不携带 SNN 语义）；
 - 支撑可插拔 workload（`snn/stream/...`）与可替换 compute core。
 
@@ -54,7 +54,7 @@ SnnDL 的“通用 DRAM + memHierarchy”默认建模语义是 **cacheline（例
 ### Memory（纯内存：addr↔bytes）
 - `IMemoryAccess.h`
   - 纯内存访问接口：只做 `addr+size ↔ bytes`，不携带 weight/synapse/bcsr/route 语义。
-  - 典型实现：`services/memory/StandardMemAccess`。
+  - 典型实现：`platform/memory/StandardMemAccess`。
 - `ICoreMemoryLink.h`
   - CoreShell 与“内存端点/胶水层”的窄连接面（用于隔离 StandardMem 类型泄露）。
 
@@ -62,7 +62,7 @@ SnnDL 的“通用 DRAM + memHierarchy”默认建模语义是 **cacheline（例
 - `SnnWeightReader.h`
   - `IWeightReader` 抽象：为 compute core 提供统一权重读取/缓存入口（实现通常在 synapse/weights）。
 - `IWeightReaderAdopter.h`
-  - 窄接口：将 `IWeightReader` 所有权从装配方（CoreShell）移交给 workload（避免 control/workload 双实例装配）。
+  - 窄接口：将 `IWeightReader` 所有权从装配方（CoreShell）移交给 workload（避免 platform/core/workload 双实例装配）。
 - `ISynapseRoute.h` / `SynapseRouteBuildConfig.h`
   - fanout/route 的窄接口：路由构建与查询（语义集中在 synapse 域，不进入 NoC/Memory）。
 
@@ -70,11 +70,9 @@ SnnDL 的“通用 DRAM + memHierarchy”默认建模语义是 **cacheline（例
 - `IGasCmdSender.h` / `IGasStageSink.h` / `IGasStepGate.h` / `GasOps.h`
   - 阶段事件/统计/门控的窄接口（用于把 Stage 载体与具体实现隔离）。
 - `IGasOrchestrator.h`
-  - GAS 阶段编排接口（供 `services/synapse/gas` 控制器调用；services 仅依赖 api/，不 include control 实现）。
+  - GAS 阶段编排接口（供 `snn/synapse/gas` 控制器调用；services 仅依赖 api/，不 include control 实现）。
 - `IGlobalStepHooks.h` / `ICoreControlHooks.h`
   - MultiCorePE → core 的注入接口：全局 step start、NoC 注入/门控决策、以及回退的手动驱动（debug/兜底）。
-- `IManualWindowDrive.h`（已弃用，仅兼容保留）
-  - 旧的“手动窗口驱动”兼容接口头；主线不再依赖/暴露该能力。
 
 ### PE 级聚合
 - `IPeAggregation.h`
@@ -82,15 +80,17 @@ SnnDL 的“通用 DRAM + memHierarchy”默认建模语义是 **cacheline（例
 
 ---
 
-## 兼容性说明（legacy）
+## Core 与网络接口
 
-- `SnnCoreAPI.h` / `SnnInterface.h` / `SnnPEParentInterface.h`
-  - 为历史装配/脚本兼容保留的接口集合；新链路优先使用 `CoreShellAPI + ICoreWorkload` 的主路径。
+- `CoreShellAPI.h` / `ICoreWorkload.h`
+  - 唯一 Core 装配路径；父 PE 通过 `CorePlatformConfig` 下发权威拓扑。
+- `SnnInterface.h`
+  - payload-agnostic NIC 接口；父 PE 通过 `setTopology()` 同步节点身份和网络规模。
 
 ---
 
 ## 依赖边界（必须遵守）
 
-- `api/*` **不应依赖** `control/`、`components/`、`services/` 的实现细节。
+- `api/*` **不应依赖** `platform/`、`components/`、`workloads/`、`snn/` 或 `research/` 的实现细节。
 - 允许依赖：`SST core` 基础类型（`sst/core/*`）与 C++ 标准库。
-- 推荐依赖方向：`components/control/services/compute` → `api`（单向），避免反向依赖。
+- 推荐依赖方向：实现域 → `api`（单向），避免接口层反向依赖实现。
