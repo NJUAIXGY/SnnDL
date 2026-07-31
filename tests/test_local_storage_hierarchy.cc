@@ -380,26 +380,26 @@ static void test_pod_metadata_object_plane_exports_kind_resolved_stats() {
     assert(third.accepted);
 
     std::map<std::string, uint64_t> stats;
-    plane.exportStatsToMap(stats, "atlas_pod_metadata_");
+    plane.exportStatsToMap(stats, "local_storage_pod_metadata_");
 
-    assert(stats["atlas_pod_metadata_enabled"] == 1u);
-    assert(stats["atlas_pod_metadata_observe_total"] == 3u);
-    assert(stats["atlas_pod_metadata_unique_object_total"] == 2u);
-    assert(stats["atlas_pod_metadata_overlap_hit_total"] == 1u);
-    assert(stats["atlas_pod_metadata_evict_total"] == 1u);
-    assert(stats["atlas_pod_metadata_active_entries_total"] == 1u);
+    assert(stats["local_storage_pod_metadata_enabled"] == 1u);
+    assert(stats["local_storage_pod_metadata_observe_total"] == 3u);
+    assert(stats["local_storage_pod_metadata_unique_object_total"] == 2u);
+    assert(stats["local_storage_pod_metadata_overlap_hit_total"] == 1u);
+    assert(stats["local_storage_pod_metadata_evict_total"] == 1u);
+    assert(stats["local_storage_pod_metadata_active_entries_total"] == 1u);
 
-    assert(stats["atlas_pod_metadata_premphf_base_observe_total"] == 2u);
-    assert(stats["atlas_pod_metadata_premphf_base_unique_object_total"] == 1u);
-    assert(stats["atlas_pod_metadata_premphf_base_overlap_hit_total"] == 1u);
-    assert(stats["atlas_pod_metadata_premphf_base_evict_total"] == 1u);
-    assert(stats["atlas_pod_metadata_premphf_base_active_entries_total"] == 0u);
+    assert(stats["local_storage_pod_metadata_premphf_base_observe_total"] == 2u);
+    assert(stats["local_storage_pod_metadata_premphf_base_unique_object_total"] == 1u);
+    assert(stats["local_storage_pod_metadata_premphf_base_overlap_hit_total"] == 1u);
+    assert(stats["local_storage_pod_metadata_premphf_base_evict_total"] == 1u);
+    assert(stats["local_storage_pod_metadata_premphf_base_active_entries_total"] == 0u);
 
-    assert(stats["atlas_pod_metadata_rowindex_observe_total"] == 1u);
-    assert(stats["atlas_pod_metadata_rowindex_unique_object_total"] == 1u);
-    assert(stats["atlas_pod_metadata_rowindex_overlap_hit_total"] == 0u);
-    assert(stats["atlas_pod_metadata_rowindex_evict_total"] == 0u);
-    assert(stats["atlas_pod_metadata_rowindex_active_entries_total"] == 1u);
+    assert(stats["local_storage_pod_metadata_rowindex_observe_total"] == 1u);
+    assert(stats["local_storage_pod_metadata_rowindex_unique_object_total"] == 1u);
+    assert(stats["local_storage_pod_metadata_rowindex_overlap_hit_total"] == 0u);
+    assert(stats["local_storage_pod_metadata_rowindex_evict_total"] == 0u);
+    assert(stats["local_storage_pod_metadata_rowindex_active_entries_total"] == 1u);
 }
 
 static void test_pod_metadata_object_plane_exports_premphf_band_stats() {
@@ -426,13 +426,13 @@ static void test_pod_metadata_object_plane_exports_premphf_band_stats() {
     assert(second.accepted);
 
     std::map<std::string, uint64_t> stats;
-    plane.exportStatsToMap(stats, "atlas_pod_metadata_");
+    plane.exportStatsToMap(stats, "local_storage_pod_metadata_");
 
-    assert(stats["atlas_pod_metadata_premphf_band_observe_total"] == 2u);
-    assert(stats["atlas_pod_metadata_premphf_band_unique_object_total"] == 1u);
-    assert(stats["atlas_pod_metadata_premphf_band_overlap_hit_total"] == 1u);
-    assert(stats["atlas_pod_metadata_premphf_band_evict_total"] == 0u);
-    assert(stats["atlas_pod_metadata_premphf_band_active_entries_total"] == 1u);
+    assert(stats["local_storage_pod_metadata_premphf_band_observe_total"] == 2u);
+    assert(stats["local_storage_pod_metadata_premphf_band_unique_object_total"] == 1u);
+    assert(stats["local_storage_pod_metadata_premphf_band_overlap_hit_total"] == 1u);
+    assert(stats["local_storage_pod_metadata_premphf_band_evict_total"] == 0u);
+    assert(stats["local_storage_pod_metadata_premphf_band_active_entries_total"] == 1u);
 }
 
 static void test_pod_metadata_object_plane_exports_lifecycle_probe_stats() {
@@ -466,11 +466,11 @@ static void test_pod_metadata_object_plane_exports_lifecycle_probe_stats() {
     assert(plane.observe(band_second_object).accepted);
 
     std::map<std::string, uint64_t> stats;
-    plane.exportStatsToMap(stats, "atlas_pod_metadata_");
+    plane.exportStatsToMap(stats, "local_storage_pod_metadata_");
 
-    assert(stats["atlas_pod_metadata_active_entries_peak_total"] == 2u);
-    assert(stats["atlas_pod_metadata_premphf_band_duplicate_consumer_total"] == 1u);
-    assert(stats["atlas_pod_metadata_premphf_band_active_entries_peak_total"] == 2u);
+    assert(stats["local_storage_pod_metadata_active_entries_peak_total"] == 2u);
+    assert(stats["local_storage_pod_metadata_premphf_band_duplicate_consumer_total"] == 1u);
+    assert(stats["local_storage_pod_metadata_premphf_band_active_entries_peak_total"] == 2u);
 }
 
 static void test_pod_owner_service_table_exports_kind_resolved_stats() {
@@ -521,25 +521,25 @@ static void test_pod_owner_service_table_exports_kind_resolved_stats() {
     assert(descriptor_alloc.allocated_owner);
 
     std::map<std::string, uint64_t> stats;
-    table.exportStatsToMap(stats, "atlas_pod_owner_");
+    table.exportStatsToMap(stats, "local_storage_pod_owner_");
 
-    assert(stats["atlas_pod_owner_enabled"] == 1u);
-    assert(stats["atlas_pod_owner_lookup_total"] == 3u);
-    assert(stats["atlas_pod_owner_owner_alloc_total"] == 2u);
-    assert(stats["atlas_pod_owner_owner_hit_total"] == 1u);
-    assert(stats["atlas_pod_owner_join_request_total"] == 1u);
-    assert(stats["atlas_pod_owner_join_grant_total"] == 1u);
-    assert(stats["atlas_pod_owner_active_entries_total"] == 2u);
+    assert(stats["local_storage_pod_owner_enabled"] == 1u);
+    assert(stats["local_storage_pod_owner_lookup_total"] == 3u);
+    assert(stats["local_storage_pod_owner_owner_alloc_total"] == 2u);
+    assert(stats["local_storage_pod_owner_owner_hit_total"] == 1u);
+    assert(stats["local_storage_pod_owner_join_request_total"] == 1u);
+    assert(stats["local_storage_pod_owner_join_grant_total"] == 1u);
+    assert(stats["local_storage_pod_owner_active_entries_total"] == 2u);
 
-    assert(stats["atlas_pod_owner_premphf_base_owner_alloc_total"] == 1u);
-    assert(stats["atlas_pod_owner_premphf_base_owner_hit_total"] == 1u);
-    assert(stats["atlas_pod_owner_premphf_base_join_grant_total"] == 1u);
-    assert(stats["atlas_pod_owner_premphf_base_active_entries_total"] == 1u);
+    assert(stats["local_storage_pod_owner_premphf_base_owner_alloc_total"] == 1u);
+    assert(stats["local_storage_pod_owner_premphf_base_owner_hit_total"] == 1u);
+    assert(stats["local_storage_pod_owner_premphf_base_join_grant_total"] == 1u);
+    assert(stats["local_storage_pod_owner_premphf_base_active_entries_total"] == 1u);
 
-    assert(stats["atlas_pod_owner_rowdescriptor_owner_alloc_total"] == 1u);
-    assert(stats["atlas_pod_owner_rowdescriptor_owner_hit_total"] == 0u);
-    assert(stats["atlas_pod_owner_rowdescriptor_join_grant_total"] == 0u);
-    assert(stats["atlas_pod_owner_rowdescriptor_active_entries_total"] == 1u);
+    assert(stats["local_storage_pod_owner_rowdescriptor_owner_alloc_total"] == 1u);
+    assert(stats["local_storage_pod_owner_rowdescriptor_owner_hit_total"] == 0u);
+    assert(stats["local_storage_pod_owner_rowdescriptor_join_grant_total"] == 0u);
+    assert(stats["local_storage_pod_owner_rowdescriptor_active_entries_total"] == 1u);
 }
 
 static void test_pod_owner_service_table_exports_premphf_band_stats() {
@@ -579,12 +579,12 @@ static void test_pod_owner_service_table_exports_premphf_band_stats() {
     assert(join.granted);
 
     std::map<std::string, uint64_t> stats;
-    table.exportStatsToMap(stats, "atlas_pod_owner_");
+    table.exportStatsToMap(stats, "local_storage_pod_owner_");
 
-    assert(stats["atlas_pod_owner_premphf_band_owner_alloc_total"] == 1u);
-    assert(stats["atlas_pod_owner_premphf_band_owner_hit_total"] == 1u);
-    assert(stats["atlas_pod_owner_premphf_band_join_grant_total"] == 1u);
-    assert(stats["atlas_pod_owner_premphf_band_active_entries_total"] == 1u);
+    assert(stats["local_storage_pod_owner_premphf_band_owner_alloc_total"] == 1u);
+    assert(stats["local_storage_pod_owner_premphf_band_owner_hit_total"] == 1u);
+    assert(stats["local_storage_pod_owner_premphf_band_join_grant_total"] == 1u);
+    assert(stats["local_storage_pod_owner_premphf_band_active_entries_total"] == 1u);
 }
 
 static void test_pod_owner_service_table_exports_lifecycle_probe_stats() {
@@ -634,13 +634,13 @@ static void test_pod_owner_service_table_exports_lifecycle_probe_stats() {
     assert(rejected_join.reject_reason == PodOwnerServiceTable::RejectReason::TableFull);
 
     std::map<std::string, uint64_t> stats;
-    table.exportStatsToMap(stats, "atlas_pod_owner_");
+    table.exportStatsToMap(stats, "local_storage_pod_owner_");
 
-    assert(stats["atlas_pod_owner_active_entries_peak_total"] == 1u);
-    assert(stats["atlas_pod_owner_premphf_band_owner_reject_total"] == 1u);
-    assert(stats["atlas_pod_owner_premphf_band_join_request_total"] == 2u);
-    assert(stats["atlas_pod_owner_premphf_band_join_reject_total"] == 1u);
-    assert(stats["atlas_pod_owner_premphf_band_active_entries_peak_total"] == 1u);
+    assert(stats["local_storage_pod_owner_active_entries_peak_total"] == 1u);
+    assert(stats["local_storage_pod_owner_premphf_band_owner_reject_total"] == 1u);
+    assert(stats["local_storage_pod_owner_premphf_band_join_request_total"] == 2u);
+    assert(stats["local_storage_pod_owner_premphf_band_join_reject_total"] == 1u);
+    assert(stats["local_storage_pod_owner_premphf_band_active_entries_peak_total"] == 1u);
 }
 
 static void test_pe_local_service_object_table_tracks_live_ready_and_late_join() {
@@ -930,7 +930,7 @@ static void test_pe_local_service_object_table_ready_lease_expires_after_ttl() {
     assert(stats.released_total == 1u);
 }
 
-static void test_pe_local_service_object_table_tracks_atlas_object_census() {
+static void test_pe_local_service_object_table_tracks_local_storage_object_census() {
     PeLocalServiceObjectTable::Config cfg{};
     cfg.enable = true;
     cfg.num_pods = 1;
@@ -997,15 +997,15 @@ static void test_pe_local_service_object_table_tracks_atlas_object_census() {
     assert(private_release_result.released);
 
     const auto stats = table.snapshotStats();
-    assert(stats.atlas_obj_materialize_total == 2u);
-    assert(stats.atlas_obj_publicize_total == 2u);
-    assert(stats.atlas_obj_owner_form_total == 2u);
-    assert(stats.atlas_obj_ready_total == 1u);
-    assert(stats.atlas_obj_release_total == 2u);
-    assert(stats.atlas_obj_private_only_total == 1u);
+    assert(stats.local_storage_object_materialize_total == 2u);
+    assert(stats.local_storage_object_publicize_total == 2u);
+    assert(stats.local_storage_object_owner_form_total == 2u);
+    assert(stats.local_storage_object_ready_total == 1u);
+    assert(stats.local_storage_object_release_total == 2u);
+    assert(stats.local_storage_object_private_only_total == 1u);
 }
 
-static void test_pe_local_service_object_table_exports_atlas_prefixed_stats() {
+static void test_pe_local_service_object_table_exports_local_storage_prefixed_stats() {
     PeLocalServiceObjectTable::Config cfg{};
     cfg.enable = true;
     cfg.num_pods = 1;
@@ -1043,18 +1043,18 @@ static void test_pe_local_service_object_table_exports_atlas_prefixed_stats() {
     assert(release_result.released);
 
     std::map<std::string, uint64_t> stats;
-    table.exportStatsToMap(stats, "atlas_service_");
+    table.exportStatsToMap(stats, "local_storage_service_");
 
-    assert(stats["atlas_service_enabled"] == 1u);
-    assert(stats["atlas_service_owner_form_total"] == 1u);
-    assert(stats["atlas_service_ready_transition_total"] == 1u);
-    assert(stats["atlas_service_released_total"] == 1u);
-    assert(stats["atlas_service_atlas_obj_materialize_total"] == 1u);
-    assert(stats["atlas_service_atlas_obj_publicize_total"] == 1u);
-    assert(stats["atlas_service_atlas_obj_owner_form_total"] == 1u);
-    assert(stats["atlas_service_atlas_obj_ready_total"] == 1u);
-    assert(stats["atlas_service_atlas_obj_release_total"] == 1u);
-    assert(stats["atlas_service_atlas_obj_private_only_total"] == 1u);
+    assert(stats["local_storage_service_enabled"] == 1u);
+    assert(stats["local_storage_service_owner_form_total"] == 1u);
+    assert(stats["local_storage_service_ready_transition_total"] == 1u);
+    assert(stats["local_storage_service_released_total"] == 1u);
+    assert(stats["local_storage_service_local_storage_object_materialize_total"] == 1u);
+    assert(stats["local_storage_service_local_storage_object_publicize_total"] == 1u);
+    assert(stats["local_storage_service_local_storage_object_owner_form_total"] == 1u);
+    assert(stats["local_storage_service_local_storage_object_ready_total"] == 1u);
+    assert(stats["local_storage_service_local_storage_object_release_total"] == 1u);
+    assert(stats["local_storage_service_local_storage_object_private_only_total"] == 1u);
 }
 
 static void test_pe_weight_object_plane_tracks_shared_idx_and_l0_pressure() {
@@ -1170,16 +1170,16 @@ static void test_pe_weight_object_plane_exports_prefixed_stats() {
     plane.onClockTick(31);
 
     std::map<std::string, uint64_t> stats;
-    plane.exportStatsToMap(stats, "pulse_osa_shared_weight_");
+    plane.exportStatsToMap(stats, "local_storage_shared_weight_");
 
-    assert(stats["pulse_osa_shared_weight_owner_scope_enable"] == 1u);
-    assert(stats["pulse_osa_shared_weight_actual_owner_enable"] == 1u);
-    assert(stats["pulse_osa_shared_weight_idx_reads_total"] == 1u);
-    assert(stats["pulse_osa_shared_weight_idx_resident_bytes_peak"] == 64u);
-    assert(stats["pulse_osa_shared_weight_l0_fill_total"] == 1u);
-    assert(stats["pulse_osa_shared_weight_l0_evict_total"] == 1u);
-    assert(stats["pulse_osa_shared_weight_l0_writes_total"] == 2u);
-    assert(stats["pulse_osa_shared_weight_l0_resident_bytes_peak"] == 128u);
+    assert(stats["local_storage_shared_weight_owner_scope_enable"] == 1u);
+    assert(stats["local_storage_shared_weight_actual_owner_enable"] == 1u);
+    assert(stats["local_storage_shared_weight_idx_reads_total"] == 1u);
+    assert(stats["local_storage_shared_weight_idx_resident_bytes_peak"] == 64u);
+    assert(stats["local_storage_shared_weight_l0_fill_total"] == 1u);
+    assert(stats["local_storage_shared_weight_l0_evict_total"] == 1u);
+    assert(stats["local_storage_shared_weight_l0_writes_total"] == 2u);
+    assert(stats["local_storage_shared_weight_l0_resident_bytes_peak"] == 128u);
 }
 
 int main() {
@@ -1200,8 +1200,8 @@ int main() {
     test_pe_local_service_object_table_keeps_entries_across_window_skew();
     test_pe_local_service_object_table_ready_lease_hits_within_ttl();
     test_pe_local_service_object_table_ready_lease_expires_after_ttl();
-    test_pe_local_service_object_table_tracks_atlas_object_census();
-    test_pe_local_service_object_table_exports_atlas_prefixed_stats();
+    test_pe_local_service_object_table_tracks_local_storage_object_census();
+    test_pe_local_service_object_table_exports_local_storage_prefixed_stats();
     test_pe_weight_object_plane_tracks_shared_idx_and_l0_pressure();
     test_pe_weight_object_plane_aggregates_multiple_clients();
     test_pe_weight_object_plane_classifies_authority_state();

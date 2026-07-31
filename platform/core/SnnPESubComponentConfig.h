@@ -46,7 +46,7 @@ struct SnnPESubComponentConfig {
     float init_default_weight = 0.5f;
     bool readresp_zero_fallback = false;
     uint32_t max_outstanding_requests = 16;
-    std::string synapse_weight_mode = "bcsr_gas"; // bcsr_gas | gcss_valueonly_dstcore | gcss_valueonly_dstcore_idx2 | gcss_idx2_rowmphf | gcss_valueonly_dstcore_vlf_premphf | gcss_valueonly_dstcore_vlf_premphf_plp
+    std::string synapse_weight_mode = "bcsr_gas";
 
     // Weight cache
     uint32_t max_cache_entries = 65536;
@@ -142,7 +142,6 @@ struct SnnPESubComponentConfig {
 
     // Misc cached paths
     std::string weights_template;
-    std::string gcss_index_template;
     uint32_t neurons_per_pe = 0;
     std::string weights_file;
 
@@ -181,24 +180,7 @@ inline SnnPESubComponentConfig parseSnnPESubComponentConfig(const SST::Params& p
     c.init_default_weight = params.find<float>("init_default_weight", 0.5f);
     c.readresp_zero_fallback = params.find<int>("readresp_zero_fallback", 0) != 0;
     c.max_outstanding_requests = params.find<uint32_t>("max_outstanding_requests", 16);
-    {
-        std::string mode = params.find<std::string>("synapse_weight_mode", "bcsr_gas");
-        for (char& ch : mode) {
-            if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
-        }
-        if (mode == "gscc_valueonly_dstcore") mode = "gcss_valueonly_dstcore";
-        if (mode == "gscc_valueonly_dstcore_vlf_premphf") mode = "gcss_valueonly_dstcore_vlf_premphf";
-        if (mode == "gscc_valueonly_dstcore_vlf_premphf_plp") mode = "gcss_valueonly_dstcore_vlf_premphf_plp";
-        if (mode != "bcsr_gas" &&
-            mode != "gcss_valueonly_dstcore" &&
-            mode != "gcss_valueonly_dstcore_idx2" &&
-            mode != "gcss_idx2_rowmphf" &&
-            mode != "gcss_valueonly_dstcore_vlf_premphf" &&
-            mode != "gcss_valueonly_dstcore_vlf_premphf_plp") {
-            mode = "bcsr_gas";
-        }
-        c.synapse_weight_mode = mode;
-    }
+    c.synapse_weight_mode = "bcsr_gas";
 
     c.max_cache_entries = params.find<uint32_t>("max_cache_entries", 65536);
     c.use_clock_weight_cache = params.find<int>("use_clock_weight_cache", 0) != 0;
@@ -285,7 +267,6 @@ inline SnnPESubComponentConfig parseSnnPESubComponentConfig(const SST::Params& p
         c.apply_dense_acc_enable && (params.find<int>("acc_shadow_verify_enable", 0) != 0);
 
     c.weights_template = params.find<std::string>("weights_template", "");
-    c.gcss_index_template = params.find<std::string>("gcss_index_template", "");
     c.neurons_per_pe = params.find<uint32_t>("neurons_per_pe", 0);
     c.weights_file = params.find<std::string>("weights_file", "");
 

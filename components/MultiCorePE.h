@@ -35,12 +35,10 @@
 #include "events/NocPacketEvent.h"
 #include "SnnInterface.h"
 #include "IPeAggregation.h"
-#include "ExperimentalNocPrefetchPeStats.h"
 #include "CoreShellAPI.h"
 #include "../api/IDmaSchedulerProvider.h"
 #include "../api/ILocalStorageProvider.h"
 #include "../api/IPePodSharedMetadataProvider.h"
-#include "../api/IPeSharedCoreFabricProvider.h"
 #include "../api/IPeWeightObjectPlaneProvider.h"
 #include "../api/GlobalNeuronLayout.h"
 #include "platform/noc/OptimizedInternalRing.h"
@@ -63,7 +61,6 @@ class LocalStorageHierarchyController;
 class PodMetadataObjectPlane;
 class PodOwnerServiceTable;
 class PeLocalServiceObjectTable;
-class PeSharedCoreFabric;
 class PeWeightObjectPlane;
 
 // RingMessage和RingMessageType现在定义在OptimizedInternalRing.h中
@@ -96,7 +93,6 @@ class MultiCorePE : public SST::Component,
                     public IDmaSchedulerProvider,
                     public ILocalStorageProvider,
                     public IPePodSharedMetadataProvider,
-                    public IPeSharedCoreFabricProvider,
                     public IPeWeightObjectPlaneProvider {
 public:
     // ELI注册信息
@@ -171,40 +167,6 @@ public:
         {"pe_internal_pod_join_entry_bytes", "pod join table 每 entry 字节数", "16"},
         {"pe_internal_pod_ready_enable", "启用 pod ready table 对象注册", "0"},
         {"pe_internal_pod_ready_entries", "pod ready queue 深度", "0"},
-        {"pulse_enable", "启用 PULSE PE 内 core fabric（实验特性，默认关闭）", "0"},
-        {"pulse_osa_enable", "启用 PULSE-OSA PE 内 owner-scoped shared object plane（实验特性，默认关闭）", "0"},
-        {"pulse_osa_shared_weight_owner_enable", "启用 PULSE-OSA shared weight object owner（实验特性，默认关闭）", "0"},
-        {"pulse_osa_shared_weight_owner_actual_enable", "启用 PULSE-OSA shared weight owner actual residency authority（实验特性，默认关闭）", "0"},
-        {"pulse_osa_metadata_txn_enable", "启用 PULSE-OSA metadata transaction seam 统计/行为（实验特性，默认关闭）", "0"},
-        {"pulse_osa_metadata_ready_lease_enable", "启用 PULSE-OSA metadata ready lease（实验特性，默认关闭）", "0"},
-        {"pulse_osa_metadata_ready_lease_ttl", "PULSE-OSA metadata ready lease TTL（周期，0=关闭 lease）", "0"},
-        {"pulse_osa_metadata_object_mask", "PULSE-OSA metadata object mask：rowdescriptor/rowidx/idx2/preband/all，可逗号分隔", "rowdescriptor"},
-        {"pulse_observe_only", "PULSE Phase 0/1 强制 observe-only（1=只观测不改行为）", "1"},
-        {"pulse_ingress_enable", "启用 PULSE ingress tap 与 mirror 统计", "1"},
-        {"pulse_agenda_observe_only", "启用 PULSE agenda observe-only 统计占位", "1"},
-        {"pulse_harbor_enable", "启用 PULSE Gather-Harbor observe-only bucket 统计", "0"},
-        {"pulse_descriptor_enable", "启用 PULSE Descriptor Lifter observe-only 统计", "0"},
-        {"pulse_descriptor_actual_enable", "启用 PULSE descriptor core-side WMS service（PE fabric不提供该能力）", "0"},
-        {"experimental_rowdescriptor_ready_join_dedup_enable", "启用 PULSE rowdescriptor ready-join dedup actual shortcut（实验特性，默认关闭）", "0"},
-        {"pulse_domain_retire_enable", "启用 PULSE domain-local retire 轨道（实验特性，默认关闭）", "0"},
-        {"pulse_domain_retire_observe_only", "PULSE domain-local retire 保持 observe-only/shadow 模式", "1"},
-        {"pulse_domain_retire_mode", "PULSE domain-local retire 模式：per_post/descriptor_domain", "per_post"},
-        {"pulse_domain_retire_release_budget", "PULSE domain-local retire 每 tick/window 的释放预算（0=无限）", "0"},
-        {"pulse_frontier_observe_enable", "启用 PULSE frontier observe-only 导出与跨 core overlap 统计", "0"},
-        {"pulse_frontier_top_lines", "PULSE frontier observe 每窗口导出的 top-H 唯一 line 数", "32"},
-        {"pulse_metadata_frontier_observe_enable", "启用 PULSE metadata frontier observe-only 导出与跨 core overlap 统计", "0"},
-        {"pulse_metadata_frontier_top_items", "PULSE metadata frontier observe 每窗口扫描的 top-H 唯一 pre 数", "32"},
-        {"pulse_metadata_frontier_band_slots", "PULSE metadata frontier observe 的 pre-base band 粒度（slot 数）", "128"},
-        {"pulse_mfb_preband_band_slots", "PULSE-MFB actual preband planner 的 pre-base band 粒度（slot 数，0=继承 pulse_metadata_frontier_band_slots）", "0"},
-        {"pulse_metadata_seed_enable", "启用 PULSE metadata seeding actual path（实验特性，默认关闭）", "0"},
-        {"pulse_metadata_seed_top_bases", "PULSE metadata seeding 每窗口扫描的 top-H 唯一 pre-base 候选数（per-core）", "32"},
-        {"pulse_metadata_seed_window_budget", "PULSE metadata seeding 每窗口最多发起的 seed prefetch 数（per-core, 0=无限）", "0"},
-        {"pulse_prebase_shared_lookup_enable", "启用 PULSE pre-base shared lookup actual path（实验特性，默认关闭）", "0"},
-        {"pulse_ingress_entries", "PULSE activation ingress mirror 深度", "0"},
-        {"pulse_core_queue_entries", "PULSE activation per-core queue mirror 深度", "0"},
-        {"pulse_descriptor_packet_min", "PULSE Descriptor Lifter 最小 packet 阈值", "2"},
-        {"pulse_bypass_high_watermark_pct", "PULSE pressure-bypass 高水位百分比", "100"},
-        {"pulse_bypass_mode", "PULSE pressure-bypass 策略：disabled/high_watermark", "disabled"},
         {"ls_state_enable", "显式 state store 对象开关（未设置时兼容 state_sram_enable）", "0"},
         {"ls_state_capacity_bytes", "显式 state store 容量（未设置时兼容 state_sram_capacity_bytes）", "0"},
         {"ls_state_banks", "显式 state store bank 数（未设置时兼容 state_sram_banks）", "16"},
@@ -357,9 +319,6 @@ public:
             {"snn_tx_bundle_v1_packets_total", "SNN workload: 发送的bundle-v1包数（PE聚合）", "packets", 1},
             {"snn_tx_bundle_v2_packets_total", "SNN workload: 发送的bundle-v2包数（PE聚合）", "packets", 1},
             {"snn_tx_bundle_v3_packets_total", "SNN workload: 发送的bundle-v3包数（PE聚合）", "packets", 1},
-            {"snn_tx_cohort_packets_total", "STORM: sender-side logical cohort packets（PE聚合）", "packets", 1},
-            {"snn_tx_cohort_pres_total", "STORM: sender-side pre count carried by cohort packets（PE聚合）", "pres", 1},
-            {"snn_tx_cohort_bandcolor_switch_total", "STORM: sender-side cohort color switches（PE聚合）", "switches", 1},
             {"snn_rx_spike_packets_total", "SNN workload: 接收的Spike包数（PE聚合）", "packets", 1},
             {"snn_rx_spikekey_total", "SNN workload: 接收的SpikeKey包数（PE聚合）", "packets", 1},
             {"snn_rx_spiketilekey_total", "SNN workload: 接收的SpikeTileKey包数（PE聚合）", "packets", 1},
@@ -617,58 +576,6 @@ public:
         {"gas_retire_shadow_per_post_recoverable_edges_total", "Shadow per-post retire可恢复edge累计量（PE聚合）", "edge_cycles", 1},
         {"gas_retire_shadow_per_post_ready_posts_peak", "Shadow per-post retire ready-post峰值（PE聚合）", "posts", 1},
         {"gas_retire_shadow_per_post_committable_edges_peak", "Shadow per-post retire可提交edge峰值（PE聚合）", "edges", 1},
-        {"exp_noc_rowidx_prefetch_rows_total", "Experimental STORM-PIF: number of BCSR row-index rows prefetched（PE聚合）", "rows", 1},
-        {"exp_noc_rowidx_prefetch_bytes_total", "Experimental STORM-PIF: bytes issued for BCSR row-index prefetch（PE聚合）", "bytes", 1},
-        {"exp_noc_rowidx_prefetch_complete_inflight_miss_total", "Experimental STORM-PIF v8: rowindex prefetch completions that found no inflight record at response time（PE聚合）", "responses", 1},
-        {"exp_noc_rowidx_prefetch_complete_zero_waiters_total", "Experimental STORM-PIF v8: rowindex prefetch completions that found an inflight record with zero waiters（PE聚合）", "responses", 1},
-        {"exp_noc_rowidx_prefetch_complete_waiters_total", "Experimental STORM-PIF v8: rowindex prefetch completions that found an inflight record with waiters（PE聚合）", "responses", 1},
-        {"exp_noc_rowidx_prefetch_rows_deferred_total", "Experimental STORM-PIF: row-index prefetch rows deferred by inflight pressure（PE聚合）", "rows", 1},
-        {"exp_noc_rowidx_prefetch_rows_failed_total", "Experimental STORM-PIF: row-index prefetch rows that failed to issue（PE聚合）", "rows", 1},
-        {"exp_noc_rowidx_cache_hits_total", "Experimental STORM-PIF: row-index cache hits on BCSR requests（PE聚合）", "hits", 1},
-        {"exp_noc_rowidx_cache_misses_total", "Experimental STORM-PIF: row-index cache misses on BCSR requests（PE聚合）", "misses", 1},
-        {"exp_noc_rowidx_cache_fills_total", "Experimental STORM-PIF: row-index cache fill operations（PE聚合）", "fills", 1},
-        {"exp_noc_rowidx_cache_full_drop_total", "Experimental STORM-PIF: row-index cache insert drops due to capacity limit（PE聚合）", "drops", 1},
-        {"exp_noc_rowidx_cache_entries_final", "Experimental STORM-PIF: final row-index cache entries at finish（PE聚合）", "entries", 1},
-        {"exp_noc_rowidx_bulk_fill_total", "Experimental STORM-PIF v8: successful rowindex bulk fill responses（PE聚合）", "fills", 1},
-        {"exp_noc_rowidx_bulk_rows_cached_total", "Experimental STORM-PIF v8: non-empty block rows cached by bulk rowindex fill（PE聚合）", "rows", 1},
-        {"exp_noc_rowidx_bulk_waiters_resolved_total", "Experimental STORM-PIF v8: waiters resolved via bulk rowindex fill（PE聚合）", "waiters", 1},
-        {"exp_noc_rowidx_touch_rows_total", "Experimental STORM-PIF: unique touched block_rows enqueued from Gather（PE聚合）", "rows", 1},
-        {"exp_noc_rowidx_touch_events_total", "Experimental STORM-PIF v8: total Gather touch events observed（PE聚合）", "events", 1},
-        {"exp_noc_rowidx_rows_filtered_cold_total", "Experimental STORM-PIF v8: touches filtered by hot_touch_min threshold（PE聚合）", "events", 1},
-        {"exp_noc_rowidx_budget_ticks_total", "Experimental STORM-PIF v8: ticks where prefetch budget was computed（PE聚合）", "ticks", 1},
-        {"exp_noc_rowidx_budget_effective_total", "Experimental STORM-PIF v8: effective prefetch budget consumed by scheduler（PE聚合）", "rows", 1},
-        {"exp_noc_rowidx_budget_adapt_ticks_total", "Experimental STORM-PIF v8: ticks where adaptive budget deviated from base budget（PE聚合）", "ticks", 1},
-        {"exp_noc_rowidx_ready_transition_apply_promote_cached_total", "Experimental STORM-PIF v8: cached apply-promote rowindex ready transitions（PE聚合）", "objects", 1},
-        {"exp_noc_rowidx_ready_signal_rowindex_response_total", "Experimental STORM-PIF v8: rowindex-only response ready signals across all rowindex response paths（PE聚合）", "signals", 1},
-        {"exp_noc_rowidx_ready_transition_rowindex_response_total", "Experimental STORM-PIF v8: rowindex-only response ready transitions across all rowindex response paths（PE聚合）", "objects", 1},
-        {"exp_noc_rowidx_ready_signal_prefetch_response_total", "Experimental STORM-PIF v8: rowindex ready signals emitted from prefetch response（PE聚合）", "signals", 1},
-        {"exp_noc_rowidx_ready_transition_prefetch_response_total", "Experimental STORM-PIF v8: rowindex ready transitions from prefetch response（PE聚合）", "objects", 1},
-        {"exp_noc_rowidx_ready_signal_rowindex_response_inflight_waiters_total", "Experimental STORM-PIF v8: rowindex response ready signals from inflight entries with waiters（PE聚合）", "signals", 1},
-        {"exp_noc_rowidx_ready_transition_rowindex_response_inflight_waiters_total", "Experimental STORM-PIF v8: rowindex response ready transitions from inflight entries with waiters（PE聚合）", "objects", 1},
-        {"exp_noc_rowidx_ready_signal_rowindex_response_inflight_zero_waiters_total", "Experimental STORM-PIF v8: rowindex response ready signals from inflight entries without waiters（PE聚合）", "signals", 1},
-        {"exp_noc_rowidx_ready_transition_rowindex_response_inflight_zero_waiters_total", "Experimental STORM-PIF v8: rowindex response ready transitions from inflight entries without waiters（PE聚合）", "objects", 1},
-        {"exp_noc_rowidx_ready_signal_rowindex_response_noninflight_prefetch_only_total", "Experimental STORM-PIF v8: rowindex response ready signals from non-inflight prefetch-only responses（PE聚合）", "signals", 1},
-        {"exp_noc_rowidx_ready_transition_rowindex_response_noninflight_prefetch_only_total", "Experimental STORM-PIF v8: rowindex response ready transitions from non-inflight prefetch-only responses（PE聚合）", "objects", 1},
-        {"exp_noc_rowidx_ready_signal_prefetch_response_inflight_waiters_total", "Experimental STORM-PIF v8: experimental prefetch ready signals from inflight entries with waiters（PE聚合）", "signals", 1},
-        {"exp_noc_rowidx_ready_transition_prefetch_response_inflight_waiters_total", "Experimental STORM-PIF v8: experimental prefetch ready transitions from inflight entries with waiters（PE聚合）", "objects", 1},
-        {"exp_noc_rowidx_ready_signal_prefetch_response_inflight_zero_waiters_total", "Experimental STORM-PIF v8: experimental prefetch ready signals from inflight entries without waiters（PE聚合）", "signals", 1},
-        {"exp_noc_rowidx_ready_transition_prefetch_response_inflight_zero_waiters_total", "Experimental STORM-PIF v8: experimental prefetch ready transitions from inflight entries without waiters（PE聚合）", "objects", 1},
-        {"exp_noc_rowidx_ready_signal_prefetch_response_noninflight_prefetch_only_total", "Experimental STORM-PIF v8: experimental prefetch ready signals from non-inflight prefetch-only responses（PE聚合）", "signals", 1},
-        {"exp_noc_rowidx_ready_transition_prefetch_response_noninflight_prefetch_only_total", "Experimental STORM-PIF v8: experimental prefetch ready transitions from non-inflight prefetch-only responses（PE聚合）", "objects", 1},
-        {"exp_noc_rowidx_detached_demand_join_total", "Experimental STORM-PIF v8: demand requests that joined a detached rowindex prefetch already in flight（PE聚合）", "joins", 1},
-        {"exp_noc_rowidx_detached_demand_waiters_resolved_total", "Experimental STORM-PIF v8: detached-demand waiters resolved from detached rowindex completion（PE聚合）", "waiters", 1},
-        {"exp_noc_rowidx_detached_demand_fallback_zero_total", "Experimental STORM-PIF v8: detached-demand waiters that fell back to zero weight because block_col was absent（PE聚合）", "waiters", 1},
-        {"exp_noc_rowidx_detached_demand_ready_signal_total", "Experimental STORM-PIF v8: detached-demand rowindex ready signals emitted at detached completion（PE聚合）", "signals", 1},
-        {"exp_noc_rowidx_detached_demand_ready_transition_total", "Experimental STORM-PIF v8: detached-demand rowindex ready transitions emitted at detached completion（PE聚合）", "objects", 1},
-        {"exp_noc_rowidx_ready_bypass_experimental_cache_hit_total", "Experimental STORM-PIF v8: demand path bypasses via experimental rowindex cache hit（PE聚合）", "hits", 1},
-        {"exp_noc_rowidx_ready_bypass_rowindex_get_hit_total", "Experimental STORM-PIF v8: demand path bypasses via BCSR rowIndexGet hit（PE聚合）", "hits", 1},
-        {"exp_noc_rowidx_close_attempt_total", "Experimental STORM-PIF v8: owner close attempts over touched rowindex objects（PE聚合）", "attempts", 1},
-        {"exp_noc_rowidx_close_attempt_active_owner_total", "Experimental STORM-PIF v8: close attempts that found an active owner-local object（PE聚合）", "attempts", 1},
-        {"exp_noc_rowidx_close_attempt_already_pending_total", "Experimental STORM-PIF v8: close attempts that hit release-pending active objects（PE聚合）", "attempts", 1},
-        {"exp_noc_rowidx_close_attempt_not_active_total", "Experimental STORM-PIF v8: close attempts that found no active object（PE聚合）", "attempts", 1},
-        {"exp_noc_rowidx_close_attempt_not_owner_total", "Experimental STORM-PIF v8: close attempts that found an active non-owner object（PE聚合）", "attempts", 1},
-        {"gcss_lookup_hit_total", "GCSS lookup hits（PE聚合）", "hits", 1},
-        {"gcss_lookup_miss_total", "GCSS lookup misses（PE聚合）", "misses", 1},
         {"weight_read_dense_reqs_total", "Issued weight-read requests classified as dense（PE聚合）", "requests", 1},
         {"weight_read_dense_bytes_total", "Issued weight-read bytes classified as dense（PE聚合）", "bytes", 1},
         {"weight_read_rowptr_reqs_total", "Issued weight-read requests classified as BCSR rowptr（PE聚合）", "requests", 1},
@@ -677,8 +584,6 @@ public:
         {"weight_read_colidx_bytes_total", "Issued weight-read bytes classified as BCSR colidx（PE聚合）", "bytes", 1},
         {"weight_read_blockdata_reqs_total", "Issued weight-read requests classified as BCSR blockdata（PE聚合）", "requests", 1},
         {"weight_read_blockdata_bytes_total", "Issued weight-read bytes classified as BCSR blockdata（PE聚合）", "bytes", 1},
-        {"weight_read_gcss_reqs_total", "Issued weight-read requests classified as GCSS value-only（PE聚合）", "requests", 1},
-        {"weight_read_gcss_bytes_total", "Issued weight-read bytes classified as GCSS value-only（PE聚合）", "bytes", 1},
         {"weight_idx_sram_reads_total", "Observe-only weight idx SRAM reads（PE聚合）", "reads", 1},
         {"weight_idx_sram_writes_total", "Observe-only weight idx SRAM writes（PE聚合）", "writes", 1},
         {"weight_idx_sram_bytes_read_total", "Observe-only weight idx SRAM read bytes（PE聚合）", "bytes", 1},
@@ -689,8 +594,6 @@ public:
         {"weight_idx_sram_bank_peak_accesses_per_tick", "Weight idx SRAM peak accesses on any bank（PE聚合）", "accesses", 1},
         {"weight_idx_sram_energy_read_pj_total", "Weight idx SRAM read energy（PE聚合）", "pJ", 1},
         {"weight_idx_sram_energy_write_pj_total", "Weight idx SRAM write energy（PE聚合）", "pJ", 1},
-        {"weight_idx_lookup_total", "GCSS index lookups（PE聚合）", "lookups", 1},
-        {"weight_idx_lookup_idx2_total", "GCSSIDX2 lookups（PE聚合）", "lookups", 1},
         {"weight_l0_sram_reads_total", "Observe-only weight L0 SRAM reads（PE聚合）", "reads", 1},
         {"weight_l0_sram_writes_total", "Observe-only weight L0 SRAM writes（PE聚合）", "writes", 1},
         {"weight_l0_sram_bytes_read_total", "Observe-only weight L0 SRAM read bytes（PE聚合）", "bytes", 1},
@@ -706,23 +609,6 @@ public:
         {"weight_l0_hit_total", "Weight L0 hits（PE聚合）", "hits", 1},
         {"weight_l0_fill_total", "Weight L0 fills（PE聚合）", "fills", 1},
         {"weight_l0_evict_total", "Weight L0 evictions（PE聚合）", "evictions", 1},
-        {"pulse_osa_shared_weight_enabled", "PULSE-OSA shared weight owner enabled flag（PE级）", "bool", 1},
-        {"pulse_osa_shared_weight_owner_scope_enable", "PULSE-OSA shared weight owner scope enabled flag（PE级）", "bool", 1},
-        {"pulse_osa_shared_weight_actual_owner_enable", "PULSE-OSA shared weight actual owner enabled flag（PE级）", "bool", 1},
-        {"pulse_osa_shared_weight_idx_enabled", "PULSE-OSA shared weight idx plane enabled flag（PE级）", "bool", 1},
-        {"pulse_osa_shared_weight_idx_reads_total", "PULSE-OSA shared weight idx reads（PE级）", "reads", 1},
-        {"pulse_osa_shared_weight_idx_writes_total", "PULSE-OSA shared weight idx writes（PE级）", "writes", 1},
-        {"pulse_osa_shared_weight_idx_bank_conflict_ticks_total", "PULSE-OSA shared weight idx conflict ticks（PE级）", "ticks", 1},
-        {"pulse_osa_shared_weight_idx_predicted_extra_cycles_total", "PULSE-OSA shared weight idx predicted extra cycles（PE级）", "cycles", 1},
-        {"pulse_osa_shared_weight_idx_resident_bytes_peak", "PULSE-OSA shared weight idx resident bytes peak（PE级）", "bytes", 1},
-        {"pulse_osa_shared_weight_l0_enabled", "PULSE-OSA shared weight L0 plane enabled flag（PE级）", "bool", 1},
-        {"pulse_osa_shared_weight_l0_reads_total", "PULSE-OSA shared weight L0 reads（PE级）", "reads", 1},
-        {"pulse_osa_shared_weight_l0_writes_total", "PULSE-OSA shared weight L0 writes（PE级）", "writes", 1},
-        {"pulse_osa_shared_weight_l0_fill_total", "PULSE-OSA shared weight L0 fills（PE级）", "fills", 1},
-        {"pulse_osa_shared_weight_l0_evict_total", "PULSE-OSA shared weight L0 evicts（PE级）", "evicts", 1},
-        {"pulse_osa_shared_weight_l0_bank_conflict_ticks_total", "PULSE-OSA shared weight L0 conflict ticks（PE级）", "ticks", 1},
-        {"pulse_osa_shared_weight_l0_predicted_extra_cycles_total", "PULSE-OSA shared weight L0 predicted extra cycles（PE级）", "cycles", 1},
-        {"pulse_osa_shared_weight_l0_resident_bytes_peak", "PULSE-OSA shared weight L0 resident bytes peak（PE级）", "bytes", 1},
         {"core_state_sram_reads_total", "Observe-only state SRAM reads（PE聚合）", "reads", 1},
         {"core_state_sram_writes_total", "Observe-only state SRAM writes（PE聚合）", "writes", 1},
         {"core_state_sram_bytes_read_total", "Observe-only state SRAM read bytes（PE聚合）", "bytes", 1},
@@ -767,416 +653,6 @@ public:
         {"ls_objects_enabled_total", "Local storage: 有效对象总数", "objects", 1},
         {"ls_capacity_bytes_total", "Local storage: 总容量字节数", "bytes", 1},
         {"ls_queue_slots_total", "Local storage: 总队列槽位数", "slots", 1},
-        {"atlas_service_enabled", "PE-Atlas service-object table 是否启用（PE聚合）", "bool", 1},
-        {"atlas_service_owner_form_total", "PE-Atlas service-object owner form 总数（PE聚合）", "objects", 1},
-        {"atlas_service_join_live_total", "PE-Atlas service-object live join 总数（PE聚合）", "joins", 1},
-        {"atlas_service_join_ready_total", "PE-Atlas service-object ready join 总数（PE聚合）", "joins", 1},
-        {"atlas_service_late_join_total", "PE-Atlas service-object late join 总数（PE聚合）", "joins", 1},
-        {"atlas_service_duplicate_join_total", "PE-Atlas service-object duplicate join 总数（PE聚合）", "joins", 1},
-        {"atlas_service_ready_transition_total", "PE-Atlas service-object ready transition 总数（PE聚合）", "objects", 1},
-        {"atlas_service_ready_fanout_total", "PE-Atlas service-object ready fanout 总数（PE聚合）", "fanouts", 1},
-        {"atlas_service_ready_fanout_consumers_sum", "PE-Atlas service-object ready fanout consumer 累计数（PE聚合）", "consumers", 1},
-        {"atlas_service_ready_fanout_consumers_peak", "PE-Atlas service-object ready fanout consumer 峰值（PE聚合）", "consumers", 1},
-        {"atlas_service_released_total", "PE-Atlas service-object release 总数（PE聚合）", "objects", 1},
-        {"atlas_service_release_deferred_total", "PE-Atlas service-object deferred release 总数（PE聚合）", "objects", 1},
-        {"atlas_service_ready_release_total", "PE-Atlas service-object ready-triggered release 总数（PE聚合）", "objects", 1},
-        {"atlas_service_ready_lease_hit_total", "PE-Atlas service-object ready lease hit 总数（PE聚合）", "hits", 1},
-        {"atlas_service_ready_lease_expired_total", "PE-Atlas service-object ready lease expired 总数（PE聚合）", "events", 1},
-        {"atlas_service_potential_private_service_elide_total", "PE-Atlas service-object private-service elide 潜力总数（PE聚合）", "objects", 1},
-        {"atlas_service_active_entries_total", "PE-Atlas service-object active entries 总数（PE聚合）", "entries", 1},
-        {"atlas_service_release_pending_active_total", "PE-Atlas service-object pending release active entries 总数（PE聚合）", "entries", 1},
-        {"atlas_service_atlas_obj_materialize_total", "PE-Atlas object materialize 总数（PE聚合）", "objects", 1},
-        {"atlas_service_atlas_obj_publicize_total", "PE-Atlas object publicize 总数（PE聚合）", "objects", 1},
-        {"atlas_service_atlas_obj_owner_form_total", "PE-Atlas object owner form 总数（PE聚合）", "objects", 1},
-        {"atlas_service_atlas_obj_ready_total", "PE-Atlas object ready 总数（PE聚合）", "objects", 1},
-        {"atlas_service_atlas_obj_release_total", "PE-Atlas object release 总数（PE聚合）", "objects", 1},
-        {"atlas_service_atlas_obj_private_only_total", "PE-Atlas object private-only release 总数（PE聚合）", "objects", 1},
-        {"atlas_pod_metadata_enabled", "PE-Atlas pod metadata plane 是否启用（PE聚合）", "bool", 1},
-        {"atlas_pod_metadata_observe_total", "PE-Atlas pod metadata plane observe 总数（PE聚合）", "events", 1},
-        {"atlas_pod_metadata_unique_object_total", "PE-Atlas pod metadata plane unique object 总数（PE聚合）", "objects", 1},
-        {"atlas_pod_metadata_overlap_hit_total", "PE-Atlas pod metadata plane overlap hit 总数（PE聚合）", "hits", 1},
-        {"atlas_pod_metadata_duplicate_consumer_total", "PE-Atlas pod metadata plane duplicate consumer 总数（PE聚合）", "events", 1},
-        {"atlas_pod_metadata_evict_total", "PE-Atlas pod metadata plane evict 总数（PE聚合）", "objects", 1},
-        {"atlas_pod_metadata_active_entries_total", "PE-Atlas pod metadata plane active entries 总数（PE聚合）", "entries", 1},
-        {"atlas_pod_metadata_active_entries_peak_total", "PE-Atlas pod metadata plane active entries 峰值（PE聚合）", "entries", 1},
-        {"atlas_pod_metadata_premphf_base_observe_total", "PE-Atlas pod metadata premphf_base observe 总数（PE聚合）", "events", 1},
-        {"atlas_pod_metadata_premphf_base_unique_object_total", "PE-Atlas pod metadata premphf_base unique object 总数（PE聚合）", "objects", 1},
-        {"atlas_pod_metadata_premphf_base_overlap_hit_total", "PE-Atlas pod metadata premphf_base overlap hit 总数（PE聚合）", "hits", 1},
-        {"atlas_pod_metadata_premphf_base_duplicate_consumer_total", "PE-Atlas pod metadata premphf_base duplicate consumer 总数（PE聚合）", "events", 1},
-        {"atlas_pod_metadata_premphf_base_evict_total", "PE-Atlas pod metadata premphf_base evict 总数（PE聚合）", "objects", 1},
-        {"atlas_pod_metadata_premphf_base_active_entries_total", "PE-Atlas pod metadata premphf_base active entries 总数（PE聚合）", "entries", 1},
-        {"atlas_pod_metadata_premphf_base_active_entries_peak_total", "PE-Atlas pod metadata premphf_base active entries 峰值（PE聚合）", "entries", 1},
-        {"atlas_pod_metadata_premphf_band_observe_total", "PE-Atlas pod metadata premphf_band observe 总数（PE聚合）", "events", 1},
-        {"atlas_pod_metadata_premphf_band_unique_object_total", "PE-Atlas pod metadata premphf_band unique object 总数（PE聚合）", "objects", 1},
-        {"atlas_pod_metadata_premphf_band_overlap_hit_total", "PE-Atlas pod metadata premphf_band overlap hit 总数（PE聚合）", "hits", 1},
-        {"atlas_pod_metadata_premphf_band_duplicate_consumer_total", "PE-Atlas pod metadata premphf_band duplicate consumer 总数（PE聚合）", "events", 1},
-        {"atlas_pod_metadata_premphf_band_evict_total", "PE-Atlas pod metadata premphf_band evict 总数（PE聚合）", "objects", 1},
-        {"atlas_pod_metadata_premphf_band_active_entries_total", "PE-Atlas pod metadata premphf_band active entries 总数（PE聚合）", "entries", 1},
-        {"atlas_pod_metadata_premphf_band_active_entries_peak_total", "PE-Atlas pod metadata premphf_band active entries 峰值（PE聚合）", "entries", 1},
-        {"atlas_pod_metadata_idx2row_observe_total", "PE-Atlas pod metadata idx2row observe 总数（PE聚合）", "events", 1},
-        {"atlas_pod_metadata_idx2row_unique_object_total", "PE-Atlas pod metadata idx2row unique object 总数（PE聚合）", "objects", 1},
-        {"atlas_pod_metadata_idx2row_overlap_hit_total", "PE-Atlas pod metadata idx2row overlap hit 总数（PE聚合）", "hits", 1},
-        {"atlas_pod_metadata_idx2row_duplicate_consumer_total", "PE-Atlas pod metadata idx2row duplicate consumer 总数（PE聚合）", "events", 1},
-        {"atlas_pod_metadata_idx2row_evict_total", "PE-Atlas pod metadata idx2row evict 总数（PE聚合）", "objects", 1},
-        {"atlas_pod_metadata_idx2row_active_entries_total", "PE-Atlas pod metadata idx2row active entries 总数（PE聚合）", "entries", 1},
-        {"atlas_pod_metadata_idx2row_active_entries_peak_total", "PE-Atlas pod metadata idx2row active entries 峰值（PE聚合）", "entries", 1},
-        {"atlas_pod_metadata_rowindex_observe_total", "PE-Atlas pod metadata rowindex observe 总数（PE聚合）", "events", 1},
-        {"atlas_pod_metadata_rowindex_unique_object_total", "PE-Atlas pod metadata rowindex unique object 总数（PE聚合）", "objects", 1},
-        {"atlas_pod_metadata_rowindex_overlap_hit_total", "PE-Atlas pod metadata rowindex overlap hit 总数（PE聚合）", "hits", 1},
-        {"atlas_pod_metadata_rowindex_duplicate_consumer_total", "PE-Atlas pod metadata rowindex duplicate consumer 总数（PE聚合）", "events", 1},
-        {"atlas_pod_metadata_rowindex_evict_total", "PE-Atlas pod metadata rowindex evict 总数（PE聚合）", "objects", 1},
-        {"atlas_pod_metadata_rowindex_active_entries_total", "PE-Atlas pod metadata rowindex active entries 总数（PE聚合）", "entries", 1},
-        {"atlas_pod_metadata_rowindex_active_entries_peak_total", "PE-Atlas pod metadata rowindex active entries 峰值（PE聚合）", "entries", 1},
-        {"atlas_pod_metadata_rowdescriptor_observe_total", "PE-Atlas pod metadata rowdescriptor observe 总数（PE聚合）", "events", 1},
-        {"atlas_pod_metadata_rowdescriptor_unique_object_total", "PE-Atlas pod metadata rowdescriptor unique object 总数（PE聚合）", "objects", 1},
-        {"atlas_pod_metadata_rowdescriptor_overlap_hit_total", "PE-Atlas pod metadata rowdescriptor overlap hit 总数（PE聚合）", "hits", 1},
-        {"atlas_pod_metadata_rowdescriptor_duplicate_consumer_total", "PE-Atlas pod metadata rowdescriptor duplicate consumer 总数（PE聚合）", "events", 1},
-        {"atlas_pod_metadata_rowdescriptor_evict_total", "PE-Atlas pod metadata rowdescriptor evict 总数（PE聚合）", "objects", 1},
-        {"atlas_pod_metadata_rowdescriptor_active_entries_total", "PE-Atlas pod metadata rowdescriptor active entries 总数（PE聚合）", "entries", 1},
-        {"atlas_pod_metadata_rowdescriptor_active_entries_peak_total", "PE-Atlas pod metadata rowdescriptor active entries 峰值（PE聚合）", "entries", 1},
-        {"atlas_pod_owner_enabled", "PE-Atlas pod owner table 是否启用（PE聚合）", "bool", 1},
-        {"atlas_pod_owner_lookup_total", "PE-Atlas pod owner table lookup 总数（PE聚合）", "lookups", 1},
-        {"atlas_pod_owner_owner_alloc_total", "PE-Atlas pod owner table owner alloc 总数（PE聚合）", "objects", 1},
-        {"atlas_pod_owner_owner_hit_total", "PE-Atlas pod owner table owner hit 总数（PE聚合）", "hits", 1},
-        {"atlas_pod_owner_owner_reject_total", "PE-Atlas pod owner table owner reject 总数（PE聚合）", "events", 1},
-        {"atlas_pod_owner_join_request_total", "PE-Atlas pod owner table join request 总数（PE聚合）", "requests", 1},
-        {"atlas_pod_owner_join_grant_total", "PE-Atlas pod owner table join grant 总数（PE聚合）", "grants", 1},
-        {"atlas_pod_owner_join_reject_total", "PE-Atlas pod owner table join reject 总数（PE聚合）", "events", 1},
-        {"atlas_pod_owner_active_entries_total", "PE-Atlas pod owner table active entries 总数（PE聚合）", "entries", 1},
-        {"atlas_pod_owner_active_entries_peak_total", "PE-Atlas pod owner table active entries 峰值（PE聚合）", "entries", 1},
-        {"atlas_pod_owner_premphf_base_owner_alloc_total", "PE-Atlas pod owner premphf_base owner alloc 总数（PE聚合）", "objects", 1},
-        {"atlas_pod_owner_premphf_base_owner_hit_total", "PE-Atlas pod owner premphf_base owner hit 总数（PE聚合）", "hits", 1},
-        {"atlas_pod_owner_premphf_base_owner_reject_total", "PE-Atlas pod owner premphf_base owner reject 总数（PE聚合）", "events", 1},
-        {"atlas_pod_owner_premphf_base_join_request_total", "PE-Atlas pod owner premphf_base join request 总数（PE聚合）", "requests", 1},
-        {"atlas_pod_owner_premphf_base_join_grant_total", "PE-Atlas pod owner premphf_base join grant 总数（PE聚合）", "grants", 1},
-        {"atlas_pod_owner_premphf_base_join_reject_total", "PE-Atlas pod owner premphf_base join reject 总数（PE聚合）", "events", 1},
-        {"atlas_pod_owner_premphf_base_active_entries_total", "PE-Atlas pod owner premphf_base active entries 总数（PE聚合）", "entries", 1},
-        {"atlas_pod_owner_premphf_base_active_entries_peak_total", "PE-Atlas pod owner premphf_base active entries 峰值（PE聚合）", "entries", 1},
-        {"atlas_pod_owner_premphf_band_owner_alloc_total", "PE-Atlas pod owner premphf_band owner alloc 总数（PE聚合）", "objects", 1},
-        {"atlas_pod_owner_premphf_band_owner_hit_total", "PE-Atlas pod owner premphf_band owner hit 总数（PE聚合）", "hits", 1},
-        {"atlas_pod_owner_premphf_band_owner_reject_total", "PE-Atlas pod owner premphf_band owner reject 总数（PE聚合）", "events", 1},
-        {"atlas_pod_owner_premphf_band_join_request_total", "PE-Atlas pod owner premphf_band join request 总数（PE聚合）", "requests", 1},
-        {"atlas_pod_owner_premphf_band_join_grant_total", "PE-Atlas pod owner premphf_band join grant 总数（PE聚合）", "grants", 1},
-        {"atlas_pod_owner_premphf_band_join_reject_total", "PE-Atlas pod owner premphf_band join reject 总数（PE聚合）", "events", 1},
-        {"atlas_pod_owner_premphf_band_active_entries_total", "PE-Atlas pod owner premphf_band active entries 总数（PE聚合）", "entries", 1},
-        {"atlas_pod_owner_premphf_band_active_entries_peak_total", "PE-Atlas pod owner premphf_band active entries 峰值（PE聚合）", "entries", 1},
-        {"atlas_pod_owner_idx2row_owner_alloc_total", "PE-Atlas pod owner idx2row owner alloc 总数（PE聚合）", "objects", 1},
-        {"atlas_pod_owner_idx2row_owner_hit_total", "PE-Atlas pod owner idx2row owner hit 总数（PE聚合）", "hits", 1},
-        {"atlas_pod_owner_idx2row_owner_reject_total", "PE-Atlas pod owner idx2row owner reject 总数（PE聚合）", "events", 1},
-        {"atlas_pod_owner_idx2row_join_request_total", "PE-Atlas pod owner idx2row join request 总数（PE聚合）", "requests", 1},
-        {"atlas_pod_owner_idx2row_join_grant_total", "PE-Atlas pod owner idx2row join grant 总数（PE聚合）", "grants", 1},
-        {"atlas_pod_owner_idx2row_join_reject_total", "PE-Atlas pod owner idx2row join reject 总数（PE聚合）", "events", 1},
-        {"atlas_pod_owner_idx2row_active_entries_total", "PE-Atlas pod owner idx2row active entries 总数（PE聚合）", "entries", 1},
-        {"atlas_pod_owner_idx2row_active_entries_peak_total", "PE-Atlas pod owner idx2row active entries 峰值（PE聚合）", "entries", 1},
-        {"atlas_pod_owner_rowindex_owner_alloc_total", "PE-Atlas pod owner rowindex owner alloc 总数（PE聚合）", "objects", 1},
-        {"atlas_pod_owner_rowindex_owner_hit_total", "PE-Atlas pod owner rowindex owner hit 总数（PE聚合）", "hits", 1},
-        {"atlas_pod_owner_rowindex_owner_reject_total", "PE-Atlas pod owner rowindex owner reject 总数（PE聚合）", "events", 1},
-        {"atlas_pod_owner_rowindex_join_request_total", "PE-Atlas pod owner rowindex join request 总数（PE聚合）", "requests", 1},
-        {"atlas_pod_owner_rowindex_join_grant_total", "PE-Atlas pod owner rowindex join grant 总数（PE聚合）", "grants", 1},
-        {"atlas_pod_owner_rowindex_join_reject_total", "PE-Atlas pod owner rowindex join reject 总数（PE聚合）", "events", 1},
-        {"atlas_pod_owner_rowindex_active_entries_total", "PE-Atlas pod owner rowindex active entries 总数（PE聚合）", "entries", 1},
-        {"atlas_pod_owner_rowindex_active_entries_peak_total", "PE-Atlas pod owner rowindex active entries 峰值（PE聚合）", "entries", 1},
-        {"atlas_pod_owner_rowdescriptor_owner_alloc_total", "PE-Atlas pod owner rowdescriptor owner alloc 总数（PE聚合）", "objects", 1},
-        {"atlas_pod_owner_rowdescriptor_owner_hit_total", "PE-Atlas pod owner rowdescriptor owner hit 总数（PE聚合）", "hits", 1},
-        {"atlas_pod_owner_rowdescriptor_owner_reject_total", "PE-Atlas pod owner rowdescriptor owner reject 总数（PE聚合）", "events", 1},
-        {"atlas_pod_owner_rowdescriptor_join_request_total", "PE-Atlas pod owner rowdescriptor join request 总数（PE聚合）", "requests", 1},
-        {"atlas_pod_owner_rowdescriptor_join_grant_total", "PE-Atlas pod owner rowdescriptor join grant 总数（PE聚合）", "grants", 1},
-        {"atlas_pod_owner_rowdescriptor_join_reject_total", "PE-Atlas pod owner rowdescriptor join reject 总数（PE聚合）", "events", 1},
-        {"atlas_pod_owner_rowdescriptor_active_entries_total", "PE-Atlas pod owner rowdescriptor active entries 总数（PE聚合）", "entries", 1},
-        {"atlas_pod_owner_rowdescriptor_active_entries_peak_total", "PE-Atlas pod owner rowdescriptor active entries 峰值（PE聚合）", "entries", 1},
-        {"atlas_census_premphf_base_frontier_events_total", "PE-Atlas census premphf_base frontier evidence 总数（PE聚合）", "events", 1},
-        {"atlas_census_premphf_base_producer_events_total", "PE-Atlas census premphf_base producer evidence 总数（PE聚合）", "events", 1},
-        {"atlas_census_premphf_base_gate_events_total", "PE-Atlas census premphf_base gate evidence 总数（PE聚合）", "events", 1},
-        {"atlas_census_premphf_base_service_events_total", "PE-Atlas census premphf_base service evidence 总数（PE聚合）", "events", 1},
-        {"atlas_census_premphf_band_frontier_events_total", "PE-Atlas census premphf_band frontier evidence 总数（PE聚合）", "events", 1},
-        {"atlas_census_premphf_band_producer_events_total", "PE-Atlas census premphf_band producer evidence 总数（PE聚合）", "events", 1},
-        {"atlas_census_premphf_band_gate_events_total", "PE-Atlas census premphf_band gate evidence 总数（PE聚合）", "events", 1},
-        {"atlas_census_premphf_band_service_events_total", "PE-Atlas census premphf_band service evidence 总数（PE聚合）", "events", 1},
-        {"atlas_census_idx2row_frontier_events_total", "PE-Atlas census idx2row frontier evidence 总数（PE聚合）", "events", 1},
-        {"atlas_census_idx2row_producer_events_total", "PE-Atlas census idx2row producer evidence 总数（PE聚合）", "events", 1},
-        {"atlas_census_idx2row_gate_events_total", "PE-Atlas census idx2row gate evidence 总数（PE聚合）", "events", 1},
-        {"atlas_census_idx2row_service_events_total", "PE-Atlas census idx2row service evidence 总数（PE聚合）", "events", 1},
-        {"atlas_census_rowindex_frontier_events_total", "PE-Atlas census rowindex frontier evidence 总数（PE聚合）", "events", 1},
-        {"atlas_census_rowindex_producer_events_total", "PE-Atlas census rowindex producer evidence 总数（PE聚合）", "events", 1},
-        {"atlas_census_rowindex_gate_events_total", "PE-Atlas census rowindex gate evidence 总数（PE聚合）", "events", 1},
-        {"atlas_census_rowindex_service_events_total", "PE-Atlas census rowindex service evidence 总数（PE聚合）", "events", 1},
-        {"atlas_census_rowdescriptor_frontier_events_total", "PE-Atlas census rowdescriptor frontier evidence 总数（PE聚合）", "events", 1},
-        {"atlas_census_rowdescriptor_producer_events_total", "PE-Atlas census rowdescriptor producer evidence 总数（PE聚合）", "events", 1},
-        {"atlas_census_rowdescriptor_gate_events_total", "PE-Atlas census rowdescriptor gate evidence 总数（PE聚合）", "events", 1},
-        {"atlas_census_rowdescriptor_service_events_total", "PE-Atlas census rowdescriptor service evidence 总数（PE聚合）", "events", 1},
-        {"atlas_proxy_idx2row_materialize_total", "PE-Atlas proxy idx2row materialize 总数（PE聚合）", "events", 1},
-        {"atlas_proxy_idx2row_publicize_total", "PE-Atlas proxy idx2row publicize 总数（PE聚合）", "events", 1},
-        {"atlas_proxy_idx2row_owner_form_total", "PE-Atlas proxy idx2row owner form 总数（PE聚合）", "events", 1},
-        {"atlas_proxy_idx2row_join_live_total", "PE-Atlas proxy idx2row join live 总数（PE聚合）", "events", 1},
-        {"atlas_proxy_idx2row_join_ready_total", "PE-Atlas proxy idx2row join ready 总数（PE聚合）", "events", 1},
-        {"atlas_proxy_idx2row_ready_total", "PE-Atlas proxy idx2row ready 总数（PE聚合）", "events", 1},
-        {"atlas_proxy_idx2row_release_total", "PE-Atlas proxy idx2row release 总数（PE聚合）", "events", 1},
-        {"atlas_proxy_idx2row_release_missing_total", "PE-Atlas proxy idx2row release miss 总数（PE聚合）", "events", 1},
-        {"atlas_proxy_idx2row_fallback_total", "PE-Atlas proxy idx2row fallback 总数（PE聚合）", "events", 1},
-        {"atlas_proxy_premphf_base_materialize_total", "PE-Atlas proxy premphf_base materialize 总数（PE聚合）", "events", 1},
-        {"atlas_proxy_premphf_base_publicize_total", "PE-Atlas proxy premphf_base publicize 总数（PE聚合）", "events", 1},
-        {"atlas_proxy_premphf_base_owner_form_total", "PE-Atlas proxy premphf_base owner form 总数（PE聚合）", "events", 1},
-        {"atlas_proxy_premphf_base_shared_hit_total", "PE-Atlas proxy premphf_base shared hit 总数（PE聚合）", "events", 1},
-        {"atlas_proxy_premphf_base_lookup_ready_total", "PE-Atlas proxy premphf_base lookup ready 总数（PE聚合）", "events", 1},
-        {"atlas_proxy_premphf_base_proxy_only_gap_total", "PE-Atlas proxy premphf_base proxy-only gap 总数（PE聚合）", "events", 1},
-        {"atlas_proxy_premphf_band_materialize_total", "PE-Atlas proxy premphf_band materialize 总数（PE聚合）", "events", 1},
-        {"atlas_proxy_premphf_band_publicize_total", "PE-Atlas proxy premphf_band publicize 总数（PE聚合）", "events", 1},
-        {"atlas_proxy_premphf_band_owner_form_candidate_total", "PE-Atlas proxy premphf_band owner-form candidate 总数（PE聚合）", "events", 1},
-        {"atlas_proxy_premphf_band_join_ready_candidate_total", "PE-Atlas proxy premphf_band join-ready candidate 总数（PE聚合）", "events", 1},
-        {"atlas_proxy_premphf_band_zero_service_total", "PE-Atlas proxy premphf_band zero-service 总数（PE聚合）", "events", 1},
-        {"atlas_proxy_rowindex_materialize_total", "PE-Atlas proxy rowindex materialize 总数（PE聚合）", "events", 1},
-        {"atlas_proxy_rowindex_publicize_total", "PE-Atlas proxy rowindex publicize 总数（PE聚合）", "events", 1},
-        {"atlas_proxy_rowindex_owner_form_total", "PE-Atlas proxy rowindex owner form 总数（PE聚合）", "events", 1},
-        {"atlas_proxy_rowindex_join_live_total", "PE-Atlas proxy rowindex join live 总数（PE聚合）", "events", 1},
-        {"atlas_proxy_rowindex_join_ready_total", "PE-Atlas proxy rowindex join ready 总数（PE聚合）", "events", 1},
-        {"atlas_proxy_rowindex_ready_total", "PE-Atlas proxy rowindex ready 总数（PE聚合）", "events", 1},
-        {"atlas_proxy_rowindex_release_total", "PE-Atlas proxy rowindex release 总数（PE聚合）", "events", 1},
-        {"atlas_proxy_rowindex_release_missing_total", "PE-Atlas proxy rowindex release miss 总数（PE聚合）", "events", 1},
-        {"atlas_proxy_rowindex_fallback_total", "PE-Atlas proxy rowindex fallback 总数（PE聚合）", "events", 1},
-        {"atlas_phase_local_begin_gather_total", "PE-Atlas phase local begin gather 总数（PE聚合）", "events", 1},
-        {"atlas_phase_local_first_touch_after_gather_open_total", "PE-Atlas phase local first touch after gather-open 总数（PE聚合）", "events", 1},
-        {"atlas_phase_local_touch_without_gather_open_total", "PE-Atlas phase local touch without gather-open 总数（PE聚合）", "events", 1},
-        {"atlas_phase_local_touch_during_apply_total", "PE-Atlas phase local touch during apply 总数（PE聚合）", "events", 1},
-        {"atlas_phase_local_begin_apply_total", "PE-Atlas phase local begin apply 总数（PE聚合）", "events", 1},
-        {"atlas_phase_local_begin_apply_with_touch_total", "PE-Atlas phase local begin apply with gather-touch 总数（PE聚合）", "events", 1},
-        {"atlas_phase_local_begin_apply_with_pending_rowidx_total", "PE-Atlas phase local begin apply with pending rowidx 总数（PE聚合）", "events", 1},
-        {"atlas_phase_local_begin_apply_without_pending_rowidx_total", "PE-Atlas phase local begin apply without pending rowidx 总数（PE聚合）", "events", 1},
-        {"atlas_phase_local_end_scatter_total", "PE-Atlas phase local end scatter 总数（PE聚合）", "events", 1},
-        {"atlas_storage_map_shared_owner_scope_enable", "PE-Atlas storage map shared owner-scope enable（PE级）", "flags", 1},
-        {"atlas_storage_map_shared_actual_owner_enable", "PE-Atlas storage map shared actual-owner enable（PE级）", "flags", 1},
-        {"atlas_storage_map_weight_idx_shared_enabled", "PE-Atlas storage map weight idx shared mirror enable（PE级）", "flags", 1},
-        {"atlas_storage_map_weight_value_shared_enabled", "PE-Atlas storage map weight value shared mirror enable（PE级）", "flags", 1},
-        {"atlas_storage_map_weight_idx_private_authority_total", "PE-Atlas storage map weight idx private authority one-hot（PE级）", "flags", 1},
-        {"atlas_storage_map_weight_idx_shared_mirror_only_total", "PE-Atlas storage map weight idx shared mirror-only one-hot（PE级）", "flags", 1},
-        {"atlas_storage_map_weight_idx_shared_authority_active_total", "PE-Atlas storage map weight idx shared authority-active one-hot（PE级）", "flags", 1},
-        {"atlas_storage_map_weight_value_private_authority_total", "PE-Atlas storage map weight value private authority one-hot（PE级）", "flags", 1},
-        {"atlas_storage_map_weight_value_shared_mirror_only_total", "PE-Atlas storage map weight value shared mirror-only one-hot（PE级）", "flags", 1},
-        {"atlas_storage_map_weight_value_shared_authority_active_total", "PE-Atlas storage map weight value shared authority-active one-hot（PE级）", "flags", 1},
-        {"atlas_storage_map_weight_idx_private_reads_total", "PE-Atlas storage map weight idx private reads 总数（PE聚合）", "reads", 1},
-        {"atlas_storage_map_weight_idx_shared_reads_total", "PE-Atlas storage map weight idx shared reads 总数（PE级）", "reads", 1},
-        {"atlas_storage_map_weight_idx_private_resident_bytes_peak", "PE-Atlas storage map weight idx private resident bytes peak（PE聚合）", "bytes", 1},
-        {"atlas_storage_map_weight_idx_shared_resident_bytes_peak", "PE-Atlas storage map weight idx shared resident bytes peak（PE级）", "bytes", 1},
-        {"atlas_storage_map_weight_value_private_reads_total", "PE-Atlas storage map weight value private reads 总数（PE聚合）", "reads", 1},
-        {"atlas_storage_map_weight_value_shared_reads_total", "PE-Atlas storage map weight value shared reads 总数（PE级）", "reads", 1},
-        {"atlas_storage_map_weight_value_private_resident_bytes_peak", "PE-Atlas storage map weight value private resident bytes peak（PE聚合）", "bytes", 1},
-        {"atlas_storage_map_weight_value_shared_resident_bytes_peak", "PE-Atlas storage map weight value shared resident bytes peak（PE级）", "bytes", 1},
-        {"atlas_shared_weight_census_state_absent_total", "PE-Atlas shared weight census 状态：对象未构建 one-hot（PE级）", "flags", 1},
-        {"atlas_shared_weight_census_state_owner_scope_off_total", "PE-Atlas shared weight census 状态：owner-scope 关闭 one-hot（PE级）", "flags", 1},
-        {"atlas_shared_weight_census_state_mirror_only_total", "PE-Atlas shared weight census 状态：shared mirror-only one-hot（PE级）", "flags", 1},
-        {"atlas_shared_weight_census_state_actual_owner_total", "PE-Atlas shared weight census 状态：actual-owner one-hot（PE级）", "flags", 1},
-        {"atlas_shared_weight_census_absent_reason_workload_ineligible_total", "PE-Atlas shared weight census 缺席原因：workload 不可用 one-hot（PE级）", "flags", 1},
-        {"atlas_shared_weight_census_absent_reason_local_storage_gate_total", "PE-Atlas shared weight census 缺席原因：local-storage gate one-hot（PE级）", "flags", 1},
-        {"atlas_shared_weight_census_absent_reason_pulse_osa_gate_total", "PE-Atlas shared weight census 缺席原因：pulse-osa gate one-hot（PE级）", "flags", 1},
-        {"atlas_shared_weight_census_absent_reason_owner_request_gate_total", "PE-Atlas shared weight census 缺席原因：shared-weight owner request gate one-hot（PE级）", "flags", 1},
-        {"atlas_control_runtime_produced_frontier_export_total", "PE-Atlas control runtime produced frontier-export 总数（PE级）", "messages", 1},
-        {"atlas_control_runtime_produced_owner_announce_total", "PE-Atlas control runtime produced owner-announce 总数（PE级）", "messages", 1},
-        {"atlas_control_runtime_produced_join_request_total", "PE-Atlas control runtime produced join-request 总数（PE级）", "messages", 1},
-        {"atlas_control_runtime_produced_ready_fanout_total", "PE-Atlas control runtime produced ready-fanout 总数（PE级）", "messages", 1},
-        {"atlas_control_runtime_produced_join_reject_total", "PE-Atlas control runtime produced join-reject 总数（PE级）", "messages", 1},
-        {"atlas_control_runtime_queued_frontier_export_total", "PE-Atlas control runtime queued frontier-export 总数（PE级）", "messages", 1},
-        {"atlas_control_runtime_queued_owner_announce_total", "PE-Atlas control runtime queued owner-announce 总数（PE级）", "messages", 1},
-        {"atlas_control_runtime_queued_join_request_total", "PE-Atlas control runtime queued join-request 总数（PE级）", "messages", 1},
-        {"atlas_control_runtime_queued_ready_fanout_total", "PE-Atlas control runtime queued ready-fanout 总数（PE级）", "messages", 1},
-        {"atlas_control_runtime_queued_join_reject_total", "PE-Atlas control runtime queued join-reject 总数（PE级）", "messages", 1},
-        {"atlas_control_runtime_consumed_frontier_export_total", "PE-Atlas control runtime consumed frontier-export 总数（PE级）", "messages", 1},
-        {"atlas_control_runtime_consumed_owner_announce_total", "PE-Atlas control runtime consumed owner-announce 总数（PE级）", "messages", 1},
-        {"atlas_control_runtime_consumed_join_request_total", "PE-Atlas control runtime consumed join-request 总数（PE级）", "messages", 1},
-        {"atlas_control_runtime_consumed_ready_fanout_total", "PE-Atlas control runtime consumed ready-fanout 总数（PE级）", "messages", 1},
-        {"atlas_control_runtime_consumed_join_reject_total", "PE-Atlas control runtime consumed join-reject 总数（PE级）", "messages", 1},
-        {"atlas_control_runtime_backlog_messages_current", "PE-Atlas control runtime 当前 backlog 消息数（PE级）", "messages", 1},
-        {"atlas_control_runtime_backlog_messages_peak", "PE-Atlas control runtime 峰值 backlog 消息数（PE级）", "messages", 1},
-        {"atlas_control_runtime_backlog_cycles_total", "PE-Atlas control runtime backlog 累计周期（PE级）", "cycles", 1},
-        {"atlas_control_runtime_produced_any_nonzero_total", "PE-Atlas control runtime produced 任一非零 one-hot（PE级）", "flags", 1},
-        {"atlas_control_runtime_queued_any_nonzero_total", "PE-Atlas control runtime queued 任一非零 one-hot（PE级）", "flags", 1},
-        {"atlas_control_runtime_consumed_any_nonzero_total", "PE-Atlas control runtime consumed 任一非零 one-hot（PE级）", "flags", 1},
-        {"atlas_control_runtime_backlog_any_nonzero_total", "PE-Atlas control runtime backlog 任一非零 one-hot（PE级）", "flags", 1},
-        {"atlas_control_runtime_all_zero_total", "PE-Atlas control runtime 全零 one-hot（PE级）", "flags", 1},
-        {"atlas_control_runtime_state_fabric_absent_total", "PE-Atlas control runtime 状态：fabric 未构建 one-hot（PE级）", "flags", 1},
-        {"atlas_control_runtime_state_fabric_present_idle_total", "PE-Atlas control runtime 状态：fabric 已构建但 idle one-hot（PE级）", "flags", 1},
-        {"atlas_control_runtime_state_produced_without_queue_total", "PE-Atlas control runtime 状态：produced 非零但 queue 未激活 one-hot（PE级）", "flags", 1},
-        {"atlas_control_runtime_state_queued_without_consume_total", "PE-Atlas control runtime 状态：queue 非零但 consume 未激活 one-hot（PE级）", "flags", 1},
-        {"atlas_control_runtime_state_consumed_active_total", "PE-Atlas control runtime 状态：consume 已激活 one-hot（PE级）", "flags", 1},
-        {"atlas_enable_state_local_storage_effective_total", "PE-Atlas enable-state: local storage effective", "flags", 1},
-        {"atlas_enable_state_pe_internal_cpe_effective_total", "PE-Atlas enable-state: pe-internal cpe effective", "flags", 1},
-        {"atlas_enable_state_pe_internal_pod_effective_total", "PE-Atlas enable-state: pe-internal pod effective", "flags", 1},
-        {"atlas_enable_state_pe_internal_pod_metadata_effective_total", "PE-Atlas enable-state: pod metadata effective", "flags", 1},
-        {"atlas_enable_state_pe_internal_pod_owner_effective_total", "PE-Atlas enable-state: pod owner effective", "flags", 1},
-        {"atlas_enable_state_pe_local_service_table_present_total", "PE-Atlas enable-state: local service table present", "flags", 1},
-        {"atlas_enable_state_rowindex_effective_total", "PE-Atlas enable-state: rowindex effective", "flags", 1},
-        {"atlas_enable_state_rowindex_gate_pulse_osa_total", "PE-Atlas enable-state: rowindex gate pulse-osa", "flags", 1},
-        {"atlas_enable_state_rowindex_gate_metadata_txn_total", "PE-Atlas enable-state: rowindex gate metadata txn", "flags", 1},
-        {"atlas_enable_state_rowindex_gate_metadata_mask_total", "PE-Atlas enable-state: rowindex gate metadata mask includes rowindex", "flags", 1},
-        {"atlas_enable_state_rowindex_gate_pod_enable_total", "PE-Atlas enable-state: rowindex gate pod enable", "flags", 1},
-        {"atlas_enable_state_rowindex_gate_pod_metadata_enable_total", "PE-Atlas enable-state: rowindex gate pod metadata enable", "flags", 1},
-        {"atlas_enable_state_rowindex_gate_pod_owner_enable_total", "PE-Atlas enable-state: rowindex gate pod owner enable", "flags", 1},
-        {"atlas_enable_state_rowindex_gate_service_table_present_total", "PE-Atlas enable-state: rowindex gate service table present", "flags", 1},
-        {"atlas_enable_state_pulse_effective_total", "PE-Atlas enable-state: pulse effective", "flags", 1},
-        {"atlas_enable_state_pulse_fabric_present_total", "PE-Atlas enable-state: pulse fabric present", "flags", 1},
-        {"atlas_enable_state_pulse_observe_only_total", "PE-Atlas enable-state: pulse observe-only", "flags", 1},
-        {"atlas_enable_state_pulse_actual_ingress_effective_total", "PE-Atlas enable-state: pulse actual ingress effective", "flags", 1},
-        {"atlas_enable_state_pulse_harbor_effective_total", "PE-Atlas enable-state: pulse harbor effective", "flags", 1},
-        {"atlas_enable_state_pulse_descriptor_effective_total", "PE-Atlas enable-state: pulse descriptor effective", "flags", 1},
-        {"atlas_enable_state_pulse_descriptor_actual_effective_total", "PE-Atlas enable-state: pulse descriptor actual effective", "flags", 1},
-        {"atlas_enable_state_pulse_osa_effective_total", "PE-Atlas enable-state: pulse-osa effective", "flags", 1},
-        {"atlas_enable_state_pulse_osa_shared_weight_owner_effective_total", "PE-Atlas enable-state: shared weight owner effective", "flags", 1},
-        {"atlas_enable_state_pulse_osa_shared_weight_actual_effective_total", "PE-Atlas enable-state: shared weight actual-owner effective", "flags", 1},
-        {"atlas_enable_state_pe_weight_plane_present_total", "PE-Atlas enable-state: shared weight plane present", "flags", 1},
-        {"atlas_enable_state_pulse_osa_metadata_txn_effective_total", "PE-Atlas enable-state: pulse-osa metadata txn effective", "flags", 1},
-        {"atlas_enable_state_pulse_osa_metadata_ready_lease_effective_total", "PE-Atlas enable-state: pulse-osa metadata ready-lease effective", "flags", 1},
-        {"atlas_enable_state_pulse_osa_metadata_mask_nonzero_total", "PE-Atlas enable-state: pulse-osa metadata mask nonzero", "flags", 1},
-        {"atlas_enable_state_control_runtime_produce_eligible_total", "PE-Atlas enable-state: control runtime produce eligible", "flags", 1},
-        {"atlas_enable_state_control_runtime_end_to_end_eligible_total", "PE-Atlas enable-state: control runtime end-to-end eligible", "flags", 1},
-        {"atlas_activation_gate_workload_pure_snn_datapath_eligible", "PE-Atlas activation gate: workload 允许 pure-SNN datapath 特性", "flags", 1},
-        {"atlas_activation_gate_local_storage_enable", "PE-Atlas activation gate: local storage effective enable", "flags", 1},
-        {"atlas_activation_gate_pulse_requested", "PE-Atlas activation gate: pulse raw request", "flags", 1},
-        {"atlas_activation_gate_pulse_effective", "PE-Atlas activation gate: pulse effective enable", "flags", 1},
-        {"atlas_activation_gate_pulse_fabric_constructed", "PE-Atlas activation gate: pulse fabric constructed", "flags", 1},
-        {"atlas_activation_gate_pulse_observe_only_effective", "PE-Atlas activation gate: pulse observe-only effective", "flags", 1},
-        {"atlas_activation_gate_pulse_actual_ingress_eligible", "PE-Atlas activation gate: pulse actual ingress eligible", "flags", 1},
-        {"atlas_activation_gate_pulse_harbor_enable_effective", "PE-Atlas activation gate: pulse harbor effective", "flags", 1},
-        {"atlas_activation_gate_pulse_descriptor_enable_effective", "PE-Atlas activation gate: pulse descriptor effective", "flags", 1},
-        {"atlas_activation_gate_pulse_descriptor_actual_requested", "PE-Atlas activation gate: pulse descriptor actual raw request", "flags", 1},
-        {"atlas_activation_gate_pulse_descriptor_actual_effective", "PE-Atlas activation gate: pulse descriptor actual effective", "flags", 1},
-        {"atlas_activation_gate_pulse_osa_requested", "PE-Atlas activation gate: pulse-osa raw request", "flags", 1},
-        {"atlas_activation_gate_pulse_osa_effective", "PE-Atlas activation gate: pulse-osa effective enable", "flags", 1},
-        {"atlas_activation_gate_shared_weight_owner_requested", "PE-Atlas activation gate: shared weight owner raw request", "flags", 1},
-        {"atlas_activation_gate_shared_weight_owner_effective", "PE-Atlas activation gate: shared weight owner effective enable", "flags", 1},
-        {"atlas_activation_gate_shared_weight_plane_constructed", "PE-Atlas activation gate: shared weight plane constructed", "flags", 1},
-        {"atlas_activation_gate_shared_weight_actual_owner_requested", "PE-Atlas activation gate: shared weight actual-owner raw request", "flags", 1},
-        {"atlas_activation_gate_shared_weight_actual_owner_effective", "PE-Atlas activation gate: shared weight actual-owner effective", "flags", 1},
-        {"atlas_activation_gate_pe_internal_pod_requested", "PE-Atlas activation gate: pe-internal pod raw request", "flags", 1},
-        {"atlas_activation_gate_rowindex_requested", "PE-Atlas activation gate: rowindex direct request observed", "flags", 1},
-        {"atlas_activation_gate_pe_internal_pod_metadata_requested", "PE-Atlas activation gate: pod metadata raw request", "flags", 1},
-        {"atlas_activation_gate_pe_internal_pod_owner_requested", "PE-Atlas activation gate: pod owner raw request", "flags", 1},
-        {"atlas_activation_gate_rowindex_constructed", "PE-Atlas activation gate: rowindex direct lifecycle constructed", "flags", 1},
-        {"atlas_activation_gate_pod_metadata_plane_constructed", "PE-Atlas activation gate: pod metadata plane constructed", "flags", 1},
-        {"atlas_activation_gate_pod_owner_table_constructed", "PE-Atlas activation gate: pod owner table constructed", "flags", 1},
-        {"atlas_activation_gate_service_table_constructed", "PE-Atlas activation gate: service table constructed", "flags", 1},
-        {"pulse_ingress_packets_total", "PULSE ingress mirror 观测到的总包数", "packets", 1},
-        {"pulse_ingress_spike_packets_total", "PULSE ingress mirror 观测到的 Spike 包数", "packets", 1},
-        {"pulse_ingress_spikekey_packets_total", "PULSE ingress mirror 观测到的 SpikeKey 包数", "packets", 1},
-        {"pulse_ingress_spiketilekey_packets_total", "PULSE ingress mirror 观测到的 SpikeTileKey 包数", "packets", 1},
-        {"pulse_ingress_core_dispatch_total", "PULSE ingress/core mirror 观测到的 core dispatch 数", "dispatches", 1},
-        {"pulse_ingress_shared_buffered_total", "PULSE 实际进入 shared ingress buffer 的包数", "packets", 1},
-        {"pulse_ingress_shared_dispatch_total", "PULSE 通过 shared batch drain 投递的包数", "packets", 1},
-        {"pulse_ingress_direct_deliver_total", "PULSE 未经 shared batch drain 而 direct deliver 的包数", "packets", 1},
-        {"pulse_ingress_bypass_total", "PULSE pressure-bypass 观测命中次数", "events", 1},
-        {"pulse_ingress_pressure_bypass_total", "PULSE 因 pressure 触发的 bypass 包数", "packets", 1},
-        {"pulse_ingress_singleton_bypass_total", "PULSE 因 singleton 回退的包数", "packets", 1},
-        {"pulse_ingress_deadline_bypass_total", "PULSE 因 deadline 回退的包数", "packets", 1},
-        {"pulse_ingress_pressure_cycles_total", "PULSE ingress pressure 观测累计周期", "cycles", 1},
-        {"pulse_ingress_entries_peak", "PULSE ingress mirror 峰值占用", "entries", 1},
-        {"pulse_control_entries_current", "PULSE control plane 当前队列占用", "entries", 1},
-        {"pulse_control_entries_peak", "PULSE control plane 队列峰值占用", "entries", 1},
-        {"pulse_control_backlog_cycles_total", "PULSE control plane backlog 累计周期", "cycles", 1},
-        {"pulse_control_messages_enqueued_total", "PULSE control plane 入队消息总数", "messages", 1},
-        {"pulse_control_messages_dequeued_total", "PULSE control plane 出队消息总数", "messages", 1},
-        {"pulse_control_frontier_export_total", "PULSE control plane frontier export 消息总数", "messages", 1},
-        {"pulse_control_owner_announce_total", "PULSE control plane owner announce 消息总数", "messages", 1},
-        {"pulse_control_join_request_total", "PULSE control plane join request 消息总数", "messages", 1},
-        {"pulse_control_ready_fanout_total", "PULSE control plane ready fanout 消息总数", "messages", 1},
-        {"pulse_control_join_reject_total", "PULSE control plane join reject 消息总数", "messages", 1},
-        {"pulse_core_queue_entries_peak", "PULSE core queue mirror 峰值占用", "entries", 1},
-        {"pulse_harbor_buckets_total", "PULSE Gather-Harbor 已关闭 bucket 总数", "buckets", 1},
-        {"pulse_harbor_packet_sum", "PULSE Gather-Harbor bucket 累计包数", "packets", 1},
-        {"pulse_harbor_consumer_sum", "PULSE Gather-Harbor bucket 累计 consumer 数", "consumers", 1},
-        {"pulse_harbor_bucket_peak", "PULSE Gather-Harbor 活跃 bucket 峰值", "buckets", 1},
-        {"pulse_harbor_singleton_buckets_total", "PULSE Gather-Harbor singleton bucket 总数", "buckets", 1},
-        {"pulse_descriptor_total", "PULSE Descriptor Lifter 发出的 descriptor 总数", "descriptors", 1},
-        {"pulse_descriptor_packet_sum", "PULSE Descriptor Lifter 累计 packet 数", "packets", 1},
-        {"pulse_descriptor_consumer_sum", "PULSE Descriptor Lifter 累计 consumer 数", "consumers", 1},
-        {"pulse_descriptor_singleton_drop_total", "PULSE Descriptor Lifter 因阈值不足未提升的 bucket 数", "buckets", 1},
-        {"pulse_agenda_candidates_total", "PULSE agenda scorer 观测到的候选 cohort 数", "candidates", 1},
-        {"pulse_agenda_accepted_total", "PULSE agenda scorer 接受的 cohort 数", "cohorts", 1},
-        {"pulse_agenda_rejected_total", "PULSE agenda scorer 拒绝的 cohort 数", "cohorts", 1},
-        {"pulse_agenda_reject_gate_total", "PULSE agenda scorer 因 correctness gate 拒绝的 cohort 数", "cohorts", 1},
-        {"pulse_correctness_ready_blocked_cycles_total", "PULSE correctness contract 下 ready-but-blocked 周期数", "cycles", 1},
-        {"pulse_correctness_scoreboard_occupancy_peak", "PULSE correctness scoreboard 峰值占用", "entries", 1},
-        {"pulse_shared_service_hits_total", "PULSE shared line service waiter join 命中数", "requests", 1},
-        {"pulse_shared_service_misses_total", "PULSE shared line service owner 发起数", "requests", 1},
-        {"pulse_region_service_entries_peak", "PULSE shared region service 活跃表项峰值", "entries", 1},
-        {"pulse_ready_fanout_total", "PULSE shared line service 成功 ready fanout 总数", "consumers", 1},
-        {"pulse_rowdescriptor_ready_transition_total", "PULSE rowdescriptor service 进入 ready transition 的次数", "objects", 1},
-        {"pulse_rowdescriptor_join_ready_total", "PULSE rowdescriptor join-ready 命中的次数", "objects", 1},
-        {"pulse_rowdescriptor_ready_join_shortcut_candidates_total", "PULSE rowdescriptor ready-join shortcut 检查过的候选 band 数", "bands", 1},
-        {"pulse_rowdescriptor_ready_join_shortcut_taken_total", "PULSE rowdescriptor ready-join shortcut 真正命中的 band 数", "bands", 1},
-        {"pulse_rowdescriptor_ready_join_shortcut_late_release_taken_total", "PULSE rowdescriptor ready-join shortcut 中 late-release safe path 命中的 band 数", "bands", 1},
-        {"pulse_rowdescriptor_ready_join_shortcut_deferred_live_park_total", "PULSE rowdescriptor ready-join shortcut 在 live-join 阶段被本地 parked waiter 暂存的 band 数", "bands", 1},
-        {"pulse_rowdescriptor_ready_join_shortcut_deferred_live_apply_total", "PULSE rowdescriptor ready-join shortcut 经 deferred live waiter 二次转正的 band 数", "bands", 1},
-        {"pulse_rowdescriptor_owner_form_deferred_park_total", "PULSE rowdescriptor owner-form deferred replay 被 parked 的 band 数", "bands", 1},
-        {"pulse_rowdescriptor_owner_form_deferred_activate_total", "PULSE rowdescriptor owner-form deferred replay 在 shared-trigger 后被激活的 band 数", "bands", 1},
-        {"pulse_rowdescriptor_ready_join_shortcut_blocked_not_ready_total", "PULSE rowdescriptor ready-join shortcut 因对象尚未 ready 未命中的 band 数", "bands", 1},
-        {"pulse_rowdescriptor_ready_join_shortcut_blocked_owner_form_total", "PULSE rowdescriptor ready-join shortcut 因当前 core 首次 owner-form 被阻塞的 band 数", "bands", 1},
-        {"pulse_rowdescriptor_ready_join_shortcut_blocked_join_live_total", "PULSE rowdescriptor ready-join shortcut 因对象仍处于 live-join 阶段被阻塞的 band 数", "bands", 1},
-        {"pulse_rowdescriptor_ready_join_shortcut_blocked_other_total", "PULSE rowdescriptor ready-join shortcut 因未归类的 not-ready 原因被阻塞的 band 数", "bands", 1},
-        {"pulse_rowdescriptor_ready_join_shortcut_release_deferred_total", "PULSE rowdescriptor ready-join shortcut 命中后未走 replay-drain release 的 band 数", "bands", 1},
-        {"pulse_rowdescriptor_ready_join_shortcut_apply_complete_total", "PULSE rowdescriptor ready-join shortcut 本地直接完成 apply 收尾的 band 数", "bands", 1},
-        {"pulse_rowdescriptor_ready_join_shortcut_release_forwarded_total", "PULSE rowdescriptor ready-join shortcut 将 release 责任前递给 owner/finalizer 的 band 数", "bands", 1},
-        {"pulse_rowdescriptor_ready_join_shortcut_release_missing_total", "PULSE rowdescriptor ready-join shortcut 在 release 阶段未找到活动对象的 band 数", "bands", 1},
-        {"pulse_rowdescriptor_ready_join_descriptor_elide_total", "PULSE rowdescriptor ready-join 去重省掉的 descriptor 形成次数", "descriptors", 1},
-        {"pulse_rowdescriptor_ready_join_lines_elide_total", "PULSE rowdescriptor ready-join 去重省掉的 line 数", "lines", 1},
-        {"pulse_rowdescriptor_owner_first_service_elide_join_live_total", "PULSE rowdescriptor owner-first service elide 中由 join-live 形成的次数", "objects", 1},
-        {"pulse_rowdescriptor_owner_first_service_elide_join_ready_total", "PULSE rowdescriptor owner-first service elide 中由 join-ready 形成的次数", "objects", 1},
-        {"pulse_rowdescriptor_owner_first_service_elide_late_join_total", "PULSE rowdescriptor owner-first service elide 中落在 late-join 相位的次数", "objects", 1},
-        {"pulse_pod_rowdescriptor_owner_form_total", "PULSE PE-internal pod seam 中 rowdescriptor owner-form 的次数", "objects", 1},
-        {"pulse_pod_rowdescriptor_owner_hit_total", "PULSE PE-internal pod seam 中 rowdescriptor owner-hit 的次数", "objects", 1},
-        {"pulse_pod_rowdescriptor_join_live_total", "PULSE PE-internal pod seam 中 rowdescriptor live-join 的次数", "objects", 1},
-        {"pulse_pod_rowdescriptor_join_ready_total", "PULSE PE-internal pod seam 中 rowdescriptor ready-join 的次数", "objects", 1},
-        {"pulse_pod_rowdescriptor_ready_transition_total", "PULSE PE-internal pod seam 中 rowdescriptor ready transition 的次数", "objects", 1},
-        {"pulse_pod_rowdescriptor_late_join_total", "PULSE PE-internal pod seam 中 rowdescriptor late-join 的次数", "objects", 1},
-        {"pulse_pod_rowdescriptor_guard_total", "PULSE PE-internal pod seam 中 rowdescriptor 在 shadow gate 被 guard 掉的次数", "objects", 1},
-        {"pulse_pod_rowdescriptor_guard_disabled_total", "PULSE PE-internal pod seam 中 rowdescriptor 因 enable/binding 开关被 shadow gate guard 的次数", "objects", 1},
-        {"pulse_pod_rowdescriptor_guard_missing_metadata_plane_total", "PULSE PE-internal pod seam 中 rowdescriptor 因 metadata plane 缺失被 shadow gate guard 的次数", "objects", 1},
-        {"pulse_pod_rowdescriptor_guard_missing_owner_table_total", "PULSE PE-internal pod seam 中 rowdescriptor 因 owner table 缺失被 shadow gate guard 的次数", "objects", 1},
-        {"pulse_pod_rowdescriptor_guard_zero_pod_count_total", "PULSE PE-internal pod seam 中 rowdescriptor 因 pod_count=0 被 shadow gate guard 的次数", "objects", 1},
-        {"pulse_pod_rowdescriptor_guard_window_zero_total", "PULSE PE-internal pod seam 中 rowdescriptor 因 window_seq=0 被 shadow gate guard 的次数", "objects", 1},
-        {"pulse_pod_rowdescriptor_guard_invalid_cfg_pod_total", "PULSE PE-internal pod seam 中 rowdescriptor 因 pod 配置非法被 shadow gate guard 的次数", "objects", 1},
-        {"pulse_pod_rowdescriptor_reject_total", "PULSE PE-internal pod seam 中 rowdescriptor 在 owner/join 阶段被 reject 的次数", "objects", 1},
-        {"pulse_pod_rowdescriptor_attempted_total", "PULSE PE-internal pod seam 中 rowdescriptor observe 尝试总数", "objects", 1},
-        {"pulse_pod_rowdescriptor_potential_private_service_elide_total", "PULSE PE-internal pod seam 中 rowdescriptor 可省掉 private service 的次数", "objects", 1},
-        {"pulse_pod_rowdescriptor_owner_first_issue_deferred_total", "PULSE PE-internal pod seam 中 rowdescriptor owner-first 在 private issue 前成功 defer 的次数", "objects", 1},
-        {"pulse_pod_rowdescriptor_owner_first_private_issue_avoided_total", "PULSE PE-internal pod seam 中 rowdescriptor owner-first 真正避免本地 private issue 的次数", "objects", 1},
-        {"pulse_pod_rowdescriptor_owner_first_service_elide_total", "PULSE PE-internal pod seam 中 rowdescriptor owner-first 生命周期上形成 service elide 的次数", "objects", 1},
-        {"pulse_metadata_txn_export_total", "PULSE-OSA metadata transaction 在 PE 顶层汇总的 export 总数", "objects", 1},
-        {"pulse_metadata_txn_owner_launch_total", "PULSE-OSA metadata transaction 在 PE 顶层汇总的 owner launch 总数", "objects", 1},
-        {"pulse_metadata_txn_join_live_total", "PULSE-OSA metadata transaction 在 PE 顶层汇总的 live join 总数", "objects", 1},
-        {"pulse_metadata_txn_join_ready_total", "PULSE-OSA metadata transaction 在 PE 顶层汇总的 ready join 总数", "objects", 1},
-        {"pulse_metadata_txn_late_join_total", "PULSE-OSA metadata transaction 在 PE 顶层汇总的 late join 总数", "objects", 1},
-        {"pulse_metadata_txn_ready_lease_hit_total", "PULSE-OSA metadata transaction 在 PE 顶层汇总的 ready lease hit 总数", "objects", 1},
-        {"pulse_metadata_txn_ready_lease_expired_total", "PULSE-OSA metadata transaction 在 PE 顶层汇总的 ready lease expired 总数", "objects", 1},
-        {"pulse_metadata_txn_envelope_size_sum_total", "PULSE-OSA metadata transaction 在 PE 顶层汇总的 envelope size 总数", "lines", 1},
-        {"pulse_metadata_frontier_observed_total", "PULSE metadata frontier 在更早 metadata lane 上被观察到的总次数", "objects", 1},
-        {"pulse_metadata_frontier_same_window_reobserve_total", "PULSE metadata frontier 在同一 window 上重复观察到同一对象的总次数", "objects", 1},
-        {"pulse_metadata_frontier_owner_form_candidate_total", "PULSE metadata frontier 在更早 metadata lane 上形成 owner candidate 的总次数", "objects", 1},
-        {"pulse_metadata_frontier_join_ready_candidate_total", "PULSE metadata frontier 在更早 metadata lane 上形成 ready-join candidate 的总次数", "objects", 1},
-        {"pulse_metadata_frontier_premphf_base_observed_total", "PULSE metadata frontier pre-mphf-base lane 被观察到的总次数", "objects", 1},
-        {"pulse_metadata_frontier_premphf_base_same_window_reobserve_total", "PULSE metadata frontier pre-mphf-base lane 在同窗重复观察到同一对象的总次数", "objects", 1},
-        {"pulse_metadata_frontier_premphf_base_owner_form_candidate_total", "PULSE metadata frontier pre-mphf-base lane 形成 owner candidate 的总次数", "objects", 1},
-        {"pulse_metadata_frontier_premphf_base_join_ready_candidate_total", "PULSE metadata frontier pre-mphf-base lane 形成 ready-join candidate 的总次数", "objects", 1},
-        {"pulse_metadata_frontier_premphf_band_observed_total", "PULSE metadata frontier pre-mphf-band lane 被观察到的总次数", "objects", 1},
-        {"pulse_metadata_frontier_premphf_band_same_window_reobserve_total", "PULSE metadata frontier pre-mphf-band lane 在同窗重复观察到同一对象的总次数", "objects", 1},
-        {"pulse_metadata_frontier_premphf_band_owner_form_candidate_total", "PULSE metadata frontier pre-mphf-band lane 形成 owner candidate 的总次数", "objects", 1},
-        {"pulse_metadata_frontier_premphf_band_join_ready_candidate_total", "PULSE metadata frontier pre-mphf-band lane 形成 ready-join candidate 的总次数", "objects", 1},
-        {"pulse_metadata_frontier_idx2row_observed_total", "PULSE metadata frontier idx2row lane 被观察到的总次数", "objects", 1},
-        {"pulse_metadata_frontier_idx2row_same_window_reobserve_total", "PULSE metadata frontier idx2row lane 在同窗重复观察到同一对象的总次数", "objects", 1},
-        {"pulse_metadata_frontier_idx2row_owner_form_candidate_total", "PULSE metadata frontier idx2row lane 形成 owner candidate 的总次数", "objects", 1},
-        {"pulse_metadata_frontier_idx2row_join_ready_candidate_total", "PULSE metadata frontier idx2row lane 形成 ready-join candidate 的总次数", "objects", 1},
-        {"pulse_metadata_frontier_rowindex_observed_total", "PULSE metadata frontier rowindex lane 被观察到的总次数", "objects", 1},
-        {"pulse_metadata_frontier_rowindex_same_window_reobserve_total", "PULSE metadata frontier rowindex lane 在同窗重复观察到同一对象的总次数", "objects", 1},
-        {"pulse_metadata_frontier_rowindex_owner_form_candidate_total", "PULSE metadata frontier rowindex lane 形成 owner candidate 的总次数", "objects", 1},
-        {"pulse_metadata_frontier_rowindex_join_ready_candidate_total", "PULSE metadata frontier rowindex lane 形成 ready-join candidate 的总次数", "objects", 1},
-        {"pulse_actual_gate_enable_false_total", "PULSE actual shared-line gate 因 enable=0 被关闭的 GCSS 请求数", "requests", 1},
-        {"pulse_actual_gate_window_zero_total", "PULSE actual shared-line gate 因 window_seq=0 被关闭的 GCSS 请求数", "requests", 1},
-        {"pulse_actual_gate_line_too_small_total", "PULSE actual shared-line gate 因 line_size 太小被关闭的 GCSS 请求数", "requests", 1},
-        {"pulse_actual_gate_taken_total", "PULSE actual shared-line gate 真正进入 shared service 分支的 GCSS 请求数", "requests", 1},
-        {"pulse_frontier_windows_total", "PULSE frontier observe 导出的窗口数", "windows", 1},
-        {"pulse_frontier_lines_exported_total", "PULSE frontier observe 导出的 top-H line 总数", "lines", 1},
-        {"pulse_frontier_overlap_lines_total", "PULSE frontier observe 检测到跨 core overlap 的 line 总数", "lines", 1},
-        {"pulse_frontier_overlap_peer_total", "PULSE frontier observe overlap 的 peer 命中总数", "peers", 1},
-        {"pulse_frontier_max_exported_per_window", "PULSE frontier observe 单窗口导出 line 峰值", "lines", 1},
-        {"pulse_prebase_lookup_owner_fill_total", "PULSE pre-base shared lookup 首次 owner fill 次数", "lookups", 1},
-        {"pulse_prebase_lookup_shared_hits_total", "PULSE pre-base shared lookup 共享命中次数", "lookups", 1},
-        {"pulse_prebase_lookup_entries_peak", "PULSE pre-base shared lookup 活跃表项峰值", "entries", 1}
     )
 
     /**
@@ -1258,243 +734,6 @@ public:
                           uint64_t fastpath_reject_refractory_total);
     void recordStepGasStat(uint32_t seq, const GasStatEvent& st);
     void recordCoreStepGasStat(int core_id, uint32_t seq, const GasStatEvent& st);
-    void recordStepRetireStat(uint32_t seq,
-                              uint64_t retire_global_hol_cycles_total,
-                              uint64_t retire_ready_but_blocked_edges_total,
-                              uint64_t retire_per_post_progress_total,
-                              uint64_t retire_wait_cycles_total,
-                              uint64_t retire_wait_cycles_due_to_hol_total,
-                              uint64_t retire_wait_cycles_due_to_barrier_total,
-                              uint64_t retire_wait_cycles_due_to_not_ready_total,
-                              uint64_t retire_samepost_blocked_edges_total,
-                              uint64_t retire_crosspost_blocked_edges_total,
-                              uint64_t retire_policy_loss_cycles_total,
-                              uint64_t retire_policy_loss_edges_total,
-                              uint64_t retire_shadow_per_post_recoverable_cycles_total,
-                              uint64_t retire_shadow_per_post_recoverable_edges_total,
-                              uint64_t retire_shadow_per_post_ready_posts_peak,
-                              uint64_t retire_shadow_per_post_committable_edges_peak,
-                              uint64_t retire_head_hol_cycles_dense_total,
-                              uint64_t retire_head_hol_cycles_cache_total,
-                              uint64_t retire_head_hol_cycles_miss_total,
-                              uint64_t retire_head_hol_cycles_bcsr_total,
-                              uint64_t retire_head_hol_cycles_bcsr_file_total,
-                              uint64_t retire_head_hol_cycles_gcss_total,
-                              uint64_t retire_head_blocked_edges_dense_total,
-                              uint64_t retire_head_blocked_edges_cache_total,
-                              uint64_t retire_head_blocked_edges_miss_total,
-                              uint64_t retire_head_blocked_edges_bcsr_total,
-                              uint64_t retire_head_blocked_edges_bcsr_file_total,
-                              uint64_t retire_head_blocked_edges_gcss_total,
-                              uint64_t retire_gcss_head_queued_not_issued_cycles_total,
-                              uint64_t retire_gcss_qni_head_wait_episodes_total,
-                              uint64_t retire_gcss_qni_head_wait_cycles_max,
-                              uint64_t retire_gcss_head_queued_not_issued_blocked_edges_total,
-                              uint64_t retire_gcss_head_issued_wait_resp_cycles_total,
-                              uint64_t retire_gcss_head_issued_wait_resp_blocked_edges_total,
-                              uint64_t retire_gcss_resp_ready_but_hol_cycles_total,
-                              uint64_t retire_gcss_resp_ready_but_hol_blocked_edges_total,
-                              uint64_t retire_gcss_qni_loader_not_ready_cycles_total,
-                              uint64_t retire_gcss_qni_loader_not_ready_blocked_edges_total,
-                              uint64_t retire_gcss_qni_weight_sram_stall_cycles_total,
-                              uint64_t retire_gcss_qni_weight_sram_stall_blocked_edges_total,
-                              uint64_t retire_gcss_qni_vlf_younger_ahead_cycles_total,
-                              uint64_t retire_gcss_qni_vlf_younger_ahead_blocked_edges_total,
-                              uint64_t retire_gcss_qni_vlf_younger_ahead_depth_total,
-                              uint64_t retire_gcss_qni_vlf_younger_ahead_depth_samples_total,
-                              uint64_t retire_gcss_qni_vlf_younger_ahead_depth_max,
-                              uint64_t retire_gcss_qni_issue_deferred_total,
-                              uint64_t retire_gcss_qni_pending_direct_queue_residency_cycles_total,
-                              uint64_t retire_gcss_qni_pending_direct_queue_residency_samples_total,
-                              uint64_t retire_gcss_qni_pending_direct_queue_residency_cycles_max,
-                              uint64_t retire_gcss_qni_vlf_front_inflight_full_cycles_total,
-                              uint64_t retire_gcss_qni_vlf_front_inflight_full_blocked_edges_total,
-                              uint64_t retire_gcss_qni_vlf_front_waiting_issue_cycles_total,
-                              uint64_t retire_gcss_qni_vlf_front_waiting_issue_blocked_edges_total,
-                              uint64_t retire_gcss_qni_pending_younger_ahead_cycles_total,
-                              uint64_t retire_gcss_qni_pending_younger_ahead_blocked_edges_total,
-                              uint64_t retire_gcss_qni_pending_front_inflight_full_cycles_total,
-                              uint64_t retire_gcss_qni_pending_front_inflight_full_blocked_edges_total,
-                              uint64_t retire_gcss_qni_pending_front_waiting_tick_cycles_total,
-                              uint64_t retire_gcss_qni_pending_front_waiting_tick_blocked_edges_total,
-                              uint64_t retire_gcss_qni_unknown_cycles_total,
-                              uint64_t retire_gcss_qni_unknown_blocked_edges_total,
-                              uint64_t retire_begin_apply_windows_total,
-                              uint64_t retire_begin_apply_prev_edges_total,
-                              uint64_t retire_begin_apply_outstanding_carryin_total,
-                              uint64_t retire_begin_apply_outstanding_carryin_windows_total,
-                              uint64_t retire_begin_apply_loader_not_ready_windows_total,
-                              uint64_t retire_edge_retire_registered_total,
-                              uint64_t retire_edge_retire_retired_total,
-                              uint64_t retire_end_scatter_gcss_vlf_issue_queue_residual_total,
-                              uint64_t retire_end_scatter_pending_direct_reads_residual_total,
-                              uint64_t retire_end_scatter_outstanding_residual_total,
-                              uint64_t retire_end_scatter_residual_work_windows_total,
-                              uint64_t retire_gcss_vlf_issue_prepare_total,
-                              uint64_t retire_gcss_vlf_issue_edges_total,
-                              uint64_t retire_gcss_vlf_issue_reorder_trigger_total,
-                              uint64_t retire_gcss_vlf_issue_line_groups_total,
-                              uint64_t retire_ready_queue_peak,
-                              uint64_t retire_unblock_events_total);
-    void recordPulseAgendaObservability(uint32_t seq,
-                                        uint64_t candidates_total,
-                                        uint64_t accepted_total,
-                                        uint64_t rejected_total,
-                                        uint64_t reject_gate_total,
-                                        uint64_t correctness_ready_blocked_cycles_total,
-                                        uint64_t correctness_scoreboard_occupancy_peak,
-                                        uint64_t shared_service_hits_total,
-                                        uint64_t shared_service_misses_total,
-                                        uint64_t region_service_entries_peak,
-                                        uint64_t ready_fanout_total,
-                                        uint64_t rowdescriptor_ready_transition_total,
-                                        uint64_t rowdescriptor_join_ready_total,
-                                        uint64_t rowdescriptor_ready_join_shortcut_candidates_total,
-                                        uint64_t rowdescriptor_ready_join_shortcut_taken_total,
-                                        uint64_t rowdescriptor_ready_join_shortcut_late_release_taken_total,
-                                        uint64_t rowdescriptor_ready_join_shortcut_deferred_live_park_total,
-                                        uint64_t rowdescriptor_ready_join_shortcut_deferred_live_apply_total,
-                                        uint64_t rowdescriptor_owner_form_deferred_park_total,
-                                        uint64_t rowdescriptor_owner_form_deferred_activate_total,
-                                        uint64_t rowdescriptor_ready_join_shortcut_blocked_not_ready_total,
-                                        uint64_t rowdescriptor_ready_join_shortcut_blocked_owner_form_total,
-                                        uint64_t rowdescriptor_ready_join_shortcut_blocked_join_live_total,
-                                        uint64_t rowdescriptor_ready_join_shortcut_blocked_other_total,
-                                        uint64_t rowdescriptor_ready_join_shortcut_release_deferred_total,
-                                        uint64_t rowdescriptor_ready_join_shortcut_apply_complete_total,
-                                        uint64_t rowdescriptor_ready_join_shortcut_release_forwarded_total,
-                                        uint64_t rowdescriptor_ready_join_shortcut_release_missing_total,
-                                        uint64_t rowdescriptor_ready_join_descriptor_elide_total,
-                                        uint64_t rowdescriptor_ready_join_lines_elide_total,
-                                        uint64_t rowdescriptor_owner_first_service_elide_join_live_total,
-                                        uint64_t rowdescriptor_owner_first_service_elide_join_ready_total,
-                                        uint64_t rowdescriptor_owner_first_service_elide_late_join_total,
-                                        uint64_t actual_gate_enable_false_total,
-                                        uint64_t actual_gate_window_zero_total,
-                                        uint64_t actual_gate_line_too_small_total,
-                                        uint64_t actual_gate_taken_total,
-                                        uint64_t frontier_windows_total,
-                                        uint64_t frontier_lines_exported_total,
-                                        uint64_t frontier_overlap_lines_total,
-                                        uint64_t frontier_overlap_peer_total,
-                                        uint64_t frontier_max_exported_per_window,
-                                        uint64_t prebase_lookup_owner_fill_total,
-                                        uint64_t prebase_lookup_shared_hits_total,
-                                        uint64_t prebase_lookup_entries_peak);
-    void recordPulsePodRowdescriptorObservability(
-        uint32_t seq,
-        uint64_t owner_form_total,
-        uint64_t owner_hit_total,
-        uint64_t join_live_total,
-        uint64_t join_ready_total,
-        uint64_t ready_transition_total,
-        uint64_t late_join_total,
-        uint64_t guard_total,
-        uint64_t guard_disabled_total,
-        uint64_t guard_missing_metadata_plane_total,
-        uint64_t guard_missing_owner_table_total,
-        uint64_t guard_zero_pod_count_total,
-        uint64_t guard_window_zero_total,
-        uint64_t guard_invalid_cfg_pod_total,
-        uint64_t reject_total,
-        uint64_t attempted_total,
-        uint64_t potential_private_service_elide_total,
-        uint64_t owner_first_issue_deferred_total,
-        uint64_t owner_first_private_issue_avoided_total,
-        uint64_t owner_first_service_elide_total);
-    void recordPulseOsaMetadataTxnObservability(
-        const WeightMemorySubsystem::PulseOsaMetadataTxnStats& stats);
-    void recordAtlasObjectObservability(
-        const WeightMemorySubsystem::ExperimentalPeAtlasObjectCensus& census,
-        const WeightMemorySubsystem::ExperimentalPeAtlasRowIndexLifecycleLedger& rowindex,
-        const WeightMemorySubsystem::ExperimentalPeAtlasIdx2RowLifecycleLedger& idx2row,
-        const WeightMemorySubsystem::ExperimentalPeAtlasPreMphfBaseProxyLedger& premphf_base,
-        const WeightMemorySubsystem::ExperimentalPeAtlasPreMphfBandProxyLedger& premphf_band,
-        const WeightMemorySubsystem::ExperimentalPeAtlasPhaseStats& phase,
-        const WeightMemorySubsystem::PeInternalPodStats& pod_runtime);
-    void appendAtlasActivationGateStats_(std::map<std::string, uint64_t>& stats) const;
-    void appendAtlasSharedWeightCensusStats_(std::map<std::string, uint64_t>& stats) const;
-    void appendAtlasControlRuntimeClassificationStats_(
-        std::map<std::string, uint64_t>& stats) const;
-    void recordCoreStepRetireStat(int core_id,
-                                  uint32_t seq,
-                                  uint64_t retire_global_hol_cycles_total,
-                                  uint64_t retire_ready_but_blocked_edges_total,
-                                  uint64_t retire_per_post_progress_total,
-                                  uint64_t retire_wait_cycles_total,
-                                  uint64_t retire_wait_cycles_due_to_hol_total,
-                                  uint64_t retire_wait_cycles_due_to_barrier_total,
-                                  uint64_t retire_wait_cycles_due_to_not_ready_total,
-                                  uint64_t retire_samepost_blocked_edges_total,
-                                  uint64_t retire_crosspost_blocked_edges_total,
-                                  uint64_t retire_policy_loss_cycles_total,
-                                  uint64_t retire_policy_loss_edges_total,
-                                  uint64_t retire_shadow_per_post_recoverable_cycles_total,
-                                  uint64_t retire_shadow_per_post_recoverable_edges_total,
-                                  uint64_t retire_shadow_per_post_ready_posts_peak,
-                                  uint64_t retire_shadow_per_post_committable_edges_peak,
-                                  uint64_t retire_head_hol_cycles_dense_total,
-                                  uint64_t retire_head_hol_cycles_cache_total,
-                                  uint64_t retire_head_hol_cycles_miss_total,
-                                  uint64_t retire_head_hol_cycles_bcsr_total,
-                                  uint64_t retire_head_hol_cycles_bcsr_file_total,
-                                  uint64_t retire_head_hol_cycles_gcss_total,
-                                  uint64_t retire_head_blocked_edges_dense_total,
-                                  uint64_t retire_head_blocked_edges_cache_total,
-                                  uint64_t retire_head_blocked_edges_miss_total,
-                                  uint64_t retire_head_blocked_edges_bcsr_total,
-                                  uint64_t retire_head_blocked_edges_bcsr_file_total,
-                                  uint64_t retire_head_blocked_edges_gcss_total,
-                                  uint64_t retire_gcss_head_queued_not_issued_cycles_total,
-                                  uint64_t retire_gcss_qni_head_wait_episodes_total,
-                                  uint64_t retire_gcss_qni_head_wait_cycles_max,
-                                  uint64_t retire_gcss_head_queued_not_issued_blocked_edges_total,
-                                  uint64_t retire_gcss_head_issued_wait_resp_cycles_total,
-                                  uint64_t retire_gcss_head_issued_wait_resp_blocked_edges_total,
-                                  uint64_t retire_gcss_resp_ready_but_hol_cycles_total,
-                                  uint64_t retire_gcss_resp_ready_but_hol_blocked_edges_total,
-                                  uint64_t retire_gcss_qni_loader_not_ready_cycles_total,
-                                  uint64_t retire_gcss_qni_loader_not_ready_blocked_edges_total,
-                                  uint64_t retire_gcss_qni_weight_sram_stall_cycles_total,
-                                  uint64_t retire_gcss_qni_weight_sram_stall_blocked_edges_total,
-                                  uint64_t retire_gcss_qni_vlf_younger_ahead_cycles_total,
-                                  uint64_t retire_gcss_qni_vlf_younger_ahead_blocked_edges_total,
-                                  uint64_t retire_gcss_qni_vlf_younger_ahead_depth_total,
-                                  uint64_t retire_gcss_qni_vlf_younger_ahead_depth_samples_total,
-                                  uint64_t retire_gcss_qni_vlf_younger_ahead_depth_max,
-                                  uint64_t retire_gcss_qni_issue_deferred_total,
-                                  uint64_t retire_gcss_qni_pending_direct_queue_residency_cycles_total,
-                                  uint64_t retire_gcss_qni_pending_direct_queue_residency_samples_total,
-                                  uint64_t retire_gcss_qni_pending_direct_queue_residency_cycles_max,
-                                  uint64_t retire_gcss_qni_vlf_front_inflight_full_cycles_total,
-                                  uint64_t retire_gcss_qni_vlf_front_inflight_full_blocked_edges_total,
-                                  uint64_t retire_gcss_qni_vlf_front_waiting_issue_cycles_total,
-                                  uint64_t retire_gcss_qni_vlf_front_waiting_issue_blocked_edges_total,
-                                  uint64_t retire_gcss_qni_pending_younger_ahead_cycles_total,
-                                  uint64_t retire_gcss_qni_pending_younger_ahead_blocked_edges_total,
-                                  uint64_t retire_gcss_qni_pending_front_inflight_full_cycles_total,
-                                  uint64_t retire_gcss_qni_pending_front_inflight_full_blocked_edges_total,
-                                  uint64_t retire_gcss_qni_pending_front_waiting_tick_cycles_total,
-                                  uint64_t retire_gcss_qni_pending_front_waiting_tick_blocked_edges_total,
-                                  uint64_t retire_gcss_qni_unknown_cycles_total,
-                                  uint64_t retire_gcss_qni_unknown_blocked_edges_total,
-                                  uint64_t retire_begin_apply_windows_total,
-                                  uint64_t retire_begin_apply_prev_edges_total,
-                                  uint64_t retire_begin_apply_outstanding_carryin_total,
-                                  uint64_t retire_begin_apply_outstanding_carryin_windows_total,
-                                  uint64_t retire_begin_apply_loader_not_ready_windows_total,
-                                  uint64_t retire_edge_retire_registered_total,
-                                  uint64_t retire_edge_retire_retired_total,
-                                  uint64_t retire_end_scatter_gcss_vlf_issue_queue_residual_total,
-                                  uint64_t retire_end_scatter_pending_direct_reads_residual_total,
-                                  uint64_t retire_end_scatter_outstanding_residual_total,
-                                  uint64_t retire_end_scatter_residual_work_windows_total,
-                                  uint64_t retire_gcss_vlf_issue_prepare_total,
-                                  uint64_t retire_gcss_vlf_issue_edges_total,
-                                  uint64_t retire_gcss_vlf_issue_reorder_trigger_total,
-                                  uint64_t retire_gcss_vlf_issue_line_groups_total,
-                                  uint64_t retire_ready_queue_peak,
-                                  uint64_t retire_unblock_events_total);
     void recordStepApplyScatter(uint32_t seq,
                                 uint64_t acc_updates,
                                 uint64_t posts_touched,
@@ -1524,9 +763,7 @@ public:
                                         uint64_t last_completion_status,
                                         uint64_t last_fault_csr,
                                         uint64_t backend_runtime_bridge_provider_bound);
-    void accumulateSynapseReadStats(uint64_t gcss_lookup_hit_total,
-                                    uint64_t gcss_lookup_miss_total,
-                                    uint64_t dense_reqs_total,
+    void accumulateSynapseReadStats(uint64_t dense_reqs_total,
                                     uint64_t dense_bytes_total,
                                     uint64_t rowptr_reqs_total,
                                     uint64_t rowptr_bytes_total,
@@ -1534,8 +771,6 @@ public:
                                     uint64_t colidx_bytes_total,
                                     uint64_t blockdata_reqs_total,
                                     uint64_t blockdata_bytes_total,
-                                    uint64_t gcss_reqs_total,
-                                    uint64_t gcss_bytes_total,
                                     uint64_t weight_idx_sram_reads_total,
                                     uint64_t weight_idx_sram_writes_total,
                                     uint64_t weight_idx_sram_bytes_read_total,
@@ -1546,8 +781,6 @@ public:
                                     uint64_t weight_idx_sram_bank_peak_accesses_per_tick,
                                     uint64_t weight_idx_sram_energy_read_pj_total,
                                     uint64_t weight_idx_sram_energy_write_pj_total,
-                                    uint64_t weight_idx_lookup_total,
-                                    uint64_t weight_idx_lookup_idx2_total,
                                     uint64_t weight_l0_sram_reads_total,
                                     uint64_t weight_l0_sram_writes_total,
                                     uint64_t weight_l0_sram_bytes_read_total,
@@ -1585,7 +818,6 @@ public:
                                             uint64_t gas_retire_shadow_per_post_recoverable_edges_total,
                                             uint64_t gas_retire_shadow_per_post_ready_posts_peak,
                                             uint64_t gas_retire_shadow_per_post_committable_edges_peak);
-    void accumulateExperimentalNocPrefetchStats(const ExperimentalNocRowidxPeStats& rowidx);
     // PE级阶段事件收敛：核心通知PE，PE只写一次（每窗一行）
     // 接收核心上报的阶段事件；当 event=EndScatter 且 spikes>0 时，同时记录本窗发放
     void notifyStageEvent(uint32_t seq, const std::string& event, uint64_t ts_ns,
@@ -1610,11 +842,7 @@ public:
     PeLocalServiceObjectTable* peLocalServiceObjectTable() override {
         return pe_local_service_object_table_.get();
     }
-    PeSharedCoreFabric* peSharedCoreFabric() override { return pulse_fabric_.get(); }
     PeWeightObjectPlane* peWeightObjectPlane() override { return pe_weight_object_plane_.get(); }
-    bool pulseOsaMetadataTxnEnabled() const { return pulse_osa_metadata_txn_enable_; }
-    bool pulseOsaMetadataReadyLeaseEnabled() const { return pulse_osa_metadata_ready_lease_enable_; }
-    uint32_t pulseOsaMetadataObjectMaskBits() const { return pulse_osa_metadata_object_mask_bits_; }
     bool peInternalCpeEnabledConfig() const { return pe_internal_cpe_enable_cfg_; }
     bool peInternalPodEnabledConfig() const { return pe_internal_pod_enable_cfg_; }
     bool peInternalPodMetadataEnabledConfig() const {
@@ -1754,173 +982,6 @@ private:
     Statistic<uint64_t>* stat_ls_objects_enabled_total_ = nullptr;
     Statistic<uint64_t>* stat_ls_capacity_bytes_total_ = nullptr;
     Statistic<uint64_t>* stat_ls_queue_slots_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_service_enabled_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_service_owner_form_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_service_join_live_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_service_join_ready_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_service_late_join_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_service_duplicate_join_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_service_ready_transition_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_service_ready_fanout_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_service_ready_fanout_consumers_sum_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_service_ready_fanout_consumers_peak_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_service_released_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_service_release_deferred_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_service_ready_release_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_service_ready_lease_hit_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_service_ready_lease_expired_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_service_potential_private_service_elide_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_service_active_entries_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_service_release_pending_active_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_service_atlas_obj_materialize_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_service_atlas_obj_publicize_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_service_atlas_obj_owner_form_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_service_atlas_obj_ready_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_service_atlas_obj_release_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_service_atlas_obj_private_only_total_ = nullptr;
-    std::unordered_map<std::string, Statistic<uint64_t>*> atlas_object_plane_stats_;
-    Statistic<uint64_t>* stat_pulse_osa_shared_weight_enabled_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_osa_shared_weight_owner_scope_enable_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_osa_shared_weight_actual_owner_enable_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_osa_shared_weight_idx_enabled_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_osa_shared_weight_idx_reads_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_osa_shared_weight_idx_writes_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_osa_shared_weight_idx_bank_conflict_ticks_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_osa_shared_weight_idx_predicted_extra_cycles_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_osa_shared_weight_idx_resident_bytes_peak_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_osa_shared_weight_l0_enabled_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_osa_shared_weight_l0_reads_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_osa_shared_weight_l0_writes_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_osa_shared_weight_l0_fill_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_osa_shared_weight_l0_evict_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_osa_shared_weight_l0_bank_conflict_ticks_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_osa_shared_weight_l0_predicted_extra_cycles_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_osa_shared_weight_l0_resident_bytes_peak_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_ingress_packets_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_ingress_spike_packets_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_ingress_spikekey_packets_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_ingress_spiketilekey_packets_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_ingress_core_dispatch_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_ingress_shared_buffered_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_ingress_shared_dispatch_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_ingress_direct_deliver_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_ingress_bypass_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_ingress_pressure_bypass_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_ingress_singleton_bypass_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_ingress_deadline_bypass_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_ingress_pressure_cycles_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_ingress_entries_peak_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_control_entries_current_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_control_entries_peak_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_control_backlog_cycles_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_core_queue_entries_peak_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_harbor_buckets_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_harbor_packet_sum_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_harbor_consumer_sum_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_harbor_bucket_peak_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_harbor_singleton_buckets_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_descriptor_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_descriptor_packet_sum_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_descriptor_consumer_sum_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_descriptor_singleton_drop_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_control_messages_enqueued_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_control_messages_dequeued_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_control_frontier_export_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_control_owner_announce_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_control_join_request_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_control_ready_fanout_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_control_join_reject_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_agenda_candidates_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_agenda_accepted_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_agenda_rejected_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_agenda_reject_gate_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_correctness_ready_blocked_cycles_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_correctness_scoreboard_occupancy_peak_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_shared_service_hits_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_shared_service_misses_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_region_service_entries_peak_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_ready_fanout_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_rowdescriptor_ready_transition_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_rowdescriptor_join_ready_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_rowdescriptor_ready_join_shortcut_candidates_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_rowdescriptor_ready_join_shortcut_taken_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_rowdescriptor_ready_join_shortcut_late_release_taken_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_rowdescriptor_ready_join_shortcut_deferred_live_park_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_rowdescriptor_ready_join_shortcut_deferred_live_apply_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_rowdescriptor_owner_form_deferred_park_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_rowdescriptor_owner_form_deferred_activate_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_rowdescriptor_ready_join_shortcut_blocked_not_ready_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_rowdescriptor_ready_join_shortcut_blocked_owner_form_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_rowdescriptor_ready_join_shortcut_blocked_join_live_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_rowdescriptor_ready_join_shortcut_blocked_other_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_rowdescriptor_ready_join_shortcut_release_deferred_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_rowdescriptor_ready_join_shortcut_apply_complete_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_rowdescriptor_ready_join_shortcut_release_forwarded_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_rowdescriptor_ready_join_shortcut_release_missing_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_rowdescriptor_ready_join_descriptor_elide_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_rowdescriptor_ready_join_lines_elide_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_rowdescriptor_owner_first_service_elide_join_live_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_rowdescriptor_owner_first_service_elide_join_ready_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_rowdescriptor_owner_first_service_elide_late_join_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_pod_rowdescriptor_owner_form_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_pod_rowdescriptor_owner_hit_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_pod_rowdescriptor_join_live_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_pod_rowdescriptor_join_ready_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_pod_rowdescriptor_ready_transition_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_pod_rowdescriptor_late_join_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_pod_rowdescriptor_guard_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_pod_rowdescriptor_guard_disabled_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_pod_rowdescriptor_guard_missing_metadata_plane_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_pod_rowdescriptor_guard_missing_owner_table_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_pod_rowdescriptor_guard_zero_pod_count_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_pod_rowdescriptor_guard_window_zero_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_pod_rowdescriptor_guard_invalid_cfg_pod_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_pod_rowdescriptor_reject_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_pod_rowdescriptor_attempted_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_pod_rowdescriptor_potential_private_service_elide_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_pod_rowdescriptor_owner_first_issue_deferred_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_pod_rowdescriptor_owner_first_private_issue_avoided_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_pod_rowdescriptor_owner_first_service_elide_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_txn_export_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_txn_owner_launch_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_txn_join_live_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_txn_join_ready_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_txn_late_join_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_txn_ready_lease_hit_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_txn_ready_lease_expired_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_txn_envelope_size_sum_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_frontier_observed_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_frontier_same_window_reobserve_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_frontier_owner_form_candidate_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_frontier_join_ready_candidate_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_frontier_premphf_base_observed_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_frontier_premphf_base_same_window_reobserve_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_frontier_premphf_base_owner_form_candidate_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_frontier_premphf_base_join_ready_candidate_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_frontier_premphf_band_observed_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_frontier_premphf_band_same_window_reobserve_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_frontier_premphf_band_owner_form_candidate_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_frontier_premphf_band_join_ready_candidate_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_frontier_idx2row_observed_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_frontier_idx2row_same_window_reobserve_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_frontier_idx2row_owner_form_candidate_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_frontier_idx2row_join_ready_candidate_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_frontier_rowindex_observed_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_frontier_rowindex_same_window_reobserve_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_frontier_rowindex_owner_form_candidate_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_frontier_rowindex_join_ready_candidate_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_actual_gate_enable_false_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_actual_gate_window_zero_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_actual_gate_line_too_small_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_actual_gate_taken_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_frontier_windows_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_frontier_lines_exported_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_frontier_overlap_lines_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_frontier_overlap_peer_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_frontier_max_exported_per_window_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_prebase_lookup_owner_fill_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_prebase_lookup_shared_hits_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_prebase_lookup_entries_peak_ = nullptr;
     // Batch-A 组件级直方图统计
     Statistic<uint64_t>* stat_mem_read_latency_cycles_ = nullptr;
     Statistic<uint64_t>* stat_mem_read_latency_cycles_weights_ = nullptr;
@@ -1960,58 +1021,6 @@ private:
     Statistic<uint64_t>* stat_gas_retire_shadow_per_post_recoverable_edges_total_ = nullptr;
     Statistic<uint64_t>* stat_gas_retire_shadow_per_post_ready_posts_peak_ = nullptr;
     Statistic<uint64_t>* stat_gas_retire_shadow_per_post_committable_edges_peak_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_prefetch_rows_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_prefetch_bytes_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_prefetch_complete_inflight_miss_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_prefetch_complete_zero_waiters_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_prefetch_complete_waiters_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_prefetch_rows_deferred_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_prefetch_rows_failed_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_cache_hits_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_cache_misses_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_cache_fills_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_cache_full_drop_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_cache_entries_final_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_bulk_fill_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_bulk_rows_cached_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_bulk_waiters_resolved_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_touch_rows_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_touch_events_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_rows_filtered_cold_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_budget_ticks_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_budget_effective_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_budget_adapt_ticks_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_ready_transition_apply_promote_cached_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_ready_signal_rowindex_response_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_ready_transition_rowindex_response_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_ready_signal_prefetch_response_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_ready_transition_prefetch_response_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_ready_signal_rowindex_response_inflight_waiters_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_ready_transition_rowindex_response_inflight_waiters_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_ready_signal_rowindex_response_inflight_zero_waiters_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_ready_transition_rowindex_response_inflight_zero_waiters_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_ready_signal_rowindex_response_noninflight_prefetch_only_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_ready_transition_rowindex_response_noninflight_prefetch_only_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_ready_signal_prefetch_response_inflight_waiters_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_ready_transition_prefetch_response_inflight_waiters_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_ready_signal_prefetch_response_inflight_zero_waiters_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_ready_transition_prefetch_response_inflight_zero_waiters_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_ready_signal_prefetch_response_noninflight_prefetch_only_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_ready_transition_prefetch_response_noninflight_prefetch_only_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_detached_demand_join_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_detached_demand_waiters_resolved_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_detached_demand_fallback_zero_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_detached_demand_ready_signal_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_detached_demand_ready_transition_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_ready_bypass_experimental_cache_hit_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_ready_bypass_rowindex_get_hit_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_close_attempt_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_close_attempt_active_owner_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_close_attempt_already_pending_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_close_attempt_not_active_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_close_attempt_not_owner_total_ = nullptr;
-    Statistic<uint64_t>* stat_gcss_lookup_hit_total_ = nullptr;
-    Statistic<uint64_t>* stat_gcss_lookup_miss_total_ = nullptr;
     Statistic<uint64_t>* stat_weight_read_dense_reqs_total_ = nullptr;
     Statistic<uint64_t>* stat_weight_read_dense_bytes_total_ = nullptr;
     Statistic<uint64_t>* stat_weight_read_rowptr_reqs_total_ = nullptr;
@@ -2020,8 +1029,6 @@ private:
     Statistic<uint64_t>* stat_weight_read_colidx_bytes_total_ = nullptr;
     Statistic<uint64_t>* stat_weight_read_blockdata_reqs_total_ = nullptr;
     Statistic<uint64_t>* stat_weight_read_blockdata_bytes_total_ = nullptr;
-    Statistic<uint64_t>* stat_weight_read_gcss_reqs_total_ = nullptr;
-    Statistic<uint64_t>* stat_weight_read_gcss_bytes_total_ = nullptr;
     Statistic<uint64_t>* stat_weight_idx_sram_reads_total_ = nullptr;
     Statistic<uint64_t>* stat_weight_idx_sram_writes_total_ = nullptr;
     Statistic<uint64_t>* stat_weight_idx_sram_bytes_read_total_ = nullptr;
@@ -2203,46 +1210,11 @@ private:
         uint64_t retire_head_hol_cycles_miss_total = 0;
         uint64_t retire_head_hol_cycles_bcsr_total = 0;
         uint64_t retire_head_hol_cycles_bcsr_file_total = 0;
-        uint64_t retire_head_hol_cycles_gcss_total = 0;
         uint64_t retire_head_blocked_edges_dense_total = 0;
         uint64_t retire_head_blocked_edges_cache_total = 0;
         uint64_t retire_head_blocked_edges_miss_total = 0;
         uint64_t retire_head_blocked_edges_bcsr_total = 0;
         uint64_t retire_head_blocked_edges_bcsr_file_total = 0;
-        uint64_t retire_head_blocked_edges_gcss_total = 0;
-        uint64_t retire_gcss_head_queued_not_issued_cycles_total = 0;
-        uint64_t retire_gcss_qni_head_wait_episodes_total = 0;
-        uint64_t retire_gcss_qni_head_wait_cycles_max = 0;
-        uint64_t retire_gcss_head_queued_not_issued_blocked_edges_total = 0;
-        uint64_t retire_gcss_head_issued_wait_resp_cycles_total = 0;
-        uint64_t retire_gcss_head_issued_wait_resp_blocked_edges_total = 0;
-        uint64_t retire_gcss_resp_ready_but_hol_cycles_total = 0;
-        uint64_t retire_gcss_resp_ready_but_hol_blocked_edges_total = 0;
-        uint64_t retire_gcss_qni_loader_not_ready_cycles_total = 0;
-        uint64_t retire_gcss_qni_loader_not_ready_blocked_edges_total = 0;
-        uint64_t retire_gcss_qni_weight_sram_stall_cycles_total = 0;
-        uint64_t retire_gcss_qni_weight_sram_stall_blocked_edges_total = 0;
-        uint64_t retire_gcss_qni_vlf_younger_ahead_cycles_total = 0;
-        uint64_t retire_gcss_qni_vlf_younger_ahead_blocked_edges_total = 0;
-        uint64_t retire_gcss_qni_vlf_younger_ahead_depth_total = 0;
-        uint64_t retire_gcss_qni_vlf_younger_ahead_depth_samples_total = 0;
-        uint64_t retire_gcss_qni_vlf_younger_ahead_depth_max = 0;
-        uint64_t retire_gcss_qni_issue_deferred_total = 0;
-        uint64_t retire_gcss_qni_pending_direct_queue_residency_cycles_total = 0;
-        uint64_t retire_gcss_qni_pending_direct_queue_residency_samples_total = 0;
-        uint64_t retire_gcss_qni_pending_direct_queue_residency_cycles_max = 0;
-        uint64_t retire_gcss_qni_vlf_front_inflight_full_cycles_total = 0;
-        uint64_t retire_gcss_qni_vlf_front_inflight_full_blocked_edges_total = 0;
-        uint64_t retire_gcss_qni_vlf_front_waiting_issue_cycles_total = 0;
-        uint64_t retire_gcss_qni_vlf_front_waiting_issue_blocked_edges_total = 0;
-        uint64_t retire_gcss_qni_pending_younger_ahead_cycles_total = 0;
-        uint64_t retire_gcss_qni_pending_younger_ahead_blocked_edges_total = 0;
-        uint64_t retire_gcss_qni_pending_front_inflight_full_cycles_total = 0;
-        uint64_t retire_gcss_qni_pending_front_inflight_full_blocked_edges_total = 0;
-        uint64_t retire_gcss_qni_pending_front_waiting_tick_cycles_total = 0;
-        uint64_t retire_gcss_qni_pending_front_waiting_tick_blocked_edges_total = 0;
-        uint64_t retire_gcss_qni_unknown_cycles_total = 0;
-        uint64_t retire_gcss_qni_unknown_blocked_edges_total = 0;
         uint64_t retire_begin_apply_windows_total = 0;
         uint64_t retire_begin_apply_prev_edges_total = 0;
         uint64_t retire_begin_apply_outstanding_carryin_total = 0;
@@ -2250,14 +1222,9 @@ private:
         uint64_t retire_begin_apply_loader_not_ready_windows_total = 0;
         uint64_t retire_edge_retire_registered_total = 0;
         uint64_t retire_edge_retire_retired_total = 0;
-        uint64_t retire_end_scatter_gcss_vlf_issue_queue_residual_total = 0;
         uint64_t retire_end_scatter_pending_direct_reads_residual_total = 0;
         uint64_t retire_end_scatter_outstanding_residual_total = 0;
         uint64_t retire_end_scatter_residual_work_windows_total = 0;
-        uint64_t retire_gcss_vlf_issue_prepare_total = 0;
-        uint64_t retire_gcss_vlf_issue_edges_total = 0;
-        uint64_t retire_gcss_vlf_issue_reorder_trigger_total = 0;
-        uint64_t retire_gcss_vlf_issue_line_groups_total = 0;
         uint64_t retire_ready_queue_peak = 0;
         uint64_t retire_unblock_events_total = 0;
         uint64_t step_barrier_wait_ns = 0;
@@ -2300,25 +1267,7 @@ private:
     uint64_t test_cycle_counter_;
     int test_spikes_sent_;  // 已发送的测试脉冲计数
     bool pure_snn_datapath_workload_eligible_ = false;
-    bool pulse_enable_requested_ = false;
     bool local_storage_enable_ = false;
-    bool pulse_enable_ = false;
-    bool pulse_osa_requested_ = false;
-    bool pulse_osa_enable_ = false;
-    bool pulse_descriptor_actual_requested_ = false;
-    bool pulse_osa_shared_weight_owner_requested_ = false;
-    bool pulse_osa_shared_weight_owner_actual_requested_ = false;
-    bool pulse_osa_shared_weight_owner_enable_ = false;
-    bool pulse_osa_shared_weight_owner_actual_enable_ = false;
-    bool pulse_osa_metadata_txn_enable_ = false;
-    bool pulse_osa_metadata_ready_lease_enable_ = false;
-    uint32_t pulse_osa_metadata_ready_lease_ttl_ = 0;
-    std::string pulse_osa_metadata_object_mask_ = "rowdescriptor";
-    uint32_t pulse_osa_metadata_object_mask_bits_ = 0;
-    bool atlas_rowindex_requested_seen_ = false;
-    bool atlas_rowindex_effective_seen_ = false;
-    bool atlas_rowindex_constructed_seen_ = false;
-    bool atlas_control_runtime_produced_any_nonzero_last_ = false;
 
     // ===== NoC 端到端延迟画像（native multicast lab）=====
     uint32_t noc_lat_hist_max_ = 131072; // cycles；>hist_max 归入 overflow bin（hist_max+1）
@@ -2334,7 +1283,6 @@ private:
     std::unique_ptr<PodMetadataObjectPlane> pod_metadata_object_plane_;
     std::unique_ptr<PodOwnerServiceTable> pod_owner_service_table_;
     std::unique_ptr<PeLocalServiceObjectTable> pe_local_service_object_table_;
-    std::unique_ptr<PeSharedCoreFabric> pulse_fabric_;
     std::unique_ptr<PeWeightObjectPlane> pe_weight_object_plane_;
 
     // ===== 时间窗口化统计（Batch‑B） =====
@@ -2420,17 +1368,9 @@ private:
         int endpoint_id = -1;
         NocPacketEvent* pkt = nullptr;
     };
-    struct PulseIngressBufferedPacket {
-        uint64_t token = 0;
-        int endpoint_id = -1;
-        NocPacketEvent* pkt = nullptr;
-    };
     std::unordered_map<uint32_t, std::vector<DeferredNocPacket>> deferred_packets_by_seq_{};
-    std::unordered_map<uint64_t, PulseIngressBufferedPacket> pulse_ingress_buffered_packets_{};
-    uint64_t pulse_next_dispatch_token_ = 1;
     void flushDeferredPacketsForSeq_(uint32_t seq);
     void clearAllDeferredPackets_();
-    void clearAllPulseIngressPackets_();
     // Step-limited 下的就绪门控：等待 WeightLoader 发布 done 再发送 PE_READY（避免 naive_* 在 rowptr 未就绪时爆炸式积压）
     std::string loader_done_key_;
     bool wait_for_loader_done_ = false;
@@ -2518,10 +1458,7 @@ private:
      * @brief 将NoC packet按kind分流并投递到指定endpoint/core
      */
     void deliverPacketToEndpoint_(int endpoint_id, NocPacketEvent* pkt);
-    void deliverPacketDirectToCore_(int endpoint_id, NocPacketEvent* pkt, bool pulse_account_delivery);
-    void drainPulseIngress_();
-    bool pulseActualIngressEnabled_() const;
-    bool pulseActualIngressEligible_(NocPacketKind kind) const;
+    void deliverPacketDirectToCore_(int endpoint_id, NocPacketEvent* pkt);
     void resetAllCoreMembranes();
     
     // === 网络端口事件处理器 ===

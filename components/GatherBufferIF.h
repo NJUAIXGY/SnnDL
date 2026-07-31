@@ -38,8 +38,6 @@ public:
         {"gap_merge_enable", "Enable fine-grained gap merge (0/1)", "1"},
         {"gap_merge_k_bytes", "Gap merge threshold k (bytes); 0=disable", "0"},
         {"burst_bytes_max", "Max burst size (bytes) when merging", "65536"},
-        {"vlf_enable", "Experimental: enable value-line fusion (cacheline-aligned, no-hole fusion) during staged segment build (0/1)", "0"},
-        {"vlf_run_enable", "Experimental: allow merging adjacent cachelines into contiguous runs under VLF (0/1)", "0"},
         {"bank_bits", "Number of bits in bank field (0=disable bank_row)", "0"},
         {"bank_shift", "LSB bit index of bank field", "0"},
         {"bank_auto_enable", "Enable heuristic bank bits/shift auto-detect when bank_bits=0", "1"},
@@ -49,10 +47,7 @@ public:
         {"apply_frags_per_issue", "Apply-stage max downstream fragments per issue step (0=unlimited)", "1"},
         {"apply_bank_credit", "Apply-stage per-bank max active granules (0=unlimited)", "1"},
         {"apply_age_fair_ns", "Apply-stage fairness threshold (ns): force-issue when age >= threshold (0=disable)", "2000"},
-        {"dram_cmd_cost_merge_enable", "Experimental: enable DRAM command-cost guided merge decisions at segment-build (0/1)", "0"},
-        {"dram_cmd_t_row_hit_ns", "Experimental: DRAM command-cost model row-hit service ns (per line)", "30"},
-        {"dram_cmd_t_row_miss_ns", "Experimental: DRAM command-cost model row-miss service ns (per line)", "120"},
-        {"row_window_enable", "Enable coarse row-window merge (0/1)", "0"},
+		{"row_window_enable", "Enable coarse row-window merge (0/1)", "0"},
         {"row_window_bytes", "Row-window byte threshold to trigger burst", "0"},
         {"row_window_timeout_ns", "Row-window timeout to trigger burst (ns)", "0"},
         {"gather_auto_end_bytes", "Auto-end Gather window when accumulated upstream bytes reach threshold (0=disable)", "0"},
@@ -143,10 +138,7 @@ public:
         {"gas_gap_absorbed_bytes", "Gap bytes absorbed by fine-grained merge (sum)", "bytes", 1},
         {"gas_row_window_triggers", "Number of row-window bursts (coarse merge)", "count", 1},
         {"gas_row_window_bytes", "Bytes issued by row-window bursts (sum)", "bytes", 1},
-        {"gas_cmd_cost_veto", "Number of absorb attempts vetoed by cmd-cost model", "count", 1},
-        {"gas_cmd_cost_veto_fine_gap", "Number of fine-gap absorb attempts vetoed by cmd-cost model", "count", 1},
-        {"gas_cmd_cost_veto_row_window", "Number of row-window absorb attempts vetoed by cmd-cost model", "count", 1},
-        // Segment diagnostics.
+		// Segment diagnostics.
         {"gas_overfetch_bytes", "Overfetch bytes issued by segment merges (issued_bytes - payload_bytes)", "bytes", 1},
         {"gas_unique_line_count", "Approx unique cacheline count touched by staged reads (per window)", "count", 1},
         {"gas_covered_line_count", "Approx covered cacheline count by issued segments (per window)", "count", 1},
@@ -297,7 +289,6 @@ private:
     void applyCtrlConfig_(uint64_t k, uint64_t rowwin_bytes, uint64_t timeout_ns);
     bool rebuildPendingAsGranules_(int buf);
     static std::vector<uint64_t> parseCsvU64_(const std::string& s);
-    std::pair<uint64_t, uint64_t> cmdCostNsForBank_(uint32_t bank_idx) const;
 	    uint64_t ensureSortKey_(Granule& g);
 	    void rebuildIssueOrder_(int buf);
     void issueMoreUnissuedFromOrder_(int buf);
@@ -334,9 +325,6 @@ private:
     bool gap_merge_enable_ = true;
     uint64_t gap_k_bytes_ = 0;      // tolerated hole bytes; 0=disable gap merge
     uint64_t burst_bytes_max_ = 64*1024; // Lmax
-    // Experimental: GCSS value-line fusion (no-hole cacheline fusion in staged builder).
-    bool vlf_enable_ = false;
-    bool vlf_run_enable_ = false;
     uint32_t bank_bits_ = 0;        // bank field width; 0 disables bank_row sort
     uint32_t bank_shift_ = 0;       // bank bit LSB
     bool bank_auto_enable_ = true;  // allow heuristic detection if bits==0
@@ -435,11 +423,7 @@ private:
     uint64_t row_window_bytes_ = 0;
     uint64_t row_window_timeout_ns_ = 0;
 
-    // Experimental: DRAM command-cost guided merge decisions during segment build (row-local only).
-    bool dram_cmd_cost_merge_enable_ = false;
-    uint32_t dram_cmd_t_row_hit_ns_ = 30;
-    uint32_t dram_cmd_t_row_miss_ns_ = 120;
-    // Double-buffer indices
+	    // Double-buffer indices
     int gather_buf_index_ = 0; // 当前接收/构建/发射（下轮）的SB
     int apply_buf_index_  = 1; // 当前用于Apply/回答上游的SB
     // --- Adaptive k (C3) ---
@@ -534,10 +518,7 @@ private:
     Statistic<uint64_t>* stat_gap_absorbed_bytes_ = nullptr; // total gap bytes absorbed by gap merge
     Statistic<uint64_t>* stat_row_window_triggers_ = nullptr; // number of row-window bursts
     Statistic<uint64_t>* stat_row_window_bytes_ = nullptr;    // bytes issued due to row-window
-    Statistic<uint64_t>* stat_cmd_cost_veto_ = nullptr;       // total cmd-cost veto decisions
-    Statistic<uint64_t>* stat_cmd_cost_veto_fine_gap_ = nullptr; // fine-gap veto decisions
-    Statistic<uint64_t>* stat_cmd_cost_veto_row_window_ = nullptr; // row-window veto decisions
-    // Segment diagnostics.
+	    // Segment diagnostics.
     Statistic<uint64_t>* stat_overfetch_bytes_ = nullptr;     // issued_bytes - payload_bytes (sum over segments)
     Statistic<uint64_t>* stat_unique_line_count_ = nullptr;   // approx unique lines touched (per window)
     Statistic<uint64_t>* stat_covered_line_count_ = nullptr;  // approx covered lines by issued segments (per window)

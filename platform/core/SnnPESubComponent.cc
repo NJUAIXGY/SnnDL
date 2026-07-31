@@ -17,7 +17,6 @@
 #include "IGasCreditGate.h"
 #include "IGasStepGate.h"
 #include "api/IPePodSharedMetadataProvider.h"
-#include "api/IPeSharedCoreFabricProvider.h"
 #include "api/IPeWeightObjectPlaneProvider.h"
 #include "ISnnComputeCore.h"
 #include "snn/synapse/stdmem/StdMemEndpoint.h"
@@ -26,7 +25,6 @@
 #include "snn/synapse/weights/WeightCacheOps.h"
 #include "snn/synapse/weights/WeightAccessor.h"
 #include "snn/synapse/weights/DenseWeightLayout.h"
-#include "research/local_storage/PeLocalServiceObjectTable.h"
 #include "research/local_storage/PeWeightObjectPlane.h"
 #include "ISpikeTransport.h"
 #include "NocSpikeTransport.h"
@@ -60,52 +58,6 @@ using namespace SST;
 using namespace SST::SnnDL;
 
 namespace {
-static std::string normalizePulseMetadataMaskToken_(std::string token) {
-    for (char& ch : token) {
-        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-    }
-    token.erase(
-        std::remove_if(
-            token.begin(),
-            token.end(),
-            [](unsigned char ch) {
-                return ch == '_' || ch == '-' || std::isspace(ch) != 0;
-            }),
-        token.end());
-    return token;
-}
-
-static uint32_t parsePulseMetadataObjectMask_(const std::string& raw_mask) {
-    if (raw_mask.empty()) return 0u;
-
-    uint32_t mask = 0u;
-    size_t start = 0u;
-    while (start <= raw_mask.size()) {
-        const size_t end = raw_mask.find_first_of(",|+; ", start);
-        const std::string token = normalizePulseMetadataMaskToken_(
-            raw_mask.substr(start, (end == std::string::npos) ? std::string::npos : (end - start)));
-        if (!token.empty()) {
-            if (token == "all") {
-                mask |= PeLocalServiceObjectTable::kMetadataKindMaskAll;
-            } else if (token == "preband") {
-                mask |= PeLocalServiceObjectTable::kMetadataKindMaskPreband;
-            } else if (token == "prebase" || token == "base" || token == "premphfbase") {
-                mask |= PeLocalServiceObjectTable::kMetadataKindMaskPreMphfBase;
-            } else if (token == "band" || token == "premphfband") {
-                mask |= PeLocalServiceObjectTable::kMetadataKindMaskPreMphfBand;
-            } else if (token == "idx2" || token == "idx2row") {
-                mask |= PeLocalServiceObjectTable::kMetadataKindMaskIdx2Row;
-            } else if (token == "rowidx" || token == "rowindex") {
-                mask |= PeLocalServiceObjectTable::kMetadataKindMaskRowIndex;
-            } else if (token == "rowdescriptor") {
-                mask |= PeLocalServiceObjectTable::kMetadataKindMaskRowDescriptor;
-            }
-        }
-        if (end == std::string::npos) break;
-        start = end + 1u;
-    }
-    return mask;
-}
 } // namespace
 
 // 诊断门控改为参数化：由 enable_extended_diagnostics_ 成员控制
@@ -238,239 +190,6 @@ void SnnPESubComponent::Impl::markEndScatter(uint32_t seq, uint64_t spikes_emitt
     // endScatterWindow() keeps diagnostic printing internally gated by debug flags.
     if (core->weight_mem_subsystem_) {
         core->weight_mem_subsystem_->endScatterWindow(seq);
-        const auto retire_obs = core->weight_mem_subsystem_->retireObservabilityStats();
-        const auto pulse_obs = core->weight_mem_subsystem_->pulseAgendaObservabilityStats();
-        const auto pod_align =
-            core->weight_mem_subsystem_->experimentalPeInternalPodPathAlignmentStats();
-        const auto& pod_rowdescriptor = pod_align.rowdescriptor;
-        if (auto* pe = core->snn_parent_observer_) {
-            pe->recordStepRetireStat(
-                seq,
-                retire_obs.global_hol_cycles_total,
-                retire_obs.ready_but_blocked_edges_total,
-                retire_obs.per_post_progress_total,
-                retire_obs.wait_cycles_total,
-                retire_obs.wait_cycles_due_to_hol_total,
-                retire_obs.wait_cycles_due_to_barrier_total,
-                retire_obs.wait_cycles_due_to_not_ready_total,
-                retire_obs.samepost_blocked_edges_total,
-                retire_obs.crosspost_blocked_edges_total,
-                retire_obs.policy_loss_cycles_total,
-                retire_obs.policy_loss_edges_total,
-                retire_obs.shadow_per_post_recoverable_cycles_total,
-                retire_obs.shadow_per_post_recoverable_edges_total,
-                retire_obs.shadow_per_post_ready_posts_peak,
-                retire_obs.shadow_per_post_committable_edges_peak,
-                retire_obs.head_hol_cycles_dense_total,
-                retire_obs.head_hol_cycles_cache_total,
-                retire_obs.head_hol_cycles_miss_total,
-                retire_obs.head_hol_cycles_bcsr_total,
-                retire_obs.head_hol_cycles_bcsr_file_total,
-                retire_obs.head_hol_cycles_gcss_total,
-                retire_obs.head_blocked_edges_dense_total,
-                retire_obs.head_blocked_edges_cache_total,
-                retire_obs.head_blocked_edges_miss_total,
-                retire_obs.head_blocked_edges_bcsr_total,
-                retire_obs.head_blocked_edges_bcsr_file_total,
-                retire_obs.head_blocked_edges_gcss_total,
-                retire_obs.gcss_head_queued_not_issued_cycles_total,
-                retire_obs.gcss_qni_head_wait_episodes_total,
-                retire_obs.gcss_qni_head_wait_cycles_max,
-                retire_obs.gcss_head_queued_not_issued_blocked_edges_total,
-                retire_obs.gcss_head_issued_wait_resp_cycles_total,
-                retire_obs.gcss_head_issued_wait_resp_blocked_edges_total,
-                retire_obs.gcss_resp_ready_but_hol_cycles_total,
-                retire_obs.gcss_resp_ready_but_hol_blocked_edges_total,
-                retire_obs.gcss_qni_loader_not_ready_cycles_total,
-                retire_obs.gcss_qni_loader_not_ready_blocked_edges_total,
-                retire_obs.gcss_qni_weight_sram_stall_cycles_total,
-                retire_obs.gcss_qni_weight_sram_stall_blocked_edges_total,
-                retire_obs.gcss_qni_vlf_younger_ahead_cycles_total,
-                retire_obs.gcss_qni_vlf_younger_ahead_blocked_edges_total,
-                retire_obs.gcss_qni_vlf_younger_ahead_depth_total,
-                retire_obs.gcss_qni_vlf_younger_ahead_depth_samples_total,
-                retire_obs.gcss_qni_vlf_younger_ahead_depth_max,
-                retire_obs.gcss_qni_issue_deferred_total,
-                retire_obs.gcss_qni_pending_direct_queue_residency_cycles_total,
-                retire_obs.gcss_qni_pending_direct_queue_residency_samples_total,
-                retire_obs.gcss_qni_pending_direct_queue_residency_cycles_max,
-                retire_obs.gcss_qni_vlf_front_inflight_full_cycles_total,
-                retire_obs.gcss_qni_vlf_front_inflight_full_blocked_edges_total,
-                retire_obs.gcss_qni_vlf_front_waiting_issue_cycles_total,
-                retire_obs.gcss_qni_vlf_front_waiting_issue_blocked_edges_total,
-                retire_obs.gcss_qni_pending_younger_ahead_cycles_total,
-                retire_obs.gcss_qni_pending_younger_ahead_blocked_edges_total,
-                retire_obs.gcss_qni_pending_front_inflight_full_cycles_total,
-                retire_obs.gcss_qni_pending_front_inflight_full_blocked_edges_total,
-                retire_obs.gcss_qni_pending_front_waiting_tick_cycles_total,
-                retire_obs.gcss_qni_pending_front_waiting_tick_blocked_edges_total,
-                retire_obs.gcss_qni_unknown_cycles_total,
-                retire_obs.gcss_qni_unknown_blocked_edges_total,
-                retire_obs.begin_apply_windows_total,
-                retire_obs.begin_apply_prev_edges_total,
-                retire_obs.begin_apply_outstanding_carryin_total,
-                retire_obs.begin_apply_outstanding_carryin_windows_total,
-                retire_obs.begin_apply_loader_not_ready_windows_total,
-                retire_obs.edge_retire_registered_total,
-                retire_obs.edge_retire_retired_total,
-                retire_obs.end_scatter_gcss_vlf_issue_queue_residual_total,
-                retire_obs.end_scatter_pending_direct_reads_residual_total,
-                retire_obs.end_scatter_outstanding_residual_total,
-                retire_obs.end_scatter_residual_work_windows_total,
-                retire_obs.gcss_vlf_issue_prepare_total,
-                retire_obs.gcss_vlf_issue_edges_total,
-                retire_obs.gcss_vlf_issue_reorder_trigger_total,
-                retire_obs.gcss_vlf_issue_line_groups_total,
-                retire_obs.ready_queue_peak,
-                retire_obs.unblock_events_total);
-            pe->recordPulseAgendaObservability(
-                seq,
-                pulse_obs.candidates_total,
-                pulse_obs.accepted_total,
-                pulse_obs.rejected_total,
-                pulse_obs.reject_gate_total,
-                pulse_obs.correctness_ready_blocked_cycles_total,
-                pulse_obs.correctness_scoreboard_occupancy_peak,
-                pulse_obs.shared_service_hits_total,
-                pulse_obs.shared_service_misses_total,
-                pulse_obs.region_service_entries_peak,
-                pulse_obs.ready_fanout_total,
-                pulse_obs.rowdescriptor_ready_transition_total,
-                pulse_obs.rowdescriptor_join_ready_total,
-                pulse_obs.rowdescriptor_ready_join_shortcut_candidates_total,
-                pulse_obs.rowdescriptor_ready_join_shortcut_taken_total,
-                pulse_obs.rowdescriptor_ready_join_shortcut_late_release_taken_total,
-                pulse_obs.rowdescriptor_ready_join_shortcut_deferred_live_park_total,
-                pulse_obs.rowdescriptor_ready_join_shortcut_deferred_live_apply_total,
-                pulse_obs.rowdescriptor_owner_form_deferred_park_total,
-                pulse_obs.rowdescriptor_owner_form_deferred_activate_total,
-                pulse_obs.rowdescriptor_ready_join_shortcut_blocked_not_ready_total,
-                pulse_obs.rowdescriptor_ready_join_shortcut_blocked_owner_form_total,
-                pulse_obs.rowdescriptor_ready_join_shortcut_blocked_join_live_total,
-                pulse_obs.rowdescriptor_ready_join_shortcut_blocked_other_total,
-                pulse_obs.rowdescriptor_ready_join_shortcut_release_deferred_total,
-                pulse_obs.rowdescriptor_ready_join_shortcut_apply_complete_total,
-                pulse_obs.rowdescriptor_ready_join_shortcut_release_forwarded_total,
-                pulse_obs.rowdescriptor_ready_join_shortcut_release_missing_total,
-                pulse_obs.rowdescriptor_ready_join_descriptor_elide_total,
-                pulse_obs.rowdescriptor_ready_join_lines_elide_total,
-                pulse_obs.rowdescriptor_owner_first_service_elide_join_live_total,
-                pulse_obs.rowdescriptor_owner_first_service_elide_join_ready_total,
-                pulse_obs.rowdescriptor_owner_first_service_elide_late_join_total,
-                pulse_obs.actual_gate_enable_false_total,
-                pulse_obs.actual_gate_window_zero_total,
-                pulse_obs.actual_gate_line_too_small_total,
-                pulse_obs.actual_gate_taken_total,
-                pulse_obs.frontier_windows_total,
-                pulse_obs.frontier_lines_exported_total,
-                pulse_obs.frontier_overlap_lines_total,
-                pulse_obs.frontier_overlap_peer_total,
-                pulse_obs.frontier_max_exported_per_window,
-                pulse_obs.prebase_lookup_owner_fill_total,
-                pulse_obs.prebase_lookup_shared_hits_total,
-                pulse_obs.prebase_lookup_entries_peak);
-            pe->recordPulsePodRowdescriptorObservability(
-                seq,
-                pod_rowdescriptor.seam_owner_form_total,
-                pod_rowdescriptor.seam_joiner_hit_total,
-                pod_rowdescriptor.seam_owner_live_join_total,
-                pod_rowdescriptor.seam_owner_ready_join_total,
-                pod_rowdescriptor.seam_ready_transition_total,
-                pod_rowdescriptor.seam_late_join_total,
-                pod_rowdescriptor.seam_guard_total,
-                pod_rowdescriptor.seam_guard_disabled_total,
-                pod_rowdescriptor.seam_guard_missing_metadata_plane_total,
-                pod_rowdescriptor.seam_guard_missing_owner_table_total,
-                pod_rowdescriptor.seam_guard_zero_pod_count_total,
-                pod_rowdescriptor.seam_guard_window_zero_total,
-                pod_rowdescriptor.seam_guard_invalid_cfg_pod_total,
-                pod_rowdescriptor.seam_reject_total,
-                pod_rowdescriptor.seam_attempted_total,
-                pod_rowdescriptor.seam_potential_private_service_elide_total,
-                pod_rowdescriptor.seam_owner_first_issue_deferred_total,
-                pod_rowdescriptor.seam_owner_first_private_issue_avoided_total,
-                pod_rowdescriptor.seam_owner_first_service_elide_total);
-            pe->recordCoreStepRetireStat(
-                core->core_id_,
-                seq,
-                retire_obs.global_hol_cycles_total,
-                retire_obs.ready_but_blocked_edges_total,
-                retire_obs.per_post_progress_total,
-                retire_obs.wait_cycles_total,
-                retire_obs.wait_cycles_due_to_hol_total,
-                retire_obs.wait_cycles_due_to_barrier_total,
-                retire_obs.wait_cycles_due_to_not_ready_total,
-                retire_obs.samepost_blocked_edges_total,
-                retire_obs.crosspost_blocked_edges_total,
-                retire_obs.policy_loss_cycles_total,
-                retire_obs.policy_loss_edges_total,
-                retire_obs.shadow_per_post_recoverable_cycles_total,
-                retire_obs.shadow_per_post_recoverable_edges_total,
-                retire_obs.shadow_per_post_ready_posts_peak,
-                retire_obs.shadow_per_post_committable_edges_peak,
-                retire_obs.head_hol_cycles_dense_total,
-                retire_obs.head_hol_cycles_cache_total,
-                retire_obs.head_hol_cycles_miss_total,
-                retire_obs.head_hol_cycles_bcsr_total,
-                retire_obs.head_hol_cycles_bcsr_file_total,
-                retire_obs.head_hol_cycles_gcss_total,
-                retire_obs.head_blocked_edges_dense_total,
-                retire_obs.head_blocked_edges_cache_total,
-                retire_obs.head_blocked_edges_miss_total,
-                retire_obs.head_blocked_edges_bcsr_total,
-                retire_obs.head_blocked_edges_bcsr_file_total,
-                retire_obs.head_blocked_edges_gcss_total,
-                retire_obs.gcss_head_queued_not_issued_cycles_total,
-                retire_obs.gcss_qni_head_wait_episodes_total,
-                retire_obs.gcss_qni_head_wait_cycles_max,
-                retire_obs.gcss_head_queued_not_issued_blocked_edges_total,
-                retire_obs.gcss_head_issued_wait_resp_cycles_total,
-                retire_obs.gcss_head_issued_wait_resp_blocked_edges_total,
-                retire_obs.gcss_resp_ready_but_hol_cycles_total,
-                retire_obs.gcss_resp_ready_but_hol_blocked_edges_total,
-                retire_obs.gcss_qni_loader_not_ready_cycles_total,
-                retire_obs.gcss_qni_loader_not_ready_blocked_edges_total,
-                retire_obs.gcss_qni_weight_sram_stall_cycles_total,
-                retire_obs.gcss_qni_weight_sram_stall_blocked_edges_total,
-                retire_obs.gcss_qni_vlf_younger_ahead_cycles_total,
-                retire_obs.gcss_qni_vlf_younger_ahead_blocked_edges_total,
-                retire_obs.gcss_qni_vlf_younger_ahead_depth_total,
-                retire_obs.gcss_qni_vlf_younger_ahead_depth_samples_total,
-                retire_obs.gcss_qni_vlf_younger_ahead_depth_max,
-                retire_obs.gcss_qni_issue_deferred_total,
-                retire_obs.gcss_qni_pending_direct_queue_residency_cycles_total,
-                retire_obs.gcss_qni_pending_direct_queue_residency_samples_total,
-                retire_obs.gcss_qni_pending_direct_queue_residency_cycles_max,
-                retire_obs.gcss_qni_vlf_front_inflight_full_cycles_total,
-                retire_obs.gcss_qni_vlf_front_inflight_full_blocked_edges_total,
-                retire_obs.gcss_qni_vlf_front_waiting_issue_cycles_total,
-                retire_obs.gcss_qni_vlf_front_waiting_issue_blocked_edges_total,
-                retire_obs.gcss_qni_pending_younger_ahead_cycles_total,
-                retire_obs.gcss_qni_pending_younger_ahead_blocked_edges_total,
-                retire_obs.gcss_qni_pending_front_inflight_full_cycles_total,
-                retire_obs.gcss_qni_pending_front_inflight_full_blocked_edges_total,
-                retire_obs.gcss_qni_pending_front_waiting_tick_cycles_total,
-                retire_obs.gcss_qni_pending_front_waiting_tick_blocked_edges_total,
-                retire_obs.gcss_qni_unknown_cycles_total,
-                retire_obs.gcss_qni_unknown_blocked_edges_total,
-                retire_obs.begin_apply_windows_total,
-                retire_obs.begin_apply_prev_edges_total,
-                retire_obs.begin_apply_outstanding_carryin_total,
-                retire_obs.begin_apply_outstanding_carryin_windows_total,
-                retire_obs.begin_apply_loader_not_ready_windows_total,
-                retire_obs.edge_retire_registered_total,
-                retire_obs.edge_retire_retired_total,
-                retire_obs.end_scatter_gcss_vlf_issue_queue_residual_total,
-                retire_obs.end_scatter_pending_direct_reads_residual_total,
-                retire_obs.end_scatter_outstanding_residual_total,
-                retire_obs.end_scatter_residual_work_windows_total,
-                retire_obs.gcss_vlf_issue_prepare_total,
-                retire_obs.gcss_vlf_issue_edges_total,
-                retire_obs.gcss_vlf_issue_reorder_trigger_total,
-                retire_obs.gcss_vlf_issue_line_groups_total,
-                retire_obs.ready_queue_peak,
-                retire_obs.unblock_events_total);
-        }
     }
     reportWindowSpikes(static_cast<uint32_t>(seq), spikes_emitted);
     core->spikes_emitted_window_ = 0;
@@ -877,14 +596,7 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
     }
     // 全网读取扩展参数
     weights_cols_ = cfg.weights_cols;
-    synapse_weight_mode_ = cfg.synapse_weight_mode;
-    const bool gcss_valueonly_mode =
-        (synapse_weight_mode_ == "gcss_valueonly_dstcore") ||
-        (synapse_weight_mode_ == "gcss_valueonly_dstcore_idx2") ||
-        (synapse_weight_mode_ == "gcss_idx2_rowmphf") ||
-        (synapse_weight_mode_ == "gcss_valueonly_dstcore_vlf_premphf") ||
-        (synapse_weight_mode_ == "gcss_valueonly_dstcore_vlf_premphf_plp");
-    gcss_index_template_ = cfg.gcss_index_template;
+    synapse_weight_mode_ = "bcsr_gas";
     std::string index_mode_str = cfg.index_mode;
     // 神经元状态布局参数已下沉到 compute core（控制层不再持有）
     verify_routing_weights_ = cfg.verify_routing_weights;
@@ -896,9 +608,6 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
         // CSR 模式已弃用：统一禁用
         use_post_row_pre_col_ = true;
         SNNDL_DEBUG_LOG(1, "[CSR] 索引模式已禁用，改用密集/BCSR读取\n");
-    }
-    if (gcss_valueonly_mode) {
-        use_bcsr_ = false;
     }
     if (weights_cols_ == 0) weights_cols_ = num_neurons_; // 默认沿用旧行宽
     // 配置权重索引解析器（独立于控制层实现）
@@ -1055,14 +764,6 @@ SnnPESubComponent::SnnPESubComponent(ComponentId_t id, Params& params)
 
     // Weights template is used by both synapse/weights (BCSR) and synapse/route; keep cached here.
     weights_template_ = cfg.weights_template;
-    if (gcss_valueonly_mode &&
-        gcss_index_template_.empty() &&
-        output_ && output_->getVerboseLevel() >= 1) {
-        output_->verbose(CALL_INFO, 1, 0,
-            "[gcss] warning: synapse_weight_mode=%s but gcss_index_template is empty (core=%d node=%u)\n",
-            synapse_weight_mode_.c_str(), core_id_, node_id_);
-    }
-
     // neurons_per_pe：默认按 total_cores*num_neurons 推导；但允许脚本显式覆盖（保持兼容）
     uint32_t np_from_params = cfg.neurons_per_pe;
     uint32_t computed_neurons_per_pe = static_cast<uint32_t>(total_cores_) * static_cast<uint32_t>(num_neurons_);
@@ -1424,19 +1125,11 @@ void SnnPESubComponent::refreshSharedWeightObjectPlaneBinding_() {
         pod_provider ? pod_provider->pePodOwnerServiceTable() : nullptr;
     auto* service_table =
         pod_provider ? pod_provider->peLocalServiceObjectTable() : nullptr;
-    auto* fabric_provider = dynamic_cast<IPeSharedCoreFabricProvider*>(parent_pe_cached_);
-    auto* fabric = fabric_provider ? fabric_provider->peSharedCoreFabric() : nullptr;
-    auto* mc_pe = snn_parent_observer_;
-
     weight_mem_subsystem_->bindSharedWeightObjectPlane(plane);
     weight_mem_subsystem_->bindPodMetadataObjectPlane(metadata_plane);
     weight_mem_subsystem_->bindPodOwnerServiceTable(owner_table);
     weight_mem_subsystem_->bindPeLocalServiceObjectTable(service_table);
-    weight_mem_subsystem_->bindPeSharedCoreFabric(fabric);
-    weight_mem_subsystem_->setPulseOsaMetadataTxnConfig(
-        mc_pe ? mc_pe->pulseOsaMetadataTxnEnabled() : false,
-        mc_pe ? mc_pe->pulseOsaMetadataReadyLeaseEnabled() : false,
-        mc_pe ? mc_pe->pulseOsaMetadataObjectMaskBits() : 0u);
+    auto* mc_pe = snn_parent_observer_;
     if (mc_pe) {
         const uint32_t pod_count =
             std::max<uint32_t>(1u, mc_pe->peInternalPodCountConfig());
@@ -1468,7 +1161,6 @@ void SnnPESubComponent::setNocTransport(INocTransport* noc) {
 bool SnnPESubComponent::deliverPacket(NocPacketEvent* packet) {
     return invokeWorkload_([&]() {
         if (!packet) return true;
-        // Experimental PULSE gather-preband isolation:
         // serialize PE-side workload ingress so packet delivery cannot race
         // with stage transitions / workload ticks on the same core.
         if (workload_) {
@@ -1831,39 +1523,6 @@ void SnnPESubComponent::configureWeightReaderSubsystem_(const Params& params) {
                 params.find<uint32_t>("bcsr_row_index_prefetch_all_rows_threshold", 1024);
             ocfg.bcsr_row_index_prefetch_all_rows_max_bytes =
                 params.find<uint64_t>("bcsr_row_index_prefetch_all_rows_max_bytes", 64ull * 1024ull);
-            ocfg.experimental_noc_rowidx_prefetch_enable =
-                params.find<int>("experimental_noc_rowidx_prefetch_enable", 0) != 0;
-            ocfg.experimental_noc_rowidx_prefetch_budget_per_tick =
-                params.find<uint32_t>("experimental_noc_rowidx_prefetch_budget_per_tick", 4);
-            ocfg.experimental_noc_rowidx_cache_rows =
-                params.find<uint32_t>("experimental_noc_rowidx_cache_rows", 1024);
-            ocfg.experimental_noc_rowidx_prefetch_gather_only =
-                params.find<int>("experimental_noc_rowidx_prefetch_gather_only", 1) != 0;
-            ocfg.experimental_noc_rowidx_prefetch_detached_enable =
-                params.find<int>("experimental_noc_rowidx_prefetch_detached_enable", 0) != 0;
-            ocfg.experimental_noc_rowidx_prefetch_carry_to_apply_enable =
-                params.find<int>("experimental_noc_rowidx_prefetch_carry_to_apply_enable", 0) != 0;
-            ocfg.experimental_noc_rowidx_hot_touch_min =
-                params.find<uint32_t>("experimental_noc_rowidx_hot_touch_min", 1);
-            ocfg.experimental_noc_rowidx_budget_adapt_enable =
-                params.find<int>("experimental_noc_rowidx_budget_adapt_enable", 0) != 0;
-            ocfg.experimental_noc_rowidx_budget_adapt_max_per_tick =
-                params.find<uint32_t>("experimental_noc_rowidx_budget_adapt_max_per_tick", 32);
-            ocfg.experimental_noc_rowidx_budget_adapt_q_depth =
-                params.find<uint32_t>("experimental_noc_rowidx_budget_adapt_q_depth", 16);
-            ocfg.experimental_idx2_ingress_prefetch_enable = false;
-            ocfg.experimental_idx2_ingress_prefetch_budget_per_tick = 0;
-            ocfg.experimental_idx2_ingress_prefetch_cache_entries = 0;
-            ocfg.experimental_idx2_ingress_prefetch_max_inflight = 0;
-            ocfg.experimental_idx2_ingress_prefetch_gather_only = false;
-            ocfg.experimental_idx2_ingress_prefetch_carry_to_apply_enable = false;
-            ocfg.experimental_idx2_ingress_prefetch_apply_max_inflight = 0;
-            ocfg.experimental_idx2_ingress_prefetch_apply_outstanding_reserve = 0;
-            ocfg.experimental_idx2_ingress_prefetch_apply_frontier_keep_pending = 0;
-            ocfg.experimental_idx2_ingress_tail_guard_enable = false;
-            ocfg.experimental_idx2_ingress_budget_adapt_enable = false;
-            ocfg.experimental_idx2_ingress_budget_adapt_max_per_tick = 0;
-            ocfg.experimental_idx2_ingress_budget_adapt_q_depth = 0;
             ocfg.bcsr_block_cache_auto_tune =
                 params.find<int>("bcsr_block_cache_auto_tune", 1) != 0;
             ocfg.bcsr_block_cache_max_bytes =
@@ -1937,82 +1596,6 @@ void SnnPESubComponent::configureWeightReaderSubsystem_(const Params& params) {
             ocfg.core_id = static_cast<uint32_t>(core_id_);
             ocfg.total_cores = static_cast<uint32_t>(total_cores_);
             ocfg.weights_template = weights_template_;
-            ocfg.gcss_index_template = gcss_index_template_;
-            ocfg.experimental_retire_policy =
-                params.find<std::string>("experimental_retire_policy", "global_inorder");
-            ocfg.experimental_gcss_phase_breakdown_enable =
-                params.find<int>("experimental_gcss_phase_breakdown_enable", 0) != 0;
-            ocfg.experimental_retire_shadow_per_post_enable = false;
-            ocfg.experimental_gcss_vlf_queue_policy =
-                params.find<std::string>("experimental_gcss_vlf_queue_policy", "locality_first");
-            ocfg.experimental_gcss_vlf_fair_band_size =
-                params.find<uint32_t>("experimental_gcss_vlf_fair_band_size", 256);
-            const bool pulse_enable = params.find<int>("pulse_enable", 0) != 0;
-            const bool pulse_agenda_observe_only =
-                params.find<int>("pulse_agenda_observe_only", 1) != 0;
-            const bool pulse_descriptor_actual_enable =
-                params.find<int>("pulse_descriptor_actual_enable", 0) != 0;
-            ocfg.pulse_agenda_enable =
-                pulse_enable &&
-                (pulse_agenda_observe_only || pulse_descriptor_actual_enable);
-            ocfg.pulse_descriptor_actual_enable =
-                pulse_enable && pulse_descriptor_actual_enable;
-            ocfg.pulse_osa_metadata_txn_enable =
-                pulse_enable && (params.find<int>("pulse_osa_metadata_txn_enable", 0) != 0);
-            ocfg.pulse_osa_metadata_ready_lease_enable =
-                pulse_enable && (params.find<int>("pulse_osa_metadata_ready_lease_enable", 0) != 0);
-            const std::string pulse_osa_metadata_object_mask =
-                pulse_enable
-                    ? params.find<std::string>("pulse_osa_metadata_object_mask", "rowdescriptor")
-                    : "rowdescriptor";
-            ocfg.pulse_osa_metadata_object_mask =
-                pulse_enable
-                    ? parsePulseMetadataObjectMask_(
-                          pulse_osa_metadata_object_mask.empty() ? "rowdescriptor"
-                                                                 : pulse_osa_metadata_object_mask)
-                    : 0u;
-            ocfg.experimental_rowdescriptor_ready_join_dedup_enable =
-                ocfg.pulse_descriptor_actual_enable &&
-                (params.find<int>("experimental_rowdescriptor_ready_join_dedup_enable", 0) != 0);
-            ocfg.pulse_domain_retire_enable = false;
-            ocfg.pulse_domain_retire_observe_only = true;
-            ocfg.pulse_frontier_observe_enable =
-                pulse_enable && (params.find<int>("pulse_frontier_observe_enable", 0) != 0);
-            ocfg.pulse_frontier_top_lines =
-                std::max<uint32_t>(1u, params.find<uint32_t>("pulse_frontier_top_lines", 32));
-            ocfg.pulse_metadata_frontier_observe_enable =
-                pulse_enable && (params.find<int>("pulse_metadata_frontier_observe_enable", 0) != 0);
-            ocfg.pulse_metadata_frontier_top_items =
-                std::max<uint32_t>(1u, params.find<uint32_t>("pulse_metadata_frontier_top_items", 32));
-            ocfg.pulse_metadata_frontier_band_slots =
-                std::max<uint32_t>(1u, params.find<uint32_t>("pulse_metadata_frontier_band_slots", 128));
-            ocfg.pulse_mfb_preband_band_slots =
-                params.find<uint32_t>("pulse_mfb_preband_band_slots", 0u);
-            ocfg.pulse_metadata_seed_enable = false;
-            ocfg.pulse_metadata_seed_top_bases =
-                std::max<uint32_t>(1u, params.find<uint32_t>("pulse_metadata_seed_top_bases", 32));
-            ocfg.pulse_metadata_seed_window_budget =
-                params.find<uint32_t>("pulse_metadata_seed_window_budget", 0);
-            ocfg.pulse_mfb_preband_seed_enable = false;
-            ocfg.pulse_mfb_preband_top_bands =
-                std::max<uint32_t>(1u, params.find<uint32_t>("pulse_mfb_preband_top_bands", 32));
-            ocfg.pulse_mfb_preband_lines_per_band =
-                std::max<uint32_t>(1u, params.find<uint32_t>("pulse_mfb_preband_lines_per_band", 4));
-            ocfg.pulse_mfb_preband_window_budget =
-                params.find<uint32_t>("pulse_mfb_preband_window_budget", 0);
-            ocfg.pulse_mfb_gather_preband_enable = false;
-            ocfg.pulse_mfb_gather_barrier_enable = false;
-            ocfg.pulse_mfb_gather_top_bands =
-                std::max<uint32_t>(1u, params.find<uint32_t>("pulse_mfb_gather_top_bands", 32));
-            ocfg.pulse_mfb_gather_lines_per_band =
-                std::max<uint32_t>(1u, params.find<uint32_t>("pulse_mfb_gather_lines_per_band", 4));
-            ocfg.pulse_mfb_gather_window_budget =
-                params.find<uint32_t>("pulse_mfb_gather_window_budget", 0);
-            ocfg.pulse_mfb_gather_min_consumers =
-                std::max<uint32_t>(2u, params.find<uint32_t>("pulse_mfb_gather_min_consumers", 2));
-            ocfg.pulse_prebase_shared_lookup_enable =
-                pulse_enable &&
-                (params.find<int>("pulse_prebase_shared_lookup_enable", 0) != 0);
             ocfg.pe_internal_cpe_enable =
                 params.find<int>("pe_internal_cpe_enable", 0) != 0;
             ocfg.pe_internal_pod_enable =
@@ -2055,22 +1638,6 @@ void SnnPESubComponent::configureWeightReaderSubsystem_(const Params& params) {
                 ocfg.pe_internal_pod_id =
                     std::min<uint32_t>(ocfg.core_id / pod_size, pod_count - 1u);
             }
-            ocfg.pulse_domain_retire_mode =
-                params.find<std::string>("pulse_domain_retire_mode", "per_post");
-            std::transform(
-                ocfg.pulse_domain_retire_mode.begin(),
-                ocfg.pulse_domain_retire_mode.end(),
-                ocfg.pulse_domain_retire_mode.begin(),
-                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-            if (ocfg.pulse_domain_retire_mode != "descriptor_domain") {
-                ocfg.pulse_domain_retire_mode = "per_post";
-            }
-            ocfg.pulse_domain_retire_release_budget =
-                params.find<uint32_t>("pulse_domain_retire_release_budget", 0);
-            ocfg.experimental_pre_window_profile_export_enable =
-                params.find<int>("experimental_pre_window_profile_export_enable", 0) != 0;
-            ocfg.experimental_pre_window_profile_export_dir =
-                params.find<std::string>("experimental_pre_window_profile_export_dir", "");
             ocfg.bcsr_mgr = bcsr_weights_.get();
             mem->configureOrchestrator(std::move(ocfg));
             if (byte_exact_verify_enable_ && output_) {

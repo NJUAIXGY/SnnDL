@@ -64,7 +64,7 @@ inline bool workloadAllowsSnnStimulus(WorkloadKind k) {
 
 // Pure SNN datapath features stay reserved for the native `snn` workload. Experimental
 // control-plane workloads such as `riscv_snn` may share stimulus semantics without inheriting
-// DMA/local-storage/pulse infrastructure by accident.
+// DMA or local-storage infrastructure by accident.
 inline bool workloadAllowsPureSnnDatapathFeatures(WorkloadKind k) {
     return k == WorkloadKind::Snn;
 }

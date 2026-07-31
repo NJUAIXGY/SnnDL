@@ -73,9 +73,6 @@ public:
     uint64_t txCohortPacketsTotal() const { return tx_cohort_packets_total_; }
     uint64_t txCohortPresTotal() const { return tx_cohort_pres_total_; }
     uint64_t txCohortBandcolorSwitchTotal() const { return tx_cohort_bandcolor_switch_total_; }
-    uint64_t stormCohortPacketsTotal() const { return tx_cohort_packets_total_; }
-    uint64_t stormCohortPresTotal() const { return tx_cohort_pres_total_; }
-    uint64_t stormCohortBandcolorSwitchTotal() const { return tx_cohort_bandcolor_switch_total_; }
 
 private:
     void emitCommon_(uint32_t source_global, uint32_t source_local, uint64_t now_cycle);

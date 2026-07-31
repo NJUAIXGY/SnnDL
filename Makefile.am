@@ -31,7 +31,6 @@ libSnnDL_la_SOURCES = \
 	api/IMemoryAccess.h \
 	api/IDmaTaggedAccess.h \
 	api/IDmaSchedulerProvider.h \
-	api/IPeSharedCoreFabricProvider.h \
 	api/ILocalStorageProvider.h \
 	api/ICoreWorkload.h \
 	api/ISnnAccelRuntimeServices.h \
@@ -59,8 +58,6 @@ libSnnDL_la_SOURCES = \
 	components/GatherBufferIF.h \
 	components/gather/GatherBufferIFConfig.cc \
 	components/gather/GatherBufferIFConfig.h \
-	components/gather/apply/DramAwareModel.cc \
-	components/gather/apply/DramAwareModel.h \
 	components/GatingPE.cc \
 	components/GatingPE.h \
 	components/MemKCalBench.cc \
@@ -216,11 +213,6 @@ libSnnDL_la_SOURCES = \
 	research/local_storage/PeWeightObjectPlane.h \
 	platform/memory/DmaMemAccessProxy.cc \
 	platform/memory/DmaMemAccessProxy.h \
-	research/pe_fabric/PulseAgendaScorer.cc \
-	research/pe_fabric/PulseAgendaScorer.h \
-	research/pe_fabric/PulseDescriptor.h \
-	research/pe_fabric/PeSharedCoreFabric.cc \
-	research/pe_fabric/PeSharedCoreFabric.h \
 	platform/memory/PeDmaScheduler.cc \
 	platform/memory/PeDmaScheduler.h \
 	platform/memory/StandardMemAccess.cc \
@@ -294,8 +286,6 @@ test-riscv-snn-toolchain-firmware-protocol:
 
 test-compile:
 	$(CXXCOMPILE) -c $(srcdir)/tests/test_includes.cc -o $(builddir)/test_includes.o
-	$(CXXCOMPILE) -c $(srcdir)/tests/test_pe_internal_pod_shadow_gate.cc -o $(builddir)/test_pe_internal_pod_shadow_gate.o
-	$(CXXCOMPILE) -c $(srcdir)/tests/test_pe_internal_pod_shadow_wms_seam.cc -o $(builddir)/test_pe_internal_pod_shadow_wms_seam.o
 	$(CXXCOMPILE) -c $(srcdir)/tests/test_riscv_snn_abi.cc -o $(builddir)/test_riscv_snn_abi.o
 	$(CXXCOMPILE) -c $(srcdir)/tests/test_riscv_snn_backend_timing_contract.cc -o $(builddir)/test_riscv_snn_backend_timing_contract.o
 	$(CXXCOMPILE) -c $(srcdir)/tests/test_riscv_snn_boot_driver.cc -o $(builddir)/test_riscv_snn_boot_driver.o

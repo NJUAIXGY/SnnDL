@@ -91,7 +91,6 @@ class StreamWorkload;
     void processLocalSpike_(SpikeEvent* spike);
     bool expandPreGlobalToLocalSpikes_(uint32_t pre_global, uint64_t ts);
     const std::vector<uint32_t>* lookupPostsLocalForPre_(uint32_t pre_global);
-    bool resolvePreRankForPost_(uint32_t pre_global, uint32_t post_local, uint32_t& out_rank);
     bool expandPreGlobalToWindowEdgesFast_(uint32_t pre_global);
     bool isPreLocal_(uint32_t pre_global) const;
     uint32_t remapPreGlobalModulo_(uint32_t pre_global) const;

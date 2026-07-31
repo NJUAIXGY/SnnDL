@@ -1,5 +1,4 @@
 // GatherBufferIF.cc: GAS-aware StandardMem front-end with scratchpad buffering
-
 #include <sst/core/sst_config.h>
 #include "GatherBufferIF.h"
 
@@ -12,7 +11,6 @@
 #include <mutex>
 
 #include "gather/GatherBufferIFConfig.h"
-#include "components/gather/apply/DramCmdCostMergeModel.h"
 #include "SnnDLStringUtil.h"
 
 using namespace SST;
@@ -178,21 +176,12 @@ GatherBufferIF::GatherBufferIF(ComponentId_t id, Params& params, TimeConverter* 
     gap_merge_enable_ = cfg.gap_merge_enable;
     gap_k_bytes_ = cfg.gap_merge_k_bytes;
     burst_bytes_max_ = cfg.burst_bytes_max;
-    vlf_enable_ = cfg.vlf_enable;
-    vlf_run_enable_ = cfg.vlf_run_enable;
     bank_bits_ = cfg.bank_bits;
     bank_shift_ = cfg.bank_shift;
     bank_auto_enable_ = cfg.bank_auto_enable;
     bank_auto_min_banks_ = cfg.bank_auto_min_banks;
     bank_auto_max_banks_ = cfg.bank_auto_max_banks;
     apply_issue_policy_ = parseApplyIssuePolicy(cfg.apply_issue_policy);
-    dram_cmd_cost_merge_enable_ = cfg.dram_cmd_cost_merge_enable;
-    dram_cmd_t_row_hit_ns_ = cfg.dram_cmd_t_row_hit_ns;
-    dram_cmd_t_row_miss_ns_ = cfg.dram_cmd_t_row_miss_ns;
-    if (dram_cmd_t_row_hit_ns_ == 0) dram_cmd_t_row_hit_ns_ = 1;
-    if (dram_cmd_t_row_miss_ns_ < dram_cmd_t_row_hit_ns_) {
-        dram_cmd_t_row_miss_ns_ = dram_cmd_t_row_hit_ns_;
-    }
     apply_frags_per_issue_ = cfg.apply_frags_per_issue;
     apply_bank_credit_ = cfg.apply_bank_credit;
     apply_age_fair_ns_ = cfg.apply_age_fair_ns;
@@ -262,9 +251,6 @@ GatherBufferIF::GatherBufferIF(ComponentId_t id, Params& params, TimeConverter* 
     stat_gap_absorbed_bytes_ = registerStatistic<uint64_t>("gas_gap_absorbed_bytes");
     stat_row_window_triggers_ = registerStatistic<uint64_t>("gas_row_window_triggers");
     stat_row_window_bytes_    = registerStatistic<uint64_t>("gas_row_window_bytes");
-    stat_cmd_cost_veto_       = registerStatistic<uint64_t>("gas_cmd_cost_veto");
-    stat_cmd_cost_veto_fine_gap_ = registerStatistic<uint64_t>("gas_cmd_cost_veto_fine_gap");
-    stat_cmd_cost_veto_row_window_ = registerStatistic<uint64_t>("gas_cmd_cost_veto_row_window");
     // Segment diagnostics.
     stat_overfetch_bytes_     = registerStatistic<uint64_t>("gas_overfetch_bytes");
     stat_unique_line_count_   = registerStatistic<uint64_t>("gas_unique_line_count");
@@ -632,9 +618,9 @@ void GatherBufferIF::send(Request* req) {
             const bool allow_staging_in_apply = window_auto_;
             const bool take_staging_path =
                 defer_issue_until_apply_ &&
-                (gap_merge_enable_ || row_window_enable_ || vlf_enable_) &&
+                (gap_merge_enable_ || row_window_enable_) &&
                 (stage_ == Stage::Gather || (stage_ == Stage::Apply && allow_staging_in_apply));
-            if (defer_issue_until_apply_ && (gap_merge_enable_ || row_window_enable_ || vlf_enable_) &&
+            if (defer_issue_until_apply_ && (gap_merge_enable_ || row_window_enable_) &&
                 stage_ == Stage::Apply && !window_auto_) {
                 static bool warned_defer_apply_requires_clock = false;
                 if (!warned_defer_apply_requires_clock) {
@@ -1391,7 +1377,7 @@ void GatherBufferIF::maybeEnterApply_() {
     }
     if (defer_issue_until_apply_) {
         // If we staged reads (for gap-merge and/or row-window), build segments now.
-        if (gap_merge_enable_ || row_window_enable_ || vlf_enable_) {
+        if (gap_merge_enable_ || row_window_enable_) {
             buildGranulesWithGapMergeBuf_(apply_buf_index_);
         }
         // 排序（确定性）并“尽可能发射”：受 inflight 限制时，后续靠 ReadResp 回调持续补发，保证 forward progress。
@@ -1499,33 +1485,9 @@ void GatherBufferIF::buildGranulesWithGapMergeBuf_(int buf) {
     uint64_t gap_k_bytes_eff = gap_k_bytes_;
     uint64_t overfetch_budget_left = 0; // 0 => unlimited
 
-    // Experimental: DRAM command-cost guided gap-merge guardrail.
-    // This caps "k" to a deterministic threshold derived from DRAM hit/miss service costs,
-    // and is intended to prevent pathological over-fetch when logical rows are smaller than
-    // the physical DRAM row (e.g., dense weight rows).
-    const bool cmd_cost_merge = dram_cmd_cost_merge_enable_;
-    uint64_t cmd_cost_k_bytes = 0;
-    if (cmd_cost_merge) {
-        const auto base_ns = cmdCostNsForBank_(0);
-        cmd_cost_k_bytes = gather::apply::DramCmdCostMergeModel::deriveGapKBytes(
-            line_bytes,
-            static_cast<uint64_t>(base_ns.first),
-            static_cast<uint64_t>(base_ns.second));
-        if (gap_merge_enable_eff) {
-            if (gap_k_bytes_eff == 0) {
-                gap_k_bytes_eff = cmd_cost_k_bytes;
-            } else if (cmd_cost_k_bytes > 0) {
-                gap_k_bytes_eff = std::min<uint64_t>(gap_k_bytes_eff, cmd_cost_k_bytes);
-            }
-        }
-    }
-
-    // Per-window DRAM-aware counters (exported as statistics; only meaningful when dram_aware=1).
-    uint64_t win_overfetch_bytes = 0;
-    uint64_t win_covered_line_count = 0;
-    uint64_t win_cmd_cost_veto = 0;
-    uint64_t win_cmd_cost_veto_fine_gap = 0;
-    uint64_t win_cmd_cost_veto_row_window = 0;
+	    // Per-window merge counters.
+	    uint64_t win_overfetch_bytes = 0;
+	    uint64_t win_covered_line_count = 0;
 
     // Heuristic bank bits/shift detection if requested
     if (!bank_auto_done_ && bank_auto_enable_ && bank_bits_ == 0) {
@@ -1556,194 +1518,6 @@ void GatherBufferIF::buildGranulesWithGapMergeBuf_(int buf) {
             if (best_bits != 0) { bank_bits_ = best_bits; bank_shift_ = best_shift; }
             bank_auto_done_ = true;
         }
-    }
-
-    // === Experimental: Value-Line Fusion (VLF) ===
-    //
-    // Motivation:
-    // - GCSS value-only paths often issue many small (e.g., 4B) reads.
-    // - The existing staged segment builder can absorb byte-gaps (gap_merge / row_window),
-    //   which may create large "holes" and inflate covered cachelines (overfetch) dramatically.
-    // - VLF aligns each staged read to cacheline boundaries and only fuses overlapping spans
-    //   (and optionally adjacent spans when vlf_run_enable_=1). It never absorbs holes.
-    if (vlf_enable_) {
-        struct VlfReq {
-            uint64_t base;   // cacheline-aligned base (inclusive)
-            uint64_t end;    // cacheline-aligned end (exclusive)
-            uint64_t addr;   // original request addr
-            uint32_t size;   // original request size
-            uint64_t arr_ns; // arrival time (ns), best-effort
-            Request::id_t up_id;
-        };
-        auto alignUp = [](uint64_t x, uint64_t a) -> uint64_t {
-            if (a == 0) return x;
-            return ((x + a - 1u) / a) * a;
-        };
-
-        // Group by (bank,rowIndex) using aligned base; keep consistent with legacy ordering knobs.
-        std::unordered_map<uint64_t, std::vector<VlfReq>> groups;
-        size_t estimated_groups = staged_reads.size() / 8;
-        if (estimated_groups < 8) estimated_groups = 8;
-        groups.reserve(estimated_groups);
-
-        for (auto* rd : staged_reads) {
-            const uint64_t addr = rd->pAddr;
-            const uint32_t sz = static_cast<uint32_t>(rd->size);
-            const uint64_t base = alignDown(addr, line_bytes);
-            const uint64_t end = alignUp(addr + (uint64_t)sz, line_bytes);
-            const uint64_t key = (bank_bits_ ? (bankIndex(base) << 32) : 0ull) | (uint32_t)rowIndex(base);
-            uint64_t arr = 0;
-            auto itst = staged_arrival_ns.find(rd->getID());
-            if (itst != staged_arrival_ns.end()) arr = itst->second;
-            auto& vec = groups[key];
-            if (vec.empty()) vec.reserve(8);
-            vec.push_back({base, end, addr, sz, arr, rd->getID()});
-        }
-
-        // Per-window counters for evidence (same meaning as legacy).
-        win_overfetch_bytes = 0;
-        win_covered_line_count = 0;
-
-        for (auto& kv : groups) {
-            auto& vec = kv.second;
-            std::sort(vec.begin(), vec.end(),
-                      [](const VlfReq& a, const VlfReq& b){
-                          if (a.base != b.base) return a.base < b.base;
-                          if (a.end != b.end) return a.end < b.end;
-                          if (a.addr != b.addr) return a.addr < b.addr;
-                          return a.up_id < b.up_id;
-                      });
-
-            uint64_t cur_base = 0, cur_end = 0;
-            bool has = false;
-            uint64_t seg_sum_bytes = 0;
-            uint64_t seg_start_ns = 0;
-            std::vector<VlfReq> segSubs;
-            segSubs.reserve(vec.size() / 2 + 2);
-
-            auto flush_segment = [&]() {
-                if (!has) return;
-                const uint64_t base = cur_base;
-                const uint64_t sz_u64 = (cur_end >= cur_base) ? (cur_end - cur_base) : 0;
-                if (sz_u64 == 0) { segSubs.clear(); has = false; seg_sum_bytes = 0; seg_start_ns = 0; return; }
-                if (sz_u64 > 0xffffffffull) {
-                    out_.fatal(CALL_INFO, -1,
-                               "GatherBufferIF VLF fatal: segment too large (base=0x%llx sz=%" PRIu64 ")\n",
-                               (unsigned long long)base, (uint64_t)sz_u64);
-                }
-                const uint32_t sz = static_cast<uint32_t>(sz_u64);
-
-                // Issue-size accounting (cacheline-aligned, no holes).
-                if ((uint64_t)sz > seg_sum_bytes) win_overfetch_bytes += ((uint64_t)sz - seg_sum_bytes);
-                win_covered_line_count += (((uint64_t)sz + line_bytes - 1) / line_bytes);
-
-                GranuleKey gkey = makeGranuleKey_(base, sz);
-                if (diag_granule_build_logged_ < 64) {
-                    out_.verbose(CALL_INFO, 2, 0,
-                        "[diag-gbi-vlf-granule] node=%u core=%u buf=%d base=0x%llx size=%u subs=%zu\n",
-                        node_id_param_, core_id_param_, buf,
-                        (unsigned long long)base,
-                        sz, segSubs.size());
-                    ++diag_granule_build_logged_;
-                }
-                const bool granule_exists = (S.granules.find(gkey) != S.granules.end());
-                auto& g = ensureGranule_(buf, gkey);
-                if (!granule_exists) ++frontend_granules_built_count;
-                if (seg_start_ns != 0) {
-                    if (g.min_arrival_ns == 0 || seg_start_ns < g.min_arrival_ns) g.min_arrival_ns = seg_start_ns;
-                }
-                g.subs.reserve(g.subs.size() + segSubs.size());
-                for (auto& it : segSubs) {
-                    const uint64_t off_u64 = (it.addr >= base) ? (it.addr - base) : 0;
-                    if (off_u64 + (uint64_t)it.size > (uint64_t)sz) {
-                        out_.fatal(CALL_INFO, -1,
-                                   "GatherBufferIF VLF fatal: sub-read out of segment bounds (base=0x%llx sz=%u addr=0x%llx size=%u off=%" PRIu64 ")\n",
-                                   (unsigned long long)base, (unsigned)sz,
-                                   (unsigned long long)it.addr, (unsigned)it.size, (uint64_t)off_u64);
-                    }
-                    g.subs.push_back({it.up_id, (uint32_t)off_u64, it.size});
-                    g.payload_bytes += (uint64_t)it.size;
-                }
-
-                // Optional: export granule size samples (kept consistent with legacy path).
-                if (!export_granules_csv_.empty()) {
-                    exportGranuleRow_(seg_start_ns, (uint32_t)sz);
-                }
-
-                // Upstream aggregation: report per-segment metrics (bursts/payload).
-                if (upstream_handler_) {
-                    const uint64_t bursts = 1;
-                    const uint64_t payload = seg_sum_bytes;
-                    auto* s = new GasStatData((uint32_t)current_gather_id_, 0, 0, /*rwt=*/0, /*rwb=*/0, bursts, payload);
-                    auto* cr = new StandardMem::CustomResp((StandardMem::Request::id_t)0, s, 0, 0, 0);
-                    (*upstream_handler_)(cr);
-                }
-
-                segSubs.clear();
-                has = false;
-                seg_sum_bytes = 0;
-                seg_start_ns = 0;
-            };
-
-            for (auto& it : vec) {
-                const uint64_t a = it.base;
-                const uint64_t b = it.end;
-                if (!has) {
-                    cur_base = a; cur_end = b; has = true;
-                    seg_sum_bytes = it.size;
-                    segSubs.clear(); segSubs.push_back(it);
-                    seg_start_ns = it.arr_ns;
-                    continue;
-                }
-
-                const bool overlap = (a < cur_end);
-                const bool adjacent = (a == cur_end);
-                const bool can_adj_merge = adjacent && vlf_run_enable_;
-                const uint64_t new_end = (b > cur_end) ? b : cur_end;
-                const uint64_t new_len = (new_end >= cur_base) ? (new_end - cur_base) : 0;
-
-                if (overlap || can_adj_merge) {
-                    // Bound run length by burst_bytes_max_ (reuse existing Lmax knob).
-                    if (burst_bytes_max_ == 0 || new_len <= burst_bytes_max_) {
-                        cur_end = new_end;
-                        segSubs.push_back(it);
-                        seg_sum_bytes += it.size;
-                        if (it.arr_ns > 0 && (seg_start_ns == 0 || it.arr_ns < seg_start_ns)) seg_start_ns = it.arr_ns;
-                        continue;
-                    }
-                }
-
-                // Gap or run too large: flush and start a new segment.
-                flush_segment();
-                cur_base = a; cur_end = b; has = true;
-                segSubs.clear(); segSubs.push_back(it);
-                seg_sum_bytes = it.size;
-                seg_start_ns = it.arr_ns;
-            }
-            flush_segment();
-        }
-
-        // Surface VLF window-level metrics to PE stats sink (align with legacy semantics).
-        if (upstream_handler_) {
-            auto* s = new GasStatData((uint32_t)current_gather_id_, 0, 0, 0, 0, 0, 0, 0, 0,
-                                      /*gap_abs=*/0,
-                                      frontend_staged_reads_count,
-                                      frontend_staged_line_touches,
-                                      frontend_granules_built_count,
-                                      unique_line_count,
-                                      win_covered_line_count,
-                                      win_overfetch_bytes,
-                                      /*apply_credit_eff=*/0,
-                                      /*cmd_veto=*/0,
-                                      /*cmd_veto_fine=*/0,
-                                      /*cmd_veto_rowwin=*/0);
-            auto* cr = new StandardMem::CustomResp((StandardMem::Request::id_t)0, s, 0, 0, 0);
-            (*upstream_handler_)(cr);
-        }
-        if (stat_unique_line_count_) stat_unique_line_count_->addData(unique_line_count);
-        if (stat_covered_line_count_) stat_covered_line_count_->addData(win_covered_line_count);
-        if (stat_overfetch_bytes_) stat_overfetch_bytes_->addData(win_overfetch_bytes);
-        return;
     }
 
     // Group by (bank,rowIndex)
@@ -1782,9 +1556,7 @@ void GatherBufferIF::buildGranulesWithGapMergeBuf_(int buf) {
             group_bank_idx = bank_bits_ ? static_cast<uint32_t>(kv.first >> 32)
                                         : static_cast<uint32_t>(bankIndex(vec.front().addr));
         }
-        const auto cmd_cost_ns = cmdCostNsForBank_(group_bank_idx);
-        const uint64_t cmd_hit_ns = cmd_cost_ns.first;
-        const uint64_t cmd_miss_ns = cmd_cost_ns.second;
+	        (void)group_bank_idx;
         uint64_t cur_base = 0, cur_end = 0; bool has=false;
         uint64_t seg_sum_bytes = 0;      // sum of sub-read sizes in current segment
         bool seg_used_row_window = false; // whether coarse row-window absorption was used
@@ -1861,19 +1633,8 @@ void GatherBufferIF::buildGranulesWithGapMergeBuf_(int buf) {
                 uint64_t new_len = (b - cur_base);
                 bool absorbed = false;
                 if (gap_merge_enable_eff && gap_k_bytes_eff>0 && gap <= gap_k_bytes_eff && new_len <= burst_bytes_max_) {
-                    bool cmd_allow_absorb = true;
-                    if (cmd_cost_merge) {
-                        cmd_allow_absorb = gather::apply::DramCmdCostMergeModel::allowAbsorbGap(
-                            gap, line_bytes, cmd_hit_ns, cmd_miss_ns);
-                        if (!cmd_allow_absorb) {
-                            if (stat_cmd_cost_veto_) stat_cmd_cost_veto_->addData(1);
-                            if (stat_cmd_cost_veto_fine_gap_) stat_cmd_cost_veto_fine_gap_->addData(1);
-                            win_cmd_cost_veto += 1;
-                            win_cmd_cost_veto_fine_gap += 1;
-                        }
-                    }
-                    // absorb gap (optional budget guard)
-                    if (cmd_allow_absorb && (overfetch_budget_left == 0 || gap <= overfetch_budget_left)) {
+	                    // absorb gap (optional budget guard)
+	                    if (overfetch_budget_left == 0 || gap <= overfetch_budget_left) {
                         cur_end = b;
                         gap_abs_sum += gap;
                         if (overfetch_budget_left > 0) overfetch_budget_left -= gap;
@@ -1896,18 +1657,7 @@ void GatherBufferIF::buildGranulesWithGapMergeBuf_(int buf) {
                 if (!absorbed && row_window_enable_ && row_window_bytes_>0) {
                     uint64_t tentative_sum = seg_sum_bytes + it.size;
                     if (tentative_sum <= row_window_bytes_ && new_len <= burst_bytes_max_) {
-                        bool cmd_allow_absorb = true;
-                        if (cmd_cost_merge) {
-                            cmd_allow_absorb = gather::apply::DramCmdCostMergeModel::allowAbsorbGap(
-                                gap, line_bytes, cmd_hit_ns, cmd_miss_ns);
-                            if (!cmd_allow_absorb) {
-                                if (stat_cmd_cost_veto_) stat_cmd_cost_veto_->addData(1);
-                                if (stat_cmd_cost_veto_row_window_) stat_cmd_cost_veto_row_window_->addData(1);
-                                win_cmd_cost_veto += 1;
-                                win_cmd_cost_veto_row_window += 1;
-                            }
-                        }
-                        if (cmd_allow_absorb) {
+	                        {
                             // absorb regardless of gap size (optional budget guard)
                             if (overfetch_budget_left == 0 || gap <= overfetch_budget_left) {
                                 cur_end = b;
@@ -1934,9 +1684,8 @@ void GatherBufferIF::buildGranulesWithGapMergeBuf_(int buf) {
     if (stat_gap_absorbed_bytes_ && gap_abs_sum) stat_gap_absorbed_bytes_->addData(gap_abs_sum);
     // Surface window-level merge diagnostics to the PE-level stats sink (SnnPESubComponent) via CustomResp,
     // because GatherBufferIF is instantiated during init() and cannot reliably emit CSV stats itself.
-    if ((gap_abs_sum || frontend_staged_reads_count || frontend_staged_line_touches || frontend_granules_built_count ||
-         unique_line_count || win_covered_line_count || win_overfetch_bytes ||
-         win_cmd_cost_veto || win_cmd_cost_veto_fine_gap || win_cmd_cost_veto_row_window) &&
+	    if ((gap_abs_sum || frontend_staged_reads_count || frontend_staged_line_touches || frontend_granules_built_count ||
+	         unique_line_count || win_covered_line_count || win_overfetch_bytes) &&
         upstream_handler_) {
         auto* s = new GasStatData((uint32_t)current_gather_id_, 0, 0, 0, 0, 0, 0, 0, 0,
                                   gap_abs_sum,
@@ -1945,11 +1694,7 @@ void GatherBufferIF::buildGranulesWithGapMergeBuf_(int buf) {
                                   frontend_granules_built_count,
                                   unique_line_count,
                                   win_covered_line_count,
-                                  win_overfetch_bytes,
-                                  0,
-                                  win_cmd_cost_veto,
-                                  win_cmd_cost_veto_fine_gap,
-                                  win_cmd_cost_veto_row_window);
+	                                  win_overfetch_bytes);
         auto* cr = new StandardMem::CustomResp((StandardMem::Request::id_t)0, s, 0, 0, 0);
         (*upstream_handler_)(cr);
     }
@@ -2411,7 +2156,7 @@ bool GatherBufferIF::clockTick(Cycle_t) {
         // Drain staged reads (collected during Gather/Apply) into merged granules, then issue.
         // This is required for row-window/gap-merge validation in dense microbench where reads
         // are often triggered at BeginApply.
-        if (defer_issue_until_apply_ && (gap_merge_enable_ || row_window_enable_ || vlf_enable_) && !sb_[apply_buf_index_].staging_reads.empty()) {
+        if (defer_issue_until_apply_ && (gap_merge_enable_ || row_window_enable_) && !sb_[apply_buf_index_].staging_reads.empty()) {
             buildGranulesWithGapMergeBuf_(apply_buf_index_);
             sb_[apply_buf_index_].issue_order_dirty = true;
             rebuildIssueOrder_(apply_buf_index_);
@@ -2845,13 +2590,6 @@ std::vector<uint64_t> GatherBufferIF::parseCsvU64_(const std::string& s) {
     if (!num.empty()) v.push_back((uint64_t)std::stoull(num));
     if (v.empty()) v.push_back(0);
     return v;
-}
-
-std::pair<uint64_t, uint64_t> GatherBufferIF::cmdCostNsForBank_(uint32_t bank_idx) const {
-    (void)bank_idx;
-    uint64_t hit_ns = std::max<uint64_t>(1ull, static_cast<uint64_t>(dram_cmd_t_row_hit_ns_));
-    uint64_t miss_ns = std::max<uint64_t>(hit_ns, static_cast<uint64_t>(dram_cmd_t_row_miss_ns_));
-    return {hit_ns, miss_ns};
 }
 
 bool GatherBufferIF::diagEnabled_(int level) const {

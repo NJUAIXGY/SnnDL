@@ -46,13 +46,6 @@ struct GatherBufferIFConfig {
     uint64_t gap_merge_k_bytes = 0;
     uint64_t burst_bytes_max = 64 * 1024;
 
-    // Experimental: GCSS value-line fusion (VLF).
-    // When enabled, staged reads are fused at cacheline granularity without absorbing "holes"
-    // (i.e., no byte-gap fill / no row-window coarse merge). This targets pathological
-    // read amplification observed in GCSS value-only paths.
-    bool vlf_enable = false;
-    // Optional: merge adjacent cachelines into contiguous runs (still no holes).
-    bool vlf_run_enable = false;
 
     // Bank/row ordering
     uint32_t bank_bits = 0;
@@ -139,13 +132,7 @@ struct GatherBufferIFConfig {
     std::string ctrl_rowwin_list = "0,16384,32768,65536";
     std::string ctrl_timeout_list = "0,300,600";
 
-    // Experimental: DRAM command-cost guided gap-merge/row-pack decisions during segment build.
-    // This is intentionally isolated from baseline GAS semantics and must be explicitly enabled.
-    bool dram_cmd_cost_merge_enable = false;
-    uint32_t dram_cmd_t_row_hit_ns = 30;
-    uint32_t dram_cmd_t_row_miss_ns = 120;
-
-    // Granule/window metrics export
+	    // Granule/window metrics export
     std::string export_granules_csv;
     uint32_t node_id = 0;
     uint32_t core_id = static_cast<uint32_t>(-1);

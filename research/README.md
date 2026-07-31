@@ -7,8 +7,10 @@
 - `gas/`：实验性 GAS credit 与预测策略。
 - `local_storage/`：PE/Pod 本地对象、shadow gate 和共享元数据。
 - `noc3d/`：3D NoC、HBM stack stub 与原生多播实验组件。
-- `pe_fabric/`：PE 内共享 fabric、pulse agenda 和 descriptor 机制。
 - `route3d/`：3D 路由映射与突触路由扩展。
+
+已移出主线的 PE shared-fabric、agenda 和 descriptor 实验保留在
+`archive/legacy_optimizations/research/pe_fabric/`，不参与当前构建。
 
 ## 稳定性边界
 

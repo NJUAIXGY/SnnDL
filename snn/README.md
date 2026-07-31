@@ -5,7 +5,7 @@
 ## 子域
 
 - `compute/`：神经动力学、学习核心和 `ISnnComputeCore` 实现。
-- `synapse/`：权重、BCSR/GCSS、路由、Spike 通信和 GAS 数据结构。
+- `synapse/`：权重、BCSR、路由、Spike 通信和 GAS 数据结构。
 - `stimulus/`：Step 与外部 spike 注入。
 - `profiling/`：SNN 专属 profiling 辅助。
 

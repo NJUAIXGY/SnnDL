@@ -40,8 +40,6 @@ GatherBufferIFConfig parseGatherBufferIFConfig(const SST::Params& params) {
     c.gap_merge_k_bytes = params.find<uint64_t>("gap_merge_k_bytes", 0);
     c.burst_bytes_max = params.find<uint64_t>("burst_bytes_max", 64 * 1024);
 
-    c.vlf_enable = params.find<int>("vlf_enable", 0) != 0;
-    c.vlf_run_enable = params.find<int>("vlf_run_enable", 0) != 0;
 
     c.bank_bits = params.find<uint32_t>("bank_bits", 0);
     c.bank_shift = params.find<uint32_t>("bank_shift", 0);
@@ -123,11 +121,7 @@ GatherBufferIFConfig parseGatherBufferIFConfig(const SST::Params& params) {
     c.ctrl_rowwin_list = params.find<std::string>("ctrl_rowwin_list", "0,16384,32768,65536");
     c.ctrl_timeout_list = params.find<std::string>("ctrl_timeout_list", "0,300,600");
 
-    c.dram_cmd_cost_merge_enable = params.find<int>("dram_cmd_cost_merge_enable", 0) != 0;
-    c.dram_cmd_t_row_hit_ns = params.find<uint32_t>("dram_cmd_t_row_hit_ns", 30);
-    c.dram_cmd_t_row_miss_ns = params.find<uint32_t>("dram_cmd_t_row_miss_ns", 120);
-
-    c.export_granules_csv = params.find<std::string>("export_granules_csv", "");
+	    c.export_granules_csv = params.find<std::string>("export_granules_csv", "");
     c.node_id = params.find<uint32_t>("node_id", 0);
     c.core_id = params.find<uint32_t>("core_id", static_cast<uint32_t>(-1));
     c.export_window_metrics_csv = params.find<std::string>("export_window_metrics_csv", "");

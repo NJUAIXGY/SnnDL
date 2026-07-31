@@ -195,28 +195,6 @@ public:
         {"bcsr_blockdata_row_stride_bytes", "BCSR rowpack_v1: row stride bytes for blockdata region (0=unused in flat)", "0"},
         {"bcsr_blockids_row_stride_bytes", "BCSR rowpack_v1: row stride bytes for blockids region (optional)", "0"},
         {"bcsr_block_fetch_mode", "BCSR blockdata fetch mode: full_block (default) | row_cacheline", "full_block"},
-        {"experimental_noc_rowidx_prefetch_enable", "Experimental STORM-PIF: prefetch BCSR row-index metadata from Gather touches (0/1)", "0"},
-        {"experimental_noc_rowidx_prefetch_budget_per_tick", "Experimental STORM-PIF: max prefetched block_rows per tick", "4"},
-        {"experimental_noc_rowidx_cache_rows", "Experimental STORM-PIF: max cached BCSR row-index rows (0=unlimited)", "1024"},
-        {"experimental_noc_rowidx_prefetch_gather_only", "Experimental STORM-PIF: only prefetch when not in Apply window (0/1)", "1"},
-        {"experimental_noc_rowidx_prefetch_carry_to_apply_enable", "Experimental STORM-PIF: retain Gather-enqueued rowidx frontier and start detached draining in BeginApply using the current window_seq (0/1)", "0"},
-        {"experimental_noc_rowidx_hot_touch_min", "Experimental STORM-PIF v8: min touches per block_row before enqueueing prefetch", "1"},
-        {"experimental_noc_rowidx_budget_adapt_enable", "Experimental STORM-PIF v8: enable queue/headroom adaptive prefetch budget (0/1)", "0"},
-        {"experimental_noc_rowidx_budget_adapt_max_per_tick", "Experimental STORM-PIF v8: adaptive budget upper bound per tick", "32"},
-        {"experimental_noc_rowidx_budget_adapt_q_depth", "Experimental STORM-PIF v8: queue depth target used for adaptive budget scaling", "16"},
-        {"experimental_idx2_ingress_prefetch_enable", "Experimental STORM-NIP: prefetch idx2 value lines from Gather ingress touches (0/1)", "0"},
-        {"experimental_idx2_ingress_prefetch_budget_per_tick", "Experimental STORM-NIP: base prefetch issue budget per tick", "4"},
-        {"experimental_idx2_ingress_prefetch_cache_entries", "Experimental STORM-NIP: max resident idx2 prefetched values in the private L0 cache", "4096"},
-        {"experimental_idx2_ingress_prefetch_max_inflight", "Experimental STORM-NIP: per-core inflight cap for idx2 ingress prefetch (0=auto)", "0"},
-        {"experimental_idx2_ingress_prefetch_gather_only", "Experimental STORM-NIP: restrict idx2 prefetch to Gather-only windows (0/1)", "1"},
-        {"experimental_idx2_ingress_prefetch_carry_to_apply_enable", "Experimental STORM-NIP: retain Gather-enqueued idx2 pending work and continue draining into Apply while still blocking new Apply-stage touches (0/1)", "0"},
-        {"experimental_idx2_ingress_prefetch_apply_max_inflight", "Experimental STORM-NIP: Apply-carry inflight cap for retained idx2 prefetches (0=inherit gather cap)", "0"},
-        {"experimental_idx2_ingress_prefetch_apply_outstanding_reserve", "Experimental STORM-NIP: reserve this many outstanding slots for non-prefetch demand when carry-to-apply is enabled", "0"},
-        {"experimental_idx2_ingress_prefetch_apply_frontier_keep_pending", "Experimental STORM-NIP: at BeginApply keep only this many retained pending idx2 prefetches after touch-rank frontier reordering (0=disable)", "0"},
-        {"experimental_idx2_ingress_tail_guard_enable", "Experimental STORM-NIP: drop tail completions that have no waiters in gather-only mode (0/1)", "0"},
-        {"experimental_idx2_ingress_budget_adapt_enable", "Experimental STORM-NIP: enable queue/headroom adaptive prefetch budget (0/1)", "0"},
-        {"experimental_idx2_ingress_budget_adapt_max_per_tick", "Experimental STORM-NIP: adaptive budget upper bound per tick", "32"},
-        {"experimental_idx2_ingress_budget_adapt_q_depth", "Experimental STORM-NIP: queue depth target used for adaptive budget scaling", "16"},
         {"weights_cols", "Number of columns in weight matrix when using global read (post_row_pre_col)", "0"},
         {"index_mode", "Indexing mode: pre_row_post_col (default) or post_row_pre_col", "pre_row_post_col"},
         {"use_soa_neuron_state", "Use Structure-of-Arrays layout for neuron state (0=AoS,1=SoA)", "0"},
@@ -260,8 +238,7 @@ public:
         {"route_layers_mask", "Allowed layer transitions, e.g. I>H1,H1>H2,H2>O", ""},
         {"route_filter_warn", "Print prominent warning when route filters are enabled (0/1)", "1"},
         {"readresp_zero_fallback", "When DRAM returns 0 for weight, fallback to init_default_weight (0/1)", "0"},
-        {"synapse_weight_mode", "Synapse weight sourcing mode: bcsr_gas | gcss_valueonly_dstcore | gcss_valueonly_dstcore_idx2 | gcss_idx2_rowmphf | gcss_valueonly_dstcore_vlf_premphf | gcss_valueonly_dstcore_vlf_premphf_plp", "bcsr_gas"},
-        {"gcss_index_template", "Template for per-core GCSS index files, e.g. .../pe{pe:02d}/core{core:02d}.gcss.idx.bin", ""},
+        {"synapse_weight_mode", "Synapse weight sourcing mode (fixed): bcsr_gas", "bcsr_gas"},
         {"weight_sram_model_enable", "Observe-only weight SRAM model master enable (0/1)", "0"},
         {"weight_idx_sram_enable", "Observe-only weight index SRAM enable (0/1)", "0"},
         {"weight_l0_sram_enable", "Observe-only weight L0 SRAM enable (0/1)", "0"},
@@ -320,25 +297,7 @@ public:
         {"window_read_budget", "Max number of (pre,post) single-col reads per window", "1024"},
         {"scatter_diag_limit", "Limit scatter diagnostic logs when window_read_debug=1 (0=disable)", "0"},
         // 安全保护：限制单窗边集合容量，防止极端随机发放导致内存增长
-        {"edge_collector_max_capacity", "Max edges per window before overflow protection", "1000000"},
-        // Experimental retire policy in WeightMemorySubsystem (default keeps historical behavior).
-        {"experimental_retire_policy", "Retire policy: global_inorder | per_post", "global_inorder"},
-        {"experimental_gcss_phase_breakdown_enable", "Experimental observability: enable GCSS HOL phase breakdown counters (0/1)", "0"},
-        {"experimental_retire_shadow_per_post_enable", "Experimental observability: shadow per-post retire attribution in global_inorder mode (0/1)", "0"},
-        {"experimental_gcss_vlf_queue_policy", "Experimental GCSS-VLF queue policy: locality_first | banded_line_fair", "locality_first"},
-        {"experimental_gcss_vlf_fair_band_size", "Experimental GCSS-VLF fairness: retire-order edges per age band when queue_policy=banded_line_fair", "256"},
-        {"pulse_mfb_gather_preband_enable", "Experimental PULSE-MFB gather-preband barrier enable (0/1)", "0"},
-        {"pulse_mfb_gather_barrier_enable", "Experimental PULSE-MFB gather-preband PE barrier enable (0/1)", "0"},
-        {"pulse_mfb_gather_top_bands", "Experimental PULSE-MFB gather-preband top bands per window", "32"},
-        {"pulse_mfb_gather_lines_per_band", "Experimental PULSE-MFB gather-preband selected lines per band", "4"},
-        {"pulse_mfb_gather_window_budget", "Experimental PULSE-MFB gather-preband owner launch budget per window (0=unbounded)", "0"},
-        {"pulse_mfb_gather_min_consumers", "Experimental PULSE-MFB gather-preband minimum distinct consumer cores required before launching owner-first seed", "2"},
-        {"pulse_osa_metadata_txn_enable", "Enable PULSE-OSA metadata transaction seam (experimental, default off)", "0"},
-        {"pulse_osa_metadata_ready_lease_enable", "Enable PULSE-OSA metadata ready lease (experimental, default off)", "0"},
-        {"pulse_osa_metadata_ready_lease_ttl", "PULSE-OSA metadata ready lease TTL in cycles (0=disabled)", "0"},
-        {"pulse_osa_metadata_object_mask", "PULSE-OSA metadata object mask: rowdescriptor/rowidx/idx2/preband/all", "rowdescriptor"},
-        {"experimental_pre_window_profile_export_enable", "Experimental GCSS-PLP: export per-window pre first-touch profile (0/1)", "0"},
-        {"experimental_pre_window_profile_export_dir", "Experimental GCSS-PLP: output directory for per-core pre-window profile CSVs", ""}
+        {"edge_collector_max_capacity", "Max edges per window before overflow protection", "1000000"}
     )
 
     SST_ELI_DOCUMENT_STATISTICS(
@@ -376,117 +335,6 @@ public:
         {"gas_row_window_bytes_total", "Total bytes issued by row-window bursts (including holes)", "bytes", 1},
         {"gas_bursts_total", "Total number of bursts (segments) built by GAS", "count", 1},
         {"gas_payload_bytes_total", "Total useful payload bytes requested upstream (sum of sub-reads)", "bytes", 1},
-        {"gas_gap_absorbed_bytes_total", "Total gap bytes absorbed by fine-grained gap-merge", "bytes", 1},
-        {"exp_noc_rowidx_prefetch_rows_total", "Experimental STORM-PIF: number of BCSR row-index rows prefetched", "rows", 1},
-        {"exp_noc_rowidx_prefetch_bytes_total", "Experimental STORM-PIF: bytes issued for BCSR row-index prefetch", "bytes", 1},
-        {"exp_noc_rowidx_prefetch_rows_deferred_total", "Experimental STORM-PIF: row-index prefetch rows deferred by inflight pressure", "rows", 1},
-        {"exp_noc_rowidx_prefetch_rows_failed_total", "Experimental STORM-PIF: row-index prefetch rows that failed to issue", "rows", 1},
-        {"exp_noc_rowidx_cache_hits_total", "Experimental STORM-PIF: row-index cache hits on BCSR requests", "hits", 1},
-        {"exp_noc_rowidx_cache_misses_total", "Experimental STORM-PIF: row-index cache misses on BCSR requests", "misses", 1},
-        {"exp_noc_rowidx_cache_fills_total", "Experimental STORM-PIF: row-index cache fill operations", "fills", 1},
-        {"exp_noc_rowidx_cache_full_drop_total", "Experimental STORM-PIF: row-index cache insert drops due to capacity limit", "drops", 1},
-        {"exp_noc_rowidx_cache_entries_final", "Experimental STORM-PIF: final row-index cache entries at finish", "entries", 1},
-        {"exp_noc_rowidx_touch_rows_total", "Experimental STORM-PIF: unique touched block_rows enqueued from Gather", "rows", 1},
-        {"exp_noc_rowidx_touch_events_total", "Experimental STORM-PIF v8: total Gather touch events observed", "events", 1},
-        {"exp_noc_rowidx_rows_filtered_cold_total", "Experimental STORM-PIF v8: touches filtered by hot_touch_min threshold", "events", 1},
-        {"exp_noc_rowidx_carry_apply_pending_rows_total", "Experimental STORM-PIF v8: pending Gather-carried rowindex rows visible at BeginApply", "rows", 1},
-        {"exp_noc_rowidx_drain_skip_phase_gather_total", "Experimental STORM-PIF v8: drain ticks skipped because carry-to-apply blocks Gather-stage draining", "ticks", 1},
-        {"exp_noc_rowidx_drain_skip_phase_apply_disabled_total", "Experimental STORM-PIF v8: drain ticks skipped because gather-only mode disables Apply-stage draining", "ticks", 1},
-        {"exp_noc_rowidx_drain_skip_no_pending_total", "Experimental STORM-PIF v8: drain ticks skipped because no pending rowindex frontier remained", "ticks", 1},
-        {"exp_noc_rowidx_drain_skip_loader_not_ready_total", "Experimental STORM-PIF v8: drain ticks skipped because loader was not ready", "ticks", 1},
-        {"exp_noc_rowidx_drain_skip_rowptr_not_ready_total", "Experimental STORM-PIF v8: drain ticks skipped because BCSR rowptr was not ready", "ticks", 1},
-        {"exp_noc_rowidx_drain_skip_budget_zero_total", "Experimental STORM-PIF v8: drain attempts blocked after scheduling budget resolved to zero", "ticks", 1},
-        {"exp_noc_rowidx_drain_skip_cache_hit_total", "Experimental STORM-PIF v8: pending frontier rows skipped because rowindex cache was already hot", "rows", 1},
-        {"exp_noc_rowidx_drain_skip_detached_inflight_total", "Experimental STORM-PIF v8: pending frontier rows skipped because a detached rowindex prefetch was already inflight", "rows", 1},
-        {"exp_noc_rowidx_drain_skip_colidx_inflight_total", "Experimental STORM-PIF v8: pending frontier rows skipped because a window-scoped colidx inflight entry already existed", "rows", 1},
-        {"exp_noc_rowidx_drain_skip_empty_row_total", "Experimental STORM-PIF v8: pending frontier rows skipped because rowBounds was empty/invalid", "rows", 1},
-        {"exp_noc_rowidx_budget_ticks_total", "Experimental STORM-PIF v8: ticks where prefetch budget was computed", "ticks", 1},
-        {"exp_noc_rowidx_budget_effective_total", "Experimental STORM-PIF v8: effective prefetch budget consumed by scheduler", "rows", 1},
-        {"exp_noc_rowidx_budget_adapt_ticks_total", "Experimental STORM-PIF v8: ticks where adaptive budget deviated from base budget", "ticks", 1},
-        {"exp_noc_rowidx_detached_demand_join_total", "Experimental STORM-PIF v8: demand requests that joined a detached rowindex prefetch already in flight", "joins", 1},
-        {"exp_noc_rowidx_detached_demand_waiters_resolved_total", "Experimental STORM-PIF v8: detached-demand waiters resolved from detached rowindex completion", "waiters", 1},
-        {"exp_noc_rowidx_detached_demand_fallback_zero_total", "Experimental STORM-PIF v8: detached-demand waiters that fell back to zero because block_col was absent", "waiters", 1},
-        {"exp_noc_rowidx_detached_demand_ready_signal_total", "Experimental STORM-PIF v8: detached-demand rowindex ready signals emitted at detached completion", "signals", 1},
-        {"exp_noc_rowidx_detached_demand_ready_transition_total", "Experimental STORM-PIF v8: detached-demand rowindex ready transitions emitted at detached completion", "objects", 1},
-        {"pulse_metadata_txn_export_total", "PULSE-OSA metadata transaction: exported metadata objects observed by the seam", "objects", 1},
-        {"pulse_metadata_txn_owner_launch_total", "PULSE-OSA metadata transaction: owner launches admitted into the seam", "objects", 1},
-        {"pulse_metadata_txn_join_live_total", "PULSE-OSA metadata transaction: joins that landed on live owners", "objects", 1},
-        {"pulse_metadata_txn_join_ready_total", "PULSE-OSA metadata transaction: joins that landed on ready or leased-ready owners", "objects", 1},
-        {"pulse_metadata_txn_late_join_total", "PULSE-OSA metadata transaction: joins that arrived after owner release", "objects", 1},
-        {"pulse_metadata_txn_ready_lease_hit_total", "PULSE-OSA metadata transaction: joins served directly from ready lease", "objects", 1},
-        {"pulse_metadata_txn_ready_lease_expired_total", "PULSE-OSA metadata transaction: late joins that observed an expired ready lease", "objects", 1},
-        {"pulse_metadata_txn_envelope_size_sum_total", "PULSE-OSA metadata transaction: cumulative rowdescriptor envelope size launched by gather replay", "lines", 1},
-        {"pulse_metadata_frontier_observed_total", "PULSE metadata frontier: early metadata objects observed before rowdescriptor formation", "objects", 1},
-        {"pulse_metadata_frontier_same_window_reobserve_total", "PULSE metadata frontier: repeated observations of the same early metadata object within one window", "objects", 1},
-        {"pulse_metadata_frontier_owner_form_candidate_total", "PULSE metadata frontier: early metadata observations that advanced to owner-form candidate", "objects", 1},
-        {"pulse_metadata_frontier_join_ready_candidate_total", "PULSE metadata frontier: early metadata observations that advanced to ready-join candidate", "objects", 1},
-        {"pulse_metadata_frontier_premphf_base_observed_total", "PULSE metadata frontier: pre-mphf-base observations", "objects", 1},
-        {"pulse_metadata_frontier_premphf_base_same_window_reobserve_total", "PULSE metadata frontier: same-window reobserves on pre-mphf-base objects", "objects", 1},
-        {"pulse_metadata_frontier_premphf_base_owner_form_candidate_total", "PULSE metadata frontier: pre-mphf-base owner-form candidates", "objects", 1},
-        {"pulse_metadata_frontier_premphf_base_join_ready_candidate_total", "PULSE metadata frontier: pre-mphf-base ready-join candidates", "objects", 1},
-        {"pulse_metadata_frontier_premphf_band_observed_total", "PULSE metadata frontier: pre-mphf-band observations", "objects", 1},
-        {"pulse_metadata_frontier_premphf_band_same_window_reobserve_total", "PULSE metadata frontier: same-window reobserves on pre-mphf-band objects", "objects", 1},
-        {"pulse_metadata_frontier_premphf_band_owner_form_candidate_total", "PULSE metadata frontier: pre-mphf-band owner-form candidates", "objects", 1},
-        {"pulse_metadata_frontier_premphf_band_join_ready_candidate_total", "PULSE metadata frontier: pre-mphf-band ready-join candidates", "objects", 1},
-        {"pulse_metadata_frontier_idx2row_observed_total", "PULSE metadata frontier: idx2row observations", "objects", 1},
-        {"pulse_metadata_frontier_idx2row_same_window_reobserve_total", "PULSE metadata frontier: same-window reobserves on idx2row objects", "objects", 1},
-        {"pulse_metadata_frontier_idx2row_owner_form_candidate_total", "PULSE metadata frontier: idx2row owner-form candidates", "objects", 1},
-        {"pulse_metadata_frontier_idx2row_join_ready_candidate_total", "PULSE metadata frontier: idx2row ready-join candidates", "objects", 1},
-        {"pulse_metadata_frontier_rowindex_observed_total", "PULSE metadata frontier: rowindex observations", "objects", 1},
-        {"pulse_metadata_frontier_rowindex_same_window_reobserve_total", "PULSE metadata frontier: same-window reobserves on rowindex objects", "objects", 1},
-        {"pulse_metadata_frontier_rowindex_owner_form_candidate_total", "PULSE metadata frontier: rowindex owner-form candidates", "objects", 1},
-        {"pulse_metadata_frontier_rowindex_join_ready_candidate_total", "PULSE metadata frontier: rowindex ready-join candidates", "objects", 1},
-        {"atlas_census_premphf_base_frontier_events_total", "PE-Atlas census: pre-mphf-base frontier evidence totals", "events", 1},
-        {"atlas_census_premphf_base_producer_events_total", "PE-Atlas census: pre-mphf-base producer evidence totals", "events", 1},
-        {"atlas_census_premphf_base_gate_events_total", "PE-Atlas census: pre-mphf-base gate/proxy evidence totals", "events", 1},
-        {"atlas_census_premphf_base_service_events_total", "PE-Atlas census: pre-mphf-base service evidence totals", "events", 1},
-        {"atlas_census_premphf_band_frontier_events_total", "PE-Atlas census: pre-mphf-band frontier evidence totals", "events", 1},
-        {"atlas_census_premphf_band_producer_events_total", "PE-Atlas census: pre-mphf-band producer evidence totals", "events", 1},
-        {"atlas_census_premphf_band_gate_events_total", "PE-Atlas census: pre-mphf-band gate/proxy evidence totals", "events", 1},
-        {"atlas_census_premphf_band_service_events_total", "PE-Atlas census: pre-mphf-band service evidence totals", "events", 1},
-        {"atlas_census_idx2row_frontier_events_total", "PE-Atlas census: idx2row frontier evidence totals", "events", 1},
-        {"atlas_census_idx2row_producer_events_total", "PE-Atlas census: idx2row producer evidence totals", "events", 1},
-        {"atlas_census_idx2row_gate_events_total", "PE-Atlas census: idx2row gate/proxy evidence totals", "events", 1},
-        {"atlas_census_idx2row_service_events_total", "PE-Atlas census: idx2row service evidence totals", "events", 1},
-        {"atlas_census_rowindex_frontier_events_total", "PE-Atlas census: rowindex frontier evidence totals", "events", 1},
-        {"atlas_census_rowindex_producer_events_total", "PE-Atlas census: rowindex producer evidence totals", "events", 1},
-        {"atlas_census_rowindex_gate_events_total", "PE-Atlas census: rowindex gate/proxy evidence totals", "events", 1},
-        {"atlas_census_rowindex_service_events_total", "PE-Atlas census: rowindex service evidence totals", "events", 1},
-        {"atlas_census_rowdescriptor_frontier_events_total", "PE-Atlas census: rowdescriptor frontier evidence totals", "events", 1},
-        {"atlas_census_rowdescriptor_producer_events_total", "PE-Atlas census: rowdescriptor producer evidence totals", "events", 1},
-        {"atlas_census_rowdescriptor_gate_events_total", "PE-Atlas census: rowdescriptor gate/proxy evidence totals", "events", 1},
-        {"atlas_census_rowdescriptor_service_events_total", "PE-Atlas census: rowdescriptor service evidence totals", "events", 1},
-        {"atlas_proxy_rowindex_materialize_total", "PE-Atlas proxy ledger: rowindex materialize events", "events", 1},
-        {"atlas_proxy_rowindex_publicize_total", "PE-Atlas proxy ledger: rowindex publicize events", "events", 1},
-        {"atlas_proxy_rowindex_owner_form_total", "PE-Atlas proxy ledger: rowindex owner-form events", "events", 1},
-        {"atlas_proxy_rowindex_join_live_total", "PE-Atlas proxy ledger: rowindex join-live events", "events", 1},
-        {"atlas_proxy_rowindex_join_ready_total", "PE-Atlas proxy ledger: rowindex join-ready events", "events", 1},
-        {"atlas_proxy_rowindex_ready_total", "PE-Atlas proxy ledger: rowindex ready transitions", "events", 1},
-        {"atlas_proxy_rowindex_release_total", "PE-Atlas proxy ledger: rowindex release events", "events", 1},
-        {"atlas_proxy_rowindex_release_missing_total", "PE-Atlas proxy ledger: rowindex release misses", "events", 1},
-        {"atlas_proxy_rowindex_fallback_total", "PE-Atlas proxy ledger: rowindex fallback-to-private events", "events", 1},
-        {"atlas_proxy_idx2row_materialize_total", "PE-Atlas proxy ledger: idx2row materialize events", "events", 1},
-        {"atlas_proxy_idx2row_publicize_total", "PE-Atlas proxy ledger: idx2row publicize events", "events", 1},
-        {"atlas_proxy_idx2row_owner_form_total", "PE-Atlas proxy ledger: idx2row owner-form events", "events", 1},
-        {"atlas_proxy_idx2row_join_live_total", "PE-Atlas proxy ledger: idx2row join-live events", "events", 1},
-        {"atlas_proxy_idx2row_join_ready_total", "PE-Atlas proxy ledger: idx2row join-ready events", "events", 1},
-        {"atlas_proxy_idx2row_ready_total", "PE-Atlas proxy ledger: idx2row ready transitions", "events", 1},
-        {"atlas_proxy_idx2row_release_total", "PE-Atlas proxy ledger: idx2row release events", "events", 1},
-        {"atlas_proxy_idx2row_release_missing_total", "PE-Atlas proxy ledger: idx2row release misses", "events", 1},
-        {"atlas_proxy_idx2row_fallback_total", "PE-Atlas proxy ledger: idx2row fallback-to-private events", "events", 1},
-        {"atlas_proxy_premphf_base_materialize_total", "PE-Atlas proxy ledger: pre-mphf-base materialize events", "events", 1},
-        {"atlas_proxy_premphf_base_publicize_total", "PE-Atlas proxy ledger: pre-mphf-base publicize events", "events", 1},
-        {"atlas_proxy_premphf_base_owner_form_total", "PE-Atlas proxy ledger: pre-mphf-base owner-form events", "events", 1},
-        {"atlas_proxy_premphf_base_shared_hit_total", "PE-Atlas proxy ledger: pre-mphf-base shared-hit events", "events", 1},
-        {"atlas_proxy_premphf_base_lookup_ready_total", "PE-Atlas proxy ledger: pre-mphf-base lookup-ready events", "events", 1},
-        {"atlas_proxy_premphf_base_proxy_only_gap_total", "PE-Atlas proxy ledger: pre-mphf-base proxy-only gap events", "events", 1},
-        {"atlas_proxy_premphf_band_materialize_total", "PE-Atlas proxy ledger: pre-mphf-band materialize events", "events", 1},
-        {"atlas_proxy_premphf_band_publicize_total", "PE-Atlas proxy ledger: pre-mphf-band publicize events", "events", 1},
-        {"atlas_proxy_premphf_band_owner_form_candidate_total", "PE-Atlas proxy ledger: pre-mphf-band owner-form candidates", "events", 1},
-        {"atlas_proxy_premphf_band_join_ready_candidate_total", "PE-Atlas proxy ledger: pre-mphf-band join-ready candidates", "events", 1},
-        {"atlas_proxy_premphf_band_zero_service_total", "PE-Atlas proxy ledger: pre-mphf-band zero-service events", "events", 1},
-        {"gcss_lookup_hit_total", "GCSS lookup hits in gcss_valueonly mode", "hits", 1},
-        {"gcss_lookup_miss_total", "GCSS lookup misses in gcss_valueonly mode", "misses", 1},
         {"weight_read_dense_reqs_total", "Issued weight-read requests classified as dense", "requests", 1},
         {"weight_read_dense_bytes_total", "Issued weight-read bytes classified as dense", "bytes", 1},
         {"weight_read_rowptr_reqs_total", "Issued weight-read requests classified as BCSR rowptr", "requests", 1},
@@ -495,8 +343,6 @@ public:
         {"weight_read_colidx_bytes_total", "Issued weight-read bytes classified as BCSR colidx", "bytes", 1},
         {"weight_read_blockdata_reqs_total", "Issued weight-read requests classified as BCSR blockdata", "requests", 1},
         {"weight_read_blockdata_bytes_total", "Issued weight-read bytes classified as BCSR blockdata", "bytes", 1},
-        {"weight_read_gcss_reqs_total", "Issued weight-read requests classified as GCSS value-only", "requests", 1},
-        {"weight_read_gcss_bytes_total", "Issued weight-read bytes classified as GCSS value-only", "bytes", 1},
         {"weight_idx_sram_reads_total", "Observe-only weight idx SRAM reads", "reads", 1},
         {"weight_idx_sram_writes_total", "Observe-only weight idx SRAM writes", "writes", 1},
         {"weight_idx_sram_bytes_read_total", "Observe-only weight idx SRAM read bytes", "bytes", 1},
@@ -507,8 +353,6 @@ public:
         {"weight_idx_sram_bank_peak_accesses_per_tick", "Weight idx SRAM peak accesses on any bank within a tick", "accesses", 1},
         {"weight_idx_sram_energy_read_pj_total", "Weight idx SRAM read energy total", "pJ", 1},
         {"weight_idx_sram_energy_write_pj_total", "Weight idx SRAM write energy total", "pJ", 1},
-        {"weight_idx_lookup_total", "Total GCSS index lookups", "lookups", 1},
-        {"weight_idx_lookup_idx2_total", "Total GCSSIDX2 lookups", "lookups", 1},
         {"weight_l0_sram_reads_total", "Observe-only weight L0 SRAM reads", "reads", 1},
         {"weight_l0_sram_writes_total", "Observe-only weight L0 SRAM writes", "writes", 1},
         {"weight_l0_sram_bytes_read_total", "Observe-only weight L0 SRAM read bytes", "bytes", 1},
@@ -996,116 +840,6 @@ private:
     Statistic<uint64_t>* stat_gas_bursts_total_ = nullptr;
     Statistic<uint64_t>* stat_gas_payload_bytes_total_ = nullptr;
     Statistic<uint64_t>* stat_gas_gap_absorbed_bytes_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_prefetch_rows_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_prefetch_bytes_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_prefetch_rows_deferred_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_prefetch_rows_failed_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_cache_hits_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_cache_misses_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_cache_fills_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_cache_full_drop_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_cache_entries_final_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_touch_rows_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_touch_events_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_rows_filtered_cold_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_carry_apply_pending_rows_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_drain_skip_phase_gather_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_drain_skip_phase_apply_disabled_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_drain_skip_no_pending_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_drain_skip_loader_not_ready_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_drain_skip_rowptr_not_ready_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_drain_skip_budget_zero_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_drain_skip_cache_hit_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_drain_skip_detached_inflight_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_drain_skip_colidx_inflight_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_drain_skip_empty_row_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_budget_ticks_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_budget_effective_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_budget_adapt_ticks_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_detached_demand_join_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_detached_demand_waiters_resolved_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_detached_demand_fallback_zero_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_detached_demand_ready_signal_total_ = nullptr;
-    Statistic<uint64_t>* stat_exp_noc_rowidx_detached_demand_ready_transition_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_txn_export_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_txn_owner_launch_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_txn_join_live_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_txn_join_ready_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_txn_late_join_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_txn_ready_lease_hit_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_txn_ready_lease_expired_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_txn_envelope_size_sum_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_frontier_observed_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_frontier_same_window_reobserve_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_frontier_owner_form_candidate_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_frontier_join_ready_candidate_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_frontier_premphf_base_observed_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_frontier_premphf_base_same_window_reobserve_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_frontier_premphf_base_owner_form_candidate_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_frontier_premphf_base_join_ready_candidate_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_frontier_premphf_band_observed_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_frontier_premphf_band_same_window_reobserve_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_frontier_premphf_band_owner_form_candidate_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_frontier_premphf_band_join_ready_candidate_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_frontier_idx2row_observed_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_frontier_idx2row_same_window_reobserve_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_frontier_idx2row_owner_form_candidate_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_frontier_idx2row_join_ready_candidate_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_frontier_rowindex_observed_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_frontier_rowindex_same_window_reobserve_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_frontier_rowindex_owner_form_candidate_total_ = nullptr;
-    Statistic<uint64_t>* stat_pulse_metadata_frontier_rowindex_join_ready_candidate_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_census_premphf_base_frontier_events_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_census_premphf_base_producer_events_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_census_premphf_base_gate_events_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_census_premphf_base_service_events_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_census_premphf_band_frontier_events_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_census_premphf_band_producer_events_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_census_premphf_band_gate_events_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_census_premphf_band_service_events_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_census_idx2row_frontier_events_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_census_idx2row_producer_events_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_census_idx2row_gate_events_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_census_idx2row_service_events_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_census_rowindex_frontier_events_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_census_rowindex_producer_events_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_census_rowindex_gate_events_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_census_rowindex_service_events_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_census_rowdescriptor_frontier_events_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_census_rowdescriptor_producer_events_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_census_rowdescriptor_gate_events_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_census_rowdescriptor_service_events_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_proxy_rowindex_materialize_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_proxy_rowindex_publicize_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_proxy_rowindex_owner_form_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_proxy_rowindex_join_live_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_proxy_rowindex_join_ready_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_proxy_rowindex_ready_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_proxy_rowindex_release_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_proxy_rowindex_release_missing_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_proxy_rowindex_fallback_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_proxy_idx2row_materialize_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_proxy_idx2row_publicize_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_proxy_idx2row_owner_form_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_proxy_idx2row_join_live_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_proxy_idx2row_join_ready_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_proxy_idx2row_ready_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_proxy_idx2row_release_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_proxy_idx2row_release_missing_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_proxy_idx2row_fallback_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_proxy_premphf_base_materialize_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_proxy_premphf_base_publicize_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_proxy_premphf_base_owner_form_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_proxy_premphf_base_shared_hit_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_proxy_premphf_base_lookup_ready_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_proxy_premphf_base_proxy_only_gap_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_proxy_premphf_band_materialize_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_proxy_premphf_band_publicize_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_proxy_premphf_band_owner_form_candidate_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_proxy_premphf_band_join_ready_candidate_total_ = nullptr;
-    Statistic<uint64_t>* stat_atlas_proxy_premphf_band_zero_service_total_ = nullptr;
-    Statistic<uint64_t>* stat_gcss_lookup_hit_total_ = nullptr;
-    Statistic<uint64_t>* stat_gcss_lookup_miss_total_ = nullptr;
     Statistic<uint64_t>* stat_weight_read_dense_reqs_total_ = nullptr;
     Statistic<uint64_t>* stat_weight_read_dense_bytes_total_ = nullptr;
     Statistic<uint64_t>* stat_weight_read_rowptr_reqs_total_ = nullptr;
@@ -1114,8 +848,6 @@ private:
     Statistic<uint64_t>* stat_weight_read_colidx_bytes_total_ = nullptr;
     Statistic<uint64_t>* stat_weight_read_blockdata_reqs_total_ = nullptr;
     Statistic<uint64_t>* stat_weight_read_blockdata_bytes_total_ = nullptr;
-    Statistic<uint64_t>* stat_weight_read_gcss_reqs_total_ = nullptr;
-    Statistic<uint64_t>* stat_weight_read_gcss_bytes_total_ = nullptr;
     Statistic<uint64_t>* stat_weight_idx_sram_reads_total_ = nullptr;
     Statistic<uint64_t>* stat_weight_idx_sram_writes_total_ = nullptr;
     Statistic<uint64_t>* stat_weight_idx_sram_bytes_read_total_ = nullptr;
@@ -1126,8 +858,6 @@ private:
     Statistic<uint64_t>* stat_weight_idx_sram_bank_peak_accesses_per_tick_ = nullptr;
     Statistic<uint64_t>* stat_weight_idx_sram_energy_read_pj_total_ = nullptr;
     Statistic<uint64_t>* stat_weight_idx_sram_energy_write_pj_total_ = nullptr;
-    Statistic<uint64_t>* stat_weight_idx_lookup_total_ = nullptr;
-    Statistic<uint64_t>* stat_weight_idx_lookup_idx2_total_ = nullptr;
     Statistic<uint64_t>* stat_weight_l0_sram_reads_total_ = nullptr;
     Statistic<uint64_t>* stat_weight_l0_sram_writes_total_ = nullptr;
     Statistic<uint64_t>* stat_weight_l0_sram_bytes_read_total_ = nullptr;
@@ -1313,7 +1043,6 @@ private:
 
     // weights_template_ 保留：用于 BCSR 文件兜底与诊断读取
     std::string weights_template_;
-    std::string gcss_index_template_;
     std::string synapse_weight_mode_ = "bcsr_gas";
     bool record_edge_apply_enable_ = false;
     bool record_edge_idle_enable_ = true;

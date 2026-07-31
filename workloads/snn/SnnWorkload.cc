@@ -17,7 +17,6 @@
 #include "snn/synapse/route/SpikeCommSubsystem.h"
 #include "snn/synapse/route/SpikeNocCodec.h"
 #include "snn/synapse/route/SpikeTileNocCodec.h"
-#include "research/local_storage/PeLocalServiceObjectTable.h"
 #include "SynapseRouteBuildConfig.h"
 #include "ISpikeTransport.h"
 #include "NocSpikeTransport.h"
@@ -140,55 +139,6 @@ std::unique_ptr<ISynapseRoute> makeSynapseRoute_(const SST::Params& params) {
     return std::make_unique<SynapseRouteSubsystem>();
 }
 
-std::string normalizePulseMetadataMaskToken_(std::string token) {
-    for (char& ch : token) {
-        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-    }
-    token.erase(
-        std::remove_if(
-            token.begin(),
-            token.end(),
-            [](unsigned char ch) {
-                return ch == '_' || ch == '-' || std::isspace(ch) != 0;
-            }),
-        token.end());
-    return token;
-}
-
-uint32_t parsePulseMetadataObjectMask_(const std::string& raw_mask) {
-    if (raw_mask.empty()) return 0u;
-
-    uint32_t mask = 0u;
-    size_t start = 0u;
-    while (start <= raw_mask.size()) {
-        const size_t end = raw_mask.find_first_of(",|+; ", start);
-        const std::string token = normalizePulseMetadataMaskToken_(
-            raw_mask.substr(
-                start,
-                (end == std::string::npos) ? std::string::npos : (end - start)));
-        if (!token.empty()) {
-            if (token == "all") {
-                mask |= PeLocalServiceObjectTable::kMetadataKindMaskAll;
-            } else if (token == "preband") {
-                mask |= PeLocalServiceObjectTable::kMetadataKindMaskPreband;
-            } else if (token == "prebase" || token == "base" || token == "premphfbase") {
-                mask |= PeLocalServiceObjectTable::kMetadataKindMaskPreMphfBase;
-            } else if (token == "band" || token == "premphfband") {
-                mask |= PeLocalServiceObjectTable::kMetadataKindMaskPreMphfBand;
-            } else if (token == "idx2" || token == "idx2row") {
-                mask |= PeLocalServiceObjectTable::kMetadataKindMaskIdx2Row;
-            } else if (token == "rowidx" || token == "rowindex") {
-                mask |= PeLocalServiceObjectTable::kMetadataKindMaskRowIndex;
-            } else if (token == "rowdescriptor") {
-                mask |= PeLocalServiceObjectTable::kMetadataKindMaskRowDescriptor;
-            }
-        }
-        if (end == std::string::npos) break;
-        start = end + 1u;
-    }
-    return mask;
-}
-
 } // namespace
 
 void SnnWorkload::markComputeActivity_() {
@@ -242,33 +192,7 @@ void SnnWorkload::configureFromParams(const SST::Params& params) {
         (index_mode_str == "bcsr_post_row") ||
         (index_mode_str == "csr_post_row");
     use_bcsr_ = (index_mode_str == "bcsr_post_row");
-    {
-        std::string mode = params.find<std::string>("synapse_weight_mode", "bcsr_gas");
-        for (char& ch : mode) {
-            if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
-        }
-        if (mode == "gscc_valueonly_dstcore") mode = "gcss_valueonly_dstcore";
-        if (mode == "gscc_valueonly_dstcore_vlf_premphf") mode = "gcss_valueonly_dstcore_vlf_premphf";
-        if (mode == "gscc_valueonly_dstcore_vlf_premphf_plp") mode = "gcss_valueonly_dstcore_vlf_premphf_plp";
-        if (mode != "bcsr_gas" &&
-            mode != "gcss_valueonly_dstcore" &&
-            mode != "gcss_valueonly_dstcore_idx2" &&
-            mode != "gcss_idx2_rowmphf" &&
-            mode != "gcss_valueonly_dstcore_vlf_premphf" &&
-            mode != "gcss_valueonly_dstcore_vlf_premphf_plp") {
-            mode = "bcsr_gas";
-        }
-        synapse_weight_mode_ = mode;
-    }
-    const bool gcss_valueonly_mode =
-        (synapse_weight_mode_ == "gcss_valueonly_dstcore") ||
-        (synapse_weight_mode_ == "gcss_valueonly_dstcore_idx2") ||
-        (synapse_weight_mode_ == "gcss_idx2_rowmphf") ||
-        (synapse_weight_mode_ == "gcss_valueonly_dstcore_vlf_premphf") ||
-        (synapse_weight_mode_ == "gcss_valueonly_dstcore_vlf_premphf_plp");
-    if (gcss_valueonly_mode) {
-        use_bcsr_ = false;
-    }
+    synapse_weight_mode_ = "bcsr_gas";
     snn_edge_record_attempt_total_ = 0;
     snn_edge_record_commit_total_ = 0;
     snn_edge_record_skip_gate_total_ = 0;
@@ -708,12 +632,6 @@ void SnnWorkload::ensureWeightReaderOwned_() {
                 weight_mem_subsystem_->issueFromEdges();
             }
         };
-        ocfg.resolve_post_local_by_prerank = [this](uint32_t pre_global, uint32_t pre_rank, uint32_t& out_post_local) -> bool {
-            const auto* posts_local = lookupPostsLocalForPre_(pre_global);
-            if (!posts_local || pre_rank >= posts_local->size()) return false;
-            out_post_local = (*posts_local)[pre_rank];
-            return true;
-        };
         ocfg.use_bcsr = use_bcsr_;
         ocfg.bcsr_prefetch_all = params_->find<int>("bcsr_prefetch_all", 0) != 0;
         ocfg.bcsr_colidx_inflight_coalesce_enable =
@@ -771,26 +689,9 @@ void SnnWorkload::ensureWeightReaderOwned_() {
         ocfg.weights_template = params_->find<std::string>("weights_template", "");
         ocfg.bcsr_mgr = bcsr_mgr_.get();
         ocfg.synapse_weight_mode = synapse_weight_mode_;
-        ocfg.gcss_index_template = params_->find<std::string>("gcss_index_template", "");
         ocfg.experimental_retire_policy =
             params_->find<std::string>("experimental_retire_policy", "global_inorder");
         ocfg.experimental_retire_shadow_per_post_enable = false;
-        const bool pulse_enable = params_->find<int>("pulse_enable", 0) != 0;
-        const bool pulse_agenda_observe_only =
-            params_->find<int>("pulse_agenda_observe_only", 1) != 0;
-        const bool pulse_descriptor_actual_enable =
-            params_->find<int>("pulse_descriptor_actual_enable", 0) != 0;
-        ocfg.pulse_agenda_enable =
-            pulse_enable &&
-            (pulse_agenda_observe_only || pulse_descriptor_actual_enable);
-        ocfg.pulse_descriptor_actual_enable =
-            pulse_enable && pulse_descriptor_actual_enable;
-        ocfg.pulse_domain_retire_enable = false;
-        ocfg.pulse_domain_retire_observe_only = true;
-        ocfg.pulse_frontier_observe_enable =
-            pulse_enable && (params_->find<int>("pulse_frontier_observe_enable", 0) != 0);
-        ocfg.pulse_frontier_top_lines =
-            std::max<uint32_t>(1u, params_->find<uint32_t>("pulse_frontier_top_lines", 32));
         ocfg.pe_internal_cpe_enable =
             params_->find<int>("pe_internal_cpe_enable", 0) != 0;
         ocfg.pe_internal_pod_enable =
@@ -832,23 +733,6 @@ void SnnWorkload::ensureWeightReaderOwned_() {
             ocfg.pe_internal_pod_id =
                 std::min<uint32_t>(ocfg.core_id / pod_size, pod_count - 1u);
         }
-        ocfg.pulse_domain_retire_mode = "per_post";
-        std::transform(
-            ocfg.pulse_domain_retire_mode.begin(),
-            ocfg.pulse_domain_retire_mode.end(),
-            ocfg.pulse_domain_retire_mode.begin(),
-            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        if (ocfg.pulse_domain_retire_mode != "descriptor_domain") {
-            ocfg.pulse_domain_retire_mode = "per_post";
-        }
-        ocfg.pulse_domain_retire_release_budget = 0;
-        ocfg.experimental_pre_window_profile_export_enable =
-            params_->find<int>("experimental_pre_window_profile_export_enable", 0) != 0;
-        ocfg.experimental_pre_window_profile_export_dir =
-            params_->find<std::string>("experimental_pre_window_profile_export_dir", "");
-        ocfg.pulse_osa_metadata_txn_enable = false;
-        ocfg.pulse_osa_metadata_ready_lease_enable = false;
-        ocfg.pulse_osa_metadata_object_mask = 0u;
         wms->configureOrchestrator(std::move(ocfg));
 
         const uint32_t window_read_budget = params_->find<uint32_t>("window_read_budget", 1024);
@@ -866,16 +750,6 @@ void SnnWorkload::ensureWeightReaderOwned_() {
         if (weight_mem_subsystem_) {
             weight_mem_subsystem_->bindMemory(rt_.mem);
         }
-    }
-
-    if (weight_mem_subsystem_) {
-        weight_mem_subsystem_->overrideResolvePostLocalByPreRank(
-            [this](uint32_t pre_global, uint32_t pre_rank, uint32_t& out_post_local) -> bool {
-                const auto* posts_local = lookupPostsLocalForPre_(pre_global);
-                if (!posts_local || pre_rank >= posts_local->size()) return false;
-                out_post_local = (*posts_local)[pre_rank];
-                return true;
-            });
     }
 
     // Phase4-Task6.4: window accumulator moved into workload=snn; bind WMS acc_update callback.
@@ -1237,7 +1111,7 @@ bool SnnWorkload::tryFinalizeDeferredScatter_() {
             rt_.log->verbose(CALL_INFO, 0, 0,
                              "[scatter-defer] node=%u core=%u seq=%u cyc=%" PRIu64
                              " pending_mem=%zu edge_retire=%zu/%zu pending_direct=%zu"
-                             " pending_block=%zu pending_colidx=%zu gcss_vlf=%zu\n",
+                             " pending_block=%zu pending_colidx=%zu\n",
                              static_cast<uint32_t>(rt_.node_id),
                              static_cast<uint32_t>(rt_.core_id),
                              scatter_commit_seq_,
@@ -1247,8 +1121,7 @@ bool SnnWorkload::tryFinalizeDeferredScatter_() {
                              d.edge_retire_total,
                              d.pending_direct_reads,
                              d.pending_block_reads,
-                             d.pending_colidx_reads,
-                             d.gcss_vlf_issue_queue);
+                             d.pending_colidx_reads);
         }
         // Throttle defer diagnostics to once per 10k cycles per core.
         scatter_defer_diag_next_cycle_ = now_cycle_cached_ + 10000u;
@@ -1649,16 +1522,6 @@ const std::vector<uint32_t>* SnnWorkload::lookupPostsLocalForPre_(uint32_t pre_g
     return &(itc->second);
 }
 
-bool SnnWorkload::resolvePreRankForPost_(uint32_t pre_global, uint32_t post_local, uint32_t& out_rank) {
-    const auto* posts_local = lookupPostsLocalForPre_(pre_global);
-    if (!posts_local || posts_local->empty()) return false;
-    const auto it = std::lower_bound(posts_local->begin(), posts_local->end(), post_local);
-    if (it == posts_local->end() || *it != post_local) return false;
-    const size_t idx = static_cast<size_t>(std::distance(posts_local->begin(), it));
-    out_rank = static_cast<uint32_t>(idx);
-    return true;
-}
-
 bool SnnWorkload::expandPreGlobalToWindowEdgesFast_(uint32_t pre_global) {
     if (!(workload_spike_input_enable_ && isWindowWorkload_() && window_read_enable_)) {
         return false;
@@ -1673,9 +1536,6 @@ bool SnnWorkload::expandPreGlobalToWindowEdgesFast_(uint32_t pre_global) {
     snn_rx_fastpath_posts_total_ += static_cast<uint64_t>(posts_local->size());
 
     bool stage_ok = false;
-    const bool premphf_mode =
-        (synapse_weight_mode_ == "gcss_valueonly_dstcore_vlf_premphf") ||
-        (synapse_weight_mode_ == "gcss_valueonly_dstcore_vlf_premphf_plp");
     const bool edge_record_backend_ready = enable_weight_fetch_ && rt_.mem;
     if (edge_record_backend_ready) {
         switch (gas_stage_) {
@@ -1698,8 +1558,7 @@ bool SnnWorkload::expandPreGlobalToWindowEdgesFast_(uint32_t pre_global) {
     }
 
     bool did = false;
-    for (size_t pre_rank = 0; pre_rank < posts_local->size(); ++pre_rank) {
-        const uint32_t post_local = (*posts_local)[pre_rank];
+    for (uint32_t post_local : *posts_local) {
         if (rt_.sinks.spikes_received) (*rt_.sinks.spikes_received)++;
         if (rt_.sinks.stat_spikes_received_total) rt_.sinks.stat_spikes_received_total->addData(1);
 
@@ -1728,18 +1587,10 @@ bool SnnWorkload::expandPreGlobalToWindowEdgesFast_(uint32_t pre_global) {
                 bool recorded = false;
                 const size_t curr_edges = weight_mem_subsystem_->edgesCurrSize();
                 if (curr_edges < edge_collector_max_capacity_) {
-                    if (premphf_mode) {
-                        weight_mem_subsystem_->recordEdgeWithPreRank(
-                            post_local,
-                            pre_global,
-                            std::numeric_limits<float>::quiet_NaN(),
-                            static_cast<uint32_t>(pre_rank));
-                    } else {
-                        weight_mem_subsystem_->recordEdgeWithWeight(
-                            post_local,
-                            pre_global,
-                            std::numeric_limits<float>::quiet_NaN());
-                    }
+                    weight_mem_subsystem_->recordEdgeWithWeight(
+                        post_local,
+                        pre_global,
+                        std::numeric_limits<float>::quiet_NaN());
                     recorded = true;
                 }
                 if (recorded) {
@@ -1879,9 +1730,6 @@ void SnnWorkload::processLocalSpike_(SpikeEvent* spike_event) {
     const bool edge_record_backend_ready = enable_weight_fetch_ && rt_.mem;
     if (edge_record_backend_ready) {
         bool stage_ok = false;
-        const bool premphf_mode =
-        (synapse_weight_mode_ == "gcss_valueonly_dstcore_vlf_premphf") ||
-        (synapse_weight_mode_ == "gcss_valueonly_dstcore_vlf_premphf_plp");
         switch (gas_stage_) {
             case GasStage::Gather:
                 stage_ok = true;
@@ -1903,37 +1751,13 @@ void SnnWorkload::processLocalSpike_(SpikeEvent* spike_event) {
         if (stage_ok) {
             bool recorded = false;
             const uint32_t pre_global = spike_event->getSourceNeuron();
-            if (premphf_mode) {
-                uint32_t pre_rank = 0;
-                if (!resolvePreRankForPost_(pre_global, post_local, pre_rank)) {
-                    if (rt_.log) {
-                        rt_.log->fatal(CALL_INFO, -1,
-                                       "SnnWorkload fatal: pre_rank miss in premphf mode "
-                                       "(pre=%u post_local=%u node=%u core=%u)\n",
-                                       pre_global, post_local,
-                                       static_cast<uint32_t>(rt_.node_id),
-                                       static_cast<uint32_t>(rt_.core_id));
-                    }
-                    std::abort();
-                }
-                const size_t curr_edges = weight_mem_subsystem_->edgesCurrSize();
-                if (curr_edges < edge_collector_max_capacity_) {
-                    weight_mem_subsystem_->recordEdgeWithPreRank(
-                        post_local,
-                        pre_global,
-                        static_cast<float>(spike_event->getWeight()),
-                        pre_rank);
-                    recorded = true;
-                }
-            } else {
-                const size_t curr_edges = weight_mem_subsystem_->edgesCurrSize();
-                if (curr_edges < edge_collector_max_capacity_) {
-                    weight_mem_subsystem_->recordEdgeWithWeight(
-                        post_local,
-                        pre_global,
-                        static_cast<float>(spike_event->getWeight()));
-                    recorded = true;
-                }
+            const size_t curr_edges = weight_mem_subsystem_->edgesCurrSize();
+            if (curr_edges < edge_collector_max_capacity_) {
+                weight_mem_subsystem_->recordEdgeWithWeight(
+                    post_local,
+                    pre_global,
+                    static_cast<float>(spike_event->getWeight()));
+                recorded = true;
             }
             if (recorded) {
                 ++snn_edge_record_commit_total_;
@@ -2019,9 +1843,6 @@ void SnnWorkload::deliverSpike(SpikeEvent* spike) {
             const bool edge_record_backend_ready = enable_weight_fetch_ && rt_.mem;
             if (edge_record_backend_ready) {
                 bool stage_ok = false;
-                const bool premphf_mode =
-        (synapse_weight_mode_ == "gcss_valueonly_dstcore_vlf_premphf") ||
-        (synapse_weight_mode_ == "gcss_valueonly_dstcore_vlf_premphf_plp");
                 switch (gas_stage_) {
                     case GasStage::Gather:
                         stage_ok = true;
@@ -2064,37 +1885,13 @@ void SnnWorkload::deliverSpike(SpikeEvent* spike) {
                     }
                     bool recorded = false;
                     const uint32_t pre_global = spike->getSourceNeuron();
-                    if (premphf_mode) {
-                        uint32_t pre_rank = 0;
-                        if (!resolvePreRankForPost_(pre_global, post_local, pre_rank)) {
-                            if (rt_.log) {
-                                rt_.log->fatal(CALL_INFO, -1,
-                                               "SnnWorkload fatal: pre_rank miss in premphf mode "
-                                               "(pre=%u post_local=%u node=%u core=%u)\n",
-                                               pre_global, post_local,
-                                               static_cast<uint32_t>(rt_.node_id),
-                                               static_cast<uint32_t>(rt_.core_id));
-                            }
-                            std::abort();
-                        }
-                        const size_t curr_edges = weight_mem_subsystem_->edgesCurrSize();
-                        if (curr_edges < edge_collector_max_capacity_) {
-                            weight_mem_subsystem_->recordEdgeWithPreRank(
-                                post_local,
-                                pre_global,
-                                static_cast<float>(spike->getWeight()),
-                                pre_rank);
-                            recorded = true;
-                        }
-                    } else {
-                        const size_t curr_edges = weight_mem_subsystem_->edgesCurrSize();
-                        if (curr_edges < edge_collector_max_capacity_) {
-                            weight_mem_subsystem_->recordEdgeWithWeight(
-                                post_local,
-                                pre_global,
-                                static_cast<float>(spike->getWeight()));
-                            recorded = true;
-                        }
+                    const size_t curr_edges = weight_mem_subsystem_->edgesCurrSize();
+                    if (curr_edges < edge_collector_max_capacity_) {
+                        weight_mem_subsystem_->recordEdgeWithWeight(
+                            post_local,
+                            pre_global,
+                            static_cast<float>(spike->getWeight()));
+                        recorded = true;
                     }
                     if (recorded) {
                         ++snn_edge_record_commit_total_;
@@ -2227,9 +2024,6 @@ void SnnWorkload::getStatistics(std::map<std::string, uint64_t>& stats) const {
     stats["snn_tx_cohort_packets_total"] = snn_tx_cohort_packets_total;
     stats["snn_tx_cohort_pres_total"] = snn_tx_cohort_pres_total;
     stats["snn_tx_cohort_bandcolor_switch_total"] = snn_tx_cohort_bandcolor_switch_total;
-    stats["storm_cohort_packets_total"] = snn_tx_cohort_packets_total;
-    stats["storm_cohort_pres_total"] = snn_tx_cohort_pres_total;
-    stats["storm_cohort_bandcolor_switch_total"] = snn_tx_cohort_bandcolor_switch_total;
     stats["snn_rx_spike_packets_total"] = snn_rx_spike_packets_total_;
     stats["snn_rx_spikekey_total"] = snn_rx_spikekey_total_;
     stats["snn_rx_spiketilekey_total"] = snn_rx_spiketilekey_total_;
@@ -2369,12 +2163,10 @@ void SnnWorkload::getStatistics(std::map<std::string, uint64_t>& stats) const {
         copy_if("weight_read_rowptr_reqs_total");
         copy_if("weight_read_colidx_reqs_total");
         copy_if("weight_read_blockdata_reqs_total");
-        copy_if("weight_read_gcss_reqs_total");
         copy_if("weight_read_dense_bytes_total");
         copy_if("weight_read_rowptr_bytes_total");
         copy_if("weight_read_colidx_bytes_total");
         copy_if("weight_read_blockdata_bytes_total");
-        copy_if("weight_read_gcss_bytes_total");
 
         if (weight_mem_subsystem_) {
             const auto read_source = weight_mem_subsystem_->readSourceStats();
@@ -2382,12 +2174,10 @@ void SnnWorkload::getStatistics(std::map<std::string, uint64_t>& stats) const {
             setStatIfMissingOrZero_(stats, "weight_read_rowptr_reqs_total", read_source.rowptr_reqs_total);
             setStatIfMissingOrZero_(stats, "weight_read_colidx_reqs_total", read_source.colidx_reqs_total);
             setStatIfMissingOrZero_(stats, "weight_read_blockdata_reqs_total", read_source.blockdata_reqs_total);
-            setStatIfMissingOrZero_(stats, "weight_read_gcss_reqs_total", read_source.gcss_reqs_total);
             setStatIfMissingOrZero_(stats, "weight_read_dense_bytes_total", read_source.dense_bytes_total);
             setStatIfMissingOrZero_(stats, "weight_read_rowptr_bytes_total", read_source.rowptr_bytes_total);
             setStatIfMissingOrZero_(stats, "weight_read_colidx_bytes_total", read_source.colidx_bytes_total);
             setStatIfMissingOrZero_(stats, "weight_read_blockdata_bytes_total", read_source.blockdata_bytes_total);
-            setStatIfMissingOrZero_(stats, "weight_read_gcss_bytes_total", read_source.gcss_bytes_total);
         }
 
         const uint64_t metadata_requests =
@@ -2395,8 +2185,7 @@ void SnnWorkload::getStatistics(std::map<std::string, uint64_t>& stats) const {
             getMapValueOrZero_(stats, "weight_read_colidx_reqs_total");
         const uint64_t gather_requests =
             getMapValueOrZero_(stats, "weight_read_dense_reqs_total") +
-            getMapValueOrZero_(stats, "weight_read_blockdata_reqs_total") +
-            getMapValueOrZero_(stats, "weight_read_gcss_reqs_total");
+            getMapValueOrZero_(stats, "weight_read_blockdata_reqs_total");
         const uint64_t stream_demands = total_gas_apply_acc_updates_;
         const uint64_t stream_issued = getMapValueOrZero_(semantic_stats, "stream_region_writes_issued_total");
         const uint64_t stream_reads_issued = getMapValueOrZero_(semantic_stats, "stream_region_reads_issued_total");

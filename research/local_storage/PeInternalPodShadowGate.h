@@ -11,7 +11,6 @@
 
 #include "research/local_storage/PodMetadataObjectPlane.h"
 #include "research/local_storage/PodOwnerServiceTable.h"
-#include "research/pe_fabric/PeSharedCoreFabric.h"
 
 namespace SST { namespace SnnDL {
 
@@ -29,7 +28,6 @@ struct PeInternalPodShadowGateConfig {
 struct PeInternalPodShadowGateBindings {
     PodMetadataObjectPlane* metadata_plane = nullptr;
     PodOwnerServiceTable* owner_table = nullptr;
-    PeSharedCoreFabric* fabric = nullptr;
 };
 
 struct PeInternalPodShadowGateCounters {
@@ -341,17 +339,6 @@ public:
         default:
             break;
         }
-        if (bindings.fabric != nullptr) {
-            PeSharedCoreFabric::ControlMessage frontier{};
-            frontier.kind = PeSharedCoreFabric::ControlMessageKind::FrontierExport;
-            frontier.scope_id = pod_id;
-            frontier.producer_core_id = cfg.core_id;
-            frontier.window_seq = cfg.window_seq;
-            frontier.object_key = observed.object_key;
-            frontier.consumer_bitmap = observed.consumer_bitmap;
-            bindings.fabric->enqueueControlMessage(frontier);
-        }
-
         counters.owner_lookup_total += 1u;
         PodOwnerServiceTable::LookupRequest lookup{};
         lookup.pod_id = pod_id;
@@ -374,35 +361,12 @@ public:
                 counters.owner_table_full_reject_total += 1u;
             }
             counters.fallback_private_issue_total += 1u;
-            if (bindings.fabric != nullptr) {
-                PeSharedCoreFabric::ControlMessage reject{};
-                reject.kind = PeSharedCoreFabric::ControlMessageKind::JoinReject;
-                reject.scope_id = pod_id;
-                reject.producer_core_id = cfg.core_id;
-                reject.window_seq = cfg.window_seq;
-                reject.object_key = observed.object_key;
-                reject.reject_reason =
-                    static_cast<uint32_t>(lookup_result.reject_reason);
-                bindings.fabric->enqueueControlMessage(reject);
-            }
             return;
         }
 
         if (lookup_result.allocated_owner) {
             counters.owner_alloc_total += 1u;
             counters.noteOwnerAllocKind(kind);
-            if (bindings.fabric != nullptr) {
-                PeSharedCoreFabric::ControlMessage owner{};
-                owner.kind = PeSharedCoreFabric::ControlMessageKind::OwnerAnnounce;
-                owner.scope_id = pod_id;
-                owner.producer_core_id = cfg.core_id;
-                owner.owner_core_id = lookup_result.owner_core_id;
-                owner.window_seq = cfg.window_seq;
-                owner.object_key = observed.object_key;
-                owner.transaction_id = lookup_result.transaction_id;
-                owner.consumer_bitmap = lookup_result.consumer_bitmap;
-                bindings.fabric->enqueueControlMessage(owner);
-            }
             counters.fallback_private_issue_total += 1u;
             return;
         }
@@ -414,37 +378,10 @@ public:
             counters.noteRejectShape(kind);
             counters.join_table_disabled_reject_total += 1u;
             counters.fallback_private_issue_total += 1u;
-            if (bindings.fabric != nullptr) {
-                PeSharedCoreFabric::ControlMessage reject{};
-                reject.kind = PeSharedCoreFabric::ControlMessageKind::JoinReject;
-                reject.scope_id = pod_id;
-                reject.producer_core_id = cfg.core_id;
-                reject.owner_core_id = lookup_result.owner_core_id;
-                reject.consumer_core_id = cfg.core_id;
-                reject.window_seq = cfg.window_seq;
-                reject.object_key = observed.object_key;
-                reject.transaction_id = lookup_result.transaction_id;
-                reject.reject_reason = static_cast<uint32_t>(
-                    PodOwnerServiceTable::RejectReason::JoinTableDisabled);
-                bindings.fabric->enqueueControlMessage(reject);
-            }
             return;
         }
 
         counters.join_request_total += 1u;
-        if (bindings.fabric != nullptr) {
-            PeSharedCoreFabric::ControlMessage join_msg{};
-            join_msg.kind = PeSharedCoreFabric::ControlMessageKind::JoinRequest;
-            join_msg.scope_id = pod_id;
-            join_msg.producer_core_id = cfg.core_id;
-            join_msg.owner_core_id = lookup_result.owner_core_id;
-            join_msg.consumer_core_id = cfg.core_id;
-            join_msg.window_seq = cfg.window_seq;
-            join_msg.object_key = observed.object_key;
-            join_msg.transaction_id = lookup_result.transaction_id;
-            join_msg.consumer_bitmap = lookup_result.consumer_bitmap;
-            bindings.fabric->enqueueControlMessage(join_msg);
-        }
 
         PodOwnerServiceTable::JoinRequest join{};
         join.pod_id = pod_id;
@@ -467,19 +404,6 @@ public:
                 counters.join_table_full_reject_total += 1u;
             }
             counters.fallback_private_issue_total += 1u;
-            if (bindings.fabric != nullptr) {
-                PeSharedCoreFabric::ControlMessage reject{};
-                reject.kind = PeSharedCoreFabric::ControlMessageKind::JoinReject;
-                reject.scope_id = pod_id;
-                reject.producer_core_id = cfg.core_id;
-                reject.owner_core_id = lookup_result.owner_core_id;
-                reject.consumer_core_id = cfg.core_id;
-                reject.window_seq = cfg.window_seq;
-                reject.object_key = observed.object_key;
-                reject.transaction_id = lookup_result.transaction_id;
-                reject.reject_reason = static_cast<uint32_t>(join_result.reject_reason);
-                bindings.fabric->enqueueControlMessage(reject);
-            }
             return;
         }
 

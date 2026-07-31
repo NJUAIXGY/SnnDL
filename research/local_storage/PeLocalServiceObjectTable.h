@@ -140,18 +140,18 @@ public:
         uint64_t potential_private_service_elide_total = 0;
         uint64_t active_entries_total = 0;
         uint64_t release_pending_active_total = 0;
-        // PE-Atlas v2 machine-visibility skeleton at the service-object-table boundary.
+        // Local-storage object lifecycle counters at the service-object-table boundary.
         // In this layer:
         // - materialize/publicize happen when an object is first inserted into the table
         // - owner_form happens when that insertion successfully establishes authority
         // - ready/release follow the table's own lifecycle transitions
         // - private_only means the object was released without any non-owner consumer
-        uint64_t atlas_obj_materialize_total = 0;
-        uint64_t atlas_obj_publicize_total = 0;
-        uint64_t atlas_obj_owner_form_total = 0;
-        uint64_t atlas_obj_ready_total = 0;
-        uint64_t atlas_obj_release_total = 0;
-        uint64_t atlas_obj_private_only_total = 0;
+        uint64_t local_storage_object_materialize_total = 0;
+        uint64_t local_storage_object_publicize_total = 0;
+        uint64_t local_storage_object_owner_form_total = 0;
+        uint64_t local_storage_object_ready_total = 0;
+        uint64_t local_storage_object_release_total = 0;
+        uint64_t local_storage_object_private_only_total = 0;
     };
 
     static constexpr uint32_t kMetadataKindMaskPreMphfBase = (1u << 1);
@@ -235,9 +235,9 @@ public:
         result.owner_core_id = inserted->second.owner_core_id;
         result.consumer_bitmap = inserted->second.consumer_bitmap;
         stats_.owner_form_total += 1u;
-        stats_.atlas_obj_materialize_total += 1u;
-        stats_.atlas_obj_publicize_total += 1u;
-        stats_.atlas_obj_owner_form_total += 1u;
+        stats_.local_storage_object_materialize_total += 1u;
+        stats_.local_storage_object_publicize_total += 1u;
+        stats_.local_storage_object_owner_form_total += 1u;
         return result;
     }
 
@@ -361,7 +361,7 @@ public:
         stats_.ready_fanout_consumers_peak = std::max<uint64_t>(
             stats_.ready_fanout_consumers_peak,
             static_cast<uint64_t>(entry.consumer_count));
-        stats_.atlas_obj_ready_total += 1u;
+        stats_.local_storage_object_ready_total += 1u;
 
         if (entry.release_pending) {
             ReleasedEntry released{};
@@ -380,9 +380,9 @@ public:
             result.released_after_transition = true;
             stats_.released_total += 1u;
             stats_.ready_release_total += 1u;
-            stats_.atlas_obj_release_total += 1u;
+            stats_.local_storage_object_release_total += 1u;
             if (released.consumer_count <= 1u) {
-                stats_.atlas_obj_private_only_total += 1u;
+                stats_.local_storage_object_private_only_total += 1u;
             }
         }
         return result;
@@ -462,9 +462,9 @@ public:
         result.valid = true;
         result.released = true;
         stats_.released_total += 1u;
-        stats_.atlas_obj_release_total += 1u;
+        stats_.local_storage_object_release_total += 1u;
         if (released.consumer_count <= 1u) {
-            stats_.atlas_obj_private_only_total += 1u;
+            stats_.local_storage_object_private_only_total += 1u;
         }
         return result;
     }
@@ -508,12 +508,12 @@ public:
             snap.potential_private_service_elide_total;
         stats[prefix + "active_entries_total"] = snap.active_entries_total;
         stats[prefix + "release_pending_active_total"] = snap.release_pending_active_total;
-        stats[prefix + "atlas_obj_materialize_total"] = snap.atlas_obj_materialize_total;
-        stats[prefix + "atlas_obj_publicize_total"] = snap.atlas_obj_publicize_total;
-        stats[prefix + "atlas_obj_owner_form_total"] = snap.atlas_obj_owner_form_total;
-        stats[prefix + "atlas_obj_ready_total"] = snap.atlas_obj_ready_total;
-        stats[prefix + "atlas_obj_release_total"] = snap.atlas_obj_release_total;
-        stats[prefix + "atlas_obj_private_only_total"] = snap.atlas_obj_private_only_total;
+        stats[prefix + "local_storage_object_materialize_total"] = snap.local_storage_object_materialize_total;
+        stats[prefix + "local_storage_object_publicize_total"] = snap.local_storage_object_publicize_total;
+        stats[prefix + "local_storage_object_owner_form_total"] = snap.local_storage_object_owner_form_total;
+        stats[prefix + "local_storage_object_ready_total"] = snap.local_storage_object_ready_total;
+        stats[prefix + "local_storage_object_release_total"] = snap.local_storage_object_release_total;
+        stats[prefix + "local_storage_object_private_only_total"] = snap.local_storage_object_private_only_total;
     }
 
 private:

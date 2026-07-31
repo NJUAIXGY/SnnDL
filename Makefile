@@ -183,7 +183,6 @@ am_libSnnDL_la_OBJECTS = events/SimpleTestEvent.lo \
 	components/CachelineFragmentMemIF.lo \
 	components/GatherBufferIF.lo \
 	components/gather/GatherBufferIFConfig.lo \
-	components/gather/apply/DramAwareModel.lo \
 	components/GatingPE.lo components/MemKCalBench.lo \
 	components/multicore/MultiCorePEConfig.lo \
 	components/multicore/MultiCorePEObservability.lo \
@@ -252,8 +251,6 @@ am_libSnnDL_la_OBJECTS = events/SimpleTestEvent.lo \
 	research/local_storage/LocalStorageHierarchyController.lo \
 	research/local_storage/PeWeightObjectPlane.lo \
 	platform/memory/DmaMemAccessProxy.lo \
-	research/pe_fabric/PulseAgendaScorer.lo \
-	research/pe_fabric/PeSharedCoreFabric.lo \
 	platform/memory/PeDmaScheduler.lo \
 	platform/memory/StandardMemAccess.lo
 libSnnDL_la_OBJECTS = $(am_libSnnDL_la_OBJECTS)
@@ -288,7 +285,6 @@ am__depfiles_remade = components/$(DEPDIR)/CachelineFragmentMemIF.Plo \
 	components/$(DEPDIR)/WeightLoader.Plo \
 	components/gas/$(DEPDIR)/GlobalGasStepController.Plo \
 	components/gather/$(DEPDIR)/GatherBufferIFConfig.Plo \
-	components/gather/apply/$(DEPDIR)/DramAwareModel.Plo \
 	components/multicore/$(DEPDIR)/MultiCorePEConfig.Plo \
 	components/multicore/$(DEPDIR)/MultiCorePEObservability.Plo \
 	components/noc/$(DEPDIR)/MulticastNIC.Plo \
@@ -317,8 +313,6 @@ am__depfiles_remade = components/$(DEPDIR)/CachelineFragmentMemIF.Plo \
 	research/noc3d/$(DEPDIR)/MulticastRouter3DNative.Plo \
 	research/noc3d/$(DEPDIR)/Noc3DSmokeSink.Plo \
 	research/noc3d/$(DEPDIR)/Noc3DSmokeSource.Plo \
-	research/pe_fabric/$(DEPDIR)/PeSharedCoreFabric.Plo \
-	research/pe_fabric/$(DEPDIR)/PulseAgendaScorer.Plo \
 	research/route3d/$(DEPDIR)/SynapseRouteSubsystem3D.Plo \
 	snn/compute/$(DEPDIR)/SnnComputeCore.Plo \
 	snn/compute/$(DEPDIR)/SnnCoreEngine.Plo \
@@ -700,7 +694,6 @@ libSnnDL_la_SOURCES = \
 	api/IMemoryAccess.h \
 	api/IDmaTaggedAccess.h \
 	api/IDmaSchedulerProvider.h \
-	api/IPeSharedCoreFabricProvider.h \
 	api/ILocalStorageProvider.h \
 	api/ICoreWorkload.h \
 	api/ISnnAccelRuntimeServices.h \
@@ -728,8 +721,6 @@ libSnnDL_la_SOURCES = \
 	components/GatherBufferIF.h \
 	components/gather/GatherBufferIFConfig.cc \
 	components/gather/GatherBufferIFConfig.h \
-	components/gather/apply/DramAwareModel.cc \
-	components/gather/apply/DramAwareModel.h \
 	components/GatingPE.cc \
 	components/GatingPE.h \
 	components/MemKCalBench.cc \
@@ -885,11 +876,6 @@ libSnnDL_la_SOURCES = \
 	research/local_storage/PeWeightObjectPlane.h \
 	platform/memory/DmaMemAccessProxy.cc \
 	platform/memory/DmaMemAccessProxy.h \
-	research/pe_fabric/PulseAgendaScorer.cc \
-	research/pe_fabric/PulseAgendaScorer.h \
-	research/pe_fabric/PulseDescriptor.h \
-	research/pe_fabric/PeSharedCoreFabric.cc \
-	research/pe_fabric/PeSharedCoreFabric.h \
 	platform/memory/PeDmaScheduler.cc \
 	platform/memory/PeDmaScheduler.h \
 	platform/memory/StandardMemAccess.cc \
@@ -1013,9 +999,6 @@ components/gather/apply/$(am__dirstamp):
 components/gather/apply/$(DEPDIR)/$(am__dirstamp):
 	@$(MKDIR_P) components/gather/apply/$(DEPDIR)
 	@: > components/gather/apply/$(DEPDIR)/$(am__dirstamp)
-components/gather/apply/DramAwareModel.lo:  \
-	components/gather/apply/$(am__dirstamp) \
-	components/gather/apply/$(DEPDIR)/$(am__dirstamp)
 components/GatingPE.lo: components/$(am__dirstamp) \
 	components/$(DEPDIR)/$(am__dirstamp)
 components/MemKCalBench.lo: components/$(am__dirstamp) \
@@ -1368,12 +1351,6 @@ research/pe_fabric/$(am__dirstamp):
 research/pe_fabric/$(DEPDIR)/$(am__dirstamp):
 	@$(MKDIR_P) research/pe_fabric/$(DEPDIR)
 	@: > research/pe_fabric/$(DEPDIR)/$(am__dirstamp)
-research/pe_fabric/PulseAgendaScorer.lo:  \
-	research/pe_fabric/$(am__dirstamp) \
-	research/pe_fabric/$(DEPDIR)/$(am__dirstamp)
-research/pe_fabric/PeSharedCoreFabric.lo:  \
-	research/pe_fabric/$(am__dirstamp) \
-	research/pe_fabric/$(DEPDIR)/$(am__dirstamp)
 platform/memory/PeDmaScheduler.lo: platform/memory/$(am__dirstamp) \
 	platform/memory/$(DEPDIR)/$(am__dirstamp)
 platform/memory/StandardMemAccess.lo: platform/memory/$(am__dirstamp) \
@@ -1461,7 +1438,6 @@ include components/$(DEPDIR)/SnnNIC.Plo # am--include-marker
 include components/$(DEPDIR)/WeightLoader.Plo # am--include-marker
 include components/gas/$(DEPDIR)/GlobalGasStepController.Plo # am--include-marker
 include components/gather/$(DEPDIR)/GatherBufferIFConfig.Plo # am--include-marker
-include components/gather/apply/$(DEPDIR)/DramAwareModel.Plo # am--include-marker
 include components/multicore/$(DEPDIR)/MultiCorePEConfig.Plo # am--include-marker
 include components/multicore/$(DEPDIR)/MultiCorePEObservability.Plo # am--include-marker
 include components/noc/$(DEPDIR)/MulticastNIC.Plo # am--include-marker
@@ -1490,8 +1466,6 @@ include research/noc3d/$(DEPDIR)/HBMStackStub.Plo # am--include-marker
 include research/noc3d/$(DEPDIR)/MulticastRouter3DNative.Plo # am--include-marker
 include research/noc3d/$(DEPDIR)/Noc3DSmokeSink.Plo # am--include-marker
 include research/noc3d/$(DEPDIR)/Noc3DSmokeSource.Plo # am--include-marker
-include research/pe_fabric/$(DEPDIR)/PeSharedCoreFabric.Plo # am--include-marker
-include research/pe_fabric/$(DEPDIR)/PulseAgendaScorer.Plo # am--include-marker
 include research/route3d/$(DEPDIR)/SynapseRouteSubsystem3D.Plo # am--include-marker
 include snn/compute/$(DEPDIR)/SnnComputeCore.Plo # am--include-marker
 include snn/compute/$(DEPDIR)/SnnCoreEngine.Plo # am--include-marker
@@ -1806,7 +1780,6 @@ distclean: distclean-am
 	-rm -f components/$(DEPDIR)/WeightLoader.Plo
 	-rm -f components/gas/$(DEPDIR)/GlobalGasStepController.Plo
 	-rm -f components/gather/$(DEPDIR)/GatherBufferIFConfig.Plo
-	-rm -f components/gather/apply/$(DEPDIR)/DramAwareModel.Plo
 	-rm -f components/multicore/$(DEPDIR)/MultiCorePEConfig.Plo
 	-rm -f components/multicore/$(DEPDIR)/MultiCorePEObservability.Plo
 	-rm -f components/noc/$(DEPDIR)/MulticastNIC.Plo
@@ -1835,8 +1808,6 @@ distclean: distclean-am
 	-rm -f research/noc3d/$(DEPDIR)/MulticastRouter3DNative.Plo
 	-rm -f research/noc3d/$(DEPDIR)/Noc3DSmokeSink.Plo
 	-rm -f research/noc3d/$(DEPDIR)/Noc3DSmokeSource.Plo
-	-rm -f research/pe_fabric/$(DEPDIR)/PeSharedCoreFabric.Plo
-	-rm -f research/pe_fabric/$(DEPDIR)/PulseAgendaScorer.Plo
 	-rm -f research/route3d/$(DEPDIR)/SynapseRouteSubsystem3D.Plo
 	-rm -f snn/compute/$(DEPDIR)/SnnComputeCore.Plo
 	-rm -f snn/compute/$(DEPDIR)/SnnCoreEngine.Plo
@@ -1935,7 +1906,6 @@ maintainer-clean: maintainer-clean-am
 	-rm -f components/$(DEPDIR)/WeightLoader.Plo
 	-rm -f components/gas/$(DEPDIR)/GlobalGasStepController.Plo
 	-rm -f components/gather/$(DEPDIR)/GatherBufferIFConfig.Plo
-	-rm -f components/gather/apply/$(DEPDIR)/DramAwareModel.Plo
 	-rm -f components/multicore/$(DEPDIR)/MultiCorePEConfig.Plo
 	-rm -f components/multicore/$(DEPDIR)/MultiCorePEObservability.Plo
 	-rm -f components/noc/$(DEPDIR)/MulticastNIC.Plo
@@ -1964,8 +1934,6 @@ maintainer-clean: maintainer-clean-am
 	-rm -f research/noc3d/$(DEPDIR)/MulticastRouter3DNative.Plo
 	-rm -f research/noc3d/$(DEPDIR)/Noc3DSmokeSink.Plo
 	-rm -f research/noc3d/$(DEPDIR)/Noc3DSmokeSource.Plo
-	-rm -f research/pe_fabric/$(DEPDIR)/PeSharedCoreFabric.Plo
-	-rm -f research/pe_fabric/$(DEPDIR)/PulseAgendaScorer.Plo
 	-rm -f research/route3d/$(DEPDIR)/SynapseRouteSubsystem3D.Plo
 	-rm -f snn/compute/$(DEPDIR)/SnnComputeCore.Plo
 	-rm -f snn/compute/$(DEPDIR)/SnnCoreEngine.Plo
@@ -2114,8 +2082,6 @@ test-riscv-snn-toolchain-firmware-protocol:
 
 test-compile:
 	$(CXXCOMPILE) -c $(srcdir)/tests/test_includes.cc -o $(builddir)/test_includes.o
-	$(CXXCOMPILE) -c $(srcdir)/tests/test_pe_internal_pod_shadow_gate.cc -o $(builddir)/test_pe_internal_pod_shadow_gate.o
-	$(CXXCOMPILE) -c $(srcdir)/tests/test_pe_internal_pod_shadow_wms_seam.cc -o $(builddir)/test_pe_internal_pod_shadow_wms_seam.o
 	$(CXXCOMPILE) -c $(srcdir)/tests/test_riscv_snn_abi.cc -o $(builddir)/test_riscv_snn_abi.o
 	$(CXXCOMPILE) -c $(srcdir)/tests/test_riscv_snn_backend_timing_contract.cc -o $(builddir)/test_riscv_snn_backend_timing_contract.o
 	$(CXXCOMPILE) -c $(srcdir)/tests/test_riscv_snn_boot_driver.cc -o $(builddir)/test_riscv_snn_boot_driver.o

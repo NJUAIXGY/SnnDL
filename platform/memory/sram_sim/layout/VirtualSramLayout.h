@@ -32,7 +32,7 @@ public:
     }
     const VirtualSramLayoutConfig& config() const { return cfg_; }
 
-    // GCSS index virtual ranges
+    // Weight-index virtual ranges shared by BCSR and local-storage accounting.
     uint64_t idxRowBaseAddr(uint32_t row) const {
         return cfg_.idx_base + static_cast<uint64_t>(row) * 32ull;
     }
@@ -78,4 +78,3 @@ private:
 };
 
 }} // namespace SST::SnnDL
-

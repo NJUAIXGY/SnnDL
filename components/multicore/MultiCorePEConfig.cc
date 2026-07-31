@@ -138,47 +138,6 @@ MultiCorePEConfig parseMultiCorePEConfig(const SST::Params& params) {
             c.pe_internal_pod_ready_enable = c.pe_internal_pod_ready_entries > 0;
         }
     }
-    c.pulse_enable = params.find<bool>("pulse_enable", false);
-    c.pulse_osa_enable = params.find<bool>("pulse_osa_enable", false);
-    c.pulse_osa_shared_weight_owner_enable =
-        params.find<bool>("pulse_osa_shared_weight_owner_enable", false);
-    c.pulse_osa_shared_weight_owner_actual_enable =
-        params.find<bool>("pulse_osa_shared_weight_owner_actual_enable", false);
-    c.pulse_osa_metadata_txn_enable =
-        params.find<bool>("pulse_osa_metadata_txn_enable", false);
-    c.pulse_osa_metadata_ready_lease_enable =
-        params.find<bool>("pulse_osa_metadata_ready_lease_enable", false);
-    c.pulse_osa_metadata_ready_lease_ttl =
-        params.find<uint32_t>("pulse_osa_metadata_ready_lease_ttl", 0);
-    c.pulse_osa_metadata_object_mask =
-        toLowerCopy(params.find<std::string>(
-            "pulse_osa_metadata_object_mask", "rowdescriptor"));
-    c.pulse_observe_only = params.find<int>("pulse_observe_only", 1) != 0;
-    c.pulse_ingress_enable = params.find<int>("pulse_ingress_enable", 1) != 0;
-    c.pulse_agenda_observe_only = params.find<int>("pulse_agenda_observe_only", 1) != 0;
-    c.pulse_harbor_enable = params.find<int>("pulse_harbor_enable", 0) != 0;
-    c.pulse_descriptor_enable = params.find<int>("pulse_descriptor_enable", 0) != 0;
-    c.pulse_descriptor_actual_enable = params.find<int>("pulse_descriptor_actual_enable", 0) != 0;
-    c.experimental_rowdescriptor_ready_join_dedup_enable =
-        params.find<int>("experimental_rowdescriptor_ready_join_dedup_enable", 0) != 0;
-    c.pulse_domain_retire_enable = params.find<int>("pulse_domain_retire_enable", 0) != 0;
-    c.pulse_domain_retire_observe_only = params.find<int>("pulse_domain_retire_observe_only", 1) != 0;
-    c.pulse_domain_retire_mode =
-        toLowerCopy(params.find<std::string>("pulse_domain_retire_mode", "per_post"));
-    if (c.pulse_domain_retire_mode != "descriptor_domain") c.pulse_domain_retire_mode = "per_post";
-    c.pulse_domain_retire_release_budget =
-        params.find<uint32_t>("pulse_domain_retire_release_budget", 0);
-    c.pulse_ingress_entries = params.find<uint32_t>("pulse_ingress_entries", 0);
-    c.pulse_core_queue_entries = params.find<uint32_t>("pulse_core_queue_entries", 0);
-    c.pulse_descriptor_packet_min = params.find<uint32_t>("pulse_descriptor_packet_min", 2);
-    if (c.pulse_descriptor_packet_min == 0) c.pulse_descriptor_packet_min = 2;
-    c.pulse_bypass_high_watermark_pct =
-        params.find<uint32_t>("pulse_bypass_high_watermark_pct", 100);
-    if (c.pulse_bypass_high_watermark_pct == 0) c.pulse_bypass_high_watermark_pct = 100;
-    if (c.pulse_bypass_high_watermark_pct > 100) c.pulse_bypass_high_watermark_pct = 100;
-    c.pulse_bypass_mode = toLowerCopy(params.find<std::string>("pulse_bypass_mode", "disabled"));
-    if (c.pulse_bypass_mode != "high_watermark") c.pulse_bypass_mode = "disabled";
-
     c.ls_state_capacity_bytes =
         params.find<uint64_t>("ls_state_capacity_bytes",
                               params.find<uint64_t>("state_sram_capacity_bytes", 0));

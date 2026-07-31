@@ -24,11 +24,6 @@ struct GlobalGasStepControllerConfig {
     uint64_t experimental_progress_period_cycles = 0;
     uint32_t experimental_progress_max_reports = 0;
     uint32_t experimental_progress_dump_first_n = 8;
-    // Experimental: step-level global apply bank credit control.
-    bool credit_ctrl_enable = false;
-    uint32_t credit_ctrl_credit_min = 1;
-    uint32_t credit_ctrl_credit_max = 2;
-    uint32_t credit_ctrl_top_k = 0; // 0=disable (even if enable=1)
     bool gating_event_enable = false;
     uint32_t gating_event_rows_per_pe = 0;
     uint32_t gating_event_top_k = 0;
@@ -49,10 +44,6 @@ inline GlobalGasStepControllerConfig parseGlobalGasStepControllerConfig(const SS
     c.experimental_progress_period_cycles = params.find<uint64_t>("experimental_progress_period_cycles", 0);
     c.experimental_progress_max_reports = params.find<uint32_t>("experimental_progress_max_reports", 0);
     c.experimental_progress_dump_first_n = params.find<uint32_t>("experimental_progress_dump_first_n", 8);
-    c.credit_ctrl_enable = params.find<int>("credit_ctrl_enable", 0) != 0;
-    c.credit_ctrl_credit_min = params.find<uint32_t>("credit_ctrl_credit_min", 1);
-    c.credit_ctrl_credit_max = params.find<uint32_t>("credit_ctrl_credit_max", 2);
-    c.credit_ctrl_top_k = params.find<uint32_t>("credit_ctrl_top_k", 0);
     c.gating_event_enable = params.find<int>("gating_event_enable", 0) != 0;
     c.gating_event_rows_per_pe = params.find<uint32_t>("gating_event_rows_per_pe", 0);
     c.gating_event_top_k = params.find<uint32_t>("gating_event_top_k", 0);
