@@ -126,7 +126,8 @@ inline bool validateBcsrMetaAgainstFile(const BcsrMeta& meta,
     if (meta.rowptr_offset >= file_size) return fail("rowptr_offset out of range");
     if (meta.colidx_offset >= file_size) return fail("colidx_offset out of range");
     if (meta.blockdata_offset >= file_size) return fail("blockdata_offset out of range");
-    if (meta.blockids_offset >= file_size) return fail("blockids_offset out of range");
+    // blockids_offset==0 is the documented "no validity mask" form.
+    if (meta.blockids_offset && meta.blockids_offset >= file_size) return fail("blockids_offset out of range");
 
     const uint32_t n_block_rows = bcsrNumBlockRows(rows_for_rowptr, br);
     if (n_block_rows == 0) return fail("invalid rows_for_rowptr");

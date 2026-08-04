@@ -3,6 +3,7 @@
 #include <cmath>
 #include <fstream>
 #include <sstream>
+#include <utility>
 
 namespace SST { namespace SnnDL {
 
@@ -192,4 +193,3 @@ void DefaultLearningCore::onWindowBoundary_(uint64_t window_idx) {
 }
 
 }} // namespace SST::SnnDL
-

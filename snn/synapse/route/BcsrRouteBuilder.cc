@@ -18,6 +18,7 @@
 #include <sst/core/output.h>
 
 #include "snn/synapse/common/BcsrMeta.h"
+#include "snn/synapse/common/BcsrDataSource.h"
 #include "SnnDLStringUtil.h"
 
 namespace SST { namespace SnnDL {
@@ -82,16 +83,40 @@ bool appendRoutesFromBcsrFile(const SynapseRouteBuildConfig& cfg,
                               ISynapseRoute::RouteMap& routes_out,
                               const BcsrAppendOptions& opt,
                               RouteWeightMap* route_weights_out) {
+    // Validate and normalize the file source once through the same contract
+    // used by weight-side fallback/diagnostic reads.  The model still limits
+    // routing to rows_hint; a larger backing dataset never changes topology.
+    BcsrFileSource source;
+    std::string source_error;
+    if (!loadBcsrFileSource(path, rows_hint, source, &source_error,
+                            /*compute_content_fingerprint=*/true)) {
+        if (out) out->verbose(CALL_INFO, 0, 0,
+                              "BCSR route source rejected: %s (%s)\n",
+                              source_error.c_str(), path.c_str());
+        return false;
+    }
+
+    const std::string contract_slot =
+        "pe=" + std::to_string(pe_index) + "/core=" + std::to_string(core_index);
+    std::string contract_error;
+    if (!bindBcsrSourceContract(contract_slot, path, source.identity(), "route",
+                                &contract_error)) {
+        if (out) out->verbose(CALL_INFO, 0, 0,
+                              "BCSR route source rejected by contract: %s\n",
+                              contract_error.c_str());
+        return false;
+    }
+
     uint32_t rows = rows_hint;
-    uint32_t cols = cfg.cols;
-    uint32_t br = cfg.bcsr_br ? cfg.bcsr_br : 16;
-    uint32_t bc = cfg.bcsr_bc ? cfg.bcsr_bc : 16;
-    uint32_t idx_bytes = cfg.bcsr_idx_bytes ? cfg.bcsr_idx_bytes : 2;
-    uint32_t val_bytes = cfg.bcsr_val_bytes ? cfg.bcsr_val_bytes : 4;
-    uint64_t rowptr_off = (cfg.bcsr_rowptr_addr > cfg.base_addr) ? (cfg.bcsr_rowptr_addr - cfg.base_addr) : 0;
-    uint64_t colidx_off = (cfg.bcsr_colidx_addr > cfg.base_addr) ? (cfg.bcsr_colidx_addr - cfg.base_addr) : 0;
-    uint64_t blockdata_off = (cfg.bcsr_blockdata_addr > cfg.base_addr) ? (cfg.bcsr_blockdata_addr - cfg.base_addr) : 0;
-    uint64_t blockids_off = (cfg.bcsr_blockids_addr > cfg.base_addr) ? (cfg.bcsr_blockids_addr - cfg.base_addr) : 0;
+    uint32_t cols = cfg.cols ? cfg.cols : source.meta.cols;
+    uint32_t br = source.blockRows();
+    uint32_t bc = source.blockCols();
+    uint32_t idx_bytes = source.indexBytes();
+    uint32_t val_bytes = source.valueBytes();
+    uint64_t rowptr_off = source.meta.rowptr_offset;
+    uint64_t colidx_off = source.meta.colidx_offset;
+    uint64_t blockdata_off = source.meta.blockdata_offset;
+    uint64_t blockids_off = source.meta.blockids_offset;
     uint32_t total_blocks = 0;
     std::string layout_mode;
     uint32_t colidx_row_stride_bytes = 0;
@@ -123,6 +148,23 @@ bool appendRoutesFromBcsrFile(const SynapseRouteBuildConfig& cfg,
     } else {
         total_blocks = 0;
     }
+    // The shared descriptor is authoritative even when a legacy parser path
+    // above filled defaults from the same JSON file.
+    rows = rows_hint ? rows_hint : source.meta.rows;
+    if (cfg.cols == 0) cols = source.meta.cols;
+    br = source.blockRows();
+    bc = source.blockCols();
+    idx_bytes = source.indexBytes();
+    val_bytes = source.valueBytes();
+    rowptr_off = source.meta.rowptr_offset;
+    colidx_off = source.meta.colidx_offset;
+    blockdata_off = source.meta.blockdata_offset;
+    blockids_off = source.meta.blockids_offset;
+    total_blocks = source.meta.total_blocks;
+    layout_mode = source.meta.layout_mode;
+    colidx_row_stride_bytes = source.meta.colidx_row_stride_bytes;
+    blockdata_row_stride_bytes = source.meta.blockdata_row_stride_bytes;
+    blockids_row_stride_bytes = source.meta.blockids_row_stride_bytes;
     if (layout_mode.empty()) layout_mode = "flat";
     if (rows == 0 || cols == 0) {
         if (out) out->verbose(CALL_INFO, 0, 0, "⚠️ BCSR路由: 元数据缺失 rows/cols %s\n", path.c_str());

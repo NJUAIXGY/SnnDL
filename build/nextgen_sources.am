@@ -1,0 +1,11 @@
+# Next-generation synchronous domain core.  This manifest is intentionally
+# independent of the legacy optional-domain source manifests.
+SNNDL_NEXT_CORE_SOURCES = \
+	api/TimestepTypes.h \
+	events/TimestepControlEvent.h \
+	snn/timestep/TimestepTracker.h \
+	snn/timestep/TimestepTracker.cc \
+	snn/compute/DeltaAccumulator.h \
+	snn/compute/DeltaAccumulator.cc \
+	snn/compute/NextGenNeuronEngine.h \
+	snn/compute/NextGenNeuronEngine.cc

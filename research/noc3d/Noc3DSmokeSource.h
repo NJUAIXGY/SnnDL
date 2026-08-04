@@ -17,7 +17,7 @@ class Noc3DSmokeSource final : public SST::Component {
 public:
     SST_ELI_REGISTER_COMPONENT(
         Noc3DSmokeSource,
-        "SnnDL",
+        "SnnDLResearch",
         "Noc3DSmokeSource",
         SST_ELI_ELEMENT_VERSION(1, 0, 0),
         "Inject a single NocPacketEvent for isolated 3D smoke runs",

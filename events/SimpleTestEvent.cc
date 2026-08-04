@@ -1,5 +1,7 @@
 #include "SimpleTestEvent.h"
 
+extern "C" void snndl_core_anchor() {}
+
 namespace SST {
 namespace SnnDL {
 

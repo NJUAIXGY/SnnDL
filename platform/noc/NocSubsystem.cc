@@ -44,6 +44,10 @@ NocSubsystem::~NocSubsystem() {
         delete incoming_queue_.front();
         incoming_queue_.pop();
     }
+    while (!pending_ring_injections_.empty()) {
+        delete pending_ring_injections_.front().packet;
+        pending_ring_injections_.pop_front();
+    }
 }
 
 void NocSubsystem::configure(const Config& cfg) {
@@ -124,7 +128,30 @@ void NocSubsystem::routeInternalPacket_(int src_core, int dst_core, NocPacketEve
     if (sent) {
         if (st_.inter_core_messages) st_.inter_core_messages->addData(1);
     } else {
-        delete packet;
+        pending_ring_injections_.push_back(PendingRingInjection{src_core, dst_core, packet});
+    }
+}
+
+void NocSubsystem::retryPendingRingInjections_() {
+    if (!rt_.optimized_ring || pending_ring_injections_.empty()) return;
+
+    // Try each packet at most once per call.  If every source VC is blocked,
+    // retain the order and return without spinning in the same simulation tick.
+    const size_t attempts = pending_ring_injections_.size();
+    for (size_t i = 0; i < attempts; ++i) {
+        PendingRingInjection pending = pending_ring_injections_.front();
+        pending_ring_injections_.pop_front();
+        RingMessage msg;
+        msg.type = RingMessageType::PACKET_MESSAGE;
+        msg.src_unit = pending.src_core;
+        msg.dst_unit = pending.dst_core;
+        msg.priority = 1;
+        msg.payload.packet = pending.packet;
+        if (rt_.optimized_ring->sendMessage(pending.src_core, pending.dst_core, msg, 1)) {
+            if (st_.inter_core_messages) st_.inter_core_messages->addData(1);
+        } else {
+            pending_ring_injections_.push_back(pending);
+        }
     }
 }
 
@@ -396,6 +423,7 @@ void NocSubsystem::drainIncomingQueue(uint64_t /*current_cycle*/) {
 
 bool NocSubsystem::isIdle() const {
     if (!incoming_queue_.empty()) return false;
+    if (!pending_ring_injections_.empty()) return false;
     if (rt_.optimized_ring && rt_.optimized_ring->getPendingMessageCount() != 0) return false;
     if (rt_.nic && rt_.nic->pendingSendCount() != 0) return false;
     return true;
@@ -406,7 +434,8 @@ size_t NocSubsystem::nicPendingSendCount() const {
 }
 
 int NocSubsystem::ringPendingMessageCount() const {
-    return rt_.optimized_ring ? rt_.optimized_ring->getPendingMessageCount() : 0;
+    const int ring_pending = rt_.optimized_ring ? rt_.optimized_ring->getPendingMessageCount() : 0;
+    return ring_pending + static_cast<int>(pending_ring_injections_.size());
 }
 
 void NocSubsystem::tickRing(uint64_t current_cycle) {
@@ -416,9 +445,14 @@ void NocSubsystem::tickRing(uint64_t current_cycle) {
 void NocSubsystem::tickOptimizedRing_(uint64_t current_cycle) {
     if (!rt_.optimized_ring) return;
 
+    retryPendingRingInjections_();
     rt_.optimized_ring->tick(current_cycle);
+    // A credit returned by this tick can accept one queued packet without
+    // waiting for another caller-side event; the message is still one-hop
+    // delayed by RingMessage::ready_cycle.
+    retryPendingRingInjections_();
 
-    // 与历史 MultiCorePE 行为保持一致：对每个 core 轮询 ejection queue
+    // Poll each endpoint queue once per tick for deterministic progress.
     for (int i = 0; i < rt_.num_cores; i++) {
         RingMessage msg;
         while (rt_.optimized_ring->receiveMessage(i, msg)) {

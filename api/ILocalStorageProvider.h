@@ -1,7 +1,7 @@
 // -*- c++ -*-
 //
 // Narrow provider interface for exposing a PE-shared local storage hierarchy
-// without coupling callers to MultiCorePE concrete implementation.
+// without coupling callers to a concrete SST component.
 
 #pragma once
 

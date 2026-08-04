@@ -2,6 +2,8 @@
 
 #include "HBMStackStub.h"
 
+extern "C" void snndl_research_anchor() {}
+
 namespace SST { namespace SnnDL {
 
 HBMStackStub::HBMStackStub(SST::ComponentId_t id, SST::Params& params)

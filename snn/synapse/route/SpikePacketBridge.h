@@ -2,7 +2,7 @@
 //
 // SpikePacketBridge:
 // - 将 SpikeEvent <-> NocPacketEvent 的编解码与投递 glue 下沉到 synapse/route 域；
-// - 目标：MultiCorePE 不直接调用 SpikeNocCodec，仅负责装配/调度。
+// - 目标：组件装配层不直接处理 SpikeNocCodec 的字段语义。
 //
 // Ownership contract:
 // - deliverPacketToEndpoint(): takes ownership of NocPacketEvent*

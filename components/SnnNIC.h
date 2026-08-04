@@ -4,7 +4,7 @@
 //
 // SnnNIC.h: SNN网络接口控制器头文件
 // Recommended NIC for SnnDL. Integrates with merlin.linkcontrol (SimpleNetwork)
-// and is the default path for MultiCorePE + SnnPESubComponent simulations.
+// and is the default path for active packet simulations.
 //
 
 #ifndef _SNNNIC_H

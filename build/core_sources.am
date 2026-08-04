@@ -1,0 +1,16 @@
+# Stable SnnDL core primitives.  No PE assembly, workload registry, weight
+# front-end, or research implementation is compiled here.
+libSnnDLCore_la_SOURCES = \
+	api/GlobalNeuronLayout.h \
+	api/SnnDLLogging.h \
+	api/SnnDLStringUtil.h \
+	events/SimpleTestEvent.cc \
+	events/SimpleTestEvent.h \
+	snn/compute/SnnCoreEngine.cc \
+	snn/compute/SnnCoreEngine.h \
+	snn/compute/SnnLearningCore.cc \
+	snn/compute/SnnLearningCore.h \
+	snn/compute/SnnNeuronModel.h \
+	snn/compute/SynapseManager.h \
+	snn/profiling/SnnProfiler.h \
+	snn/synapse/common/BcsrMeta.h

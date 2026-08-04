@@ -1,6 +1,6 @@
 // -*- c++ -*-
 //
-// Optional DMA-tagged memory read extension.
+// DMA-tagged memory read extension.
 // Keeps IMemoryAccess semantics intact while allowing upper layers
 // to attach opaque tags and a DMA priority hint.
 

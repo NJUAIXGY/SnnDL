@@ -106,7 +106,7 @@ class SimpleNetworkWrapper;
 /**
  * @brief SNN 通用网络拓扑适配器
  * 
- * 该组件作为 SnnPE/MultiCorePE 与 Merlin 路由器之间的通用适配器，
+ * 该组件作为 SST packet 端点与 Merlin 路由器之间的通用适配器，
  * 支持多种网络拓扑：Mesh、Torus、Dragonfly、Fat-tree、HyperX等。
  * 使用组合模式集成SimpleNetwork接口以支持hr_router集成。
  */

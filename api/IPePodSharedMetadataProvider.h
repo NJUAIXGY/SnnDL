@@ -1,7 +1,7 @@
 // -*- c++ -*-
 //
 // Narrow provider interface for exposing PE-internal pod-shared metadata services
-// without coupling callers to MultiCorePE concrete implementation.
+// without coupling callers to a concrete SST component.
 
 #pragma once
 

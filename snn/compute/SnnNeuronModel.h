@@ -87,7 +87,7 @@ public:
     virtual void accumulateISyn(uint32_t /*i*/, float /*w*/) {}
     virtual void clearAccumulatedISyn() {}
 
-    // Array helpers that operate on host-owned neuron states (SnnPE/SnnPESubComponent).
+    // Array helpers that operate on host-owned neuron states.
     template <typename StateT>
     void tickArray(std::vector<StateT>& neurons) {
         const uint32_t N = static_cast<uint32_t>(neurons.size());
@@ -336,7 +336,7 @@ inline ModelConfig buildModelConfigFromParams(const SST::Params& params) {
     cfg.v_rest   = params.find<float>("v_rest", 0.0f);
     cfg.tau_mem  = params.find<float>("tau_mem", 20.0f);
     cfg.t_ref    = params.find<uint32_t>("t_ref", 2);
-    // Optional knob to match SnnPESubComponent's conditional leak if needed later.
+    // Optional conditional leak knob for model-specific experiments.
     cfg.lif_leak_only_above_rest = params.find<int>("lif_leak_only_above_rest", 0) != 0;
     return cfg;
 }

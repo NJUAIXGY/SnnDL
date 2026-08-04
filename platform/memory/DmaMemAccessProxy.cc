@@ -6,6 +6,8 @@
 
 #include "platform/memory/PeDmaScheduler.h"
 
+extern "C" void snndl_local_anchor() {}
+
 namespace SST { namespace SnnDL {
 
 IMemoryAccess::RequestId

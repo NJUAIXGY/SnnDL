@@ -38,6 +38,10 @@ struct RingMessage {
     int src_unit;      // 源处理单元ID
     int dst_unit;      // 目标处理单元ID  
     uint64_t timestamp;
+    // Earliest cycle at which the message may be considered by the next
+    // router. Forwarding sets this to current_cycle+1, enforcing one hop per
+    // tick even when nodes are iterated in numeric order.
+    uint64_t ready_cycle;
     int priority;      // 消息优先级
     
     union {
@@ -48,14 +52,14 @@ struct RingMessage {
     } payload;
     
     RingMessage() : type(RingMessageType::PACKET_MESSAGE), 
-                   src_unit(-1), dst_unit(-1), timestamp(0), priority(1) {
+                   src_unit(-1), dst_unit(-1), timestamp(0), ready_cycle(0), priority(1) {
         payload.packet = nullptr;
     }
     
     // 拷贝构造函数
     RingMessage(const RingMessage& other) 
         : type(other.type), src_unit(other.src_unit), dst_unit(other.dst_unit), 
-          timestamp(other.timestamp), priority(other.priority) {
+          timestamp(other.timestamp), ready_cycle(other.ready_cycle), priority(other.priority) {
         payload = other.payload;  // 浅拷贝指针
     }
     
@@ -66,6 +70,7 @@ struct RingMessage {
             src_unit = other.src_unit;
             dst_unit = other.dst_unit;
             timestamp = other.timestamp;
+            ready_cycle = other.ready_cycle;
             priority = other.priority;
             payload = other.payload;  // 浅拷贝指针
         }

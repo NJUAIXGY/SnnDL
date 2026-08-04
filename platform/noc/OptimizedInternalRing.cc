@@ -223,6 +223,7 @@ bool OptimizedInternalRing::sendMessage(int src_node, int dst_node, const RingMe
     routed_msg.src_unit = src_node;
     routed_msg.dst_unit = dst_node;
     routed_msg.timestamp = total_cycles_.load();
+    routed_msg.ready_cycle = total_cycles_.load();
     
     // 将消息加入VC缓冲区
     vc->buffer.push(routed_msg);
@@ -351,6 +352,9 @@ void OptimizedInternalRing::processDirectionVCs(RingNode* node, RouteDirection d
     if (!vc.hasData()) return;
     
     RingMessage& msg = vc.buffer.front();
+    // A forwarded message becomes visible only on the next tick. This makes
+    // latency independent of the numeric order in which nodes are visited.
+    if (msg.ready_cycle > current_cycle) return;
     
     // 检查是否到达目标
     if (msg.dst_unit == node->node_id) {
@@ -425,7 +429,9 @@ bool OptimizedInternalRing::forwardMessage(RingNode* node, const RingMessage& me
     }
     
     // 转发消息
-    next_vc->buffer.push(message);
+    RingMessage forwarded = message;
+    forwarded.ready_cycle = total_cycles_.load() + 1;
+    next_vc->buffer.push(forwarded);
     next_vc->consumeCredit();
     next_vc->state = VCState::ACTIVE;
     next_vc->last_activity_cycle = total_cycles_.load();

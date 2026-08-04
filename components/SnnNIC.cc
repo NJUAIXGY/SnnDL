@@ -18,6 +18,8 @@
 #include "SnnNICConfig.h"
 #include "SnnDLLogging.h"
 
+extern "C" void snndl_comm_anchor() {}
+
 using namespace SST;
 using namespace SST::SnnDL;
 using namespace SST::Interfaces;

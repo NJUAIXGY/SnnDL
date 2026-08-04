@@ -4,12 +4,13 @@
 // - 统一收敛 NoC 输入侧（NIC 回调 / 外部端口 / mesh 方向链路）
 // - 覆盖 send/recv/forward + 本地投递（跨 core ring）
 //
-// Phase4-A1.1：以“编排/适配层”形式落地，先通过回调复用 MultiCorePE 现有后端能力，
-// 保持行为/统计口径不变，再逐步把后端实现迁出 MultiCorePE。
+// Packet orchestration layer: callbacks keep endpoint delivery and network
+// transport independent from the SST component that owns the subsystem.
 
 #pragma once
 
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <queue>
 #include <string>
@@ -38,7 +39,7 @@ public:
         int node_id = 0;
         int num_cores = 1;
 
-        // NoC backends（由 MultiCorePE 装配并保证生命周期）
+        // NoC backends are supplied by the owning component and outlive this object.
         SnnInterface* nic = nullptr;
         OptimizedInternalRing* optimized_ring = nullptr;
         SST::Link* external_spike_output_link = nullptr;  // legacy fallback
@@ -49,7 +50,7 @@ public:
         const uint32_t* active_step_seq = nullptr;  // 非拥有
         uint32_t step_seq_offset = 0;
 
-        // 投递回调（由 MultiCorePE 提供实现）：NoC 只负责把 packet 投递到目标 endpoint
+        // Delivery callback: NoC only forwards a packet to its endpoint.
         std::function<void(int /*endpoint_id*/, NocPacketEvent*)> deliver_to_endpoint;
     };
 
@@ -79,7 +80,7 @@ public:
     void onExternalPortEvent(SST::Event* event);
     void onDirectionalLinkEvent(SST::Event* event, const std::string& direction);
 
-    // === Scheduled by MultiCorePE ===
+    // === Scheduled by the owning component ===
     void drainIncomingQueue(uint64_t current_cycle);
     void tickRing(uint64_t current_cycle);
 
@@ -89,10 +90,17 @@ public:
     int ringPendingMessageCount() const;
 
 private:
+    struct PendingRingInjection {
+        int src_core = -1;
+        int dst_core = -1;
+        NocPacketEvent* packet = nullptr;
+    };
+
     void enqueueIncoming_(NocPacketEvent* packet);
     void sendExternalPacket_(NocPacketEvent* packet);
     void forwardExternalPacket_(NocPacketEvent* packet);
     void routeInternalPacket_(int src_core, int dst_core, NocPacketEvent* packet);
+    void retryPendingRingInjections_();
     void tickOptimizedRing_(uint64_t current_cycle);
 
     Config cfg_{};
@@ -100,6 +108,9 @@ private:
     Stats st_{};
 
     std::queue<NocPacketEvent*> incoming_queue_;
+    // Owns packets until the ring accepts them.  Source VC pressure is
+    // backpressure, never a packet-loss condition.
+    std::deque<PendingRingInjection> pending_ring_injections_;
 };
 
 }} // namespace SST::SnnDL

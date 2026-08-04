@@ -1,7 +1,7 @@
 // -*- c++ -*-
 //
 // StepBcsrReachability:
-// - 为 StepActivationSubsystem 提供 “基于 BCSR reachability 的 post 采样路由” 构建逻辑；
+// - 为外部 stimulus 提供“基于 BCSR reachability 的 post 采样路由”构建逻辑；
 // - 放入 synapse/route 域，避免 stimulus 域重复实现 BCSR 解析与口径漂移。
 //
 
@@ -52,4 +52,3 @@ bool buildStepBcsrReachabilityRoutes(const StepBcsrReachabilityConfig& cfg,
                                      std::vector<uint32_t>& pre_with_routes_out);
 
 }} // namespace SST::SnnDL
-

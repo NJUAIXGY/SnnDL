@@ -14,7 +14,7 @@ class HBMStackStub final : public SST::Component {
 public:
     SST_ELI_REGISTER_COMPONENT(
         HBMStackStub,
-        "SnnDL",
+        "SnnDLResearch",
         "HBMStackStub",
         SST_ELI_ELEMENT_VERSION(1, 0, 0),
         "Minimal HBM-like stack stub for isolated snn3dexp object graphs",

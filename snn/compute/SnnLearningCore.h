@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <functional>
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -48,7 +49,7 @@ public:
     virtual bool enabled() const = 0;
 };
 
-// 默认 superspike 学习核心（复刻旧 SnnPESubComponent 口径）
+// 默认 superspike 学习核心。
 class DefaultLearningCore final : public ILearningCore {
 public:
     void configure(uint32_t core_id,
@@ -110,4 +111,3 @@ private:
 };
 
 }} // namespace SST::SnnDL
-

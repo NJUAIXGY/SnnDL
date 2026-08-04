@@ -53,7 +53,7 @@ public:
     )
 
     SST_ELI_DOCUMENT_PORTS(
-        {"local", "本地端口（连接到 MultiCorePE.network）", {"SnnDL.NocPacketEvent"}},
+        {"local", "本地 packet 端口", {"SnnDL.NocPacketEvent"}},
         {"north", "北向端口（连接到相邻 router）", {"SnnDL.NocPacketEvent"}},
         {"south", "南向端口（连接到相邻 router）", {"SnnDL.NocPacketEvent"}},
         {"east", "东向端口（连接到相邻 router）", {"SnnDL.NocPacketEvent"}},

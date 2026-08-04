@@ -1,0 +1,101 @@
+# Active extension domains.  Each target is independent of the archived
+# legacy PE and workload object graph.
+
+libSnnDLComm_la_SOURCES = \
+	api/INocTransport.h \
+	api/ISpikeTransport.h \
+	api/ISynapseRoute.h \
+	api/MulticastLimits.h \
+	api/NocSpikeTransport.h \
+	api/SnnInterface.h \
+	api/SynapseRouteBuildConfig.h \
+	events/NocPacketBatchEvent.h \
+	events/NocPacketEvent.h \
+	events/SpikeEvent.h \
+	events/SpikeEventWrapper.cc \
+	events/SpikeEventWrapper.h \
+	events/SpikePacket.h \
+	components/SnnNIC.cc \
+	components/SnnNIC.h \
+	components/SnnNICConfig.h \
+	components/noc/LocalEndpointMulticastCodec.h \
+	components/noc/MulticastNIC.cc \
+	components/noc/MulticastNIC.h \
+	components/noc/MulticastNICConfig.h \
+	components/noc/MulticastRouter.cc \
+	components/noc/MulticastRouter.h \
+	components/noc/MulticastRouterConfig.h \
+	components/noc/SimpleNetworkWrapper.cc \
+	components/noc/SimpleNetworkWrapper.h \
+	components/noc/SnnNetworkAdapter.cc \
+	components/noc/SnnNetworkAdapter.h \
+	components/noc/SnnNetworkAdapterConfig.h \
+	platform/noc/NocSubsystem.cc \
+	platform/noc/NocSubsystem.h \
+	platform/noc/OptimizedInternalRing.cc \
+	platform/noc/OptimizedInternalRing.h \
+	snn/stimulus/ExternalSpikeInputSubsystem.cc \
+	snn/stimulus/ExternalSpikeInputSubsystem.h \
+	snn/synapse/common/BcsrDataSource.h \
+	snn/synapse/route/BcsrRouteBuilder.cc \
+	snn/synapse/route/BcsrRouteBuilder.h \
+	snn/synapse/route/SnnRouteProvider.cc \
+	snn/synapse/route/SnnRouteProvider.h \
+	snn/synapse/route/SpikeCommSubsystem.cc \
+	snn/synapse/route/SpikeCommSubsystem.h \
+	snn/synapse/route/SpikeInterBundleCodec.h \
+	snn/synapse/route/SpikeNocCodec.cc \
+	snn/synapse/route/SpikeNocCodec.h \
+	snn/synapse/route/SpikePacketBridge.cc \
+	snn/synapse/route/SpikePacketBridge.h \
+	snn/synapse/route/SpikePacketTransport.h \
+	snn/synapse/route/SpikeTileBatchEmitter.h \
+	snn/synapse/route/SpikeTileNocCodec.h \
+	snn/synapse/route/StepBcsrReachability.cc \
+	snn/synapse/route/StepBcsrReachability.h \
+	snn/synapse/route/SynapseRouteSubsystem.cc \
+	snn/synapse/route/SynapseRouteSubsystem.h
+
+libSnnDLLocal_la_SOURCES = \
+	api/IDmaSchedulerProvider.h \
+	api/IDmaTaggedAccess.h \
+	api/ILocalStorageProvider.h \
+	api/IMemoryAccess.h \
+	api/IPePodSharedMetadataProvider.h \
+	api/IPeWeightObjectPlaneProvider.h \
+	platform/memory/DmaMemAccessProxy.cc \
+	platform/memory/DmaMemAccessProxy.h \
+	platform/memory/PeDmaScheduler.cc \
+	platform/memory/PeDmaScheduler.h \
+	platform/memory/StandardMemAccess.cc \
+	platform/memory/StandardMemAccess.h \
+	platform/memory/sram_sim/layout/VirtualSramLayout.h \
+	platform/memory/sram_sim/model/BankedSramModel.cc \
+	platform/memory/sram_sim/model/BankedSramModel.h \
+	research/local_storage/LocalStorageHierarchyController.cc \
+	research/local_storage/LocalStorageHierarchyController.h \
+	research/local_storage/LocalStorageTypes.h \
+	research/local_storage/PeInternalPodShadowGate.h \
+	research/local_storage/PeLocalServiceObjectTable.h \
+	research/local_storage/PeWeightObjectPlane.cc \
+	research/local_storage/PeWeightObjectPlane.h \
+	research/local_storage/PodMetadataObjectPlane.h \
+	research/local_storage/PodOwnerServiceTable.h
+
+libSnnDLRegistry_la_SOURCES = \
+	api/BcsrSourceContract.h \
+	platform/registry/BcsrSourceContract.cc
+
+libSnnDLResearch_la_SOURCES = \
+	research/noc3d/HBMStackStub.cc \
+	research/noc3d/HBMStackStub.h \
+	research/noc3d/MulticastRouter3DNative.cc \
+	research/noc3d/MulticastRouter3DNative.h \
+	research/noc3d/MulticastRouter3DNativeConfig.h \
+	research/noc3d/Noc3DSmokeSink.cc \
+	research/noc3d/Noc3DSmokeSink.h \
+	research/noc3d/Noc3DSmokeSource.cc \
+	research/noc3d/Noc3DSmokeSource.h \
+	research/route3d/Route3DNodeMapper.h \
+	research/route3d/SynapseRouteSubsystem3D.cc \
+	research/route3d/SynapseRouteSubsystem3D.h

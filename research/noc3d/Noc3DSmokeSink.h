@@ -15,7 +15,7 @@ class Noc3DSmokeSink final : public SST::Component {
 public:
     SST_ELI_REGISTER_COMPONENT(
         Noc3DSmokeSink,
-        "SnnDL",
+        "SnnDLResearch",
         "Noc3DSmokeSink",
         SST_ELI_ELEMENT_VERSION(1, 0, 0),
         "Collect packets delivered to router.local during isolated 3D smoke runs",

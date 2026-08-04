@@ -1,0 +1,26 @@
+# Stable SnnDL domain primitives.  This target deliberately contains no PE
+# assembly, NoC protocol, storage model, workload registry, or research code.
+libSnnDLCore_la_SOURCES = \
+	api/IGasCmdSender.h \
+	api/IGasCreditGate.h \
+	api/IGasOrchestrator.h \
+	api/IGasStageSink.h \
+	api/IGasStepGate.h \
+	api/SnnDLLogging.h \
+	api/SnnDLStringUtil.h \
+	events/GasStepBarrierEvent.h \
+	events/SimpleTestEvent.cc \
+	events/SimpleTestEvent.h \
+	snn/compute/SnnCoreEngine.cc \
+	snn/compute/SnnCoreEngine.h \
+	snn/compute/SnnLearningCore.cc \
+	snn/compute/SnnLearningCore.h \
+	snn/compute/SnnNeuronModel.h \
+	snn/synapse/common/BcsrMeta.h \
+	snn/synapse/gas/AccumulatorOps.cc \
+	snn/synapse/gas/AccumulatorOps.h \
+	snn/synapse/gas/GasCustomCmd.h \
+	snn/synapse/gas/GasEdgeCollector.cc \
+	snn/synapse/gas/GasEdgeCollector.h \
+	snn/synapse/gas/GasPhaseController.cc \
+	snn/synapse/gas/GasPhaseController.h

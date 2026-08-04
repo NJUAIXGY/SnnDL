@@ -16,7 +16,7 @@ class INocTransport {
 public:
     virtual ~INocTransport() = default;
 
-    // 语义：接管 packet 生命周期（与 MultiCorePE::sendSpike 语义一致）
+    // 语义：接管 packet 生命周期，调用方不再拥有 packet。
     virtual void sendFromCore(int src_core, NocPacketEvent* packet) = 0;
 
     // 语义：仅在本 PE 内本地直达注入（不走 ring），接管 packet 生命周期
