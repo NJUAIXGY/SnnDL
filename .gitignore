@@ -33,3 +33,6 @@ weight_verification_test.log
 
 # Generated docs
 docs/*.pdf
+
+# Archived build outputs are retained locally for inspection, not versioned.
+archive/legacy_gas/build-artifacts/
