@@ -1,0 +1,32 @@
+# P1/P2 SST-native core, provider, and request-driven local storage.  This
+# manifest must remain free of legacy PE, workload, GAS, and 3D includes.
+SNNDL_V5_CORE_SOURCES = \
+	v5/events/CoreEvents.h \
+	v5/events/StorageEvents.h \
+	v5/noc/NocEventsV5.h \
+	v5/noc/PeEndpointV5.h \
+	v5/noc/PeEndpointV5.cc \
+	v5/noc/NocProbeV5.h \
+	v5/noc/NocProbeV5.cc \
+	v5/core/LifNeuronOp.h \
+	v5/core/LifNeuronOp.cc \
+	v5/core/DeterministicRetireQueue.h \
+	v5/core/DeterministicRetireQueue.cc \
+	v5/core/CorePipeline.h \
+	v5/core/CorePipeline.cc \
+	v5/core/SnnCoreV5.h \
+	v5/core/SnnCoreV5.cc \
+	v5/storage/BankedSramV5.h \
+	v5/storage/BankedSramV5.cc \
+	v5/storage/SnnDmaEngineV5.h \
+	v5/storage/SnnDmaEngineV5.cc \
+	v5/storage/CoreStorageV5.h \
+	v5/storage/CoreStorageV5.cc \
+	v5/storage/BankedSramV5Component.h \
+	v5/storage/BankedSramV5Component.cc \
+	v5/test/IdealSynapseSource.h \
+	v5/test/IdealSynapseSource.cc \
+	v5/test/DmaSourceV5.h \
+	v5/test/DmaSourceV5.cc \
+	v5/test/SramProbeV5.h \
+	v5/test/SramProbeV5.cc

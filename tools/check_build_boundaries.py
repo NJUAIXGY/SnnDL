@@ -12,13 +12,20 @@ from pathlib import Path
 SOURCE_RE = re.compile(r"^\s*([A-Za-z0-9_./-]+\.(?:cc|h))\s*\\?\s*$")
 ASSIGN_RE = re.compile(r"^([A-Za-z0-9_]+)_la_SOURCES\s*=")
 
-ACTIVE_MANIFESTS = ("build/core_sources.am", "build/extension_sources.am")
+ACTIVE_MANIFESTS = (
+    "build/core_sources.am",
+    "build/extension_sources.am",
+    "build/v5_sources.am",
+    "build/v5_core_sources.am",
+)
 ACTIVE_TARGETS = {
     "libSnnDLCore",
     "libSnnDLComm",
     "libSnnDLLocal",
     "libSnnDLRegistry",
     "libSnnDLResearch",
+    "libSnnDLV5Contracts",
+    "libSnnDLV5Core",
 }
 
 # These edges would reintroduce the archived PE/workload/GAS object graph.
@@ -34,6 +41,12 @@ FORBIDDEN = {
         "Gas",
         "GAS",
         "GatherBuffer",
+        "PeDmaScheduler",
+        "DmaMemAccessProxy",
+        "stage_budget_permille",
+        "Stage::Gather",
+        "Stage::Apply",
+        "Stage::Scatter",
     ),
     "libSnnDLComm": (
         "components/MultiCorePE",
@@ -45,6 +58,12 @@ FORBIDDEN = {
         "Gas",
         "GAS",
         "GatherBuffer",
+        "PeDmaScheduler",
+        "DmaMemAccessProxy",
+        "stage_budget_permille",
+        "Stage::Gather",
+        "Stage::Apply",
+        "Stage::Scatter",
     ),
     "libSnnDLLocal": (
         "components/",
@@ -57,6 +76,12 @@ FORBIDDEN = {
         "Gas",
         "GAS",
         "GatherBuffer",
+        "PeDmaScheduler",
+        "DmaMemAccessProxy",
+        "stage_budget_permille",
+        "Stage::Gather",
+        "Stage::Apply",
+        "Stage::Scatter",
     ),
     "libSnnDLRegistry": (
         "components/",
@@ -66,6 +91,41 @@ FORBIDDEN = {
         "Gas",
         "GAS",
         "GatherBuffer",
+        "PeDmaScheduler",
+        "DmaMemAccessProxy",
+        "stage_budget_permille",
+        "Stage::Gather",
+        "Stage::Apply",
+        "Stage::Scatter",
+    ),
+    "libSnnDLV5Contracts": (
+        "SST/",
+        "components/",
+        "platform/",
+        "research/",
+        "workloads/",
+        "PeDmaScheduler",
+        "DmaMemAccessProxy",
+        "stage_budget_permille",
+        "Stage::Gather",
+        "Stage::Apply",
+        "Stage::Scatter",
+        "Gas",
+        "GAS",
+        "GatherBuffer",
+    ),
+    "libSnnDLV5Core": (
+        "archive/",
+        "components/",
+        "platform/",
+        "research/",
+        "workloads/",
+        "PeDmaScheduler",
+        "DmaMemAccessProxy",
+        "GlobalGas",
+        "GatherBuffer",
+        "Gas",
+        "GAS",
     ),
 }
 
@@ -150,20 +210,91 @@ def check(root: Path) -> list[str]:
                 if token in text:
                     errors.append(f"nextgen: {rel}: legacy dependency token {token!r} present")
 
+    for manifest_name, variable, label in (
+        ("v5_sources.am", "SNNDL_V5_CONTRACT_SOURCES", "v5"),
+        ("v5_core_sources.am", "SNNDL_V5_CORE_SOURCES", "v5-core"),
+    ):
+        v5_manifest = root / "build" / manifest_name
+        if not v5_manifest.is_file():
+            errors.append(f"missing {label} source manifest")
+            continue
+        for rel in read_source_list(v5_manifest, variable):
+            source = root / rel
+            if not source.is_file():
+                errors.append(f"{label}: missing source {rel}")
+                continue
+            text = source.read_text(encoding="utf-8")
+            if label == "v5" and "SST/" in text:
+                errors.append(f"v5: {rel}: SST dependency is not allowed")
+            if label == "v5-core":
+                for token in ("archive/", "workloads/", "research/", "PeDmaScheduler", "DmaMemAccessProxy", "GlobalGas", "GatherBuffer"):
+                    if token in text:
+                        errors.append(f"v5-core: {rel}: forbidden dependency token {token!r}")
+
     makefile_am = root / "Makefile.am"
     if makefile_am.is_file():
         text = makefile_am.read_text(encoding="utf-8")
         # platform/core/ is now the active GAS-free SnnCoreTile boundary;
         # archived PE code is guarded by the source manifests above.
-        for token in ("libSnnDLOpt", "libSnnDLWorkloads", "components/MultiCorePE"):
+        for token in (
+            "libSnnDLOpt",
+            "libSnnDLWorkloads",
+            "components/MultiCorePE",
+            "test-dma-scheduler",
+            "PeDmaScheduler",
+            "DmaMemAccessProxy",
+            "stage_budget_permille",
+            "Stage::Gather",
+            "Stage::Apply",
+            "Stage::Scatter",
+        ):
             if token in text:
                 errors.append(f"Makefile.am: archived target/dependency token {token!r} present")
 
         aggregate = re.search(
             r"libSnnDL_la_LIBADD\s*=\s*(.*?)(?=\n\S|\Z)", text, flags=re.DOTALL
         )
-        if aggregate and "libSnnDLResearch.la" in aggregate.group(1):
-            errors.append("Makefile.am: canonical libSnnDL aggregate links libSnnDLResearch")
+        if aggregate:
+            aggregate_text = aggregate.group(1)
+            for token in (
+                "libSnnDLCore.la",
+                "libSnnDLComm.la",
+                "libSnnDLLocal.la",
+                "libSnnDLRegistry.la",
+                "libSnnDLResearch.la",
+            ):
+                if token in aggregate_text:
+                    errors.append(f"Makefile.am: canonical libSnnDL aggregate links {token}")
+
+    active_sources: set[Path] = set()
+    for rel_manifest in ACTIVE_MANIFESTS:
+        manifest = root / rel_manifest
+        if not manifest.is_file():
+            continue
+        if rel_manifest.endswith("nextgen_sources.am"):
+            rels = read_source_list(manifest, "SNNDL_NEXT_CORE_SOURCES")
+        elif rel_manifest.endswith("v5_sources.am"):
+            rels = read_source_list(manifest, "SNNDL_V5_CONTRACT_SOURCES")
+        elif rel_manifest.endswith("v5_core_sources.am"):
+            rels = read_source_list(manifest, "SNNDL_V5_CORE_SOURCES")
+        else:
+            rels = [item for items in read_manifest(manifest).values() for item in items]
+        active_sources.update(root / rel for rel in rels)
+    for source in sorted(active_sources):
+        if not source.is_file():
+            continue
+        text = source.read_text(encoding="utf-8")
+        for token in (
+            "PeDmaScheduler",
+            "DmaMemAccessProxy",
+            "stage_budget_permille",
+            "Stage::Gather",
+            "Stage::Apply",
+            "Stage::Scatter",
+            "GlobalGasStepController",
+        ):
+            if token in text:
+                errors.append(f"active source {source.relative_to(root)} contains forbidden token {token!r}")
 
     for source in sorted((root / "research" / "noc3d").glob("*.h")):
         text = source.read_text(encoding="utf-8")

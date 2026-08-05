@@ -5,6 +5,7 @@
 #include "events/TimestepControlEvent.h"
 #include "platform/core/SnnCoreTile.h"
 #include "snn/timestep/TimestepTracker.h"
+#include "v5/api/AddressSpace.h"
 
 #include <sst/core/clock.h>
 #include <sst/core/component.h>
@@ -175,6 +176,8 @@ private:
     static std::vector<std::string> split_(const std::string& value, char separator);
     void parseEdges_(const std::string& encoded);
     void parseDescriptor_(const std::string& path);
+    void setWeightRegionSize_(std::uint64_t element_count);
+    std::uint64_t weightAddress_(const Edge& edge) const;
     void loadLocalWeightStore_();
     void parseStimuli_(const std::string& encoded);
     std::uint32_t directionForLink_(SST::Link* link) const;
@@ -209,6 +212,8 @@ private:
     std::string descriptor_file_;
     std::string weight_image_file_;
     std::string descriptor_digest_;
+    ::SnnDL::v5::RegionDescriptor weight_region_{
+        ::SnnDL::v5::AddressSpaceId::PeWeightSpm, 0, 0, 0, false};
     bool local_storage_ = false;
     bool multicast_ = false;
     bool use_standard_memory_ = true;

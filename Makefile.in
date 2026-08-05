@@ -178,8 +178,7 @@ am__uninstall_files_from_dir = { \
   }
 am__installdirs = "$(DESTDIR)$(compdir)"
 LTLIBRARIES = $(comp_LTLIBRARIES)
-libSnnDL_la_DEPENDENCIES = libSnnDLCore.la libSnnDLComm.la \
-	libSnnDLLocal.la libSnnDLRegistry.la libSnnDLPlatform2D.la
+libSnnDL_la_DEPENDENCIES = libSnnDLPlatform2D.la libSnnDLV5Core.la
 am__dirstamp = $(am__leading_dot)dirstamp
 am_libSnnDL_la_OBJECTS = components/SnnDLCompatibility.lo
 libSnnDL_la_OBJECTS = $(am_libSnnDL_la_OBJECTS)
@@ -220,9 +219,7 @@ libSnnDLCore_la_LINK = $(LIBTOOL) $(AM_V_lt) --tag=CXX \
 	$(AM_CXXFLAGS) $(CXXFLAGS) $(libSnnDLCore_la_LDFLAGS) \
 	$(LDFLAGS) -o $@
 libSnnDLLocal_la_LIBADD =
-am_libSnnDLLocal_la_OBJECTS = platform/memory/DmaMemAccessProxy.lo \
-	platform/memory/PeDmaScheduler.lo \
-	platform/memory/StandardMemAccess.lo \
+am_libSnnDLLocal_la_OBJECTS = platform/memory/StandardMemAccess.lo \
 	platform/memory/sram_sim/model/BankedSramModel.lo \
 	research/local_storage/LocalStorageHierarchyController.lo \
 	research/local_storage/PeWeightObjectPlane.lo
@@ -270,6 +267,29 @@ libSnnDLResearch_la_LINK = $(LIBTOOL) $(AM_V_lt) --tag=CXX \
 	$(AM_LIBTOOLFLAGS) $(LIBTOOLFLAGS) --mode=link $(CXXLD) \
 	$(AM_CXXFLAGS) $(CXXFLAGS) $(libSnnDLResearch_la_LDFLAGS) \
 	$(LDFLAGS) -o $@
+libSnnDLV5Contracts_la_LIBADD =
+am__objects_2 = v5/api/ArtifactContract.lo
+am_libSnnDLV5Contracts_la_OBJECTS = $(am__objects_2)
+libSnnDLV5Contracts_la_OBJECTS = $(am_libSnnDLV5Contracts_la_OBJECTS)
+libSnnDLV5Contracts_la_LINK = $(LIBTOOL) $(AM_V_lt) --tag=CXX \
+	$(AM_LIBTOOLFLAGS) $(LIBTOOLFLAGS) --mode=link $(CXXLD) \
+	$(AM_CXXFLAGS) $(CXXFLAGS) $(libSnnDLV5Contracts_la_LDFLAGS) \
+	$(LDFLAGS) -o $@
+libSnnDLV5Core_la_LIBADD =
+am__objects_3 = v5/noc/PeEndpointV5.lo v5/noc/NocProbeV5.lo \
+	v5/core/LifNeuronOp.lo v5/core/DeterministicRetireQueue.lo \
+	v5/core/CorePipeline.lo v5/core/SnnCoreV5.lo \
+	v5/storage/BankedSramV5.lo v5/storage/SnnDmaEngineV5.lo \
+	v5/storage/CoreStorageV5.lo \
+	v5/storage/BankedSramV5Component.lo \
+	v5/test/IdealSynapseSource.lo v5/test/DmaSourceV5.lo \
+	v5/test/SramProbeV5.lo
+am_libSnnDLV5Core_la_OBJECTS = $(am__objects_3)
+libSnnDLV5Core_la_OBJECTS = $(am_libSnnDLV5Core_la_OBJECTS)
+libSnnDLV5Core_la_LINK = $(LIBTOOL) $(AM_V_lt) --tag=CXX \
+	$(AM_LIBTOOLFLAGS) $(LIBTOOLFLAGS) --mode=link $(CXXLD) \
+	$(AM_CXXFLAGS) $(CXXFLAGS) $(libSnnDLV5Core_la_LDFLAGS) \
+	$(LDFLAGS) -o $@
 AM_V_P = $(am__v_P_@AM_V@)
 am__v_P_ = $(am__v_P_@AM_DEFAULT_V@)
 am__v_P_0 = false
@@ -296,8 +316,6 @@ am__depfiles_remade = components/$(DEPDIR)/MeshPE2D.Plo \
 	events/$(DEPDIR)/SimpleTestEvent.Plo \
 	events/$(DEPDIR)/SpikeEventWrapper.Plo \
 	platform/core/$(DEPDIR)/SnnCoreTile.Plo \
-	platform/memory/$(DEPDIR)/DmaMemAccessProxy.Plo \
-	platform/memory/$(DEPDIR)/PeDmaScheduler.Plo \
 	platform/memory/$(DEPDIR)/StandardMemAccess.Plo \
 	platform/memory/sram_sim/model/$(DEPDIR)/BankedSramModel.Plo \
 	platform/noc/$(DEPDIR)/NocSubsystem.Plo \
@@ -322,7 +340,21 @@ am__depfiles_remade = components/$(DEPDIR)/MeshPE2D.Plo \
 	snn/synapse/route/$(DEPDIR)/SpikePacketBridge.Plo \
 	snn/synapse/route/$(DEPDIR)/StepBcsrReachability.Plo \
 	snn/synapse/route/$(DEPDIR)/SynapseRouteSubsystem.Plo \
-	snn/timestep/$(DEPDIR)/TimestepTracker.Plo
+	snn/timestep/$(DEPDIR)/TimestepTracker.Plo \
+	v5/api/$(DEPDIR)/ArtifactContract.Plo \
+	v5/core/$(DEPDIR)/CorePipeline.Plo \
+	v5/core/$(DEPDIR)/DeterministicRetireQueue.Plo \
+	v5/core/$(DEPDIR)/LifNeuronOp.Plo \
+	v5/core/$(DEPDIR)/SnnCoreV5.Plo \
+	v5/noc/$(DEPDIR)/NocProbeV5.Plo \
+	v5/noc/$(DEPDIR)/PeEndpointV5.Plo \
+	v5/storage/$(DEPDIR)/BankedSramV5.Plo \
+	v5/storage/$(DEPDIR)/BankedSramV5Component.Plo \
+	v5/storage/$(DEPDIR)/CoreStorageV5.Plo \
+	v5/storage/$(DEPDIR)/SnnDmaEngineV5.Plo \
+	v5/test/$(DEPDIR)/DmaSourceV5.Plo \
+	v5/test/$(DEPDIR)/IdealSynapseSource.Plo \
+	v5/test/$(DEPDIR)/SramProbeV5.Plo
 am__mv = mv -f
 CXXCOMPILE = $(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) \
 	$(AM_CPPFLAGS) $(CPPFLAGS) $(AM_CXXFLAGS) $(CXXFLAGS)
@@ -364,12 +396,14 @@ SOURCES = $(libSnnDL_la_SOURCES) $(libSnnDLComm_la_SOURCES) \
 	$(libSnnDLCore_la_SOURCES) $(libSnnDLLocal_la_SOURCES) \
 	$(libSnnDLNextCore_la_SOURCES) \
 	$(libSnnDLPlatform2D_la_SOURCES) \
-	$(libSnnDLRegistry_la_SOURCES) $(libSnnDLResearch_la_SOURCES)
+	$(libSnnDLRegistry_la_SOURCES) $(libSnnDLResearch_la_SOURCES) \
+	$(libSnnDLV5Contracts_la_SOURCES) $(libSnnDLV5Core_la_SOURCES)
 DIST_SOURCES = $(libSnnDL_la_SOURCES) $(libSnnDLComm_la_SOURCES) \
 	$(libSnnDLCore_la_SOURCES) $(libSnnDLLocal_la_SOURCES) \
 	$(libSnnDLNextCore_la_SOURCES) \
 	$(libSnnDLPlatform2D_la_SOURCES) \
-	$(libSnnDLRegistry_la_SOURCES) $(libSnnDLResearch_la_SOURCES)
+	$(libSnnDLRegistry_la_SOURCES) $(libSnnDLResearch_la_SOURCES) \
+	$(libSnnDLV5Contracts_la_SOURCES) $(libSnnDLV5Core_la_SOURCES)
 am__can_run_installinfo = \
   case $$AM_UPDATE_INFO_DIR in \
     n|no|NO) false;; \
@@ -397,7 +431,9 @@ am__DIST_COMMON = $(srcdir)/Makefile.in \
 	$(srcdir)/build/core_sources.am \
 	$(srcdir)/build/extension_sources.am \
 	$(srcdir)/build/nextgen_sources.am \
-	$(top_srcdir)/config/depcomp README.md
+	$(srcdir)/build/v5_core_sources.am \
+	$(srcdir)/build/v5_sources.am $(top_srcdir)/config/depcomp \
+	README.md
 DISTFILES = $(DIST_COMMON) $(DIST_SOURCES) $(TEXINFOS) $(EXTRA_DIST)
 ACLOCAL = @ACLOCAL@
 AMTAR = @AMTAR@
@@ -727,16 +763,10 @@ libSnnDLComm_la_SOURCES = \
 	snn/synapse/route/SynapseRouteSubsystem.h
 
 libSnnDLLocal_la_SOURCES = \
-	api/IDmaSchedulerProvider.h \
-	api/IDmaTaggedAccess.h \
 	api/ILocalStorageProvider.h \
 	api/IMemoryAccess.h \
 	api/IPePodSharedMetadataProvider.h \
 	api/IPeWeightObjectPlaneProvider.h \
-	platform/memory/DmaMemAccessProxy.cc \
-	platform/memory/DmaMemAccessProxy.h \
-	platform/memory/PeDmaScheduler.cc \
-	platform/memory/PeDmaScheduler.h \
 	platform/memory/StandardMemAccess.cc \
 	platform/memory/StandardMemAccess.h \
 	platform/memory/sram_sim/layout/VirtualSramLayout.h \
@@ -784,12 +814,58 @@ SNNDL_NEXT_CORE_SOURCES = \
 	snn/compute/NextGenNeuronEngine.cc
 
 
+# Standalone v5 wire contracts.  These files are independent of SST and the
+# legacy PE/workload/GAS graph; no ELI constructor is present in this target.
+SNNDL_V5_CONTRACT_SOURCES = \
+	v5/api/V5Types.h \
+	v5/api/AddressSpace.h \
+	v5/api/ArtifactContract.h \
+	v5/api/ArtifactContract.cc \
+	v5/api/StatisticNames.h
+
+
+# P1/P2 SST-native core, provider, and request-driven local storage.  This
+# manifest must remain free of legacy PE, workload, GAS, and 3D includes.
+SNNDL_V5_CORE_SOURCES = \
+	v5/events/CoreEvents.h \
+	v5/events/StorageEvents.h \
+	v5/noc/NocEventsV5.h \
+	v5/noc/PeEndpointV5.h \
+	v5/noc/PeEndpointV5.cc \
+	v5/noc/NocProbeV5.h \
+	v5/noc/NocProbeV5.cc \
+	v5/core/LifNeuronOp.h \
+	v5/core/LifNeuronOp.cc \
+	v5/core/DeterministicRetireQueue.h \
+	v5/core/DeterministicRetireQueue.cc \
+	v5/core/CorePipeline.h \
+	v5/core/CorePipeline.cc \
+	v5/core/SnnCoreV5.h \
+	v5/core/SnnCoreV5.cc \
+	v5/storage/BankedSramV5.h \
+	v5/storage/BankedSramV5.cc \
+	v5/storage/SnnDmaEngineV5.h \
+	v5/storage/SnnDmaEngineV5.cc \
+	v5/storage/CoreStorageV5.h \
+	v5/storage/CoreStorageV5.cc \
+	v5/storage/BankedSramV5Component.h \
+	v5/storage/BankedSramV5Component.cc \
+	v5/test/IdealSynapseSource.h \
+	v5/test/IdealSynapseSource.cc \
+	v5/test/DmaSourceV5.h \
+	v5/test/DmaSourceV5.cc \
+	v5/test/SramProbeV5.h \
+	v5/test/SramProbeV5.cc
+
+
 # These manifests are the reviewable active-build boundary.  The former PE and
 # workload graph is retained under archive/legacy_gas/ only.
 EXTRA_DIST = \
 	build/core_sources.am \
 	build/extension_sources.am \
 	build/nextgen_sources.am \
+	build/v5_sources.am \
+	build/v5_core_sources.am \
 	tools/check_build_boundaries.py \
 	tools/run_nextgen_core_tests.sh \
 	archive/legacy_gas/README.md \
@@ -803,6 +879,8 @@ comp_LTLIBRARIES = \
 	libSnnDLResearch.la \
 	libSnnDLPlatform2D.la \
 	libSnnDLNextCore.la \
+	libSnnDLV5Contracts.la \
+	libSnnDLV5Core.la \
 	libSnnDL.la
 
 libSnnDLCore_la_LDFLAGS = -module -avoid-version -L$(builddir)
@@ -834,6 +912,16 @@ libSnnDLPlatform2D_la_LIBADD = libSnnDLNextCore.la
 libSnnDLNextCore_la_SOURCES = $(SNNDL_NEXT_CORE_SOURCES)
 libSnnDLNextCore_la_LDFLAGS = -module -avoid-version -L$(builddir)
 
+# Header-only v5 contract types are compiled into a separate non-ELI library.
+# It is intentionally not linked into the canonical v4 aggregate.
+libSnnDLV5Contracts_la_SOURCES = $(SNNDL_V5_CONTRACT_SOURCES)
+libSnnDLV5Contracts_la_LDFLAGS = -module -avoid-version -L$(builddir)
+
+# P1 cycle pipeline.  The pure pipeline has no legacy dependency; the ELI
+# component and ideal source are loaded through this independent library.
+libSnnDLV5Core_la_SOURCES = $(SNNDL_V5_CORE_SOURCES)
+libSnnDLV5Core_la_LDFLAGS = -module -avoid-version -L$(builddir)
+
 # Aggregate compatibility name for SST installations.  The implementation is
 # intentionally an empty anchor; all active ELI objects live in the libraries
 # above, while no archived target is linked here.
@@ -844,11 +932,8 @@ libSnnDL_la_SOURCES = components/SnnDLCompatibility.cc
 # hides all active components from Python configurations.
 libSnnDL_la_LDFLAGS = -module -avoid-version -Wl,--no-as-needed -L$(builddir)
 libSnnDL_la_LIBADD = \
-	libSnnDLCore.la \
-	libSnnDLComm.la \
-	libSnnDLLocal.la \
-	libSnnDLRegistry.la \
-	libSnnDLPlatform2D.la
+	libSnnDLPlatform2D.la \
+	libSnnDLV5Core.la
 
 TEST_LINK = $(CXXLD) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) \
 	$(AM_CPPFLAGS) $(CPPFLAGS) $(CXXFLAGS)
@@ -857,7 +942,7 @@ all: all-am
 
 .SUFFIXES:
 .SUFFIXES: .cc .lo .o .obj
-$(srcdir)/Makefile.in:  $(srcdir)/Makefile.am $(srcdir)/build/core_sources.am $(srcdir)/build/extension_sources.am $(srcdir)/build/nextgen_sources.am $(am__configure_deps)
+$(srcdir)/Makefile.in:  $(srcdir)/Makefile.am $(srcdir)/build/core_sources.am $(srcdir)/build/extension_sources.am $(srcdir)/build/nextgen_sources.am $(srcdir)/build/v5_sources.am $(srcdir)/build/v5_core_sources.am $(am__configure_deps)
 	@for dep in $?; do \
 	  case '$(am__configure_deps)' in \
 	    *$$dep*) \
@@ -877,7 +962,7 @@ Makefile: $(srcdir)/Makefile.in $(top_builddir)/config.status
 	    echo ' cd $(top_builddir) && $(SHELL) ./config.status $(subdir)/$@ $(am__maybe_remake_depfiles)'; \
 	    cd $(top_builddir) && $(SHELL) ./config.status $(subdir)/$@ $(am__maybe_remake_depfiles);; \
 	esac;
-$(srcdir)/build/core_sources.am $(srcdir)/build/extension_sources.am $(srcdir)/build/nextgen_sources.am $(am__empty):
+$(srcdir)/build/core_sources.am $(srcdir)/build/extension_sources.am $(srcdir)/build/nextgen_sources.am $(srcdir)/build/v5_sources.am $(srcdir)/build/v5_core_sources.am $(am__empty):
 
 $(top_builddir)/config.status: $(top_srcdir)/configure $(CONFIG_STATUS_DEPENDENCIES)
 	cd $(top_builddir) && $(MAKE) $(AM_MAKEFLAGS) am--refresh
@@ -1027,10 +1112,6 @@ platform/memory/$(am__dirstamp):
 platform/memory/$(DEPDIR)/$(am__dirstamp):
 	@$(MKDIR_P) platform/memory/$(DEPDIR)
 	@: > platform/memory/$(DEPDIR)/$(am__dirstamp)
-platform/memory/DmaMemAccessProxy.lo: platform/memory/$(am__dirstamp) \
-	platform/memory/$(DEPDIR)/$(am__dirstamp)
-platform/memory/PeDmaScheduler.lo: platform/memory/$(am__dirstamp) \
-	platform/memory/$(DEPDIR)/$(am__dirstamp)
 platform/memory/StandardMemAccess.lo: platform/memory/$(am__dirstamp) \
 	platform/memory/$(DEPDIR)/$(am__dirstamp)
 platform/memory/sram_sim/model/$(am__dirstamp):
@@ -1133,6 +1214,70 @@ research/route3d/SynapseRouteSubsystem3D.lo:  \
 
 libSnnDLResearch.la: $(libSnnDLResearch_la_OBJECTS) $(libSnnDLResearch_la_DEPENDENCIES) $(EXTRA_libSnnDLResearch_la_DEPENDENCIES) 
 	$(AM_V_CXXLD)$(libSnnDLResearch_la_LINK) -rpath $(compdir) $(libSnnDLResearch_la_OBJECTS) $(libSnnDLResearch_la_LIBADD) $(LIBS)
+v5/api/$(am__dirstamp):
+	@$(MKDIR_P) v5/api
+	@: > v5/api/$(am__dirstamp)
+v5/api/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) v5/api/$(DEPDIR)
+	@: > v5/api/$(DEPDIR)/$(am__dirstamp)
+v5/api/ArtifactContract.lo: v5/api/$(am__dirstamp) \
+	v5/api/$(DEPDIR)/$(am__dirstamp)
+
+libSnnDLV5Contracts.la: $(libSnnDLV5Contracts_la_OBJECTS) $(libSnnDLV5Contracts_la_DEPENDENCIES) $(EXTRA_libSnnDLV5Contracts_la_DEPENDENCIES)
+	$(AM_V_CXXLD)$(libSnnDLV5Contracts_la_LINK) -rpath $(compdir) $(libSnnDLV5Contracts_la_OBJECTS) $(libSnnDLV5Contracts_la_LIBADD) $(LIBS)
+v5/noc/$(am__dirstamp):
+	@$(MKDIR_P) v5/noc
+	@: > v5/noc/$(am__dirstamp)
+v5/noc/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) v5/noc/$(DEPDIR)
+	@: > v5/noc/$(DEPDIR)/$(am__dirstamp)
+v5/noc/PeEndpointV5.lo: v5/noc/$(am__dirstamp) \
+	v5/noc/$(DEPDIR)/$(am__dirstamp)
+v5/noc/NocProbeV5.lo: v5/noc/$(am__dirstamp) \
+	v5/noc/$(DEPDIR)/$(am__dirstamp)
+v5/core/$(am__dirstamp):
+	@$(MKDIR_P) v5/core
+	@: > v5/core/$(am__dirstamp)
+v5/core/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) v5/core/$(DEPDIR)
+	@: > v5/core/$(DEPDIR)/$(am__dirstamp)
+v5/core/LifNeuronOp.lo: v5/core/$(am__dirstamp) \
+	v5/core/$(DEPDIR)/$(am__dirstamp)
+v5/core/DeterministicRetireQueue.lo: v5/core/$(am__dirstamp) \
+	v5/core/$(DEPDIR)/$(am__dirstamp)
+v5/core/CorePipeline.lo: v5/core/$(am__dirstamp) \
+	v5/core/$(DEPDIR)/$(am__dirstamp)
+v5/core/SnnCoreV5.lo: v5/core/$(am__dirstamp) \
+	v5/core/$(DEPDIR)/$(am__dirstamp)
+v5/storage/$(am__dirstamp):
+	@$(MKDIR_P) v5/storage
+	@: > v5/storage/$(am__dirstamp)
+v5/storage/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) v5/storage/$(DEPDIR)
+	@: > v5/storage/$(DEPDIR)/$(am__dirstamp)
+v5/storage/BankedSramV5.lo: v5/storage/$(am__dirstamp) \
+	v5/storage/$(DEPDIR)/$(am__dirstamp)
+v5/storage/SnnDmaEngineV5.lo: v5/storage/$(am__dirstamp) \
+	v5/storage/$(DEPDIR)/$(am__dirstamp)
+v5/storage/CoreStorageV5.lo: v5/storage/$(am__dirstamp) \
+	v5/storage/$(DEPDIR)/$(am__dirstamp)
+v5/storage/BankedSramV5Component.lo: v5/storage/$(am__dirstamp) \
+	v5/storage/$(DEPDIR)/$(am__dirstamp)
+v5/test/$(am__dirstamp):
+	@$(MKDIR_P) v5/test
+	@: > v5/test/$(am__dirstamp)
+v5/test/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) v5/test/$(DEPDIR)
+	@: > v5/test/$(DEPDIR)/$(am__dirstamp)
+v5/test/IdealSynapseSource.lo: v5/test/$(am__dirstamp) \
+	v5/test/$(DEPDIR)/$(am__dirstamp)
+v5/test/DmaSourceV5.lo: v5/test/$(am__dirstamp) \
+	v5/test/$(DEPDIR)/$(am__dirstamp)
+v5/test/SramProbeV5.lo: v5/test/$(am__dirstamp) \
+	v5/test/$(DEPDIR)/$(am__dirstamp)
+
+libSnnDLV5Core.la: $(libSnnDLV5Core_la_OBJECTS) $(libSnnDLV5Core_la_DEPENDENCIES) $(EXTRA_libSnnDLV5Core_la_DEPENDENCIES)
+	$(AM_V_CXXLD)$(libSnnDLV5Core_la_LINK) -rpath $(compdir) $(libSnnDLV5Core_la_OBJECTS) $(libSnnDLV5Core_la_LIBADD) $(LIBS)
 
 mostlyclean-compile:
 	-rm -f *.$(OBJEXT)
@@ -1168,6 +1313,16 @@ mostlyclean-compile:
 	-rm -f snn/synapse/route/*.lo
 	-rm -f snn/timestep/*.$(OBJEXT)
 	-rm -f snn/timestep/*.lo
+	-rm -f v5/api/*.$(OBJEXT)
+	-rm -f v5/api/*.lo
+	-rm -f v5/core/*.$(OBJEXT)
+	-rm -f v5/core/*.lo
+	-rm -f v5/noc/*.$(OBJEXT)
+	-rm -f v5/noc/*.lo
+	-rm -f v5/storage/*.$(OBJEXT)
+	-rm -f v5/storage/*.lo
+	-rm -f v5/test/*.$(OBJEXT)
+	-rm -f v5/test/*.lo
 
 distclean-compile:
 	-rm -f *.tab.c
@@ -1183,8 +1338,6 @@ distclean-compile:
 @AMDEP_TRUE@@am__include@ @am__quote@events/$(DEPDIR)/SimpleTestEvent.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@events/$(DEPDIR)/SpikeEventWrapper.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@platform/core/$(DEPDIR)/SnnCoreTile.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@platform/memory/$(DEPDIR)/DmaMemAccessProxy.Plo@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@platform/memory/$(DEPDIR)/PeDmaScheduler.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@platform/memory/$(DEPDIR)/StandardMemAccess.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@platform/memory/sram_sim/model/$(DEPDIR)/BankedSramModel.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@platform/noc/$(DEPDIR)/NocSubsystem.Plo@am__quote@ # am--include-marker
@@ -1210,6 +1363,20 @@ distclean-compile:
 @AMDEP_TRUE@@am__include@ @am__quote@snn/synapse/route/$(DEPDIR)/StepBcsrReachability.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@snn/synapse/route/$(DEPDIR)/SynapseRouteSubsystem.Plo@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@snn/timestep/$(DEPDIR)/TimestepTracker.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@v5/api/$(DEPDIR)/ArtifactContract.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@v5/core/$(DEPDIR)/CorePipeline.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@v5/core/$(DEPDIR)/DeterministicRetireQueue.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@v5/core/$(DEPDIR)/LifNeuronOp.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@v5/core/$(DEPDIR)/SnnCoreV5.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@v5/noc/$(DEPDIR)/NocProbeV5.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@v5/noc/$(DEPDIR)/PeEndpointV5.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@v5/storage/$(DEPDIR)/BankedSramV5.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@v5/storage/$(DEPDIR)/BankedSramV5Component.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@v5/storage/$(DEPDIR)/CoreStorageV5.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@v5/storage/$(DEPDIR)/SnnDmaEngineV5.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@v5/test/$(DEPDIR)/DmaSourceV5.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@v5/test/$(DEPDIR)/IdealSynapseSource.Plo@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@v5/test/$(DEPDIR)/SramProbeV5.Plo@am__quote@ # am--include-marker
 
 $(am__depfiles_remade):
 	@$(MKDIR_P) $(@D)
@@ -1262,6 +1429,11 @@ clean-libtool:
 	-rm -rf snn/stimulus/.libs snn/stimulus/_libs
 	-rm -rf snn/synapse/route/.libs snn/synapse/route/_libs
 	-rm -rf snn/timestep/.libs snn/timestep/_libs
+	-rm -rf v5/api/.libs v5/api/_libs
+	-rm -rf v5/core/.libs v5/core/_libs
+	-rm -rf v5/noc/.libs v5/noc/_libs
+	-rm -rf v5/storage/.libs v5/storage/_libs
+	-rm -rf v5/test/.libs v5/test/_libs
 snippets-local: 
 
 ID: $(am__tagged_files)
@@ -1413,6 +1585,16 @@ distclean-generic:
 	-rm -f snn/synapse/route/$(am__dirstamp)
 	-rm -f snn/timestep/$(DEPDIR)/$(am__dirstamp)
 	-rm -f snn/timestep/$(am__dirstamp)
+	-rm -f v5/api/$(DEPDIR)/$(am__dirstamp)
+	-rm -f v5/api/$(am__dirstamp)
+	-rm -f v5/core/$(DEPDIR)/$(am__dirstamp)
+	-rm -f v5/core/$(am__dirstamp)
+	-rm -f v5/noc/$(DEPDIR)/$(am__dirstamp)
+	-rm -f v5/noc/$(am__dirstamp)
+	-rm -f v5/storage/$(DEPDIR)/$(am__dirstamp)
+	-rm -f v5/storage/$(am__dirstamp)
+	-rm -f v5/test/$(DEPDIR)/$(am__dirstamp)
+	-rm -f v5/test/$(am__dirstamp)
 
 maintainer-clean-generic:
 	@echo "This command is intended for maintainers to use"
@@ -1434,8 +1616,6 @@ distclean: distclean-am
 	-rm -f events/$(DEPDIR)/SimpleTestEvent.Plo
 	-rm -f events/$(DEPDIR)/SpikeEventWrapper.Plo
 	-rm -f platform/core/$(DEPDIR)/SnnCoreTile.Plo
-	-rm -f platform/memory/$(DEPDIR)/DmaMemAccessProxy.Plo
-	-rm -f platform/memory/$(DEPDIR)/PeDmaScheduler.Plo
 	-rm -f platform/memory/$(DEPDIR)/StandardMemAccess.Plo
 	-rm -f platform/memory/sram_sim/model/$(DEPDIR)/BankedSramModel.Plo
 	-rm -f platform/noc/$(DEPDIR)/NocSubsystem.Plo
@@ -1461,6 +1641,20 @@ distclean: distclean-am
 	-rm -f snn/synapse/route/$(DEPDIR)/StepBcsrReachability.Plo
 	-rm -f snn/synapse/route/$(DEPDIR)/SynapseRouteSubsystem.Plo
 	-rm -f snn/timestep/$(DEPDIR)/TimestepTracker.Plo
+	-rm -f v5/api/$(DEPDIR)/ArtifactContract.Plo
+	-rm -f v5/core/$(DEPDIR)/CorePipeline.Plo
+	-rm -f v5/core/$(DEPDIR)/DeterministicRetireQueue.Plo
+	-rm -f v5/core/$(DEPDIR)/LifNeuronOp.Plo
+	-rm -f v5/core/$(DEPDIR)/SnnCoreV5.Plo
+	-rm -f v5/noc/$(DEPDIR)/NocProbeV5.Plo
+	-rm -f v5/noc/$(DEPDIR)/PeEndpointV5.Plo
+	-rm -f v5/storage/$(DEPDIR)/BankedSramV5.Plo
+	-rm -f v5/storage/$(DEPDIR)/BankedSramV5Component.Plo
+	-rm -f v5/storage/$(DEPDIR)/CoreStorageV5.Plo
+	-rm -f v5/storage/$(DEPDIR)/SnnDmaEngineV5.Plo
+	-rm -f v5/test/$(DEPDIR)/DmaSourceV5.Plo
+	-rm -f v5/test/$(DEPDIR)/IdealSynapseSource.Plo
+	-rm -f v5/test/$(DEPDIR)/SramProbeV5.Plo
 	-rm -f Makefile
 distclean-am: clean-am distclean-compile distclean-generic \
 	distclean-tags
@@ -1517,8 +1711,6 @@ maintainer-clean: maintainer-clean-am
 	-rm -f events/$(DEPDIR)/SimpleTestEvent.Plo
 	-rm -f events/$(DEPDIR)/SpikeEventWrapper.Plo
 	-rm -f platform/core/$(DEPDIR)/SnnCoreTile.Plo
-	-rm -f platform/memory/$(DEPDIR)/DmaMemAccessProxy.Plo
-	-rm -f platform/memory/$(DEPDIR)/PeDmaScheduler.Plo
 	-rm -f platform/memory/$(DEPDIR)/StandardMemAccess.Plo
 	-rm -f platform/memory/sram_sim/model/$(DEPDIR)/BankedSramModel.Plo
 	-rm -f platform/noc/$(DEPDIR)/NocSubsystem.Plo
@@ -1544,6 +1736,20 @@ maintainer-clean: maintainer-clean-am
 	-rm -f snn/synapse/route/$(DEPDIR)/StepBcsrReachability.Plo
 	-rm -f snn/synapse/route/$(DEPDIR)/SynapseRouteSubsystem.Plo
 	-rm -f snn/timestep/$(DEPDIR)/TimestepTracker.Plo
+	-rm -f v5/api/$(DEPDIR)/ArtifactContract.Plo
+	-rm -f v5/core/$(DEPDIR)/CorePipeline.Plo
+	-rm -f v5/core/$(DEPDIR)/DeterministicRetireQueue.Plo
+	-rm -f v5/core/$(DEPDIR)/LifNeuronOp.Plo
+	-rm -f v5/core/$(DEPDIR)/SnnCoreV5.Plo
+	-rm -f v5/noc/$(DEPDIR)/NocProbeV5.Plo
+	-rm -f v5/noc/$(DEPDIR)/PeEndpointV5.Plo
+	-rm -f v5/storage/$(DEPDIR)/BankedSramV5.Plo
+	-rm -f v5/storage/$(DEPDIR)/BankedSramV5Component.Plo
+	-rm -f v5/storage/$(DEPDIR)/CoreStorageV5.Plo
+	-rm -f v5/storage/$(DEPDIR)/SnnDmaEngineV5.Plo
+	-rm -f v5/test/$(DEPDIR)/DmaSourceV5.Plo
+	-rm -f v5/test/$(DEPDIR)/IdealSynapseSource.Plo
+	-rm -f v5/test/$(DEPDIR)/SramProbeV5.Plo
 	-rm -f Makefile
 maintainer-clean-am: distclean-am maintainer-clean-generic
 
@@ -1587,9 +1793,10 @@ uninstall-am: uninstall-compLTLIBRARIES
 .PRECIOUS: Makefile
 
 
-.PHONY: check-boundaries test-compile test-timestep-core \
-	test-bcsr-source-contract test-dma-scheduler test-banked-sram \
-	test-local-storage
+.PHONY: check-boundaries test-compile test-timestep-core test-v5-core-pipeline \
+	test-v5-core-storage test-v5-banked-sram \
+	test-bcsr-source-contract test-v5-address test-v5-statistics \
+	test-banked-sram test-local-storage
 
 check-boundaries:
 	python3 $(srcdir)/tools/check_build_boundaries.py --root $(srcdir)
@@ -1603,12 +1810,39 @@ test-bcsr-source-contract:
 		-o $(builddir)/test_bcsr_source_contract$(EXEEXT) && \
 	$(builddir)/test_bcsr_source_contract$(EXEEXT)
 
-test-dma-scheduler:
-	$(TEST_LINK) $(srcdir)/tests/test_pe_dma_scheduler.cc \
-		$(srcdir)/platform/memory/DmaMemAccessProxy.cc \
-		$(srcdir)/platform/memory/PeDmaScheduler.cc \
-		-o $(builddir)/test_pe_dma_scheduler$(EXEEXT) && \
-	$(builddir)/test_pe_dma_scheduler$(EXEEXT)
+test-v5-address:
+	$(TEST_LINK) $(srcdir)/tests/test_v5_address.cc \
+		$(srcdir)/v5/api/ArtifactContract.cc \
+		-o $(builddir)/test_v5_address$(EXEEXT) && \
+	$(builddir)/test_v5_address$(EXEEXT)
+
+test-v5-statistics:
+	$(TEST_LINK) $(srcdir)/tests/test_v5_statistics_contract.cc \
+		-o $(builddir)/test_v5_statistics_contract$(EXEEXT) && \
+	$(builddir)/test_v5_statistics_contract$(EXEEXT)
+
+test-v5-core-pipeline:
+	$(TEST_LINK) $(srcdir)/tests/v5/test_core_pipeline.cc \
+		$(srcdir)/v5/core/CorePipeline.cc \
+		$(srcdir)/v5/core/DeterministicRetireQueue.cc \
+		$(srcdir)/v5/core/LifNeuronOp.cc \
+		$(srcdir)/v5/storage/CoreStorageV5.cc \
+		$(srcdir)/v5/storage/BankedSramV5.cc \
+		-o $(builddir)/test_core_pipeline$(EXEEXT) && \
+	$(builddir)/test_core_pipeline$(EXEEXT)
+
+test-v5-core-storage:
+	$(TEST_LINK) $(srcdir)/tests/v5/test_core_storage_v5.cc \
+		$(srcdir)/v5/storage/CoreStorageV5.cc \
+		$(srcdir)/v5/storage/BankedSramV5.cc \
+		-o $(builddir)/test_core_storage_v5$(EXEEXT) && \
+	$(builddir)/test_core_storage_v5$(EXEEXT)
+
+test-v5-banked-sram:
+	$(TEST_LINK) $(srcdir)/tests/v5/test_banked_sram_v5.cc \
+		$(srcdir)/v5/storage/BankedSramV5.cc \
+		-o $(builddir)/test_banked_sram_v5$(EXEEXT) && \
+	$(builddir)/test_banked_sram_v5$(EXEEXT)
 
 test-banked-sram:
 	$(TEST_LINK) $(srcdir)/tests/test_banked_sram_model.cc \
@@ -1628,7 +1862,10 @@ test-compile:
 	$(CXXCOMPILE) -c $(srcdir)/tests/test_bcsr_source_contract.cc -o $(builddir)/test_bcsr_source_contract.o
 	$(CXXCOMPILE) -c $(srcdir)/tests/test_banked_sram_model.cc -o $(builddir)/test_banked_sram_model.o
 	$(CXXCOMPILE) -c $(srcdir)/tests/test_local_storage_hierarchy.cc -o $(builddir)/test_local_storage_hierarchy.o
-	$(CXXCOMPILE) -c $(srcdir)/tests/test_pe_dma_scheduler.cc -o $(builddir)/test_pe_dma_scheduler.o
+	$(CXXCOMPILE) -c $(srcdir)/tests/test_v5_address.cc -o $(builddir)/test_v5_address.o
+	$(CXXCOMPILE) -c $(srcdir)/tests/test_v5_statistics_contract.cc -o $(builddir)/test_v5_statistics_contract.o
+	$(CXXCOMPILE) -c $(srcdir)/tests/v5/test_core_pipeline.cc -o $(builddir)/test_core_pipeline.o
+	$(CXXCOMPILE) -c $(srcdir)/tests/v5/test_core_storage_v5.cc -o $(builddir)/test_core_storage_v5.o
 	$(CXXCOMPILE) -c $(srcdir)/tests/test_timestep_core.cc -o $(builddir)/test_timestep_core.o
 
 # Tell versions [3.59,3.63) of GNU make to not export all variables.

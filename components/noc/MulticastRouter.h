@@ -24,7 +24,7 @@ class MulticastRouter final : public SST::Component {
 public:
     SST_ELI_REGISTER_COMPONENT(
         MulticastRouter,
-        "SnnDL",
+        "SnnDLComm",
         "MulticastRouter",
         SST_ELI_ELEMENT_VERSION(1, 0, 0),
         "SnnDL native multicast router (blocked multicast)",

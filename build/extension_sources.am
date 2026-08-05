@@ -57,16 +57,10 @@ libSnnDLComm_la_SOURCES = \
 	snn/synapse/route/SynapseRouteSubsystem.h
 
 libSnnDLLocal_la_SOURCES = \
-	api/IDmaSchedulerProvider.h \
-	api/IDmaTaggedAccess.h \
 	api/ILocalStorageProvider.h \
 	api/IMemoryAccess.h \
 	api/IPePodSharedMetadataProvider.h \
 	api/IPeWeightObjectPlaneProvider.h \
-	platform/memory/DmaMemAccessProxy.cc \
-	platform/memory/DmaMemAccessProxy.h \
-	platform/memory/PeDmaScheduler.cc \
-	platform/memory/PeDmaScheduler.h \
 	platform/memory/StandardMemAccess.cc \
 	platform/memory/StandardMemAccess.h \
 	platform/memory/sram_sim/layout/VirtualSramLayout.h \

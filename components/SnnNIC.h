@@ -39,7 +39,7 @@ public:
     // SST组件注册宏
     SST_ELI_REGISTER_SUBCOMPONENT(
         SnnNIC,                                    // 类名
-        "SnnDL",                                  // 元素库名称
+        "SnnDLComm",                              // explicit communication extension library
         "SnnNIC",                                 // 组件名称
         SST_ELI_ELEMENT_VERSION(1, 0, 0),         // 版本号
         "SNN网络接口控制器",                        // 描述

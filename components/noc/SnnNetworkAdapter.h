@@ -115,7 +115,7 @@ public:
     // SST组件注册宏
     SST_ELI_REGISTER_SUBCOMPONENT(
         SnnNetworkAdapter,                         // 类名
-        "SnnDL",                                   // 元素库名称
+        "SnnDLComm",                               // explicit communication extension library
         "SnnNetworkAdapter",                       // 组件名称
         SST_ELI_ELEMENT_VERSION(1, 0, 0),         // 版本号
         "SNN通用网络拓扑适配器",                    // 描述

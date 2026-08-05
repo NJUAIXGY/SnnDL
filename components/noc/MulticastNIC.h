@@ -21,7 +21,7 @@ class MulticastNIC final : public SnnInterface {
 public:
     SST_ELI_REGISTER_SUBCOMPONENT(
         MulticastNIC,
-        "SnnDL",
+        "SnnDLComm",
         "MulticastNIC",
         SST_ELI_ELEMENT_VERSION(1, 0, 0),
         "Native multicast NIC (inject to local MulticastRouter)",

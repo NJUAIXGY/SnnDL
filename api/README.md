@@ -18,11 +18,13 @@ component or research implementation details.
 
 - `IMemoryAccess.h` is strictly an asynchronous `address + size <-> bytes`
   interface.
-- `IDmaTaggedAccess.h` adds opaque tags and priority without adding data
-  semantics; `IDmaSchedulerProvider.h` exposes the scheduler where needed.
 - `ILocalStorageProvider.h`, `IPePodSharedMetadataProvider.h`, and
   `IPeWeightObjectPlaneProvider.h` expose local-storage services through narrow
   provider handles.
+
+Bulk movement in the next-generation contract is represented by explicit
+byte-copy descriptors.  The old tagged scheduler interfaces are archived with
+the GAS-era PE implementation and are not an active API.
 
 ## Shared Utilities
 

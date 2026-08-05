@@ -30,13 +30,14 @@ make -j1
 make check-boundaries
 make test-timestep-core
 make test-bcsr-source-contract
-make test-dma-scheduler
+make test-v5-address
+make test-v5-statistics
 make test-banked-sram
 make test-local-storage
 ```
 
 `build/core_sources.am` and `build/extension_sources.am` are the active build
-boundary.  Keep new code out of the archive and do not add compatibility
+boundary; `build/v5_sources.am` is the standalone v5 contract boundary.  Keep new code out of the archive and do not add compatibility
 includes that reach into it.  Regenerate `Makefile.in` and `Makefile` with the
 parent tree's `automake`/`config.status` flow after changing `Makefile.am`.
 

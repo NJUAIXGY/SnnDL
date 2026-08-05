@@ -1,0 +1,8 @@
+# Standalone v5 wire contracts.  These files are independent of SST and the
+# legacy PE/workload/GAS graph; no ELI constructor is present in this target.
+SNNDL_V5_CONTRACT_SOURCES = \
+	v5/api/V5Types.h \
+	v5/api/AddressSpace.h \
+	v5/api/ArtifactContract.h \
+	v5/api/ArtifactContract.cc \
+	v5/api/StatisticNames.h

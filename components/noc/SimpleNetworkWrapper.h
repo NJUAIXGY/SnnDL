@@ -28,7 +28,7 @@ class SimpleNetworkWrapper : public SST::Interfaces::SimpleNetwork {
 public:
     SST_ELI_REGISTER_SUBCOMPONENT(
         SimpleNetworkWrapper,
-        "SnnDL",
+        "SnnDLComm",
         "SimpleNetworkWrapper", 
         SST_ELI_ELEMENT_VERSION(1, 0, 0),
         "SimpleNetwork包装器，用于SnnNetworkAdapter的hr_router集成",

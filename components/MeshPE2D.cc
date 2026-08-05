@@ -39,6 +39,7 @@ std::uint64_t parseUnsigned_(const std::string& value, const char* name) {
 MeshPE2D::MeshPE2D(SST::ComponentId_t id, SST::Params& params)
     : SST::Component(id), out_("SnnDL.MeshPE2D", 0, 0, SST::Output::STDOUT) {
     pe_id_ = params.find<std::uint32_t>("pe_id", 0);
+    weight_region_.owner_id = pe_id_;
     rows_ = std::max<std::uint32_t>(1, params.find<std::uint32_t>("rows", 1));
     cols_ = std::max<std::uint32_t>(1, params.find<std::uint32_t>("cols", 1));
     cores_per_pe_ = std::max<std::uint32_t>(1, params.find<std::uint32_t>("cores_per_pe", 1));
@@ -548,7 +549,7 @@ void MeshPE2D::issueTask_(std::uint64_t timestep, const Edge& edge,
         out_.fatal(CALL_INFO, -1, "MeshPE2D task token acquire failed: %s\n", error.what());
     }
 
-    const auto address = edge.ordinal * memory_bytes_;
+    const auto address = weightAddress_(edge);
     const Task task{timestep, post_local, address, edge.weight, accepted, stable_order};
     if (local_storage_) {
         const auto request_id = next_event_request_id_++;
@@ -780,6 +781,8 @@ std::vector<std::string> MeshPE2D::split_(const std::string& value, char separat
 void MeshPE2D::parseEdges_(const std::string& encoded) {
     const auto total_neurons = rows_ * cols_ * neurons_per_pe_;
     std::uint64_t edge_ordinal = 0;
+    std::uint64_t max_ordinal = 0;
+    bool have_edge = false;
     for (const auto& item : split_(encoded, ';')) {
         const auto fields = split_(item, ':');
         if (fields.size() != 3 && fields.size() != 4) {
@@ -794,11 +797,17 @@ void MeshPE2D::parseEdges_(const std::string& encoded) {
         const auto ordinal = fields.size() == 4
             ? parseUnsigned_(fields[3], "edge ordinal")
             : edge_ordinal;
+        if (ordinal == UINT64_MAX) {
+            throw std::out_of_range("edge ordinal exceeds addressable weight region");
+        }
         const Edge edge{pre, post, weight, ordinal};
         if (peForNeuron_(pre) == pe_id_) outgoing_edges_[pre].push_back(edge);
         if (peForNeuron_(post) == pe_id_) incoming_edges_[pre].push_back(edge);
+        max_ordinal = std::max(max_ordinal, ordinal);
+        have_edge = true;
         ++edge_ordinal;
     }
+    setWeightRegionSize_(have_edge ? max_ordinal + 1 : 0);
 }
 
 void MeshPE2D::parseDescriptor_(const std::string& path) {
@@ -865,6 +874,25 @@ void MeshPE2D::parseDescriptor_(const std::string& path) {
             throw std::invalid_argument("BCSR descriptor ordinals must be contiguous");
         }
     }
+    setWeightRegionSize_(edge_count);
+}
+
+void MeshPE2D::setWeightRegionSize_(std::uint64_t element_count) {
+    if (memory_bytes_ == 0 || element_count > UINT64_MAX / memory_bytes_) {
+        throw std::overflow_error("weight region size overflows byte address space");
+    }
+    weight_region_.size_bytes = element_count * memory_bytes_;
+}
+
+std::uint64_t MeshPE2D::weightAddress_(const Edge& edge) const {
+    ::SnnDL::v5::TypedAddress address{};
+    std::uint64_t physical = 0;
+    if (!::SnnDL::v5::typedAddressForElement(
+            weight_region_, edge.ordinal, memory_bytes_, address) ||
+        !::SnnDL::v5::resolveRegionAddress(address, weight_region_, physical)) {
+        throw std::out_of_range("edge ordinal is outside the PE weight region");
+    }
+    return physical;
 }
 
 void MeshPE2D::loadLocalWeightStore_() {
@@ -883,7 +911,7 @@ void MeshPE2D::loadLocalWeightStore_() {
 
     for (const auto& entry : incoming_edges_) {
         for (const auto& edge : entry.second) {
-            const auto address = edge.ordinal * memory_bytes_;
+            const auto address = weightAddress_(edge);
             float value = edge.weight;
             if (image.is_open()) {
                 image.clear();
