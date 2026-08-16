@@ -5,8 +5,8 @@
 namespace SnnDL {
 namespace v5 {
 
-inline constexpr const char kStatisticsContractSha256[] = "5e3242dd9ae0011ea8422201e8f90f587969b2de99b5a8dbeeb17d526cbc4d75";
-inline constexpr unsigned kStatisticNameCount = 84u;
+inline constexpr const char kStatisticsContractSha256[] = "c34aaa9030d2bbc1143685281d510149a859f9004615bbad95f09630ae23d503";
+inline constexpr unsigned kStatisticNameCount = 98u;
 
 inline constexpr const char kStatisticNameCacheL1Hits[] = "cache.l1.hits";
 inline constexpr const char kStatisticNameCacheL1Misses[] = "cache.l1.misses";
@@ -61,6 +61,16 @@ inline constexpr const char kStatisticNameDmaDescriptors[] = "dma.descriptors";
 inline constexpr const char kStatisticNameDramBytes[] = "dram.bytes";
 inline constexpr const char kStatisticNameDramRequests[] = "dram.requests";
 inline constexpr const char kStatisticNameDramResponses[] = "dram.responses";
+inline constexpr const char kStatisticNameMcastBranchTransmissions[] = "mcast.branch_transmissions";
+inline constexpr const char kStatisticNameMcastCreditStallCycles[] = "mcast.credit_stall_cycles";
+inline constexpr const char kStatisticNameMcastFlitTraversals[] = "mcast.flit_traversals";
+inline constexpr const char kStatisticNameMcastLinkTraversals[] = "mcast.link_traversals";
+inline constexpr const char kStatisticNameMcastOutputStallCycles[] = "mcast.output_stall_cycles";
+inline constexpr const char kStatisticNameMcastRouteLookups[] = "mcast.route_lookups";
+inline constexpr const char kStatisticNameMcastRouterClones[] = "mcast.router_clones";
+inline constexpr const char kStatisticNameMcastSourcePackets[] = "mcast.source_packets";
+inline constexpr const char kStatisticNameNocControlFlits[] = "noc.control_flits";
+inline constexpr const char kStatisticNameNocControlPackets[] = "noc.control_packets";
 inline constexpr const char kStatisticNameNocCoreRetryCycles[] = "noc.core_retry_cycles";
 inline constexpr const char kStatisticNameNocFlits[] = "noc.flits";
 inline constexpr const char kStatisticNameNocLogicalDeliveries[] = "noc.logical_deliveries";
@@ -87,6 +97,10 @@ inline constexpr const char kStatisticNameStorageSramResponseOccupancy[] = "stor
 inline constexpr const char kStatisticNameStorageSramWrites[] = "storage.sram.writes";
 inline constexpr const char kStatisticNameStorageStateReads[] = "storage.state.reads";
 inline constexpr const char kStatisticNameSyncBarrierWaitNs[] = "sync.barrier_wait_ns";
+inline constexpr const char kStatisticNameSyncCommands[] = "sync.commands";
+inline constexpr const char kStatisticNameSyncEpochsCompleted[] = "sync.epochs_completed";
+inline constexpr const char kStatisticNameSyncReports[] = "sync.reports";
+inline constexpr const char kStatisticNameSyncTimeouts[] = "sync.timeouts";
 inline constexpr const char kStatisticNameTimestepCommitted[] = "timestep.committed";
 inline constexpr const char kStatisticNameTimestepCoreElapsedNs[] = "timestep.core_elapsed_ns";
 inline constexpr const char kStatisticNameTimestepElapsedNs[] = "timestep.elapsed_ns";
@@ -147,6 +161,16 @@ inline constexpr std::array<const char*, kStatisticNameCount> kStatisticNames = 
     kStatisticNameDramBytes,
     kStatisticNameDramRequests,
     kStatisticNameDramResponses,
+    kStatisticNameMcastBranchTransmissions,
+    kStatisticNameMcastCreditStallCycles,
+    kStatisticNameMcastFlitTraversals,
+    kStatisticNameMcastLinkTraversals,
+    kStatisticNameMcastOutputStallCycles,
+    kStatisticNameMcastRouteLookups,
+    kStatisticNameMcastRouterClones,
+    kStatisticNameMcastSourcePackets,
+    kStatisticNameNocControlFlits,
+    kStatisticNameNocControlPackets,
     kStatisticNameNocCoreRetryCycles,
     kStatisticNameNocFlits,
     kStatisticNameNocLogicalDeliveries,
@@ -173,6 +197,10 @@ inline constexpr std::array<const char*, kStatisticNameCount> kStatisticNames = 
     kStatisticNameStorageSramWrites,
     kStatisticNameStorageStateReads,
     kStatisticNameSyncBarrierWaitNs,
+    kStatisticNameSyncCommands,
+    kStatisticNameSyncEpochsCompleted,
+    kStatisticNameSyncReports,
+    kStatisticNameSyncTimeouts,
     kStatisticNameTimestepCommitted,
     kStatisticNameTimestepCoreElapsedNs,
     kStatisticNameTimestepElapsedNs,

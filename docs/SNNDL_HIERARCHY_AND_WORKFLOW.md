@@ -1,14 +1,18 @@
 # Active SnnDL Workflow
 
-The maintained path has four explicit stages:
+The maintained P8 path has six explicit stages:
 
-1. A caller validates topology, timestep, memory, and BCSR source parameters.
-2. `BcsrRouteBuilder` loads and validates the descriptor, then binds its
-   identity through `BcsrSourceContract`.
-3. Route and stimulus code encode packet destinations; `NocSubsystem` and the
-   SST NIC transport packets across the 2D mesh.
-4. The memory domain services address/byte requests, while the synchronous
-   timestep core retires deltas and updates neuron state.
+1. The parent `snndl/v1` API validates chip, workload, mapping and simulation intent.
+2. GraphIR, StimulusIR and MappingIR are compiled with an independent float32
+   LIF oracle.
+3. Artifact v2 binds destination-owned rows/weights, source routes and
+   source-owned stimuli with a dynamic, non-overlapping ChipDram layout.
+4. The strict v5 resolver validates owners, regions, digests, capacity and
+   memory contracts before SST starts.
+5. SST runs Core, typed SRAM, DMA, L1/L2/DRAM, NIC, Merlin/native multicast and
+   timed control components.
+6. The runner compares traffic, per-timestep releases and per-Core state hashes,
+   then writes acceptance/provenance evidence.
 
 `libSnnDLNextCore.la` is a separate pure-domain closure for timestep behavior.
 `libSnnDL.la` aggregates the active SST libraries for compatibility, but it has

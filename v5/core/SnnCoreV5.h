@@ -149,7 +149,7 @@ private:
     void sendRequests_();
     void sendReleasedSpikes_();
     void sendSpikeAck_(const CoreSpikeEvent& spike, bool accepted, bool retryable);
-    void sendProviderAck_(std::uint64_t timestep, std::uint32_t source_neuron,
+    void sendProviderAck_(std::uint64_t timestep, std::uint64_t source_neuron,
                           std::uint64_t source_event_seq, std::uint64_t edge_ordinal,
                           bool row_done, bool accepted, bool retryable);
     void publishStatistics_();

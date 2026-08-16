@@ -276,7 +276,8 @@ libSnnDLV5Contracts_la_LINK = $(LIBTOOL) $(AM_V_lt) --tag=CXX \
 	$(AM_CXXFLAGS) $(CXXFLAGS) $(libSnnDLV5Contracts_la_LDFLAGS) \
 	$(LDFLAGS) -o $@
 libSnnDLV5Core_la_LIBADD =
-am__objects_3 = v5/noc/PeEndpointV5.lo v5/noc/NocProbeV5.lo \
+am__objects_3 = v5/noc/MulticastRouterV5.lo v5/noc/PeEndpointV5.lo \
+	v5/noc/NocProbeV5.lo v5/control/EpochCoordinatorV5.lo \
 	v5/core/LifNeuronOp.lo v5/core/DeterministicRetireQueue.lo \
 	v5/core/CorePipeline.lo v5/core/SnnCoreV5.lo \
 	v5/storage/BankedSramV5.lo v5/storage/SnnDmaEngineV5.lo \
@@ -342,10 +343,12 @@ am__depfiles_remade = components/$(DEPDIR)/MeshPE2D.Plo \
 	snn/synapse/route/$(DEPDIR)/SynapseRouteSubsystem.Plo \
 	snn/timestep/$(DEPDIR)/TimestepTracker.Plo \
 	v5/api/$(DEPDIR)/ArtifactContract.Plo \
+	v5/control/$(DEPDIR)/EpochCoordinatorV5.Plo \
 	v5/core/$(DEPDIR)/CorePipeline.Plo \
 	v5/core/$(DEPDIR)/DeterministicRetireQueue.Plo \
 	v5/core/$(DEPDIR)/LifNeuronOp.Plo \
 	v5/core/$(DEPDIR)/SnnCoreV5.Plo \
+	v5/noc/$(DEPDIR)/MulticastRouterV5.Plo \
 	v5/noc/$(DEPDIR)/NocProbeV5.Plo \
 	v5/noc/$(DEPDIR)/PeEndpointV5.Plo \
 	v5/storage/$(DEPDIR)/BankedSramV5.Plo \
@@ -830,10 +833,16 @@ SNNDL_V5_CORE_SOURCES = \
 	v5/events/CoreEvents.h \
 	v5/events/StorageEvents.h \
 	v5/noc/NocEventsV5.h \
+	v5/noc/MulticastBranchTableV5.h \
+	v5/noc/MulticastCreditV5.h \
+	v5/noc/MulticastRouterV5.h \
+	v5/noc/MulticastRouterV5.cc \
 	v5/noc/PeEndpointV5.h \
 	v5/noc/PeEndpointV5.cc \
 	v5/noc/NocProbeV5.h \
 	v5/noc/NocProbeV5.cc \
+	v5/control/EpochCoordinatorV5.h \
+	v5/control/EpochCoordinatorV5.cc \
 	v5/core/LifNeuronOp.h \
 	v5/core/LifNeuronOp.cc \
 	v5/core/DeterministicRetireQueue.h \
@@ -1231,10 +1240,20 @@ v5/noc/$(am__dirstamp):
 v5/noc/$(DEPDIR)/$(am__dirstamp):
 	@$(MKDIR_P) v5/noc/$(DEPDIR)
 	@: > v5/noc/$(DEPDIR)/$(am__dirstamp)
+v5/noc/MulticastRouterV5.lo: v5/noc/$(am__dirstamp) \
+	v5/noc/$(DEPDIR)/$(am__dirstamp)
 v5/noc/PeEndpointV5.lo: v5/noc/$(am__dirstamp) \
 	v5/noc/$(DEPDIR)/$(am__dirstamp)
 v5/noc/NocProbeV5.lo: v5/noc/$(am__dirstamp) \
 	v5/noc/$(DEPDIR)/$(am__dirstamp)
+v5/control/$(am__dirstamp):
+	@$(MKDIR_P) v5/control
+	@: > v5/control/$(am__dirstamp)
+v5/control/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) v5/control/$(DEPDIR)
+	@: > v5/control/$(DEPDIR)/$(am__dirstamp)
+v5/control/EpochCoordinatorV5.lo: v5/control/$(am__dirstamp) \
+	v5/control/$(DEPDIR)/$(am__dirstamp)
 v5/core/$(am__dirstamp):
 	@$(MKDIR_P) v5/core
 	@: > v5/core/$(am__dirstamp)
@@ -1315,6 +1334,8 @@ mostlyclean-compile:
 	-rm -f snn/timestep/*.lo
 	-rm -f v5/api/*.$(OBJEXT)
 	-rm -f v5/api/*.lo
+	-rm -f v5/control/*.$(OBJEXT)
+	-rm -f v5/control/*.lo
 	-rm -f v5/core/*.$(OBJEXT)
 	-rm -f v5/core/*.lo
 	-rm -f v5/noc/*.$(OBJEXT)
@@ -1364,10 +1385,12 @@ include snn/synapse/route/$(DEPDIR)/StepBcsrReachability.Plo # am--include-marke
 include snn/synapse/route/$(DEPDIR)/SynapseRouteSubsystem.Plo # am--include-marker
 include snn/timestep/$(DEPDIR)/TimestepTracker.Plo # am--include-marker
 include v5/api/$(DEPDIR)/ArtifactContract.Plo # am--include-marker
+include v5/control/$(DEPDIR)/EpochCoordinatorV5.Plo # am--include-marker
 include v5/core/$(DEPDIR)/CorePipeline.Plo # am--include-marker
 include v5/core/$(DEPDIR)/DeterministicRetireQueue.Plo # am--include-marker
 include v5/core/$(DEPDIR)/LifNeuronOp.Plo # am--include-marker
 include v5/core/$(DEPDIR)/SnnCoreV5.Plo # am--include-marker
+include v5/noc/$(DEPDIR)/MulticastRouterV5.Plo # am--include-marker
 include v5/noc/$(DEPDIR)/NocProbeV5.Plo # am--include-marker
 include v5/noc/$(DEPDIR)/PeEndpointV5.Plo # am--include-marker
 include v5/storage/$(DEPDIR)/BankedSramV5.Plo # am--include-marker
@@ -1430,6 +1453,7 @@ clean-libtool:
 	-rm -rf snn/synapse/route/.libs snn/synapse/route/_libs
 	-rm -rf snn/timestep/.libs snn/timestep/_libs
 	-rm -rf v5/api/.libs v5/api/_libs
+	-rm -rf v5/control/.libs v5/control/_libs
 	-rm -rf v5/core/.libs v5/core/_libs
 	-rm -rf v5/noc/.libs v5/noc/_libs
 	-rm -rf v5/storage/.libs v5/storage/_libs
@@ -1587,6 +1611,8 @@ distclean-generic:
 	-rm -f snn/timestep/$(am__dirstamp)
 	-rm -f v5/api/$(DEPDIR)/$(am__dirstamp)
 	-rm -f v5/api/$(am__dirstamp)
+	-rm -f v5/control/$(DEPDIR)/$(am__dirstamp)
+	-rm -f v5/control/$(am__dirstamp)
 	-rm -f v5/core/$(DEPDIR)/$(am__dirstamp)
 	-rm -f v5/core/$(am__dirstamp)
 	-rm -f v5/noc/$(DEPDIR)/$(am__dirstamp)
@@ -1642,10 +1668,12 @@ distclean: distclean-am
 	-rm -f snn/synapse/route/$(DEPDIR)/SynapseRouteSubsystem.Plo
 	-rm -f snn/timestep/$(DEPDIR)/TimestepTracker.Plo
 	-rm -f v5/api/$(DEPDIR)/ArtifactContract.Plo
+	-rm -f v5/control/$(DEPDIR)/EpochCoordinatorV5.Plo
 	-rm -f v5/core/$(DEPDIR)/CorePipeline.Plo
 	-rm -f v5/core/$(DEPDIR)/DeterministicRetireQueue.Plo
 	-rm -f v5/core/$(DEPDIR)/LifNeuronOp.Plo
 	-rm -f v5/core/$(DEPDIR)/SnnCoreV5.Plo
+	-rm -f v5/noc/$(DEPDIR)/MulticastRouterV5.Plo
 	-rm -f v5/noc/$(DEPDIR)/NocProbeV5.Plo
 	-rm -f v5/noc/$(DEPDIR)/PeEndpointV5.Plo
 	-rm -f v5/storage/$(DEPDIR)/BankedSramV5.Plo
@@ -1737,10 +1765,12 @@ maintainer-clean: maintainer-clean-am
 	-rm -f snn/synapse/route/$(DEPDIR)/SynapseRouteSubsystem.Plo
 	-rm -f snn/timestep/$(DEPDIR)/TimestepTracker.Plo
 	-rm -f v5/api/$(DEPDIR)/ArtifactContract.Plo
+	-rm -f v5/control/$(DEPDIR)/EpochCoordinatorV5.Plo
 	-rm -f v5/core/$(DEPDIR)/CorePipeline.Plo
 	-rm -f v5/core/$(DEPDIR)/DeterministicRetireQueue.Plo
 	-rm -f v5/core/$(DEPDIR)/LifNeuronOp.Plo
 	-rm -f v5/core/$(DEPDIR)/SnnCoreV5.Plo
+	-rm -f v5/noc/$(DEPDIR)/MulticastRouterV5.Plo
 	-rm -f v5/noc/$(DEPDIR)/NocProbeV5.Plo
 	-rm -f v5/noc/$(DEPDIR)/PeEndpointV5.Plo
 	-rm -f v5/storage/$(DEPDIR)/BankedSramV5.Plo
@@ -1795,7 +1825,7 @@ uninstall-am: uninstall-compLTLIBRARIES
 
 .PHONY: check-boundaries test-compile test-timestep-core test-v5-core-pipeline \
 	test-v5-core-storage test-v5-banked-sram \
-	test-bcsr-source-contract test-v5-address test-v5-statistics \
+	test-bcsr-source-contract test-v5-address test-v5-statistics test-v5-multicast-tree \
 	test-banked-sram test-local-storage
 
 check-boundaries:
@@ -1820,6 +1850,11 @@ test-v5-statistics:
 	$(TEST_LINK) $(srcdir)/tests/test_v5_statistics_contract.cc \
 		-o $(builddir)/test_v5_statistics_contract$(EXEEXT) && \
 	$(builddir)/test_v5_statistics_contract$(EXEEXT)
+
+test-v5-multicast-tree:
+	$(TEST_LINK) $(srcdir)/tests/v5/test_multicast_branch_table_v5.cc \
+		-o $(builddir)/test_multicast_branch_table_v5$(EXEEXT) && \
+	$(builddir)/test_multicast_branch_table_v5$(EXEEXT)
 
 test-v5-core-pipeline:
 	$(TEST_LINK) $(srcdir)/tests/v5/test_core_pipeline.cc \
@@ -1864,6 +1899,7 @@ test-compile:
 	$(CXXCOMPILE) -c $(srcdir)/tests/test_local_storage_hierarchy.cc -o $(builddir)/test_local_storage_hierarchy.o
 	$(CXXCOMPILE) -c $(srcdir)/tests/test_v5_address.cc -o $(builddir)/test_v5_address.o
 	$(CXXCOMPILE) -c $(srcdir)/tests/test_v5_statistics_contract.cc -o $(builddir)/test_v5_statistics_contract.o
+	$(CXXCOMPILE) -c $(srcdir)/tests/v5/test_multicast_branch_table_v5.cc -o $(builddir)/test_multicast_branch_table_v5.o
 	$(CXXCOMPILE) -c $(srcdir)/tests/v5/test_core_pipeline.cc -o $(builddir)/test_core_pipeline.o
 	$(CXXCOMPILE) -c $(srcdir)/tests/v5/test_core_storage_v5.cc -o $(builddir)/test_core_storage_v5.o
 	$(CXXCOMPILE) -c $(srcdir)/tests/test_timestep_core.cc -o $(builddir)/test_timestep_core.o

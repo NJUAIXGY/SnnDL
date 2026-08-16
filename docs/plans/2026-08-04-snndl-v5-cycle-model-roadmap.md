@@ -1,6 +1,6 @@
-# SnnDL v5 2D SNN 芯片周期级建模路线图（P0-P7）
+# SnnDL v5 2D SNN 芯片周期级建模路线图（P0-P8 历史路线）
 
-> - 状态：P0-P4 已完成并验收；下一阶段为 P5 multicast 与 timed synchronization
+> - 状态：历史路线文档；P0-P8 已完成当前闭环，P8 correctness/scale gate 已通过。后续科研基准和负载覆盖进入 P9。
 > - 日期：2026-08-04
 > - 适用代码：`remote/snndl_spec/`、`remote/snndl_system/`、
 >   `remote/sst_dram_si/`、`remote/tools/` 与本 SnnDL 子模块
@@ -8,6 +8,10 @@
 > - 明确排除：GAS、3D NoC/route、旧通用 workload、未经校准的硬件结论
 
 ## 1. 文档定位
+
+本文保留 P0-P7 的原始设计和验收计划，作为历史决策记录；它不是当前能力清单。
+当前状态以父仓库的 `docs/SNNDL_V5_TECHNICAL_ARCHITECTURE.md`、
+`TECH_PROGRESS.md` 和 P8 `acceptance.json` 为准。
 
 本路线图定义 SnnDL 从 v4 功能模型演进为 v5 周期、容量、争用和能耗可解释模型的完整工程路径。它不替代 v4 的同步 timestep 语义规范，而是在其上增加真实资源约束。
 

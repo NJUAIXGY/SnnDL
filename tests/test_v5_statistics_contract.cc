@@ -18,5 +18,7 @@ int main() {
     assert(names.count("timestep.committed") == 1u);
     assert(names.count("storage.sram.bank_conflicts") == 1u);
     assert(names.count("storage.sram.requests.retryable_rejects") == 1u);
+    assert(names.count("mcast.source_packets") == 1u);
+    assert(names.count("mcast.credit_stall_cycles") == 1u);
     return 0;
 }

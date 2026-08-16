@@ -176,7 +176,7 @@ void SnnCoreV5::handleSpike_(SST::Event* event) {
 void SnnCoreV5::handleProvider_(SST::Event* event) {
     bool accepted = false;
     std::uint64_t timestep = 0;
-    std::uint32_t source_neuron = 0;
+    std::uint64_t source_neuron = 0;
     std::uint64_t source_event_seq = 0;
     std::uint64_t edge_ordinal = 0;
     bool row_done = false;
@@ -219,7 +219,7 @@ void SnnCoreV5::sendSpikeAck_(const CoreSpikeEvent& spike, bool accepted, bool r
     spike_ack_link_->send(ack);
 }
 
-void SnnCoreV5::sendProviderAck_(std::uint64_t timestep, std::uint32_t source_neuron,
+void SnnCoreV5::sendProviderAck_(std::uint64_t timestep, std::uint64_t source_neuron,
                                  std::uint64_t source_event_seq, std::uint64_t edge_ordinal,
                                  bool row_done, bool accepted, bool retryable) {
     auto* ack = new CoreProviderAckEvent();

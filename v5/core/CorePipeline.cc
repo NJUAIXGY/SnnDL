@@ -51,7 +51,7 @@ std::uint64_t CorePipeline::hashMix_(std::uint64_t hash, std::uint64_t value) {
     return hash;
 }
 
-CorePipeline::RowKey CorePipeline::keyFor_(std::uint32_t source_neuron,
+CorePipeline::RowKey CorePipeline::keyFor_(std::uint64_t source_neuron,
                                            std::uint64_t source_event_seq) const {
     return RowKey{source_neuron, source_event_seq};
 }
@@ -149,7 +149,7 @@ void CorePipeline::start(std::uint64_t timestep) {
 
 bool CorePipeline::submitSpike(const SpikeInput& spike) {
     if (!active_ || sealed_ || spike.timestep != active_timestep_) return false;
-    if (spike.source_neuron >= config_.neurons || ingress_q_.size() >= config_.ingress_entries) {
+    if (ingress_q_.size() >= config_.ingress_entries) {
         ++stats_.ingress_full_cycles;
         return false;
     }

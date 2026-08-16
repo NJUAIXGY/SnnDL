@@ -42,20 +42,20 @@ struct CorePipelineConfig {
 
 struct SpikeInput {
     std::uint64_t timestep = 0;
-    std::uint32_t source_neuron = 0;
+    std::uint64_t source_neuron = 0;
     std::uint64_t source_event_seq = 0;
 };
 
 struct RowRequest {
     std::uint64_t timestep = 0;
-    std::uint32_t source_neuron = 0;
+    std::uint64_t source_neuron = 0;
     std::uint64_t source_event_seq = 0;
     std::uint64_t row_id = 0;
 };
 
 struct SynapseResponse {
     std::uint64_t timestep = 0;
-    std::uint32_t source_neuron = 0;
+    std::uint64_t source_neuron = 0;
     std::uint64_t source_event_seq = 0;
     std::uint32_t post_neuron = 0;
     std::uint64_t edge_ordinal = 0;
@@ -66,7 +66,7 @@ struct SynapseResponse {
 
 struct RowDone {
     std::uint64_t timestep = 0;
-    std::uint32_t source_neuron = 0;
+    std::uint64_t source_neuron = 0;
     std::uint64_t source_event_seq = 0;
     std::uint32_t edge_count = 0;
 };
@@ -142,7 +142,7 @@ public:
 
 private:
     struct RowKey {
-        std::uint32_t source_neuron = 0;
+        std::uint64_t source_neuron = 0;
         std::uint64_t source_event_seq = 0;
         bool operator<(const RowKey& other) const {
             if (source_neuron != other.source_neuron) return source_neuron < other.source_neuron;
@@ -165,7 +165,7 @@ private:
 
     static std::uint64_t effectiveLatency_(std::uint32_t latency);
     static std::uint64_t hashMix_(std::uint64_t hash, std::uint64_t value);
-    RowKey keyFor_(std::uint32_t source_neuron, std::uint64_t source_event_seq) const;
+    RowKey keyFor_(std::uint64_t source_neuron, std::uint64_t source_event_seq) const;
     bool allRowsComplete_() const;
     bool queuesEmpty_() const;
     void processNeuron_();

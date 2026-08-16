@@ -18,7 +18,7 @@ namespace SST {
 namespace SnnDL {
 namespace v5 {
 
-class IdealSynapseSource final : public SST::Component {
+class IdealSynapseSource : public SST::Component {
 public:
     SST_ELI_REGISTER_COMPONENT(
         IdealSynapseSource,
@@ -31,11 +31,21 @@ public:
 
     SST_ELI_DOCUMENT_PARAMS(
         {"timesteps", "Number of synchronous timesteps", "1"},
+        {"start_timestep", "First synchronous timestep", "0"},
+        {"core_id", "Global Core ordinal used in functional evidence", "0"},
         {"neurons", "Neuron count used for input validation", "64"},
         {"edges", "Semicolon-separated pre:post:weight:ordinal rows", "0:0:1.0:0"},
         {"stimuli", "Semicolon-separated timestep:source[:sequence] spikes", "0:0:1"},
         {"reverse_responses", "Return row responses in reverse order", "0"},
         {"memory_backed_weights", "Read row records through StandardMem after DMA preload", "0"},
+        {"external_control", "Receive Start/Seal/Commit from EpochCoordinatorV5", "0"},
+        {"artifact_required", "Reject legacy edge-string mode", "0"},
+        {"artifact_weight_file", "Validated canonical weight artifact file", ""},
+        {"artifact_weight_file_offset", "Byte offset of the validated weight region", "0"},
+        {"artifact_weight_bytes", "Byte length of the validated weight region", "0"},
+        {"artifact_rows", "Canonical pre:byte_offset:edge_count row index", ""},
+        {"artifact_stimuli", "Canonical timestep:source:sequence stimuli", ""},
+        {"artifact_digest", "Canonical manifest graph digest", ""},
         {"weight_image_base", "ChipDram base address for the untimed weight image", "0"},
         {"weight_read_base", "Local weight scratchpad base address", "0"},
         {"output_json", "Optional JSON evidence path", ""},
@@ -66,14 +76,14 @@ public:
 
 private:
     struct Edge {
-        std::uint32_t pre = 0;
+        std::uint64_t pre = 0;
         std::uint32_t post = 0;
         float weight = 0.0f;
         std::uint64_t ordinal = 0;
     };
     struct Stimulus {
         std::uint64_t timestep = 0;
-        std::uint32_t source = 0;
+        std::uint64_t source = 0;
         std::uint64_t sequence = 0;
     };
 
@@ -95,6 +105,8 @@ private:
     static std::vector<std::string> split_(const std::string& value, char separator);
     void parseEdges_(const std::string& encoded);
     void parseStimuli_(const std::string& encoded);
+    void parseArtifactRows_(const std::string& encoded);
+    void loadArtifactWeights_(const std::string& path, std::uint64_t offset, std::uint64_t bytes);
 
     SST::Output out_;
     SST::Link* control_link_ = nullptr;
@@ -106,20 +118,24 @@ private:
     SST::Link* preload_link_ = nullptr;
     SST::Interfaces::StandardMem* memory_ = nullptr;
     std::uint32_t neurons_ = 64;
+    std::uint32_t core_id_ = 0;
     std::uint64_t timesteps_ = 1;
+    std::uint64_t start_timestep_ = 0;
     bool reverse_responses_ = false;
     bool memory_backed_weights_ = false;
+    bool external_control_ = false;
+    bool artifact_mode_ = false;
     std::uint64_t weight_image_base_ = 0;
     std::uint64_t weight_read_base_ = 0;
     std::string output_json_;
     std::vector<Edge> edges_;
     std::vector<Stimulus> stimuli_;
-    std::map<std::uint32_t, std::vector<Edge>> edges_by_pre_;
+    std::map<std::uint64_t, std::vector<Edge>> edges_by_pre_;
     struct RowLocation {
         std::uint64_t byte_offset = 0;
         std::size_t edge_count = 0;
     };
-    std::map<std::uint32_t, RowLocation> row_locations_;
+    std::map<std::uint64_t, RowLocation> row_locations_;
     std::vector<std::uint8_t> weight_image_;
     struct ProviderTransaction {
         CoreRowRequestEvent request;
@@ -144,6 +160,9 @@ private:
     bool finished_ = false;
     bool preload_ready_ = false;
     bool image_initialized_ = false;
+    bool preload_reported_ = false;
+    bool ingress_ready_reported_ = false;
+    std::string artifact_digest_;
     std::uint64_t pending_memory_request_ = 0;
     bool pending_memory_ = false;
     std::uint64_t preload_ready_cycle_ = 0;
@@ -154,6 +173,7 @@ private:
     double image_weight_sum_ = 0.0;
     double decoded_weight_sum_ = 0.0;
     std::uint64_t output_spikes_ = 0;
+    std::map<std::uint64_t, std::vector<std::uint32_t>> output_spikes_by_timestep_;
     std::uint64_t rows_served_ = 0;
     std::uint64_t responses_served_ = 0;
     std::uint64_t response_attempts_ = 0;
@@ -161,7 +181,28 @@ private:
     std::uint64_t spike_retries_ = 0;
     std::uint64_t provider_retries_ = 0;
     std::uint64_t functional_hash_ = 0;
+    std::map<std::uint64_t, std::uint64_t> functional_hash_by_timestep_;
+    std::uint64_t completed_timesteps_ = 0;
+    std::uint64_t total_core_cycles_ = 0;
+    std::uint64_t total_ingress_accepted_ = 0;
+    std::uint64_t total_synapse_issued_ = 0;
+    std::uint64_t total_retire_retired_ = 0;
+    std::uint64_t total_neurons_evaluated_ = 0;
     CoreStatusEvent last_status_;
+};
+
+class ArtifactSynapseSourceV5 final : public IdealSynapseSource {
+public:
+    SST_ELI_REGISTER_COMPONENT(
+        ArtifactSynapseSourceV5,
+        "SnnDL",
+        "ArtifactSynapseSourceV5",
+        SST_ELI_ELEMENT_VERSION(1, 0, 0),
+        "P6 canonical manifest-backed row, weight, and stimulus provider",
+        COMPONENT_CATEGORY_PROCESSOR
+    )
+    ArtifactSynapseSourceV5(SST::ComponentId_t id, SST::Params& params)
+        : IdealSynapseSource(id, params) {}
 };
 
 } // namespace v5

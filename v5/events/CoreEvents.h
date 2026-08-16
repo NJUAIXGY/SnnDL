@@ -17,6 +17,9 @@ enum class CoreControlOp : std::uint8_t {
     Abort,
     CommitReady,
     CommitDone,
+    PreloadReady,
+    IngressReady,
+    IngressProgress,
 };
 
 class CoreControlEvent final : public SST::Event {
@@ -47,7 +50,7 @@ private:
 class CoreSpikeEvent final : public SST::Event {
 public:
     std::uint64_t timestep = 0;
-    std::uint32_t source_neuron = 0;
+    std::uint64_t source_neuron = 0;
     std::uint32_t target_neuron = 0;
     std::uint64_t source_event_seq = 0;
 
@@ -77,7 +80,7 @@ private:
 class CoreSpikeAckEvent final : public SST::Event {
 public:
     std::uint64_t timestep = 0;
-    std::uint32_t source_neuron = 0;
+    std::uint64_t source_neuron = 0;
     std::uint64_t source_event_seq = 0;
     bool accepted = false;
     bool retryable = true;
@@ -108,7 +111,7 @@ private:
 class CoreRowRequestEvent final : public SST::Event {
 public:
     std::uint64_t timestep = 0;
-    std::uint32_t source_neuron = 0;
+    std::uint64_t source_neuron = 0;
     std::uint64_t source_event_seq = 0;
     std::uint64_t row_id = 0;
 
@@ -138,7 +141,7 @@ private:
 class CoreSynapseResponseEvent final : public SST::Event {
 public:
     std::uint64_t timestep = 0;
-    std::uint32_t source_neuron = 0;
+    std::uint64_t source_neuron = 0;
     std::uint64_t source_event_seq = 0;
     std::uint32_t post_neuron = 0;
     std::uint64_t edge_ordinal = 0;
@@ -180,7 +183,7 @@ private:
 class CoreRowDoneEvent final : public SST::Event {
 public:
     std::uint64_t timestep = 0;
-    std::uint32_t source_neuron = 0;
+    std::uint64_t source_neuron = 0;
     std::uint64_t source_event_seq = 0;
     std::uint32_t edge_count = 0;
 
@@ -210,7 +213,7 @@ private:
 class CoreProviderAckEvent final : public SST::Event {
 public:
     std::uint64_t timestep = 0;
-    std::uint32_t source_neuron = 0;
+    std::uint64_t source_neuron = 0;
     std::uint64_t source_event_seq = 0;
     std::uint64_t edge_ordinal = 0;
     bool row_done = false;

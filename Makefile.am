@@ -106,7 +106,7 @@ TEST_LINK = $(CXXLD) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) \
 
 .PHONY: check-boundaries test-compile test-timestep-core test-v5-core-pipeline \
 	test-v5-core-storage test-v5-banked-sram \
-	test-bcsr-source-contract test-v5-address test-v5-statistics \
+	test-bcsr-source-contract test-v5-address test-v5-statistics test-v5-multicast-tree \
 	test-banked-sram test-local-storage
 
 check-boundaries:
@@ -131,6 +131,11 @@ test-v5-statistics:
 	$(TEST_LINK) $(srcdir)/tests/test_v5_statistics_contract.cc \
 		-o $(builddir)/test_v5_statistics_contract$(EXEEXT) && \
 	$(builddir)/test_v5_statistics_contract$(EXEEXT)
+
+test-v5-multicast-tree:
+	$(TEST_LINK) $(srcdir)/tests/v5/test_multicast_branch_table_v5.cc \
+		-o $(builddir)/test_multicast_branch_table_v5$(EXEEXT) && \
+	$(builddir)/test_multicast_branch_table_v5$(EXEEXT)
 
 test-v5-core-pipeline:
 	$(TEST_LINK) $(srcdir)/tests/v5/test_core_pipeline.cc \
@@ -175,6 +180,7 @@ test-compile:
 	$(CXXCOMPILE) -c $(srcdir)/tests/test_local_storage_hierarchy.cc -o $(builddir)/test_local_storage_hierarchy.o
 	$(CXXCOMPILE) -c $(srcdir)/tests/test_v5_address.cc -o $(builddir)/test_v5_address.o
 	$(CXXCOMPILE) -c $(srcdir)/tests/test_v5_statistics_contract.cc -o $(builddir)/test_v5_statistics_contract.o
+	$(CXXCOMPILE) -c $(srcdir)/tests/v5/test_multicast_branch_table_v5.cc -o $(builddir)/test_multicast_branch_table_v5.o
 	$(CXXCOMPILE) -c $(srcdir)/tests/v5/test_core_pipeline.cc -o $(builddir)/test_core_pipeline.o
 	$(CXXCOMPILE) -c $(srcdir)/tests/v5/test_core_storage_v5.cc -o $(builddir)/test_core_storage_v5.o
 	$(CXXCOMPILE) -c $(srcdir)/tests/test_timestep_core.cc -o $(builddir)/test_timestep_core.o
