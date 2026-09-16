@@ -13,6 +13,19 @@ namespace {
 std::string portName(const char* base, std::uint32_t core, bool legacy) {
     return legacy ? std::string(base) : std::string(base) + std::to_string(core);
 }
+
+std::size_t operationIndex(CoreControlOp operation) {
+    const auto value = static_cast<std::size_t>(operation);
+    return value < 9 ? value : 8;
+}
+
+const char* operationName(std::size_t index) {
+    static constexpr const char* names[] = {
+        "Start", "SealIngress", "Commit", "Abort", "CommitReady",
+        "CommitDone", "PreloadReady", "IngressReady", "IngressProgress"
+    };
+    return index < 9 ? names[index] : "Unknown";
+}
 }
 
 std::vector<std::uint32_t> PeEndpointV5::parseDestinations_(
@@ -69,6 +82,7 @@ PeEndpointV5::PeEndpointV5(SST::ComponentId_t id, SST::Params& p)
     : Component(id), out_("SnnDL.PeEndpointV5", 0, 0, Output::STDOUT),
       pe_id_(p.find<std::uint32_t>("pe_id", 0)),
       mesh_x_(std::max(1u, p.find<std::uint32_t>("mesh_x", 1))),
+      mesh_y_(std::max(1u, p.find<std::uint32_t>("mesh_y", 1))),
       cores_per_pe_(std::max(1u, p.find<std::uint32_t>("cores_per_pe", 1))),
       tx_capacity_(std::max(1u, p.find<std::uint32_t>("tx_queue_entries", 16))),
       rx_capacity_(std::max(1u, p.find<std::uint32_t>("rx_queue_entries", 16))),
@@ -76,6 +90,7 @@ PeEndpointV5::PeEndpointV5(SST::ComponentId_t id, SST::Params& p)
       flit_bytes_(std::max(1u, p.find<std::uint32_t>("flit_size_bytes", 32))),
       payload_bytes_(p.find<std::uint32_t>("payload_bytes", 0)),
       core_held_capacity_(std::max(1u, p.find<std::uint32_t>("core_held_spike_entries", 32))),
+      ingress_progress_batch_(std::max(1u, p.find<std::uint32_t>("ingress_progress_batch", 1))),
       coordinator_pe_(p.find<std::uint32_t>("coordinator_pe", 0)),
       core_attached_(p.find<int>("core_attached", 0) != 0),
       timed_control_(p.find<int>("timed_control", 0) != 0),
@@ -111,6 +126,13 @@ PeEndpointV5::PeEndpointV5(SST::ComponentId_t id, SST::Params& p)
 
     cores_.resize(cores_per_pe_);
     core_epoch_enqueued_.resize(cores_per_pe_, std::vector<std::uint64_t>(1, 0));
+    core_epoch_delivered_.resize(cores_per_pe_, std::vector<std::uint64_t>(1, 0));
+    core_control_counts_.resize(cores_per_pe_);
+    core_status_counts_.resize(cores_per_pe_);
+    core_provider_preload_ready_.assign(cores_per_pe_, 0);
+    core_provider_ingress_ready_.assign(cores_per_pe_, 0);
+    pending_ingress_progress_.assign(cores_per_pe_, 0);
+    pending_ingress_timestep_.assign(cores_per_pe_, 0);
     for (std::uint32_t core = 0; core < cores_per_pe_; ++core) {
         auto& port = cores_[core];
         port.destination_pe = destination_pes[core];
@@ -135,6 +157,25 @@ PeEndpointV5::PeEndpointV5(SST::ComponentId_t id, SST::Params& p)
             portName("core_status", core, legacy_ports_),
             new Event::Handler2<PeEndpointV5, &PeEndpointV5::handleCoreStatus_, int>(this, core));
         port.provider_status = configureLink(portName("provider_status", core, legacy_ports_));
+        const auto trace_inject_name = std::string("trace_inject") + std::to_string(core);
+        const auto trace_inject_ack_name = std::string("trace_inject_ack") + std::to_string(core);
+        const auto trace_delivery_name = std::string("trace_delivery") + std::to_string(core);
+        const auto trace_delivery_ack_name = std::string("trace_delivery_ack") + std::to_string(core);
+        const bool has_trace = isPortConnected(trace_inject_name) || isPortConnected(trace_inject_ack_name) ||
+                               isPortConnected(trace_delivery_name) || isPortConnected(trace_delivery_ack_name);
+        if (has_trace) {
+            trace_attached_ = true;
+            if (isPortConnected(trace_inject_name))
+                port.trace_inject = configureLink(
+                    trace_inject_name,
+                    new Event::Handler2<PeEndpointV5, &PeEndpointV5::handleTraceInject_, int>(this, core));
+            if (isPortConnected(trace_inject_ack_name)) port.trace_inject_ack = configureLink(trace_inject_ack_name);
+            if (isPortConnected(trace_delivery_name)) port.trace_delivery = configureLink(trace_delivery_name);
+            if (isPortConnected(trace_delivery_ack_name))
+                port.trace_delivery_ack = configureLink(
+                    trace_delivery_ack_name,
+                    new Event::Handler2<PeEndpointV5, &PeEndpointV5::handleTraceDeliveryAck_, int>(this, core));
+        }
         if (core_attached_ && (!port.provider_control || !port.core_control || !port.provider_spike ||
                               !port.provider_ack || !port.core_spike || !port.core_ack || !port.core_egress)) {
             out_.fatal(CALL_INFO, -1, "core-attached endpoint is missing proxy links for Core %u\n", core);
@@ -159,8 +200,8 @@ PeEndpointV5::PeEndpointV5(SST::ComponentId_t id, SST::Params& p)
             new Event::Handler2<PeEndpointV5, &PeEndpointV5::handleNative_>(this));
         if (!native_link_) out_.fatal(CALL_INFO, -1, "native_tree requires native_network link\n");
     }
-    if (timed_control_ && pe_id_ == coordinator_pe_ && (!epoch_command_ || !epoch_status_)) {
-        out_.fatal(CALL_INFO, -1, "coordinator endpoint requires epoch_command and epoch_status links\n");
+    if (timed_control_ && (!epoch_command_ || !epoch_status_)) {
+        out_.fatal(CALL_INFO, -1, "timed control endpoint requires direct epoch command and status links\n");
     }
 
     registerClock(p.find<std::string>("clock", "1GHz"), new Clock::Handler2<PeEndpointV5, &PeEndpointV5::tick_>(this));
@@ -204,6 +245,101 @@ void PeEndpointV5::enqueueData_(NocPacketV5Event* packet, SST::Link* ack_link) {
     if (ack_link) ack_link->send(ack); else delete ack;
 }
 
+void PeEndpointV5::enqueueTrace_(TraceNoCInjectionV5Event* event, int core_index) {
+    auto* ack = new TraceNoCInjectionAckV5Event();
+    ack->event_id = event->event_id;
+    ack->event_token = event->event_token;
+    const auto fail = [&](bool retryable) {
+        ack->accepted = false;
+        ack->retryable = retryable;
+        if (cores_[core_index].trace_inject_ack) cores_[core_index].trace_inject_ack->send(ack);
+        else delete ack;
+        delete event;
+    };
+    if (event->format_version != TraceNoCInjectionV5Event::kFormatVersion ||
+        event->source_pe != pe_id_ || event->source_core != static_cast<std::uint32_t>(core_index) ||
+        event->virtual_network != kNocDataVn || event->destination_pes.empty() ||
+        event->destination_pes.size() != event->destination_core_masks.size()) {
+        fail(false);
+        return;
+    }
+    if ((native_tree_ && event->multicast_mode != TraceNoCMulticastMode::NativeTree) ||
+        (!native_tree_ && event->multicast_mode == TraceNoCMulticastMode::NativeTree) ||
+        (event->multicast_mode == TraceNoCMulticastMode::NativeTree && event->route_id == 0)) {
+        fail(false);
+        return;
+    }
+    std::uint64_t deliveries = 0;
+    for (std::size_t index = 0; index < event->destination_pes.size(); ++index) {
+        const auto destination_pe = event->destination_pes[index];
+        const auto mask = event->destination_core_masks[index];
+        if (destination_pe >= mesh_x_ * mesh_y_ || mask == 0 || (mask >> cores_per_pe_)) {
+            fail(false);
+            return;
+        }
+        deliveries += static_cast<std::uint64_t>(__builtin_popcountll(mask));
+    }
+    if (event->multicast_mode == TraceNoCMulticastMode::Unicast && deliveries != 1) {
+        fail(false);
+        return;
+    }
+    const auto physical_packets = event->multicast_mode == TraceNoCMulticastMode::NativeTree ? 1 : deliveries;
+    if (data_tx_.size() + physical_packets > tx_capacity_) {
+        fail(true);
+        return;
+    }
+    const auto now = std::uint64_t(getCurrentSimTimeNano());
+    if (event->multicast_mode == TraceNoCMulticastMode::NativeTree) {
+        auto* packet = new NocPacketV5Event();
+        packet->packet_id = (std::uint64_t(pe_id_) << 56) ^ next_packet_id_++;
+        packet->event_id = event->event_id;
+        packet->event_token = event->event_token;
+        packet->timestep = event->timestep;
+        packet->source_pe = pe_id_;
+        packet->source_core = static_cast<std::uint32_t>(core_index);
+        packet->source_neuron = event->source_neuron;
+        packet->route_id = event->route_id;
+        packet->source_event_seq = event->source_event_seq;
+        packet->payload_bytes = event->payload_bytes;
+        packet->injection_time_ns = now;
+        data_tx_.push_back(packet);
+    } else {
+        for (std::size_t index = 0; index < event->destination_pes.size(); ++index) {
+            const auto destination_pe = event->destination_pes[index];
+            const auto mask = event->destination_core_masks[index];
+            for (std::uint32_t destination_core = 0; destination_core < cores_per_pe_; ++destination_core) {
+                if ((mask & (std::uint64_t(1) << destination_core)) == 0) continue;
+                auto* packet = new NocPacketV5Event();
+                packet->packet_id = (std::uint64_t(pe_id_) << 56) ^ next_packet_id_++;
+                packet->event_id = event->event_id;
+                packet->event_token = event->event_token;
+                packet->timestep = event->timestep;
+                packet->source_pe = pe_id_;
+                packet->source_core = static_cast<std::uint32_t>(core_index);
+                packet->source_neuron = event->source_neuron;
+                packet->route_id = event->route_id;
+                packet->destination_pe = destination_pe;
+                packet->destination_core = destination_core;
+                packet->source_event_seq = event->source_event_seq;
+                packet->payload_bytes = event->payload_bytes;
+                packet->injection_time_ns = now;
+                data_tx_.push_back(packet);
+            }
+        }
+    }
+    ack->accepted = true;
+    ack->retryable = false;
+    ack->physical_packets = static_cast<std::uint32_t>(physical_packets);
+    ++logical_spikes_;
+    source_packets_ += physical_packets;
+    if (event->timestep >= core_epoch_enqueued_[core_index].size())
+        core_epoch_enqueued_[core_index].resize(event->timestep + 1, 0);
+    core_epoch_enqueued_[core_index][event->timestep] += deliveries;
+    if (cores_[core_index].trace_inject_ack) cores_[core_index].trace_inject_ack->send(ack);
+    else delete ack;
+    delete event;
+}
+
 void PeEndpointV5::enqueueControl_(NocControlV5Event* packet) {
     if (!timed_control_ || packet->format_version != kNocPacketV5FormatVersion) {
         delete packet;
@@ -222,6 +358,47 @@ void PeEndpointV5::handleProbe_(SST::Event* event) {
     auto* packet = dynamic_cast<NocPacketV5Event*>(event);
     if (!packet) { delete event; out_.fatal(CALL_INFO, -1, "bad probe event\n"); }
     enqueueData_(packet, probe_out_);
+}
+
+void PeEndpointV5::handleTraceInject_(SST::Event* event, int core_index) {
+    auto* injection = dynamic_cast<TraceNoCInjectionV5Event*>(event);
+    if (!injection || core_index < 0 || static_cast<std::size_t>(core_index) >= cores_.size()) {
+        delete event;
+        out_.fatal(CALL_INFO, -1, "bad trace NoC injection\n");
+    }
+    enqueueTrace_(injection, core_index);
+}
+
+void PeEndpointV5::handleTraceDeliveryAck_(SST::Event* event, int core_index) {
+    auto* ack = dynamic_cast<TraceNoCDeliveryAckV5Event*>(event);
+    if (!ack || core_index < 0 || static_cast<std::size_t>(core_index) >= cores_.size()) {
+        delete event;
+        out_.fatal(CALL_INFO, -1, "bad trace NoC delivery ACK\n");
+    }
+    auto& core = cores_[core_index];
+    if (!core.trace_inflight || core.rx.empty()) {
+        delete ack;
+        out_.fatal(CALL_INFO, -1, "trace delivery ACK has no pending event\n");
+    }
+    auto* packet = core.rx.front();
+    if (packet->event_token != ack->event_token || packet->event_id != ack->event_id ||
+        packet->destination_core != ack->destination_core || ack->destination_pe != pe_id_) {
+        delete ack;
+        out_.fatal(CALL_INFO, -1, "trace delivery ACK identity mismatch\n");
+    }
+    if (ack->accepted) {
+        core.rx.pop_front();
+        delete packet;
+        ++logical_deliveries_;
+        core.trace_inflight = false;
+    } else if (!ack->retryable) {
+        delete ack;
+        out_.fatal(CALL_INFO, -1, "trace delivery permanently rejected\n");
+    } else {
+        ++core_retries_;
+        core.trace_inflight = false;
+    }
+    delete ack;
 }
 
 void PeEndpointV5::handleNative_(SST::Event* event) {
@@ -261,10 +438,19 @@ void PeEndpointV5::sendStatus_(CoreControlOp operation, std::uint64_t epoch, std
     packet->operation = operation;
     packet->epoch = epoch;
     packet->source_core = core;
-    packet->destination_pe = coordinator_pe_;
+    packet->destination_pe = pe_id_;
     packet->destination_core = 0;
     packet->logical_count = count;
-    enqueueControl_(packet);
+    // Epoch status is out-of-band control.  Return it directly to the
+    // coordinator link for this PE; it must not be injected into Merlin VN1.
+    if (!epoch_status_) {
+        delete packet;
+        out_.fatal(CALL_INFO, -1, "timed control status has no direct epoch_status link\n");
+    }
+    packet->source_pe = pe_id_;
+    packet->injection_time_ns = getCurrentSimTimeNano();
+    ++direct_status_packets_;
+    epoch_status_->send(packet);
 }
 
 void PeEndpointV5::handleProviderControl_(SST::Event* event, int core_index) {
@@ -273,6 +459,8 @@ void PeEndpointV5::handleProviderControl_(SST::Event* event, int core_index) {
         delete event; out_.fatal(CALL_INFO, -1, "bad provider control\n");
     }
     auto& core = cores_[core_index];
+    if (control->operation == CoreControlOp::PreloadReady) ++core_provider_preload_ready_[core_index];
+    if (control->operation == CoreControlOp::IngressReady) ++core_provider_ingress_ready_[core_index];
     if (timed_control_ && (control->operation == CoreControlOp::PreloadReady ||
                            control->operation == CoreControlOp::IngressReady)) {
         const auto& epoch_enqueued = core_epoch_enqueued_[core_index];
@@ -357,7 +545,26 @@ void PeEndpointV5::handleCoreAck_(SST::Event* event, int core_index) {
         delete core.rx.front();
         core.rx.pop_front();
         ++logical_deliveries_;
-        if (timed_control_) sendStatus_(CoreControlOp::IngressProgress, timestep, core_index, 1);
+        if (timed_control_) {
+            auto& epoch_delivered = core_epoch_delivered_[core_index];
+            if (timestep >= epoch_delivered.size()) epoch_delivered.resize(timestep + 1, 0);
+            ++epoch_delivered[timestep];
+            if (pending_ingress_progress_[core_index] == 0) {
+                pending_ingress_timestep_[core_index] = timestep;
+            }
+            ++pending_ingress_progress_[core_index];
+            // The source Core's egress count is not the destination Core's
+            // ingress count.  Comparing the two made a random workload emit
+            // one control packet for every ACK after the first coincidence,
+            // overwhelming the control VN.  Batch by ACK count and let the
+            // periodic tick flush the final partial batch.
+            if (pending_ingress_progress_[core_index] >= ingress_progress_batch_) {
+                sendStatus_(CoreControlOp::IngressProgress,
+                            pending_ingress_timestep_[core_index], core_index,
+                            pending_ingress_progress_[core_index]);
+                pending_ingress_progress_[core_index] = 0;
+            }
+        }
     } else if (ack->retryable) {
         ++core_retries_;
     } else {
@@ -448,6 +655,7 @@ void PeEndpointV5::handleCoreStatus_(SST::Event* event, int core_index) {
         delete event; out_.fatal(CALL_INFO, -1, "bad Core status\n");
     }
     auto& core = cores_[core_index];
+    ++core_status_counts_[core_index][operationIndex(status->operation)];
     if (core.provider_status) core.provider_status->send(status->clone());
     if (timed_control_ && (status->operation == CoreControlOp::CommitReady ||
                            status->operation == CoreControlOp::CommitDone)) {
@@ -491,22 +699,14 @@ void PeEndpointV5::transmitData_() {
 void PeEndpointV5::transmitControl_() {
     if (control_tx_.empty()) return;
     auto* packet = control_tx_.front();
-    if (packet->destination_pe == pe_id_) {
+    if (packet->destination_pe != pe_id_ || packet->kind != NocControlV5Kind::Command) {
+        delete packet;
         control_tx_.pop_front();
-        deliverControl_(packet);
-        return;
+        out_.fatal(CALL_INFO, -1, "epoch command attempted to enter Merlin control VN\n");
     }
-    const auto bits = packet->wireBytes() * 8;
-    if (!network_->spaceToSend(kNocControlVn, bits)) { ++tx_stalls_; return; }
-    auto* request = new SST::Interfaces::SimpleNetwork::Request(
-        packet->destination_pe, pe_id_, bits, true, true, packet);
-    request->vn = kNocControlVn;
-    request->allow_adaptive = false;
-    network_->send(request, kNocControlVn);
     control_tx_.pop_front();
-    ++control_tx_packets_;
-    control_bits_ += bits;
-    control_flits_ += (packet->wireBytes() + flit_bytes_ - 1) / flit_bytes_;
+    ++direct_command_packets_;
+    deliverControl_(packet);
 }
 
 void PeEndpointV5::receiveData_() {
@@ -550,6 +750,36 @@ void PeEndpointV5::receiveControl_() {
 void PeEndpointV5::distributeData_() {
     if (ingress_rx_.empty()) return;
     auto* packet = ingress_rx_.front();
+    // Trace replay owns the Core-facing completion boundary.  It must not
+    // fall through the legacy probe path when core_attached is disabled.
+    if (trace_attached_) {
+        if (packet->destination_core_mask != 0) {
+            if (packet->destination_core_mask >> cores_per_pe_)
+                out_.fatal(CALL_INFO, -1, "trace packet contains an invalid Core mask\n");
+            for (std::uint32_t core=0; core<cores_per_pe_; ++core)
+                if ((packet->destination_core_mask & (std::uint64_t(1) << core)) && cores_[core].rx.size() >= rx_capacity_)
+                    { ++rx_stalls_; return; }
+            ingress_rx_.pop_front();
+            for (std::uint32_t core=0; core<cores_per_pe_; ++core) {
+                if ((packet->destination_core_mask & (std::uint64_t(1) << core)) == 0) continue;
+                auto* copy = packet->clone();
+                copy->destination_core = core;
+                copy->destination_core_mask = 0;
+                cores_[core].rx.push_back(copy);
+            }
+            delete packet;
+            if (native_link_) native_link_->send(new NocCreditV5Event());
+            return;
+        }
+        if (packet->destination_core >= cores_per_pe_) {
+            out_.fatal(CALL_INFO, -1, "trace packet has invalid destination_core=%u\n", packet->destination_core);
+        }
+        auto& trace_core = cores_[packet->destination_core];
+        if (trace_core.rx.size() >= rx_capacity_) { ++rx_stalls_; return; }
+        ingress_rx_.pop_front();
+        trace_core.rx.push_back(packet);
+        return;
+    }
     if (!core_attached_) {
         if (probe_out_) probe_out_->send(packet->clone());
         delete packet;
@@ -587,6 +817,25 @@ void PeEndpointV5::distributeData_() {
 
 void PeEndpointV5::dispatchCores_() {
     for (auto& core : cores_) {
+        if (trace_attached_ && core.trace_inflight) continue;
+        if (trace_attached_ && !core.rx.empty()) {
+            auto* packet = core.rx.front();
+            auto* delivery = new TraceNoCDeliveryV5Event();
+            delivery->event_id = packet->event_id;
+            delivery->event_token = packet->event_token;
+            delivery->timestep = packet->timestep;
+            delivery->source_pe = packet->source_pe;
+            delivery->source_core = packet->source_core;
+            delivery->source_neuron = packet->source_neuron;
+            delivery->source_event_seq = packet->source_event_seq;
+            delivery->destination_pe = pe_id_;
+            delivery->destination_core = packet->destination_core;
+            delivery->payload_bytes = packet->payload_bytes;
+            if (core.trace_delivery) core.trace_delivery->send(delivery);
+            else delete delivery;
+            core.trace_inflight = true;
+            continue;
+        }
         if (!core.started || core.network_inflight || core.rx.empty()) continue;
         auto* packet = core.rx.front();
         auto* spike = new CoreSpikeEvent();
@@ -602,17 +851,15 @@ void PeEndpointV5::dispatchCores_() {
 
 void PeEndpointV5::deliverControl_(NocControlV5Event* packet) {
     if (packet->kind == NocControlV5Kind::Status) {
-        if (pe_id_ != coordinator_pe_ || !epoch_status_) {
-            delete packet; out_.fatal(CALL_INFO, -1, "control status reached a non-coordinator endpoint\n");
-        }
-        ++control_deliveries_;
-        epoch_status_->send(packet);
+        delete packet;
+        out_.fatal(CALL_INFO, -1, "status packet must use the direct epoch_status link\n");
         return;
     }
     if (packet->destination_core >= cores_per_pe_) {
         delete packet; out_.fatal(CALL_INFO, -1, "control command has invalid destination Core\n");
     }
     auto& core = cores_[packet->destination_core];
+    ++core_control_counts_[packet->destination_core][operationIndex(packet->operation)];
     auto* control = new CoreControlEvent(packet->operation, packet->epoch);
     if (packet->operation == CoreControlOp::Start) {
         core.started = true;
@@ -635,13 +882,18 @@ bool PeEndpointV5::drainedForSeal_(std::size_t core) const {
 
 bool PeEndpointV5::tick_(SST::Cycle_t) {
     ++cycles_;
-    receiveControl_();
     receiveData_();
     distributeData_();
     dispatchCores_();
     transmitControl_();
     transmitData_();
     for (std::size_t core = 0; core < cores_.size(); ++core) {
+        if (timed_control_ && pending_ingress_progress_[core] != 0 &&
+            (cycles_ % ingress_progress_batch_ == 0)) {
+            sendStatus_(CoreControlOp::IngressProgress, pending_ingress_timestep_[core],
+                        static_cast<std::uint32_t>(core), pending_ingress_progress_[core]);
+            pending_ingress_progress_[core] = 0;
+        }
         if (cores_[core].pending_seal && drainedForSeal_(core)) {
             cores_[core].core_control->send(cores_[core].pending_seal);
             cores_[core].pending_seal = nullptr;
@@ -673,6 +925,8 @@ void PeEndpointV5::writeEvidence_() const {
         << ",\n  \"control_tx_packets\": " << control_tx_packets_
         << ",\n  \"control_rx_packets\": " << control_rx_packets_
         << ",\n  \"control_deliveries\": " << control_deliveries_
+        << ",\n  \"direct_command_packets\": " << direct_command_packets_
+        << ",\n  \"direct_status_packets\": " << direct_status_packets_
         << ",\n  \"tx_bits\": " << tx_bits_
         << ",\n  \"tx_flits\": " << tx_flits_
         << ",\n  \"control_bits\": " << control_bits_
@@ -688,7 +942,42 @@ void PeEndpointV5::writeEvidence_() const {
         << ",\n  \"control_queue_remaining\": " << control_tx_.size()
         << ",\n  \"rx_queue_remaining\": " << (ingress_rx_.size() + core_rx_remaining)
         << ",\n  \"ack_queue_remaining\": " << ack_remaining
-        << ",\n  \"drops\": " << drops_ << "\n}\n";
+        << ",\n  \"drops\": " << drops_ << ",\n  \"cores\": [\n";
+    for (std::size_t index = 0; index < cores_.size(); ++index) {
+        const auto& core = cores_[index];
+        if (index != 0) out << ",\n";
+        out << "    {\"core\": " << index
+            << ", \"started\": " << (core.started ? "true" : "false")
+            << ", \"network_inflight\": " << (core.network_inflight ? "true" : "false")
+            << ", \"rx_pending\": " << core.rx.size()
+            << ", \"ack_pending\": " << core.ack_origins.size()
+            << ", \"pending_seal\": " << (core.pending_seal ? "true" : "false")
+            << ", \"provider_preload_ready\": " << core_provider_preload_ready_[index]
+            << ", \"provider_ingress_ready\": " << core_provider_ingress_ready_[index]
+            << ", \"ingress_progress_pending\": " << pending_ingress_progress_[index]
+            << ", \"epoch_enqueued\": [";
+        for (std::size_t epoch = 0; epoch < core_epoch_enqueued_[index].size(); ++epoch) {
+            if (epoch != 0) out << ", ";
+            out << core_epoch_enqueued_[index][epoch];
+        }
+        out << "], \"epoch_delivered\": [";
+        for (std::size_t epoch = 0; epoch < core_epoch_delivered_[index].size(); ++epoch) {
+            if (epoch != 0) out << ", ";
+            out << core_epoch_delivered_[index][epoch];
+        }
+        out << "], \"commands\": {";
+        for (std::size_t op = 0; op < 9; ++op) {
+            if (op != 0) out << ", ";
+            out << "\"" << operationName(op) << "\": " << core_control_counts_[index][op];
+        }
+        out << "}, \"statuses\": {";
+        for (std::size_t op = 0; op < 9; ++op) {
+            if (op != 0) out << ", ";
+            out << "\"" << operationName(op) << "\": " << core_status_counts_[index][op];
+        }
+        out << "}}";
+    }
+    out << "\n  ]\n}\n";
 }
 
 void PeEndpointV5::finish() {

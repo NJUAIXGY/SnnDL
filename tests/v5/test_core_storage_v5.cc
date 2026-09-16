@@ -82,11 +82,29 @@ void testDeltaIsBackedAndBounded() {
     storage.resetTimestep();
 }
 
+void testCubaLifStateUsesExplicitTwoFloatCodec() {
+    CoreStorageV5 storage(config());
+    const CubaLifNeuronState expected{1.125f, -0.25f};
+    assert(storage.writeCubaLifState(1, expected));
+    CubaLifNeuronState restored;
+    assert(storage.readCubaLifState(1, restored));
+    assert(restored.synaptic_current == expected.synaptic_current);
+    assert(restored.membrane == expected.membrane);
+
+    // The physical record is the same eight-byte width as the legacy LIF
+    // record, but decoding it through the wrong semantic codec is forbidden
+    // at the pipeline boundary.
+    LifNeuronState lif_state;
+    assert(storage.readState(1, lif_state));
+    assert(lif_state.membrane == expected.synaptic_current);
+}
+
 } // namespace
 
 int main() {
     testTypedRegionsAndState();
     testDeltaIsBackedAndBounded();
+    testCubaLifStateUsesExplicitTwoFloatCodec();
     std::cout << "v5 core storage binding: PASS\n";
     return 0;
 }

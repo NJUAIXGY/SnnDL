@@ -44,6 +44,7 @@ struct BankedSramV5Response {
     std::uint64_t service_cycle = 0;
     std::uint64_t completion_cycle = 0;
     std::uint32_t bank = 0;
+    std::uint32_t port = 0;
     std::vector<std::uint8_t> data;
     bool accepted = false;
     bool completed = false;

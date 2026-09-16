@@ -67,12 +67,31 @@ public:
         {"accumulator_latency_cycles", "Accumulator latency", "1"},
         {"neuron_lanes", "Neuron lanes per cycle", "1"},
         {"neuron_latency_cycles", "Neuron batch latency", "1"},
+        {"neuron_operator", "Neuron operator: lif, if, or cuba_lif", "lif"},
+        {"operator_binding", "Per-local-neuron operator binding v1", ""},
         {"dt_ms", "LIF integration interval", "1.0"},
         {"tau_mem_ms", "LIF membrane time constant", "20.0"},
         {"threshold", "LIF firing threshold", "1.0"},
         {"reset", "LIF reset potential", "0.0"},
         {"refractory_timesteps", "LIF refractory duration", "0"},
+        {"cuba_dt_seconds", "CubaLIF integration interval", "0.001"},
+        {"cuba_tau_syn_seconds", "CubaLIF synaptic time constant", "0.002"},
+        {"cuba_tau_mem_seconds", "CubaLIF membrane time constant", "0.003"},
+        {"cuba_resistance", "CubaLIF membrane resistance", "1.0"},
+        {"cuba_v_leak", "CubaLIF leak potential", "0.0"},
+        {"cuba_threshold", "CubaLIF firing threshold", "1.0"},
+        {"cuba_reset", "CubaLIF reset potential", "0.0"},
+        {"cuba_reset_mode", "CubaLIF reset mode: value or subtract", "value"},
+        {"cuba_input_weight", "CubaLIF external current weight", "1.0"},
         {"clock", "Core clock", "1GHz"},
+        {"schedule_plan_digest", "Compiler-owned SchedulePlan digest", ""},
+        {"schedule_stage_count", "Number of compiler schedule stages", "0"},
+        {"schedule_backpressure_policy", "Compiler schedule backpressure policy", ""},
+        {"schedule_queue_ingress", "SchedulePlan ingress reservation", "0"},
+        {"schedule_queue_synapse", "SchedulePlan synapse reservation", "0"},
+        {"schedule_admission_enabled", "Apply SchedulePlan queue reservations to Core admission", "0"},
+        {"schedule_descriptor", "Compiler-owned SchedulePlan stage/DAG descriptor", ""},
+        {"route_plan_digest", "Compiler-owned RoutePlan digest", ""},
         {"verbose", "Verbose logging level", "0"}
     )
 
@@ -162,6 +181,12 @@ private:
     SST::Link* row_provider_link_ = nullptr;
     SST::Link* status_link_ = nullptr;
     std::uint32_t core_id_ = 0;
+    std::string schedule_plan_digest_;
+    std::string route_plan_digest_;
+    std::uint32_t schedule_stage_count_ = 0;
+    std::uint32_t schedule_queue_ingress_ = 0;
+    std::uint32_t schedule_queue_synapse_ = 0;
+    std::string schedule_backpressure_policy_;
     bool commit_ready_sent_ = false;
     bool stats_published_ = false;
     std::uint64_t timestep_start_ns_ = 0;

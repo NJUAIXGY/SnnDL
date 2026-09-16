@@ -9,6 +9,7 @@
 #include <sst/core/output.h>
 
 #include <cstdint>
+#include <fstream>
 #include <map>
 #include <string>
 
@@ -37,6 +38,7 @@ public:
         {"request_queue_entries", "Finite accepted request capacity", "16"},
         {"response_queue_entries", "Finite completion queue capacity", "16"},
         {"stats_json", "Optional raw SRAM statistics output path", ""},
+        {"request_trace_json", "Optional per-request JSONL evidence path", ""},
         {"clock", "SRAM clock", "1GHz"},
         {"verbose", "Verbose logging level", "0"}
     )
@@ -78,6 +80,7 @@ private:
     bool clockTick_(SST::Cycle_t cycle);
     void sendResponse_(const BankedSramV5Response& response);
     void publishStatistics_();
+    void writeTrace_(const BankedSramV5Response& response);
 
     SST::Output out_;
     SST::Link* request_link_ = nullptr;
@@ -85,6 +88,8 @@ private:
     BankedSramV5 model_;
     std::uint64_t current_cycle_ = 0;
     std::string stats_json_;
+    std::string request_trace_json_;
+    std::ofstream request_trace_stream_;
     std::map<std::string, Statistic<std::uint64_t>*> statistics_;
 };
 

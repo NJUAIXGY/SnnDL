@@ -89,6 +89,73 @@ void testQueueBackpressure() {
     assert(pipeline.stats().ingress_full_cycles > 0);
 }
 
+void testScheduleAdmissionReservations() {
+    auto config = baseConfig(4);
+    config.schedule_admission_enabled = true;
+    config.schedule_ingress_entries = 1;
+    config.schedule_synapse_entries = 1;
+    CorePipeline pipeline(config);
+    pipeline.start(0);
+    assert(pipeline.submitSpike(SpikeInput{0, 0, 31}));
+    // The physical ingress queue has room for four entries, but the compiled
+    // SchedulePlan reservation exposes only one admission slot.
+    assert(!pipeline.submitSpike(SpikeInput{0, 1, 32}));
+    std::vector<RowRequest> requests;
+    for (int i = 0; i < 16 && requests.empty(); ++i) {
+        pipeline.tick();
+        requests = pipeline.takeRowRequests();
+    }
+    assert(requests.size() == 1);
+    assert(pipeline.acceptSynapseResponse(
+        SynapseResponse{0, 0, 31, 1, 0, 1.0f, false, 0}));
+    assert(!pipeline.acceptSynapseResponse(
+        SynapseResponse{0, 0, 31, 2, 1, 1.0f, false, 0}));
+    pipeline.tick();
+    assert(pipeline.acceptSynapseResponse(
+        SynapseResponse{0, 0, 31, 2, 1, 1.0f, true, 2}));
+}
+
+void testScheduleEarliestCycleAndStageWidth() {
+    auto config = baseConfig(4);
+    config.ingress.width = 4;
+    config.schedule_admission_enabled = true;
+    config.schedule_ingress_entries = 4;
+    config.schedule_synapse_entries = 4;
+    const char* ids[] = {"preload", "ingress", "row-lookup", "synapse-issue",
+                         "neuron-update", "retire", "seal", "commit", "drain"};
+    for (std::size_t index = 0; index < 9; ++index) {
+        ScheduleStageDescriptor stage;
+        stage.id = ids[index];
+        stage.operation = ids[index];
+        stage.resource = ids[index];
+        stage.request_class = ids[index];
+        stage.retry_policy = "runtime";
+        stage.issue_group_id = ids[index];
+        stage.earliest_cycle = index == 1 ? 3 : 0;
+        stage.max_inflight = index == 1 ? 1 : 4;
+        if (index > 0) stage.dependencies.push_back(ids[index - 1]);
+        config.schedule_stages.push_back(std::move(stage));
+    }
+    CorePipeline pipeline(config);
+    pipeline.start(0);
+    assert(pipeline.submitSpike(SpikeInput{0, 0, 41}));
+    for (int cycle = 0; cycle < 3; ++cycle) {
+        pipeline.tick();
+        assert(pipeline.takeRowRequests().empty());
+    }
+    std::vector<RowRequest> requests;
+    for (int cycle = 0; cycle < 16 && requests.empty(); ++cycle) {
+        pipeline.tick();
+        requests = pipeline.takeRowRequests();
+    }
+    assert(requests.size() == 1);
+    assert(pipeline.acceptSynapseResponse(
+        SynapseResponse{0, 0, 41, 1, 0, 1.0f, true, 1}));
+    pipeline.sealIngress();
+    for (int cycle = 0; cycle < 256 && !pipeline.readyToCommit(); ++cycle) pipeline.tick();
+    assert(pipeline.readyToCommit());
+}
+
 void testStageBackpressureAndCounters() {
     auto config = baseConfig(8);
     config.ingress_entries = 3;
@@ -192,11 +259,98 @@ void testRetireOrder() {
     assert(queue.pop().key == (RetireKey{2, 4, 0}));
 }
 
+void testCubaLifOperatorPath() {
+    auto config = baseConfig(2);
+    config.neuron_operator = NeuronOperatorKind::CubaLif;
+    config.cuba_lif.dt_seconds = 1.0f;
+    config.cuba_lif.tau_syn_seconds = 1.0f;
+    config.cuba_lif.tau_mem_seconds = 1.0f;
+    config.cuba_lif.resistance = 1.0f;
+    config.cuba_lif.threshold = 0.1f;
+    config.cuba_lif.input_weight = 1.0f;
+    config.cuba_lif.reset_mode = CubaLifNeuronOp::ResetMode::Subtract;
+    CorePipeline pipeline(config);
+    pipeline.start(0);
+    assert(pipeline.submitSpike(SpikeInput{0, 0, 19}));
+    std::vector<RowRequest> requests;
+    for (int i = 0; i < 32 && requests.empty(); ++i) {
+        pipeline.tick();
+        requests = pipeline.takeRowRequests();
+    }
+    assert(requests.size() == 1);
+    assert(pipeline.acceptSynapseResponse(
+        SynapseResponse{0, 0, 19, 1, 0, 1.0f, true, 1}));
+    pipeline.sealIngress();
+    for (int i = 0; i < 256 && !pipeline.readyToCommit(); ++i) pipeline.tick();
+    assert(pipeline.readyToCommit());
+    assert(pipeline.stats().neurons_fired == 1);
+    assert(pipeline.cubaState()[1].synaptic_current == 1.0f);
+    assert(std::fabs(pipeline.cubaState()[1].membrane - 0.5321205258369446f) < 1.0e-7f);
+    bool rejected_lif_snapshot = false;
+    try {
+        (void)pipeline.state();
+    } catch (const std::logic_error&) {
+        rejected_lif_snapshot = true;
+    }
+    assert(rejected_lif_snapshot);
+}
+
+void testMixedLocalOperatorBinding() {
+    auto config = baseConfig(4);
+    config.neuron_bindings.resize(4);
+    config.neuron_bindings[0].kind = NeuronOperatorKind::Padding;
+    config.neuron_bindings[1].kind = NeuronOperatorKind::Lif;
+    config.neuron_bindings[1].lif = config.lif;
+    config.neuron_bindings[2].kind = NeuronOperatorKind::CubaLif;
+    config.neuron_bindings[2].cuba_lif.dt_seconds = 1.0f;
+    config.neuron_bindings[2].cuba_lif.tau_syn_seconds = 1.0f;
+    config.neuron_bindings[2].cuba_lif.tau_mem_seconds = 1.0f;
+    config.neuron_bindings[2].cuba_lif.resistance = 1.0f;
+    config.neuron_bindings[2].cuba_lif.threshold = 0.1f;
+    config.neuron_bindings[3].kind = NeuronOperatorKind::Padding;
+    CorePipeline pipeline(config);
+    pipeline.start(0);
+    assert(pipeline.submitSpike(SpikeInput{0, 0, 23}));
+    std::vector<RowRequest> requests;
+    for (int i = 0; i < 32 && requests.empty(); ++i) {
+        pipeline.tick();
+        requests = pipeline.takeRowRequests();
+    }
+    assert(requests.size() == 1);
+    assert(pipeline.acceptSynapseResponse(
+        SynapseResponse{0, 0, 23, 2, 0, 1.0f, false, 0}));
+    assert(pipeline.acceptRowDone(RowDone{0, 0, 23, 1}));
+    pipeline.sealIngress();
+    for (int i = 0; i < 256 && !pipeline.readyToCommit(); ++i) pipeline.tick();
+    assert(pipeline.readyToCommit());
+    assert(pipeline.stats().neurons_evaluated == 4);
+    assert(pipeline.stats().neurons_fired == 1);
+    assert(pipeline.functionalHash() != 0);
+    bool rejected_lif_snapshot = false;
+    try {
+        (void)pipeline.state();
+    } catch (const std::logic_error&) {
+        rejected_lif_snapshot = true;
+    }
+    assert(rejected_lif_snapshot);
+    bool rejected_cuba_snapshot = false;
+    try {
+        (void)pipeline.cubaState();
+    } catch (const std::logic_error&) {
+        rejected_cuba_snapshot = true;
+    }
+    assert(rejected_cuba_snapshot);
+}
+
 } // namespace
 
 int main() {
     testRetireOrder();
+    testCubaLifOperatorPath();
+    testMixedLocalOperatorBinding();
     testQueueBackpressure();
+    testScheduleAdmissionReservations();
+    testScheduleEarliestCycleAndStageWidth();
     testStageBackpressureAndCounters();
     testDeltaCapacityIsIndependentOfRetireQueue();
     testUnrelatedStageIsolation();

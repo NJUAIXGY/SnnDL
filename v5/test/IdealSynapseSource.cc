@@ -38,7 +38,35 @@ IdealSynapseSource::IdealSynapseSource(SST::ComponentId_t id, SST::Params& param
       external_control_(params.find<int>("external_control", 0) != 0),
       weight_image_base_(params.find<std::uint64_t>("weight_image_base", 0)),
       weight_read_base_(params.find<std::uint64_t>("weight_read_base", 0)),
-      output_json_(params.find<std::string>("output_json", "")) {
+      weight_cache_line_bytes_(std::max<std::size_t>(16, params.find<std::size_t>(
+          "weight_cache_line_bytes", 64))),
+      weight_image_write_bytes_(std::max<std::size_t>(16, params.find<std::size_t>(
+          "weight_image_write_bytes", 64))),
+      weight_read_granularity_bytes_(std::max<std::size_t>(16, params.find<std::size_t>(
+          "weight_read_granularity_bytes", 16))),
+      dram_bank_count_(std::max<std::size_t>(1, params.find<std::size_t>("dram_bank_count", 1))),
+      dram_bank_interleave_bytes_(std::max<std::size_t>(1, params.find<std::size_t>("dram_bank_interleave_bytes", 64))),
+      dram_bank_policy_(params.find<std::string>("dram_bank_policy", "low_bits")),
+      output_json_(params.find<std::string>("output_json", "")),
+      request_trace_json_(params.find<std::string>("request_trace_json", "")) {
+    if (!request_trace_json_.empty()) {
+        request_trace_stream_.open(request_trace_json_, std::ios::out | std::ios::trunc);
+    }
+    readout_start_ = params.find<std::uint64_t>("readout_start", 0);
+    readout_count_ = params.find<std::uint32_t>("readout_count", 0);
+    if (readout_count_ > 0) readout_spike_counts_.assign(readout_count_, 0);
+    if (weight_read_granularity_bytes_ % 16 != 0) {
+        out_.fatal(CALL_INFO, -1, "weight_read_granularity_bytes must be a multiple of 16\n");
+    }
+    if (weight_cache_line_bytes_ < 16 || weight_cache_line_bytes_ % 16 != 0) {
+        out_.fatal(CALL_INFO, -1, "weight_cache_line_bytes must be a positive multiple of 16\n");
+    }
+    if (weight_image_write_bytes_ < 16 || weight_image_write_bytes_ % 16 != 0) {
+        out_.fatal(CALL_INFO, -1, "weight_image_write_bytes must be a positive multiple of 16\n");
+    }
+    if (dram_bank_policy_ != "low_bits") {
+        out_.fatal(CALL_INFO, -1, "unsupported dram_bank_policy; only low_bits is legal\n");
+    }
     current_timestep_ = start_timestep_;
     out_.setVerboseLevel(params.find<int>("verbose", 0));
     try {
@@ -71,21 +99,31 @@ IdealSynapseSource::IdealSynapseSource(SST::ComponentId_t id, SST::Params& param
     status_link_ = configureLink("status", new SST::Event::Handler2<IdealSynapseSource, &IdealSynapseSource::handleStatus_>(this));
     preload_link_ = configureLink("preload", new SST::Event::Handler2<IdealSynapseSource, &IdealSynapseSource::handlePreload_>(this));
     if (!control_link_ || !spike_out_link_ || !spike_ack_link_ || !spike_in_link_ || !row_provider_link_ || !status_link_) {
-        out_.fatal(CALL_INFO, -1, "IdealSynapseSource requires all six links\n");
+        out_.fatal(CALL_INFO, -1, "IdealSynapseSource requires control, spike, row-provider, and status links\n");
     }
     if (memory_backed_weights_) {
-        if (!preload_link_) out_.fatal(CALL_INFO, -1, "memory-backed IdealSynapseSource requires preload link\n");
         memory_ = loadUserSubComponent<SST::Interfaces::StandardMem>(
             "memory", ComponentInfo::SHARE_NONE, registerTimeBase("1ns"),
             new SST::Interfaces::StandardMem::Handler2<
                 IdealSynapseSource, &IdealSynapseSource::handleMemory_>(this));
         if (!memory_) out_.fatal(CALL_INFO, -1, "memory-backed IdealSynapseSource requires StandardMem slot 'memory'\n");
+        // The canonical v5 path reads weights directly from ChipDram through
+        // this StandardMem client.  The artifact image is populated during
+        // initialization; no DMA preload or local weight scratchpad is involved.
+        preload_ready_ = true;
     } else {
         preload_ready_ = true;
     }
     registerClock(params.find<std::string>("clock", "1GHz"), new SST::Clock::Handler2<IdealSynapseSource, &IdealSynapseSource::clockTick_>(this));
-    registerAsPrimaryComponent();
-    primaryComponentDoNotEndSim();
+    // In the canonical external-control topology the epoch coordinator is
+    // the sole simulation-lifetime authority.  Keeping every provider in the
+    // SST Exit refcount lets a provider that has locally drained release the
+    // simulation before a slower Core has reported CommitReady.  Standalone
+    // provider tests still use the original primary-component contract.
+    if (!external_control_) {
+        registerAsPrimaryComponent();
+        primaryComponentDoNotEndSim();
+    }
 }
 
 IdealSynapseSource::~IdealSynapseSource() = default;
@@ -93,8 +131,14 @@ void IdealSynapseSource::init(unsigned int phase) {
     if (!memory_) return;
     memory_->init(phase);
     if (phase == 0 && !image_initialized_) {
-        memory_->sendUntimedData(new SST::Interfaces::StandardMem::Write(
-            weight_image_base_, weight_image_.size(), weight_image_, true));
+        for (std::size_t offset = 0; offset < weight_image_.size(); offset += weight_image_write_bytes_) {
+            const auto bytes = std::min(weight_image_write_bytes_, weight_image_.size() - offset);
+            std::vector<std::uint8_t> payload(
+                weight_image_.begin() + static_cast<std::ptrdiff_t>(offset),
+                weight_image_.begin() + static_cast<std::ptrdiff_t>(offset + bytes));
+            memory_->sendUntimedData(new SST::Interfaces::StandardMem::Write(
+                weight_image_base_ + offset, bytes, std::move(payload), true));
+        }
         image_initialized_ = true;
     }
     while (auto* response = memory_->recvUntimedData()) delete response;
@@ -267,13 +311,39 @@ void IdealSynapseSource::issueMemoryRead_() {
     static constexpr std::uint64_t record_bytes = sizeof(std::uint32_t) + sizeof(float) + sizeof(std::uint64_t);
     const auto address = weight_read_base_ + transaction.memory_offset +
                          transaction.memory_reads_completed * record_bytes;
-    auto* request = new SST::Interfaces::StandardMem::Read(address, record_bytes);
-    pending_memory_request_ = static_cast<std::uint64_t>(request->getID());
+    const auto line_remaining = weight_cache_line_bytes_ - (address % weight_cache_line_bytes_);
+    const auto records = std::min<std::size_t>(
+        std::min(weight_read_granularity_bytes_ / record_bytes,
+                 static_cast<std::size_t>(line_remaining / record_bytes)),
+        transaction.memory_edges - transaction.memory_reads_completed);
+    if (records == 0) {
+        out_.fatal(CALL_INFO, -1, "IdealSynapseSource cannot issue a cache-line-bounded weight read\n");
+    }
+    const auto request_bytes = records * record_bytes;
+    const auto bank = (address / dram_bank_interleave_bytes_) % dram_bank_count_;
+    auto* request = new SST::Interfaces::StandardMem::Read(address, request_bytes);
+    const auto request_id = static_cast<std::uint64_t>(request->getID());
+    pending_memory_request_ = request_id;
+    pending_memory_records_ = records;
     pending_memory_ = true;
     transaction.memory_read_in_flight = true;
     memory_->send(request);
-    ++memory_reads_;
-    memory_read_bytes_ += record_bytes;
+    std::ostringstream identity;
+    identity << "t" << transaction.request.timestep << ".core" << core_id_
+             << ".row" << transaction.request.row_id << ".chunk"
+             << transaction.memory_reads_completed;
+    pending_memory_trace_ = MemoryRequestTrace{
+        identity.str(), request_id, transaction.request.timestep,
+        transaction.request.source_neuron, transaction.request.source_event_seq,
+        transaction.request.row_id,
+        transaction.memory_reads_completed, address,
+        static_cast<std::uint64_t>(request_bytes), static_cast<std::uint64_t>(records),
+        tick_count_, 0, bank, false,
+    };
+    pending_memory_trace_valid_ = true;
+    memory_reads_ += records;
+    ++memory_requests_;
+    memory_read_bytes_ += request_bytes;
 }
 
 void IdealSynapseSource::handleMemory_(SST::Interfaces::StandardMem::Request* request) {
@@ -284,29 +354,48 @@ void IdealSynapseSource::handleMemory_(SST::Interfaces::StandardMem::Request* re
         out_.fatal(CALL_INFO, -1, "IdealSynapseSource received an unexpected StandardMem response\n");
     }
     static constexpr std::size_t record_bytes = sizeof(std::uint32_t) + sizeof(float) + sizeof(std::uint64_t);
-    if (response->data.size() < record_bytes) {
+    auto& transaction = provider_transactions_.front();
+    const auto records = pending_memory_records_;
+    const auto response_bytes = records * record_bytes;
+    if (response->data.size() < response_bytes) {
         delete response;
         out_.fatal(CALL_INFO, -1, "IdealSynapseSource received a truncated weight record\n");
     }
-    Edge edge;
-    std::memcpy(&edge.post, response->data.data(), sizeof(edge.post));
-    std::memcpy(&edge.weight, response->data.data() + sizeof(edge.post), sizeof(edge.weight));
-    std::memcpy(&edge.ordinal, response->data.data() + sizeof(edge.post) + sizeof(edge.weight), sizeof(edge.ordinal));
-    if (edge.post >= neurons_) {
-        delete response;
-        out_.fatal(CALL_INFO, -1, "IdealSynapseSource decoded an invalid post neuron\n");
+    for (std::size_t index = 0; index < records; ++index) {
+        const auto* record = response->data.data() + index * record_bytes;
+        Edge edge;
+        std::memcpy(&edge.post, record, sizeof(edge.post));
+        std::memcpy(&edge.weight, record + sizeof(edge.post), sizeof(edge.weight));
+        std::memcpy(&edge.ordinal, record + sizeof(edge.post) + sizeof(edge.weight), sizeof(edge.ordinal));
+        if (edge.post >= neurons_) {
+            delete response;
+            out_.fatal(CALL_INFO, -1,
+                       "IdealSynapseSource decoded invalid post=%" PRIu32
+                       " core=%" PRIu32 " row_offset=%" PRIu64 " record=%zu\n",
+                       edge.post, core_id_, transaction.memory_offset,
+                       transaction.memory_reads_completed + index);
+        }
+        transaction.row.push_back(edge);
+        decoded_weight_sum_ += edge.weight;
     }
-    auto& transaction = provider_transactions_.front();
-    transaction.row.push_back(edge);
-    ++transaction.memory_reads_completed;
+    transaction.memory_reads_completed += records;
+    if (!pending_memory_trace_valid_ ||
+        pending_memory_trace_.request_id != pending_memory_request_) {
+        delete response;
+        out_.fatal(CALL_INFO, -1, "IdealSynapseSource memory trace state is inconsistent\n");
+    }
+    pending_memory_trace_.completion_cycle = tick_count_;
+    pending_memory_trace_.completed = true;
+    appendRequestTrace_();
+    pending_memory_trace_valid_ = false;
     transaction.memory_read_in_flight = false;
-    decoded_weight_sum_ += edge.weight;
     if (transaction.memory_reads_completed == transaction.memory_edges && reverse_responses_) {
         std::reverse(transaction.row.begin(), transaction.row.end());
     }
     pending_memory_ = false;
     delete response;
     issueMemoryRead_();
+    maybeFinish_();
 }
 
 void IdealSynapseSource::handlePreload_(SST::Event* event) {
@@ -390,6 +479,12 @@ void IdealSynapseSource::handleSpike_(SST::Event* event) {
         ++output_spikes_;
         output_spikes_by_timestep_[spike->timestep].push_back(
             static_cast<std::uint32_t>(spike->source_neuron));
+        if (readout_count_ > 0 && spike->source_neuron >= readout_start_ &&
+            spike->source_neuron < readout_start_ + readout_count_) {
+            const auto index = static_cast<std::size_t>(spike->source_neuron - readout_start_);
+            ++readout_spike_counts_[index];
+            readout_spikes_by_timestep_[spike->timestep].push_back(static_cast<std::uint32_t>(index));
+        }
         functional_hash_ ^= spike->source_neuron + 0x9e3779b97f4a7c15ULL + (functional_hash_ << 6) + (functional_hash_ >> 2);
     }
     delete event;
@@ -456,6 +551,16 @@ void IdealSynapseSource::handleProvider_(SST::Event* event) {
     }
     delete ack;
     sendNextProviderItem_();
+    maybeFinish_();
+}
+
+void IdealSynapseSource::maybeFinish_() {
+    if (finished_ || !final_commit_done_pending_ || pending_memory_ ||
+        !provider_transactions_.empty()) {
+        return;
+    }
+    finished_ = true;
+    primaryComponentOKToEndSim();
 }
 
 void IdealSynapseSource::handleStatus_(SST::Event* event) {
@@ -481,8 +586,8 @@ void IdealSynapseSource::handleStatus_(SST::Event* event) {
             stimuli_sent_ = false;
             seal_sent_ = false;
         } else if (!finished_) {
-            finished_ = true;
-            primaryComponentOKToEndSim();
+            final_commit_done_pending_ = true;
+            maybeFinish_();
         }
     }
     delete status;
@@ -558,7 +663,23 @@ void IdealSynapseSource::writeEvidence_() const {
         << "  \"rows_served\": " << rows_served_ << ",\n"
         << "  \"responses_served\": " << responses_served_ << ",\n"
         << "  \"response_attempts\": " << response_attempts_ << ",\n"
+        << "  \"memory_requests\": " << memory_requests_ << ",\n"
+        << "  \"memory_requests_issued\": " << memory_requests_ << ",\n"
+        << "  \"memory_requests_accepted\": " << memory_requests_ << ",\n"
+        << "  \"memory_requests_retried\": 0,\n"
+        << "  \"weight_record_bytes\": 16,\n"
+        << "  \"weight_cache_line_bytes\": " << weight_cache_line_bytes_ << ",\n"
+        << "  \"weight_image_write_bytes\": " << weight_image_write_bytes_ << ",\n"
+        << "  \"memory_read_granularity_bytes\": " << weight_read_granularity_bytes_ << ",\n"
         << "  \"output_spikes\": " << output_spikes_ << ",\n"
+        << "  \"readout_start\": " << readout_start_ << ",\n"
+        << "  \"readout_count\": " << readout_count_ << ",\n"
+        << "  \"readout_spike_counts\": [";
+    for (std::size_t index = 0; index < readout_spike_counts_.size(); ++index) {
+        if (index != 0) out << ", ";
+        out << readout_spike_counts_[index];
+    }
+    out << "],\n"
         << "  \"output_spikes_by_timestep\": [";
     bool first_output_timestep = true;
     for (const auto& item : output_spikes_by_timestep_) {
@@ -626,12 +747,48 @@ void IdealSynapseSource::writeEvidence_() const {
         << "}\n";
 }
 
+void IdealSynapseSource::writeRequestTrace_() const {
+    if (request_trace_stream_.is_open()) request_trace_stream_.flush();
+}
+
+void IdealSynapseSource::appendRequestTrace_() const {
+    if (!request_trace_stream_.good() || !pending_memory_trace_valid_) return;
+    const auto& trace = pending_memory_trace_;
+    request_trace_stream_ << "{\"id\": \"" << trace.identity << "\", \"request_id\": " << trace.request_id
+            << ", \"timestep\": " << trace.timestep
+            << ", \"source_neuron\": " << trace.source_neuron
+            << ", \"source_event_seq\": " << trace.source_event_seq
+            << ", \"source_core\": " << core_id_
+            << ", \"row_id\": " << trace.row_id
+            << ", \"sequence\": " << trace.sequence
+            << ", \"region_id\": \"Weights\""
+            << ", \"request_class\": \"weight-read\""
+            << ", \"issue_cycle_class\": \"synapse_issue\""
+            << ", \"byte_address\": " << trace.byte_address
+            << ", \"bytes\": " << trace.bytes
+            << ", \"records\": " << trace.records
+            << ", \"issue_cycle\": " << trace.issue_cycle
+            << ", \"completion_cycle\": " << trace.completion_cycle
+            << ", \"bank\": " << trace.bank
+            << ", \"accepted\": true, \"retried\": 0"
+            << ", \"completed\": " << (trace.completed ? "true" : "false")
+            // The provider owns the logical request identity, but it does not
+            // observe cache/controller internals. Keep those dimensions
+            // explicit so a missing instrument is never interpreted as zero.
+            << ", \"observations\": {\"l1\": \"unavailable\", \"l2\": \"unavailable\","
+            << " \"sram_port\": \"unavailable\", \"noc\": \"unavailable\","
+            << " \"mc\": \"unavailable\", \"ramulator2\": {\"channel\": \"unavailable\"," 
+            << " \"bank\": \"unavailable\", \"row\": \"unavailable\"}}"
+            << "}\n";
+}
+
 void IdealSynapseSource::finish() {
     if (memory_) memory_->finish();
     if (pending_memory_ || !provider_transactions_.empty()) {
         out_.fatal(CALL_INFO, -1, "IdealSynapseSource finished with outstanding memory/provider state\n");
     }
     writeEvidence_();
+    writeRequestTrace_();
     out_.verbose(CALL_INFO, 1, 0, "[snndl-v5-ideal] timesteps=%" PRIu64 " rows=%" PRIu64 " responses=%" PRIu64 "\n", timesteps_, rows_served_, responses_served_);
 }
 

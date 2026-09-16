@@ -4,7 +4,9 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <sstream>
 #include <stdexcept>
+#include <vector>
 
 namespace SST {
 namespace SnnDL {
@@ -20,14 +22,154 @@ using namespace ::SnnDL::v5;
 std::uint32_t positive(const SST::Params& params, const char* name, std::uint32_t fallback) {
     return std::max<std::uint32_t>(1, params.find<std::uint32_t>(name, fallback));
 }
+
+std::vector<std::string> splitBinding(const std::string& value, char delimiter) {
+    std::vector<std::string> result;
+    std::stringstream stream(value);
+    std::string item;
+    while (std::getline(stream, item, delimiter)) result.push_back(item);
+    return result;
+}
+
+std::uint32_t bindingInteger(const std::string& value, const char* field) {
+    try {
+        std::size_t consumed = 0;
+        const auto parsed = std::stoul(value, &consumed);
+        if (consumed != value.size() || parsed > 0xffffffffUL) throw std::invalid_argument("range");
+        return static_cast<std::uint32_t>(parsed);
+    } catch (const std::exception&) {
+        throw std::invalid_argument(std::string("invalid operator binding ") + field);
+    }
+}
+
+void parseScheduleDescriptor(const SST::Params& params, CorePipelineConfig& config) {
+    const auto encoded = params.find<std::string>("schedule_descriptor", "");
+    if (encoded.empty()) return;
+    const auto records = splitBinding(encoded, ';');
+    if (records.empty() || records.front() != "v1") {
+        throw std::invalid_argument("schedule_descriptor must start with v1");
+    }
+    config.schedule_stages.clear();
+    for (std::size_t index = 1; index < records.size(); ++index) {
+        if (records[index].empty()) continue;
+        const auto fields = splitBinding(records[index], '|');
+        if (fields.size() != 9) {
+            throw std::invalid_argument("schedule_descriptor stage must contain nine fields");
+        }
+        ScheduleStageDescriptor stage;
+        stage.id = fields[0];
+        stage.operation = fields[1];
+        stage.resource = fields[2];
+        stage.request_class = fields[3];
+        if (!fields[4].empty()) stage.dependencies = splitBinding(fields[4], '&');
+        stage.retry_policy = fields[5];
+        stage.issue_group_id = fields[6];
+        stage.earliest_cycle = bindingInteger(fields[7], "schedule earliest cycle");
+        stage.max_inflight = bindingInteger(fields[8], "schedule max inflight");
+        config.schedule_stages.push_back(std::move(stage));
+    }
+}
+
+float bindingFloat(const std::string& value, const char* field) {
+    try {
+        std::size_t consumed = 0;
+        const auto parsed = std::stof(value, &consumed);
+        if (consumed != value.size()) throw std::invalid_argument("value");
+        return parsed;
+    } catch (const std::exception&) {
+        throw std::invalid_argument(std::string("invalid operator binding ") + field);
+    }
+}
+
+bool validDigest(const std::string& value) {
+    if (value.empty()) return true; // legacy unit probes have no typed plan
+    if (value.size() != 64) return false;
+    return std::all_of(value.begin(), value.end(), [](unsigned char character) {
+        return (character >= '0' && character <= '9') ||
+               (character >= 'a' && character <= 'f');
+    });
+}
+
+void parseOperatorBinding(const SST::Params& params, CorePipelineConfig& config) {
+    const auto encoded = params.find<std::string>("operator_binding", "");
+    if (encoded.empty()) return;
+    const auto records = splitBinding(encoded, ';');
+    if (records.empty() || records.front() != "v1") {
+        throw std::invalid_argument("operator_binding must start with v1");
+    }
+    config.neuron_bindings.assign(config.neurons, NeuronBinding{});
+    std::uint32_t cursor = 0;
+    for (std::size_t index = 1; index < records.size(); ++index) {
+        if (records[index].empty()) continue;
+        const auto fields = splitBinding(records[index], ',');
+        if (fields.size() < 3) throw std::invalid_argument("operator binding segment is incomplete");
+        const auto start = bindingInteger(fields[0], "local start");
+        const auto end = bindingInteger(fields[1], "local end");
+        if (start != cursor || end <= start || end > config.neurons) {
+            throw std::invalid_argument("operator binding segments must cover local neurons contiguously");
+        }
+        const auto& operator_name = fields[2];
+        NeuronBinding binding;
+        if (operator_name == "input" || operator_name == "padding") {
+            binding.kind = NeuronOperatorKind::Padding;
+        } else if (operator_name == "lif") {
+            binding.kind = NeuronOperatorKind::Lif;
+            binding.lif = config.lif;
+        } else if (operator_name == "if") {
+            if (fields.size() != 6) {
+                throw std::invalid_argument("if operator binding requires 6 fields");
+            }
+            binding.kind = NeuronOperatorKind::If;
+            binding.if_op.resistance = bindingFloat(fields[3], "if resistance");
+            binding.if_op.threshold = bindingFloat(fields[4], "if threshold");
+            binding.if_op.reset = bindingFloat(fields[5], "if reset");
+        } else if (operator_name == "cuba_lif") {
+            if (fields.size() != 12) {
+                throw std::invalid_argument("cuba_lif operator binding requires 12 fields");
+            }
+            binding.kind = NeuronOperatorKind::CubaLif;
+            binding.cuba_lif.dt_seconds = bindingFloat(fields[3], "cuba dt_seconds");
+            binding.cuba_lif.tau_syn_seconds = bindingFloat(fields[4], "cuba tau_syn_seconds");
+            binding.cuba_lif.tau_mem_seconds = bindingFloat(fields[5], "cuba tau_mem_seconds");
+            binding.cuba_lif.resistance = bindingFloat(fields[6], "cuba resistance");
+            binding.cuba_lif.v_leak = bindingFloat(fields[7], "cuba v_leak");
+            binding.cuba_lif.threshold = bindingFloat(fields[8], "cuba threshold");
+            binding.cuba_lif.reset = bindingFloat(fields[9], "cuba reset");
+            if (fields[10] == "value") {
+                binding.cuba_lif.reset_mode = CubaLifNeuronOp::ResetMode::Value;
+            } else if (fields[10] == "subtract") {
+                binding.cuba_lif.reset_mode = CubaLifNeuronOp::ResetMode::Subtract;
+            } else {
+                throw std::invalid_argument("invalid CubaLIF reset mode in operator binding");
+            }
+            binding.cuba_lif.input_weight = bindingFloat(fields[11], "cuba input_weight");
+        } else {
+            throw std::invalid_argument("unknown operator in operator binding");
+        }
+        for (std::uint32_t local = start; local < end; ++local) config.neuron_bindings[local] = binding;
+        cursor = end;
+    }
+    if (cursor != config.neurons) {
+        throw std::invalid_argument("operator binding does not cover all local neurons");
+    }
+}
 }
 
 SnnCoreV5::SnnCoreV5(SST::ComponentId_t id, SST::Params& params)
     : SST::Component(id), out_("SnnDL.SnnCoreV5", 0, 0, SST::Output::STDOUT), core_id_(params.find<std::uint32_t>("core_id", 0)),
+      schedule_plan_digest_(params.find<std::string>("schedule_plan_digest", "")),
+      route_plan_digest_(params.find<std::string>("route_plan_digest", "")),
+      schedule_stage_count_(params.find<std::uint32_t>("schedule_stage_count", 0)),
+      schedule_queue_ingress_(params.find<std::uint32_t>("schedule_queue_ingress", 0)),
+      schedule_queue_synapse_(params.find<std::uint32_t>("schedule_queue_synapse", 0)),
+      schedule_backpressure_policy_(params.find<std::string>("schedule_backpressure_policy", "")),
       pipeline_([&params]() {
           CorePipelineConfig config;
           config.neurons = positive(params, "neurons", 64);
           config.ingress_entries = positive(params, "ingress_queue_entries", 16);
+          config.schedule_admission_enabled = params.find<std::uint32_t>("schedule_admission_enabled", 0) != 0;
+          config.schedule_ingress_entries = params.find<std::size_t>("schedule_queue_ingress", 0);
+          config.schedule_synapse_entries = params.find<std::size_t>("schedule_queue_synapse", 0);
           config.row_entries = positive(params, "row_queue_entries", 16);
           config.synapse_entries = positive(params, "synapse_queue_entries", 32);
           config.retire_entries = positive(params, "retire_queue_entries", 32);
@@ -45,11 +187,41 @@ SnnCoreV5::SnnCoreV5(SST::ComponentId_t id, SST::Params& params)
           config.accumulator.latency_cycles = params.find<std::uint32_t>("accumulator_latency_cycles", 1);
           config.neuron.width = positive(params, "neuron_lanes", 1);
           config.neuron.latency_cycles = params.find<std::uint32_t>("neuron_latency_cycles", 1);
+          const auto neuron_operator = params.find<std::string>("neuron_operator", "lif");
+          if (neuron_operator == "lif") {
+              config.neuron_operator = NeuronOperatorKind::Lif;
+          } else if (neuron_operator == "if") {
+              config.neuron_operator = NeuronOperatorKind::If;
+              config.if_op.resistance = params.find<float>("if_resistance", 1.0f);
+              config.if_op.threshold = params.find<float>("if_threshold", 1.0f);
+              config.if_op.reset = params.find<float>("if_reset", 0.0f);
+          } else if (neuron_operator == "cuba_lif") {
+              config.neuron_operator = NeuronOperatorKind::CubaLif;
+              config.cuba_lif.dt_seconds = params.find<float>("cuba_dt_seconds", 1.0e-3f);
+              config.cuba_lif.tau_syn_seconds = params.find<float>("cuba_tau_syn_seconds", 2.0e-3f);
+              config.cuba_lif.tau_mem_seconds = params.find<float>("cuba_tau_mem_seconds", 3.0e-3f);
+              config.cuba_lif.resistance = params.find<float>("cuba_resistance", 1.0f);
+              config.cuba_lif.v_leak = params.find<float>("cuba_v_leak", 0.0f);
+              config.cuba_lif.threshold = params.find<float>("cuba_threshold", 1.0f);
+              config.cuba_lif.reset = params.find<float>("cuba_reset", 0.0f);
+              config.cuba_lif.input_weight = params.find<float>("cuba_input_weight", 1.0f);
+              const auto reset_mode = params.find<std::string>("cuba_reset_mode", "value");
+              if (reset_mode == "value") {
+                  config.cuba_lif.reset_mode = CubaLifNeuronOp::ResetMode::Value;
+              } else if (reset_mode == "subtract") {
+                  config.cuba_lif.reset_mode = CubaLifNeuronOp::ResetMode::Subtract;
+              } else {
+                  throw std::invalid_argument("cuba_reset_mode must be value or subtract");
+              }
+          } else {
+              throw std::invalid_argument("neuron_operator must be lif, if, or cuba_lif");
+          }
           config.lif.dt_ms = params.find<float>("dt_ms", 1.0f);
           config.lif.tau_mem_ms = params.find<float>("tau_mem_ms", 20.0f);
           config.lif.threshold = params.find<float>("threshold", 1.0f);
           config.lif.reset = params.find<float>("reset", 0.0f);
           config.lif.refractory_timesteps = params.find<std::uint32_t>("refractory_timesteps", 0);
+          parseOperatorBinding(params, config);
           config.storage.core_id = params.find<std::uint32_t>("core_id", 0);
           config.storage.pe_id = params.find<std::uint32_t>("pe_id", 0);
           config.storage.index_bytes = positive(params, "core_index_bytes", 4096);
@@ -80,8 +252,28 @@ SnnCoreV5::SnnCoreV5(SST::ComponentId_t id, SST::Params& params)
           configureStorage(config.storage.delta_sram, "core_delta_sram_capacity_bytes", "core_delta_sram_banks");
           configureStorage(config.storage.index_sram, "core_index_sram_capacity_bytes", "core_index_sram_banks");
           configureStorage(config.storage.route_sram, "pe_route_sram_capacity_bytes", "pe_route_sram_banks");
+          parseScheduleDescriptor(params, config);
           return config;
       }()) {
+    if (!validDigest(schedule_plan_digest_) || !validDigest(route_plan_digest_)) {
+        throw std::invalid_argument("typed plan digests must be lowercase SHA-256 values");
+    }
+    if (!schedule_plan_digest_.empty()) {
+        if (schedule_stage_count_ == 0 || schedule_backpressure_policy_.empty()) {
+            throw std::invalid_argument("SchedulePlan descriptor is incomplete");
+        }
+        if (params.find<std::string>("schedule_descriptor", "").empty()) {
+            throw std::invalid_argument("SchedulePlan stage descriptor is missing");
+        }
+        if (schedule_stage_count_ != pipeline_.scheduleStageCount()) {
+            throw std::invalid_argument("SchedulePlan stage count does not match stage descriptor");
+        }
+        const auto ingress_capacity = params.find<std::uint32_t>("ingress_queue_entries", 16);
+        const auto synapse_capacity = params.find<std::uint32_t>("synapse_queue_entries", 32);
+        if (schedule_queue_ingress_ > ingress_capacity || schedule_queue_synapse_ > synapse_capacity) {
+            throw std::invalid_argument("SchedulePlan queue reservation exceeds Core capacity");
+        }
+    }
     out_.setVerboseLevel(params.find<int>("verbose", 0));
     control_link_ = configureLink("control", new SST::Event::Handler2<SnnCoreV5, &SnnCoreV5::handleControl_>(this));
     spike_in_link_ = configureLink("spike_in", new SST::Event::Handler2<SnnCoreV5, &SnnCoreV5::handleSpike_>(this));

@@ -309,6 +309,22 @@ bool CoreStorageV5::writeState(std::uint32_t neuron, const LifNeuronState& state
     return writeBytes_(state_, checkedMultiply(neuron, kStateBytes, "CoreState offset"), bytes);
 }
 
+bool CoreStorageV5::readCubaLifState(std::uint32_t neuron, CubaLifNeuronState& state) {
+    if (neuron >= config_.neurons) return false;
+    std::vector<std::uint8_t> bytes;
+    if (!readBytes_(state_, checkedMultiply(neuron, kStateBytes, "CoreState offset"), kStateBytes, bytes) ||
+        bytes.size() != kStateBytes) return false;
+    return CubaLifNeuronOp::decodeState(bytes.data(), bytes.size(), state);
+}
+
+bool CoreStorageV5::writeCubaLifState(std::uint32_t neuron, const CubaLifNeuronState& state) {
+    if (neuron >= config_.neurons) return false;
+    std::array<std::uint8_t, CubaLifNeuronOp::kStateBytes> bytes{};
+    CubaLifNeuronOp::encodeState(state, bytes);
+    return writeBytes_(state_, checkedMultiply(neuron, kStateBytes, "CoreState offset"),
+                       std::vector<std::uint8_t>(bytes.begin(), bytes.end()));
+}
+
 bool CoreStorageV5::appendDelta(const RetireEntry& entry) {
     if (entry.key.post_neuron >= config_.neurons) return false;
     std::vector<std::uint8_t> count_bytes;

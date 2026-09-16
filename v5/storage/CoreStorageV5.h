@@ -4,6 +4,7 @@
 #include "BankedSramV5.h"
 #include "v5/api/AddressSpace.h"
 #include "v5/core/DeterministicRetireQueue.h"
+#include "v5/core/CubaLifNeuronOp.h"
 #include "v5/core/LifNeuronOp.h"
 
 #include <cstddef>
@@ -48,6 +49,8 @@ public:
 
     bool readState(std::uint32_t neuron, LifNeuronState& state);
     bool writeState(std::uint32_t neuron, const LifNeuronState& state);
+    bool readCubaLifState(std::uint32_t neuron, CubaLifNeuronState& state);
+    bool writeCubaLifState(std::uint32_t neuron, const CubaLifNeuronState& state);
 
     // Delta entries are resident in CoreDelta.  The count and entries are
     // stored in the same region, so there is no vector shadow of accumulated

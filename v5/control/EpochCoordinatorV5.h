@@ -8,6 +8,7 @@
 #include <sst/core/output.h>
 
 #include <cstdint>
+#include <array>
 #include <string>
 #include <vector>
 
@@ -28,7 +29,9 @@ public:
         {"verbose", "Verbose level", "0"})
     SST_ELI_DOCUMENT_PORTS(
         {"command", "Commands sent through the coordinator PE endpoint", {"SnnDL.NocControlV5Event"}},
-        {"status", "Status packets returned through control VN", {"SnnDL.NocControlV5Event"}})
+        {"command_pe%(mesh_pes)d", "Per-PE direct barrier command links for scaled timed control", {"SnnDL.NocControlV5Event"}},
+        {"status", "Legacy single status input", {"SnnDL.NocControlV5Event"}},
+        {"status_pe%(mesh_pes)d", "Per-PE direct barrier status links for scaled timed control", {"SnnDL.NocControlV5Event"}})
     SST_ELI_DOCUMENT_STATISTICS(
         {"sync.commands", "Control commands emitted", "events", 1},
         {"sync.reports", "Control reports received", "events", 1},
@@ -50,17 +53,25 @@ private:
     void writeEvidence_() const;
     bool allReports_() const;
     std::size_t participant_(const NocControlV5Event&) const;
+    std::size_t seenCount_() const;
 
     SST::Output out_;
     SST::Link* command_ = nullptr;
+    std::vector<SST::Link*> command_pe_links_;
     SST::Link* status_ = nullptr;
+    std::vector<SST::Link*> status_pe_links_;
     std::uint32_t pes_ = 1, cores_per_pe_ = 1;
     std::uint64_t start_timestep_ = 0, timesteps_ = 1, timeout_cycles_ = 1000000;
     std::uint64_t epoch_ = 0, cycle_ = 0, last_progress_cycle_ = 0, phase_start_ns_ = 0;
     std::uint64_t commands_ = 0, reports_ = 0, epochs_completed_ = 0;
-    std::uint64_t barrier_wait_ns_ = 0, timeouts_ = 0, expected_data_ = 0, delivered_data_ = 0;
+    // The epoch-local counters drive the current barrier.  The total counters
+    // are monotonic evidence values covering every completed ingress epoch.
+    std::uint64_t barrier_wait_ns_ = 0, timeouts_ = 0;
+    std::uint64_t expected_data_ = 0, delivered_data_ = 0;
+    std::uint64_t total_expected_data_ = 0, total_delivered_data_ = 0;
     Phase phase_ = Phase::Preload;
     std::vector<bool> seen_;
+    std::array<std::uint64_t, 9> report_counts_{};
     std::string output_json_;
 };
 

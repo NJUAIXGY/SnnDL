@@ -3,6 +3,7 @@
 
 #include "NocEventsV5.h"
 #include "v5/events/CoreEvents.h"
+#include "v5/events/TraceEvents.h"
 
 #include <sst/core/component.h>
 #include <sst/core/interfaces/simpleNetwork.h>
@@ -10,6 +11,7 @@
 #include <sst/core/output.h>
 
 #include <cstdint>
+#include <array>
 #include <deque>
 #include <map>
 #include <string>
@@ -24,6 +26,7 @@ public:
     SST_ELI_DOCUMENT_PARAMS(
         {"pe_id", "Logical PE/network endpoint identifier", "0"},
         {"mesh_x", "2D mesh X dimension", "1"},
+        {"mesh_y", "2D mesh Y dimension", "1"},
         {"cores_per_pe", "Core dispatch ports behind this endpoint", "1"},
         {"tx_queue_entries", "Finite source data packet queue", "16"},
         {"rx_queue_entries", "Finite receive queue per Core", "16"},
@@ -41,6 +44,7 @@ public:
         {"payload_bytes", "Core-spike payload bytes", "0"},
         {"core_attached", "Enable Core/provider proxy links", "0"},
         {"timed_control", "Enable VN1 epoch control protocol", "0"},
+        {"ingress_progress_batch", "Aggregate delivered-data reports before sending VN1 progress", "1"},
         {"coordinator_pe", "PE hosting EpochCoordinatorV5", "0"},
         {"core_held_spike_entries", "Attached Core held-spike capacity", "32"},
         {"output_json", "Endpoint evidence path", ""},
@@ -49,8 +53,12 @@ public:
     SST_ELI_DOCUMENT_PORTS(
         {"probe_in", "Probe packet injection", {"SnnDL.NocPacketV5Event"}},
         {"probe_out", "Probe ACK and delivered packet", {"SnnDL.NocPacketV5Event", "SnnDL.NocInjectionAckV5Event"}},
+        {"trace_inject%(core)d", "Logical NoC trace event injection for each local Core", {"SnnDL.TraceNoCInjectionV5Event", "SnnDL.TraceNoCInjectionAckV5Event"}},
+        {"trace_inject_ack%(core)d", "Logical NoC trace injection ACK for each local Core", {"SnnDL.TraceNoCInjectionAckV5Event"}},
+        {"trace_delivery%(core)d", "Core-facing logical NoC trace delivery for each local Core", {"SnnDL.TraceNoCDeliveryV5Event", "SnnDL.TraceNoCDeliveryAckV5Event"}},
+        {"trace_delivery_ack%(core)d", "Core-facing logical NoC trace delivery ACK for each local Core", {"SnnDL.TraceNoCDeliveryAckV5Event"}},
         {"epoch_command", "Coordinator command input", {"SnnDL.NocControlV5Event"}},
-        {"epoch_status", "Coordinator status output", {"SnnDL.NocControlV5Event"}},
+        {"epoch_status", "Direct status output to the coordinator PE link", {"SnnDL.NocControlV5Event"}},
         {"native_network", "Native multicast Router data link", {"SnnDL.NocPacketV5Event", "SnnDL.NocCreditV5Event"}},
         {"provider_control", "Legacy single-Core provider control", {"SnnDL.CoreControlEvent"}},
         {"core_control", "Legacy single-Core control output", {"SnnDL.CoreControlEvent"}},
@@ -112,6 +120,10 @@ private:
         SST::Link* provider_monitor = nullptr;
         SST::Link* core_status = nullptr;
         SST::Link* provider_status = nullptr;
+        SST::Link* trace_inject = nullptr;
+        SST::Link* trace_inject_ack = nullptr;
+        SST::Link* trace_delivery = nullptr;
+        SST::Link* trace_delivery_ack = nullptr;
         std::deque<NocPacketV5Event*> rx;
         std::deque<AckOrigin> ack_origins;
         CoreControlEvent* pending_seal = nullptr;
@@ -120,9 +132,12 @@ private:
         std::map<std::uint32_t, SourceRoute> source_routes;
         bool started = false;
         bool network_inflight = false;
+        bool trace_inflight = false;
     };
 
     void handleProbe_(SST::Event*);
+    void handleTraceInject_(SST::Event*, int core);
+    void handleTraceDeliveryAck_(SST::Event*, int core);
     void handleEpochCommand_(SST::Event*);
     void handleProviderControl_(SST::Event*, int core);
     void handleProviderSpike_(SST::Event*, int core);
@@ -133,6 +148,7 @@ private:
     void handleNative_(SST::Event*);
     bool tick_(SST::Cycle_t);
     void enqueueData_(NocPacketV5Event*, SST::Link* ack_link);
+    void enqueueTrace_(TraceNoCInjectionV5Event*, int core);
     void enqueueControl_(NocControlV5Event*);
     void receiveData_();
     void receiveControl_();
@@ -153,18 +169,26 @@ private:
     std::vector<CorePort> cores_;
     std::deque<NocPacketV5Event*> data_tx_, ingress_rx_;
     std::deque<NocControlV5Event*> control_tx_;
-    std::uint32_t pe_id_=0, mesh_x_=1, cores_per_pe_=1;
+    std::uint32_t pe_id_=0, mesh_x_=1, mesh_y_=1, cores_per_pe_=1;
     std::uint32_t tx_capacity_=16, rx_capacity_=16, control_capacity_=32, flit_bytes_=32;
     std::uint32_t payload_bytes_=0, core_held_capacity_=32, coordinator_pe_=0;
-    bool core_attached_=false, timed_control_=false, legacy_ports_=false, native_tree_=false, route_contract_v2_=false;
+    std::uint32_t ingress_progress_batch_=1;
+    bool core_attached_=false, trace_attached_=false, timed_control_=false, legacy_ports_=false, native_tree_=false, route_contract_v2_=false;
     bool external_stimulus_to_network_=false;
     std::string output_json_;
     std::uint64_t cycles_=0, tx_packets_=0, rx_packets_=0, logical_deliveries_=0;
     std::uint64_t control_tx_packets_=0, control_rx_packets_=0, control_deliveries_=0;
+    std::uint64_t direct_command_packets_=0, direct_status_packets_=0;
     std::uint64_t tx_bits_=0, tx_flits_=0, control_bits_=0, control_flits_=0;
     std::uint64_t tx_stalls_=0, rx_stalls_=0, core_retries_=0;
     std::uint64_t latency_sum_ns_=0, latency_max_ns_=0, hop_sum_=0, hop_max_=0, drops_=0;
     std::vector<std::vector<std::uint64_t>> core_epoch_enqueued_;
+    std::vector<std::vector<std::uint64_t>> core_epoch_delivered_;
+    std::vector<std::array<std::uint64_t, 9>> core_control_counts_;
+    std::vector<std::array<std::uint64_t, 9>> core_status_counts_;
+    std::vector<std::uint64_t> core_provider_preload_ready_;
+    std::vector<std::uint64_t> core_provider_ingress_ready_;
+    std::vector<std::uint64_t> pending_ingress_progress_, pending_ingress_timestep_;
     std::uint64_t next_packet_id_=1, logical_spikes_=0, source_packets_=0, zero_fanout_=0;
     std::uint64_t external_zero_fanout_=0, core_zero_fanout_=0;
     std::uint32_t native_credits_=0, native_credit_limit_=0;

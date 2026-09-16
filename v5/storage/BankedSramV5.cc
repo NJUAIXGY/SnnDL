@@ -107,6 +107,7 @@ void BankedSramV5::complete_(std::uint64_t cycle) {
         response.service_cycle = item.service_cycle;
         response.completion_cycle = item.completion_cycle;
         response.bank = item.pending.bank;
+        response.port = item.port;
         response.accepted = true;
         response.completed = true;
         response.data.resize(item.pending.request.data.size(), 0);

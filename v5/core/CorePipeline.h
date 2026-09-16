@@ -2,6 +2,8 @@
 #define SST_SNN_DL_V5_CORE_PIPELINE_H
 
 #include "DeterministicRetireQueue.h"
+#include "CubaLifNeuronOp.h"
+#include "IfNeuronOp.h"
 #include "LifNeuronOp.h"
 #include "v5/storage/CoreStorageV5.h"
 
@@ -11,6 +13,7 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <string>
 #include <vector>
 
 namespace SST {
@@ -22,6 +25,32 @@ struct StageTiming {
     std::uint32_t width = 1;
 };
 
+struct ScheduleStageDescriptor {
+    std::string id;
+    std::string operation;
+    std::string resource;
+    std::string request_class;
+    std::vector<std::string> dependencies;
+    std::uint32_t earliest_cycle = 0;
+    std::string retry_policy;
+    std::string issue_group_id;
+    std::size_t max_inflight = 1;
+};
+
+enum class NeuronOperatorKind : std::uint8_t {
+    Lif = 0,
+    CubaLif = 1,
+    Padding = 2,
+    If = 3,
+};
+
+struct NeuronBinding {
+    NeuronOperatorKind kind = NeuronOperatorKind::Lif;
+    LifNeuronOp::Config lif;
+    CubaLifNeuronOp::Config cuba_lif;
+    IfNeuronOp::Config if_op;
+};
+
 struct CorePipelineConfig {
     std::uint32_t neurons = 1;
     std::size_t ingress_entries = 16;
@@ -30,13 +59,23 @@ struct CorePipelineConfig {
     std::size_t retire_entries = 32;
     std::size_t accumulator_entries = 32;
     std::size_t held_spike_entries = 32;
+    // Compiler SchedulePlan admission reservations.  A zero reservation
+    // means "use the physical queue capacity" for compatibility profiles.
+    bool schedule_admission_enabled = false;
+    std::size_t schedule_ingress_entries = 0;
+    std::size_t schedule_synapse_entries = 0;
+    std::vector<ScheduleStageDescriptor> schedule_stages;
     StageTiming ingress;
     StageTiming row_lookup;
     StageTiming synapse;
     StageTiming retire;
     StageTiming accumulator;
     StageTiming neuron;
+    NeuronOperatorKind neuron_operator = NeuronOperatorKind::Lif;
     LifNeuronOp::Config lif;
+    CubaLifNeuronOp::Config cuba_lif;
+    IfNeuronOp::Config if_op;
+    std::vector<NeuronBinding> neuron_bindings;
     CoreStorageV5Config storage;
 };
 
@@ -134,10 +173,12 @@ public:
     std::size_t pendingEntries() const;
     std::size_t heldEntries() const { return held_count_; }
     bool active() const { return active_; }
+    std::size_t scheduleStageCount() const { return config_.schedule_stages.size(); }
     bool sealed() const { return sealed_; }
     // Compatibility snapshot for tests and evidence only.  Functional reads
     // in the pipeline go through CoreStorageV5, never through this vector.
     const std::vector<LifNeuronState>& state() const;
+    const std::vector<CubaLifNeuronState>& cubaState() const;
     const CoreStorageV5& storage() const { return *storage_; }
 
 private:
@@ -178,9 +219,14 @@ private:
     void resetTimestep_();
     void recordStageCycles_();
     void recordOccupancy_();
+    std::size_t scheduleCapacity_(const char* stage_id, std::size_t fallback) const;
+    std::size_t scheduleWidth_(const char* stage_id, std::size_t fallback) const;
+    bool scheduleReady_(const char* stage_id) const;
 
     CorePipelineConfig config_;
     LifNeuronOp lif_;
+    CubaLifNeuronOp cuba_lif_;
+    IfNeuronOp if_;
     std::uint64_t active_timestep_ = 0;
     std::uint64_t last_timestep_ = 0;
     bool has_timestep_ = false;
@@ -203,6 +249,7 @@ private:
     std::map<RowKey, RowState> rows_;
     std::unique_ptr<CoreStorageV5> storage_;
     mutable std::vector<LifNeuronState> state_snapshot_;
+    mutable std::vector<CubaLifNeuronState> cuba_state_snapshot_;
     std::uint32_t next_neuron_ = 0;
     bool neuron_batch_pending_ = false;
     std::uint32_t neuron_batch_begin_ = 0;

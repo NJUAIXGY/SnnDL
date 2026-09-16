@@ -29,9 +29,16 @@ BankedSramV5Component::BankedSramV5Component(SST::ComponentId_t id, SST::Params&
           config.request_queue_entries = static_cast<std::size_t>(positive(params, "request_queue_entries", 16));
           config.response_queue_entries = static_cast<std::size_t>(positive(params, "response_queue_entries", 16));
           return config;
-      }()) {
+      }()), request_trace_json_(params.find<std::string>("request_trace_json", "")) {
     out_.setVerboseLevel(params.find<int>("verbose", 0));
     stats_json_ = params.find<std::string>("stats_json", "");
+    if (!request_trace_json_.empty()) {
+        request_trace_stream_.open(request_trace_json_, std::ios::out | std::ios::trunc);
+        if (!request_trace_stream_.good()) {
+            out_.fatal(CALL_INFO, -1, "BankedSramV5 cannot open request trace %s\n",
+                       request_trace_json_.c_str());
+        }
+    }
     request_link_ = configureLink("request", new SST::Event::Handler2<BankedSramV5Component, &BankedSramV5Component::handleRequest_>(this));
     response_link_ = configureLink("response");
     if (!request_link_ || !response_link_) {
@@ -56,18 +63,37 @@ void BankedSramV5Component::init(unsigned int) {}
 void BankedSramV5Component::setup() {}
 
 void BankedSramV5Component::sendResponse_(const BankedSramV5Response& response) {
+    writeTrace_(response);
     auto* event = new SramResponseEvent();
     event->request_id = response.request_id;
     event->address = response.address;
     event->service_cycle = response.service_cycle;
     event->completion_cycle = response.completion_cycle;
     event->bank = response.bank;
+    event->port = response.port;
     event->data = response.data;
     event->accepted = response.accepted;
     event->completed = response.completed;
     event->retryable = response.retryable;
     event->reject_reason = static_cast<std::uint8_t>(response.reject);
     response_link_->send(event);
+}
+
+void BankedSramV5Component::writeTrace_(const BankedSramV5Response& response) {
+    if (!request_trace_stream_.good()) return;
+    request_trace_stream_
+        << "{\"schema_version\":\"snndl-sram-request-event/v1\""
+        << ",\"request_id\":" << response.request_id
+        << ",\"address\":" << response.address
+        << ",\"bank\":" << response.bank
+        << ",\"port\":" << response.port
+        << ",\"accepted\":" << (response.accepted ? "true" : "false")
+        << ",\"retryable\":" << (response.retryable ? "true" : "false")
+        << ",\"reject_reason\":" << static_cast<unsigned>(response.reject)
+        << ",\"service_cycle\":" << response.service_cycle
+        << ",\"completion_cycle\":" << response.completion_cycle
+        << ",\"completed\":" << (response.completed ? "true" : "false")
+        << "}\n";
 }
 
 void BankedSramV5Component::handleRequest_(SST::Event* event) {
@@ -120,6 +146,7 @@ void BankedSramV5Component::publishStatistics_() {
 }
 
 void BankedSramV5Component::finish() {
+    if (request_trace_stream_.is_open()) request_trace_stream_.flush();
     publishStatistics_();
     if (model_.pending() != 0 || model_.inFlight() != 0) {
         out_.fatal(CALL_INFO, -1, "BankedSramV5 finished with outstanding requests\n");

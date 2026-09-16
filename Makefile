@@ -278,13 +278,17 @@ libSnnDLV5Contracts_la_LINK = $(LIBTOOL) $(AM_V_lt) --tag=CXX \
 libSnnDLV5Core_la_LIBADD =
 am__objects_3 = v5/noc/MulticastRouterV5.lo v5/noc/PeEndpointV5.lo \
 	v5/noc/NocProbeV5.lo v5/control/EpochCoordinatorV5.lo \
-	v5/core/LifNeuronOp.lo v5/core/DeterministicRetireQueue.lo \
+	v5/core/LifNeuronOp.lo v5/core/IfNeuronOp.lo \
+	v5/core/CubaLifNeuronOp.lo v5/core/DeterministicRetireQueue.lo \
 	v5/core/CorePipeline.lo v5/core/SnnCoreV5.lo \
 	v5/storage/BankedSramV5.lo v5/storage/SnnDmaEngineV5.lo \
 	v5/storage/CoreStorageV5.lo \
 	v5/storage/BankedSramV5Component.lo \
 	v5/test/IdealSynapseSource.lo v5/test/DmaSourceV5.lo \
-	v5/test/SramProbeV5.lo
+	v5/test/SramProbeV5.lo v5/trace/TraceReplayCoordinatorV5.lo \
+	v5/trace/TraceMemorySourceV5.lo v5/trace/TraceSramSourceV5.lo \
+	v5/trace/TraceNoCSourceV5.lo \
+	v5/trace/TraceNoCSinkV5.lo
 am_libSnnDLV5Core_la_OBJECTS = $(am__objects_3)
 libSnnDLV5Core_la_OBJECTS = $(am_libSnnDLV5Core_la_OBJECTS)
 libSnnDLV5Core_la_LINK = $(LIBTOOL) $(AM_V_lt) --tag=CXX \
@@ -345,7 +349,9 @@ am__depfiles_remade = components/$(DEPDIR)/MeshPE2D.Plo \
 	v5/api/$(DEPDIR)/ArtifactContract.Plo \
 	v5/control/$(DEPDIR)/EpochCoordinatorV5.Plo \
 	v5/core/$(DEPDIR)/CorePipeline.Plo \
+	v5/core/$(DEPDIR)/CubaLifNeuronOp.Plo \
 	v5/core/$(DEPDIR)/DeterministicRetireQueue.Plo \
+	v5/core/$(DEPDIR)/IfNeuronOp.Plo \
 	v5/core/$(DEPDIR)/LifNeuronOp.Plo \
 	v5/core/$(DEPDIR)/SnnCoreV5.Plo \
 	v5/noc/$(DEPDIR)/MulticastRouterV5.Plo \
@@ -357,7 +363,12 @@ am__depfiles_remade = components/$(DEPDIR)/MeshPE2D.Plo \
 	v5/storage/$(DEPDIR)/SnnDmaEngineV5.Plo \
 	v5/test/$(DEPDIR)/DmaSourceV5.Plo \
 	v5/test/$(DEPDIR)/IdealSynapseSource.Plo \
-	v5/test/$(DEPDIR)/SramProbeV5.Plo
+	v5/test/$(DEPDIR)/SramProbeV5.Plo \
+	v5/trace/$(DEPDIR)/TraceMemorySourceV5.Plo \
+	v5/trace/$(DEPDIR)/TraceSramSourceV5.Plo \
+	v5/trace/$(DEPDIR)/TraceNoCSinkV5.Plo \
+	v5/trace/$(DEPDIR)/TraceNoCSourceV5.Plo \
+	v5/trace/$(DEPDIR)/TraceReplayCoordinatorV5.Plo
 am__mv = mv -f
 CXXCOMPILE = $(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) \
 	$(AM_CPPFLAGS) $(CPPFLAGS) $(AM_CXXFLAGS) $(CXXFLAGS)
@@ -468,7 +479,7 @@ CCDEPMODE = depmode=gcc3
 CC_VERSION = gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0
 CFLAGS = -g -O2
 CPP = gcc
-CPPFLAGS = -I/home/xgy/remote-20260430/remote/sst_install_mpi/include
+CPPFLAGS = -I/home/xgy/remote-20260430/remote/sst_install_mpi/include -I/home/xgy/remote-20260430/remote/sst_install_mpi/include/sst/core
 CSCOPE = cscope
 CTAGS = ctags
 CUDA_CPPFLAGS = 
@@ -536,7 +547,7 @@ INSTALL_PROGRAM = ${INSTALL}
 INSTALL_SCRIPT = ${INSTALL}
 INSTALL_STRIP_PROGRAM = $(install_sh) -c -s
 LD = /usr/bin/ld -m elf_x86_64
-LDFLAGS = -L/home/xgy/remote-20260430/remote/sst_install_mpi/lib
+LDFLAGS = -L/home/xgy/remote-20260430/remote/sst_install_mpi/lib -L/home/xgy/remote-20260430/remote/externals/ramulator2
 LIBADD_DL =  
 LIBADD_DLD_LINK = 
 LIBADD_DLOPEN = 
@@ -570,7 +581,7 @@ MPILIBS =
 MPI_CPPFLAGS = 
 NM = /usr/bin/nm -B
 NMEDIT = 
-NUMPY_CPPFLAGS = -I/usr/local/lib/python3.10/dist-packages/numpy/core/include -DHAVE_NUMPY
+NUMPY_CPPFLAGS = -I/home/xgy/.local/lib/python3.10/site-packages/numpy/_core/include -DHAVE_NUMPY
 NVDIMMSIM_CPPFLAGS = 
 NVDIMMSIM_CXXFLAGS = 
 NVDIMMSIM_LDFLAGS = 
@@ -601,14 +612,14 @@ PINTOOL3_RUNTIME =
 PINTOOL_CPPFLAGS = 
 PINTOOL_DIR = 
 PINTOOL_LDFLAGS = 
-PINTOOL_PATH = /home/xgy/.opencode/bin:/home/xgy/.mimocode/bin:/home/xgy/.local/bin:/usr/local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path:/home/xgy/.codex/tmp/arg0/codex-arg0Jh2LgT:/home/xgy/.local/bin:/home/xgy/.opencode/bin:/home/xgy/.mimocode/bin:/home/xgy/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin
+PINTOOL_PATH = /home/xgy/.opencode/bin:/home/xgy/.mimocode/bin:/home/xgy/.local/bin:/usr/local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path:/home/xgy/.codex/tmp/arg0/codex-arg0mGEtX7:/home/xgy/.local/bin:/home/xgy/.opencode/bin:/home/xgy/.mimocode/bin:/home/xgy/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin
 PINTOOL_RUNTIME = 
 PIN_CPPFLAGS = -g   -Wall   -Werror   -Wno-unknown-pragmas   -D__PIN__=1 -DPIN_CRT=1   -fno-stack-protector   -fno-exceptions   -funwind-tables   -fasynchronous-unwind-tables   -fomit-frame-pointer   -fno-strict-aliasing   -fno-rtti   -faligned-new   -fpic   -DTARGET_IA32E   -DHOST_IA32E   -DTARGET_LINUX   -DPIN_VERSION_MINOR=
 PIN_CPPFLAGS_COMPILER = -fno-exceptions          -fabi-version=2
-RAMULATOR2_CPPFLAGS = 
-RAMULATOR2_LDFLAGS = 
-RAMULATOR2_LIB = 
-RAMULATOR2_LIBDIR = 
+RAMULATOR2_CPPFLAGS = -I/home/xgy/remote-20260430/remote/externals/ramulator2/src/ -I/home/xgy/remote-20260430/remote/externals/ramulator2/ext/spdlog/include/       -I/home/xgy/remote-20260430/remote/externals/ramulator2/ext/yaml-cpp/include/ -DRAMULATOR2 -DHAVE_RAMULATOR2
+RAMULATOR2_LDFLAGS = -L/home/xgy/remote-20260430/remote/externals/ramulator2
+RAMULATOR2_LIB = -lramulator
+RAMULATOR2_LIBDIR = /home/xgy/remote-20260430/remote/externals/ramulator2
 RAMULATOR_CPPFLAGS = 
 RAMULATOR_LDFLAGS = 
 RAMULATOR_LIB = 
@@ -619,8 +630,8 @@ SET_MAKE =
 SHELL = /bin/bash
 SHM_LIB =  
 SSTELEMENTS_GIT_BRANCH = snndl_re
-SSTELEMENTS_GIT_COMMITCOUNT = 15406
-SSTELEMENTS_GIT_HEADSHA = c2dfe8028b5438049262daa0e4483ccdbfa0dae6
+SSTELEMENTS_GIT_COMMITCOUNT = 15412
+SSTELEMENTS_GIT_HEADSHA = 5b0b68ccd9244b8b9f31e7419d0e591dbbbf4bf1
 SST_ACTIVE_ELEMENT_LIBRARIES =  ariel cacheTracer cassini cramSim ember firefly gensa golem hermes iris kingsley mask-mpi memHierarchy mercury merlin messier miranda mmu osseous prospero rdmaNic samba shogun simpleElementExample simpleSimulation SnnDL thornhill vanadis vaultsim zodiac
 SST_CONFIG_TOOL = /home/xgy/remote-20260430/remote/sst_install_mpi/bin/sst-config
 SST_DIST_ELEMENT_LIBRARIES =  ariel balar cacheTracer cassini cramSim ember firefly gensa golem hermes iris kingsley mask-mpi memHierarchy mercury merlin messier miranda mmu osseous prospero rdmaNic samba shogun simpleElementExample simpleSimulation SnnDL thornhill vanadis vaultsim zodiac
@@ -845,6 +856,10 @@ SNNDL_V5_CORE_SOURCES = \
 	v5/control/EpochCoordinatorV5.cc \
 	v5/core/LifNeuronOp.h \
 	v5/core/LifNeuronOp.cc \
+	v5/core/IfNeuronOp.h \
+	v5/core/IfNeuronOp.cc \
+	v5/core/CubaLifNeuronOp.h \
+	v5/core/CubaLifNeuronOp.cc \
 	v5/core/DeterministicRetireQueue.h \
 	v5/core/DeterministicRetireQueue.cc \
 	v5/core/CorePipeline.h \
@@ -864,7 +879,18 @@ SNNDL_V5_CORE_SOURCES = \
 	v5/test/DmaSourceV5.h \
 	v5/test/DmaSourceV5.cc \
 	v5/test/SramProbeV5.h \
-	v5/test/SramProbeV5.cc
+	v5/test/SramProbeV5.cc \
+	v5/events/TraceEvents.h \
+	v5/trace/TraceReplayCoordinatorV5.h \
+	v5/trace/TraceReplayCoordinatorV5.cc \
+	v5/trace/TraceMemorySourceV5.h \
+	v5/trace/TraceMemorySourceV5.cc \
+	v5/trace/TraceSramSourceV5.h \
+	v5/trace/TraceSramSourceV5.cc \
+	v5/trace/TraceNoCSourceV5.h \
+	v5/trace/TraceNoCSourceV5.cc \
+	v5/trace/TraceNoCSinkV5.h \
+	v5/trace/TraceNoCSinkV5.cc
 
 
 # These manifests are the reviewable active-build boundary.  The former PE and
@@ -1232,7 +1258,7 @@ v5/api/$(DEPDIR)/$(am__dirstamp):
 v5/api/ArtifactContract.lo: v5/api/$(am__dirstamp) \
 	v5/api/$(DEPDIR)/$(am__dirstamp)
 
-libSnnDLV5Contracts.la: $(libSnnDLV5Contracts_la_OBJECTS) $(libSnnDLV5Contracts_la_DEPENDENCIES) $(EXTRA_libSnnDLV5Contracts_la_DEPENDENCIES)
+libSnnDLV5Contracts.la: $(libSnnDLV5Contracts_la_OBJECTS) $(libSnnDLV5Contracts_la_DEPENDENCIES) $(EXTRA_libSnnDLV5Contracts_la_DEPENDENCIES) 
 	$(AM_V_CXXLD)$(libSnnDLV5Contracts_la_LINK) -rpath $(compdir) $(libSnnDLV5Contracts_la_OBJECTS) $(libSnnDLV5Contracts_la_LIBADD) $(LIBS)
 v5/noc/$(am__dirstamp):
 	@$(MKDIR_P) v5/noc
@@ -1261,6 +1287,10 @@ v5/core/$(DEPDIR)/$(am__dirstamp):
 	@$(MKDIR_P) v5/core/$(DEPDIR)
 	@: > v5/core/$(DEPDIR)/$(am__dirstamp)
 v5/core/LifNeuronOp.lo: v5/core/$(am__dirstamp) \
+	v5/core/$(DEPDIR)/$(am__dirstamp)
+v5/core/IfNeuronOp.lo: v5/core/$(am__dirstamp) \
+	v5/core/$(DEPDIR)/$(am__dirstamp)
+v5/core/CubaLifNeuronOp.lo: v5/core/$(am__dirstamp) \
 	v5/core/$(DEPDIR)/$(am__dirstamp)
 v5/core/DeterministicRetireQueue.lo: v5/core/$(am__dirstamp) \
 	v5/core/$(DEPDIR)/$(am__dirstamp)
@@ -1294,8 +1324,24 @@ v5/test/DmaSourceV5.lo: v5/test/$(am__dirstamp) \
 	v5/test/$(DEPDIR)/$(am__dirstamp)
 v5/test/SramProbeV5.lo: v5/test/$(am__dirstamp) \
 	v5/test/$(DEPDIR)/$(am__dirstamp)
+v5/trace/$(am__dirstamp):
+	@$(MKDIR_P) v5/trace
+	@: > v5/trace/$(am__dirstamp)
+v5/trace/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) v5/trace/$(DEPDIR)
+	@: > v5/trace/$(DEPDIR)/$(am__dirstamp)
+v5/trace/TraceReplayCoordinatorV5.lo: v5/trace/$(am__dirstamp) \
+	v5/trace/$(DEPDIR)/$(am__dirstamp)
+v5/trace/TraceMemorySourceV5.lo: v5/trace/$(am__dirstamp) \
+	v5/trace/$(DEPDIR)/$(am__dirstamp)
+v5/trace/TraceSramSourceV5.lo: v5/trace/$(am__dirstamp) \
+	v5/trace/$(DEPDIR)/$(am__dirstamp)
+v5/trace/TraceNoCSourceV5.lo: v5/trace/$(am__dirstamp) \
+	v5/trace/$(DEPDIR)/$(am__dirstamp)
+v5/trace/TraceNoCSinkV5.lo: v5/trace/$(am__dirstamp) \
+	v5/trace/$(DEPDIR)/$(am__dirstamp)
 
-libSnnDLV5Core.la: $(libSnnDLV5Core_la_OBJECTS) $(libSnnDLV5Core_la_DEPENDENCIES) $(EXTRA_libSnnDLV5Core_la_DEPENDENCIES)
+libSnnDLV5Core.la: $(libSnnDLV5Core_la_OBJECTS) $(libSnnDLV5Core_la_DEPENDENCIES) $(EXTRA_libSnnDLV5Core_la_DEPENDENCIES) 
 	$(AM_V_CXXLD)$(libSnnDLV5Core_la_LINK) -rpath $(compdir) $(libSnnDLV5Core_la_OBJECTS) $(libSnnDLV5Core_la_LIBADD) $(LIBS)
 
 mostlyclean-compile:
@@ -1344,6 +1390,8 @@ mostlyclean-compile:
 	-rm -f v5/storage/*.lo
 	-rm -f v5/test/*.$(OBJEXT)
 	-rm -f v5/test/*.lo
+	-rm -f v5/trace/*.$(OBJEXT)
+	-rm -f v5/trace/*.lo
 
 distclean-compile:
 	-rm -f *.tab.c
@@ -1387,7 +1435,9 @@ include snn/timestep/$(DEPDIR)/TimestepTracker.Plo # am--include-marker
 include v5/api/$(DEPDIR)/ArtifactContract.Plo # am--include-marker
 include v5/control/$(DEPDIR)/EpochCoordinatorV5.Plo # am--include-marker
 include v5/core/$(DEPDIR)/CorePipeline.Plo # am--include-marker
+include v5/core/$(DEPDIR)/CubaLifNeuronOp.Plo # am--include-marker
 include v5/core/$(DEPDIR)/DeterministicRetireQueue.Plo # am--include-marker
+include v5/core/$(DEPDIR)/IfNeuronOp.Plo # am--include-marker
 include v5/core/$(DEPDIR)/LifNeuronOp.Plo # am--include-marker
 include v5/core/$(DEPDIR)/SnnCoreV5.Plo # am--include-marker
 include v5/noc/$(DEPDIR)/MulticastRouterV5.Plo # am--include-marker
@@ -1400,6 +1450,11 @@ include v5/storage/$(DEPDIR)/SnnDmaEngineV5.Plo # am--include-marker
 include v5/test/$(DEPDIR)/DmaSourceV5.Plo # am--include-marker
 include v5/test/$(DEPDIR)/IdealSynapseSource.Plo # am--include-marker
 include v5/test/$(DEPDIR)/SramProbeV5.Plo # am--include-marker
+include v5/trace/$(DEPDIR)/TraceMemorySourceV5.Plo # am--include-marker
+include v5/trace/$(DEPDIR)/TraceSramSourceV5.Plo # am--include-marker
+include v5/trace/$(DEPDIR)/TraceNoCSinkV5.Plo # am--include-marker
+include v5/trace/$(DEPDIR)/TraceNoCSourceV5.Plo # am--include-marker
+include v5/trace/$(DEPDIR)/TraceReplayCoordinatorV5.Plo # am--include-marker
 
 $(am__depfiles_remade):
 	@$(MKDIR_P) $(@D)
@@ -1458,6 +1513,7 @@ clean-libtool:
 	-rm -rf v5/noc/.libs v5/noc/_libs
 	-rm -rf v5/storage/.libs v5/storage/_libs
 	-rm -rf v5/test/.libs v5/test/_libs
+	-rm -rf v5/trace/.libs v5/trace/_libs
 snippets-local: 
 
 ID: $(am__tagged_files)
@@ -1621,6 +1677,8 @@ distclean-generic:
 	-rm -f v5/storage/$(am__dirstamp)
 	-rm -f v5/test/$(DEPDIR)/$(am__dirstamp)
 	-rm -f v5/test/$(am__dirstamp)
+	-rm -f v5/trace/$(DEPDIR)/$(am__dirstamp)
+	-rm -f v5/trace/$(am__dirstamp)
 
 maintainer-clean-generic:
 	@echo "This command is intended for maintainers to use"
@@ -1670,7 +1728,9 @@ distclean: distclean-am
 	-rm -f v5/api/$(DEPDIR)/ArtifactContract.Plo
 	-rm -f v5/control/$(DEPDIR)/EpochCoordinatorV5.Plo
 	-rm -f v5/core/$(DEPDIR)/CorePipeline.Plo
+	-rm -f v5/core/$(DEPDIR)/CubaLifNeuronOp.Plo
 	-rm -f v5/core/$(DEPDIR)/DeterministicRetireQueue.Plo
+	-rm -f v5/core/$(DEPDIR)/IfNeuronOp.Plo
 	-rm -f v5/core/$(DEPDIR)/LifNeuronOp.Plo
 	-rm -f v5/core/$(DEPDIR)/SnnCoreV5.Plo
 	-rm -f v5/noc/$(DEPDIR)/MulticastRouterV5.Plo
@@ -1683,6 +1743,11 @@ distclean: distclean-am
 	-rm -f v5/test/$(DEPDIR)/DmaSourceV5.Plo
 	-rm -f v5/test/$(DEPDIR)/IdealSynapseSource.Plo
 	-rm -f v5/test/$(DEPDIR)/SramProbeV5.Plo
+	-rm -f v5/trace/$(DEPDIR)/TraceMemorySourceV5.Plo
+	-rm -f v5/trace/$(DEPDIR)/TraceSramSourceV5.Plo
+	-rm -f v5/trace/$(DEPDIR)/TraceNoCSinkV5.Plo
+	-rm -f v5/trace/$(DEPDIR)/TraceNoCSourceV5.Plo
+	-rm -f v5/trace/$(DEPDIR)/TraceReplayCoordinatorV5.Plo
 	-rm -f Makefile
 distclean-am: clean-am distclean-compile distclean-generic \
 	distclean-tags
@@ -1767,7 +1832,9 @@ maintainer-clean: maintainer-clean-am
 	-rm -f v5/api/$(DEPDIR)/ArtifactContract.Plo
 	-rm -f v5/control/$(DEPDIR)/EpochCoordinatorV5.Plo
 	-rm -f v5/core/$(DEPDIR)/CorePipeline.Plo
+	-rm -f v5/core/$(DEPDIR)/CubaLifNeuronOp.Plo
 	-rm -f v5/core/$(DEPDIR)/DeterministicRetireQueue.Plo
+	-rm -f v5/core/$(DEPDIR)/IfNeuronOp.Plo
 	-rm -f v5/core/$(DEPDIR)/LifNeuronOp.Plo
 	-rm -f v5/core/$(DEPDIR)/SnnCoreV5.Plo
 	-rm -f v5/noc/$(DEPDIR)/MulticastRouterV5.Plo
@@ -1780,6 +1847,11 @@ maintainer-clean: maintainer-clean-am
 	-rm -f v5/test/$(DEPDIR)/DmaSourceV5.Plo
 	-rm -f v5/test/$(DEPDIR)/IdealSynapseSource.Plo
 	-rm -f v5/test/$(DEPDIR)/SramProbeV5.Plo
+	-rm -f v5/trace/$(DEPDIR)/TraceMemorySourceV5.Plo
+	-rm -f v5/trace/$(DEPDIR)/TraceSramSourceV5.Plo
+	-rm -f v5/trace/$(DEPDIR)/TraceNoCSinkV5.Plo
+	-rm -f v5/trace/$(DEPDIR)/TraceNoCSourceV5.Plo
+	-rm -f v5/trace/$(DEPDIR)/TraceReplayCoordinatorV5.Plo
 	-rm -f Makefile
 maintainer-clean-am: distclean-am maintainer-clean-generic
 
@@ -1823,7 +1895,7 @@ uninstall-am: uninstall-compLTLIBRARIES
 .PRECIOUS: Makefile
 
 
-.PHONY: check-boundaries test-compile test-timestep-core test-v5-core-pipeline \
+.PHONY: check-boundaries test-compile test-timestep-core test-v5-core-pipeline test-v5-cuba-lif \
 	test-v5-core-storage test-v5-banked-sram \
 	test-bcsr-source-contract test-v5-address test-v5-statistics test-v5-multicast-tree \
 	test-banked-sram test-local-storage
@@ -1858,17 +1930,33 @@ test-v5-multicast-tree:
 
 test-v5-core-pipeline:
 	$(TEST_LINK) $(srcdir)/tests/v5/test_core_pipeline.cc \
-		$(srcdir)/v5/core/CorePipeline.cc \
-		$(srcdir)/v5/core/DeterministicRetireQueue.cc \
+	$(srcdir)/v5/core/CorePipeline.cc \
+	$(srcdir)/v5/core/DeterministicRetireQueue.cc \
 		$(srcdir)/v5/core/LifNeuronOp.cc \
+		$(srcdir)/v5/core/IfNeuronOp.cc \
+		$(srcdir)/v5/core/CubaLifNeuronOp.cc \
 		$(srcdir)/v5/storage/CoreStorageV5.cc \
 		$(srcdir)/v5/storage/BankedSramV5.cc \
 		-o $(builddir)/test_core_pipeline$(EXEEXT) && \
 	$(builddir)/test_core_pipeline$(EXEEXT)
 
+test-v5-cuba-lif:
+	$(TEST_LINK) $(srcdir)/tests/v5/test_cuba_lif_neuron_op.cc \
+		$(srcdir)/v5/core/CubaLifNeuronOp.cc \
+		-o $(builddir)/test_cuba_lif_neuron_op$(EXEEXT) && \
+	$(builddir)/test_cuba_lif_neuron_op$(EXEEXT)
+
+test-v5-if:
+	$(TEST_LINK) $(srcdir)/tests/v5/test_if_neuron_op.cc \
+		$(srcdir)/v5/core/IfNeuronOp.cc \
+		$(srcdir)/v5/core/LifNeuronOp.cc \
+		-o $(builddir)/test_if_neuron_op$(EXEEXT) && \
+	$(builddir)/test_if_neuron_op$(EXEEXT)
+
 test-v5-core-storage:
 	$(TEST_LINK) $(srcdir)/tests/v5/test_core_storage_v5.cc \
 		$(srcdir)/v5/storage/CoreStorageV5.cc \
+		$(srcdir)/v5/core/CubaLifNeuronOp.cc \
 		$(srcdir)/v5/storage/BankedSramV5.cc \
 		-o $(builddir)/test_core_storage_v5$(EXEEXT) && \
 	$(builddir)/test_core_storage_v5$(EXEEXT)

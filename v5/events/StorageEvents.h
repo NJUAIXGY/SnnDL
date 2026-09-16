@@ -46,6 +46,7 @@ public:
     std::uint64_t service_cycle = 0;
     std::uint64_t completion_cycle = 0;
     std::uint32_t bank = 0;
+    std::uint32_t port = 0;
     std::vector<std::uint8_t> data;
     bool accepted = false;
     bool completed = false;
@@ -60,6 +61,7 @@ public:
         copy->service_cycle = service_cycle;
         copy->completion_cycle = completion_cycle;
         copy->bank = bank;
+        copy->port = port;
         copy->data = data;
         copy->accepted = accepted;
         copy->completed = completed;
@@ -74,6 +76,7 @@ public:
         SST_SER(service_cycle);
         SST_SER(completion_cycle);
         SST_SER(bank);
+        SST_SER(port);
         SST_SER(data);
         SST_SER(accepted);
         SST_SER(completed);

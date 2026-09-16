@@ -2,6 +2,7 @@
 #define SST_SNN_DL_V5_NOC_EVENTS_V5_H
 
 #include <cstdint>
+#include <string>
 #include <sst/core/event.h>
 #include <sst/core/serialization/serialize.h>
 
@@ -19,6 +20,8 @@ class NocPacketV5Event final : public SST::Event {
 public:
     std::uint16_t format_version = kNocPacketV5FormatVersion;
     std::uint64_t packet_id = 0;
+    std::uint64_t event_token = 0;
+    std::string event_id;
     std::uint64_t timestep = 0;
     std::uint32_t source_pe = 0;
     std::uint32_t source_core = 0;
@@ -36,7 +39,7 @@ public:
     NocPacketV5Event* clone() override { return new NocPacketV5Event(*this); }
     void serialize_order(SST::Core::Serialization::serializer& ser) override {
         Event::serialize_order(ser);
-        SST_SER(format_version); SST_SER(packet_id); SST_SER(timestep);
+        SST_SER(format_version); SST_SER(packet_id); SST_SER(event_token); SST_SER(event_id); SST_SER(timestep);
         SST_SER(source_pe); SST_SER(source_core); SST_SER(source_neuron); SST_SER(route_id);
         SST_SER(destination_pe); SST_SER(destination_core); SST_SER(destination_core_mask); SST_SER(target_neuron);
         SST_SER(source_event_seq); SST_SER(injection_time_ns); SST_SER(payload_bytes);

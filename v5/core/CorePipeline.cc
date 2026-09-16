@@ -16,12 +16,43 @@ std::uint32_t positiveWidth(std::uint32_t width) {
 }
 
 CorePipeline::CorePipeline(const CorePipelineConfig& config)
-    : config_(config), lif_(config.lif), retire_q_(config.retire_entries),
-      storage_(nullptr), state_snapshot_(config.neurons) {
+    : config_(config), lif_(config.lif), cuba_lif_(config.cuba_lif), if_(config.if_op),
+      retire_q_(config.retire_entries), storage_(nullptr),
+      state_snapshot_(config.neurons), cuba_state_snapshot_(config.neurons) {
     if (config_.neurons == 0 || config_.ingress_entries == 0 || config_.row_entries == 0 ||
         config_.synapse_entries == 0 || config_.accumulator_entries == 0 ||
         config_.held_spike_entries == 0) {
         throw std::invalid_argument("v5 core queue and neuron capacities must be positive");
+    }
+    if (!config_.schedule_stages.empty()) {
+        static const char* expected_ids[] = {
+            "preload", "ingress", "row-lookup", "synapse-issue", "neuron-update",
+            "retire", "seal", "commit", "drain",
+        };
+        if (config_.schedule_stages.size() != sizeof(expected_ids) / sizeof(expected_ids[0])) {
+            throw std::invalid_argument("SchedulePlan descriptor must contain exactly nine stages");
+        }
+        for (std::size_t index = 0; index < config_.schedule_stages.size(); ++index) {
+            const auto& stage = config_.schedule_stages[index];
+            if (stage.id != expected_ids[index] || stage.operation.empty() ||
+                stage.resource.empty() || stage.request_class.empty() ||
+                stage.retry_policy.empty() || stage.issue_group_id.empty() ||
+                stage.max_inflight == 0) {
+                throw std::invalid_argument("SchedulePlan descriptor has an invalid stage");
+            }
+            for (const auto& dependency : stage.dependencies) {
+                if (dependency == stage.id) {
+                    throw std::invalid_argument("SchedulePlan descriptor contains a self dependency");
+                }
+            }
+            if (index == 0 && !stage.dependencies.empty()) {
+                throw std::invalid_argument("SchedulePlan preload stage must have no dependencies");
+            }
+            if (index > 0 && (stage.dependencies.size() != 1 ||
+                              stage.dependencies.front() != expected_ids[index - 1])) {
+                throw std::invalid_argument("SchedulePlan descriptor dependencies are not a linear timestep DAG");
+            }
+        }
     }
     config_.ingress.width = positiveWidth(config_.ingress.width);
     config_.row_lookup.width = positiveWidth(config_.row_lookup.width);
@@ -29,6 +60,17 @@ CorePipeline::CorePipeline(const CorePipelineConfig& config)
     config_.retire.width = positiveWidth(config_.retire.width);
     config_.accumulator.width = positiveWidth(config_.accumulator.width);
     config_.neuron.width = positiveWidth(config_.neuron.width);
+    if (config_.neuron_bindings.empty()) {
+        config_.neuron_bindings.resize(config_.neurons);
+        for (auto& binding : config_.neuron_bindings) {
+            binding.kind = config_.neuron_operator;
+            binding.lif = config_.lif;
+            binding.cuba_lif = config_.cuba_lif;
+            binding.if_op = config_.if_op;
+        }
+    } else if (config_.neuron_bindings.size() != config_.neurons) {
+        throw std::invalid_argument("v5 neuron_bindings must cover every local neuron");
+    }
     config_.storage.neurons = config_.neurons;
     // CoreDelta is resident state, not a transient retire queue.  Keep its
     // fallback independent from pipeline backpressure so a small retire queue
@@ -38,6 +80,30 @@ CorePipeline::CorePipeline(const CorePipelineConfig& config)
             CoreStorageV5Config{}.max_delta_entries_per_neuron;
     }
     storage_ = std::make_unique<CoreStorageV5>(config_.storage);
+}
+
+std::size_t CorePipeline::scheduleCapacity_(const char* stage_id, std::size_t fallback) const {
+    if (!config_.schedule_admission_enabled || config_.schedule_stages.empty()) return fallback;
+    for (const auto& stage : config_.schedule_stages) {
+        if (stage.id == stage_id) return std::min(fallback, stage.max_inflight);
+    }
+    throw std::logic_error(std::string("SchedulePlan descriptor is missing stage ") + stage_id);
+}
+
+std::size_t CorePipeline::scheduleWidth_(const char* stage_id, std::size_t fallback) const {
+    if (!config_.schedule_admission_enabled || config_.schedule_stages.empty()) return fallback;
+    for (const auto& stage : config_.schedule_stages) {
+        if (stage.id == stage_id) return std::min(fallback, stage.max_inflight);
+    }
+    throw std::logic_error(std::string("SchedulePlan descriptor is missing stage ") + stage_id);
+}
+
+bool CorePipeline::scheduleReady_(const char* stage_id) const {
+    if (!config_.schedule_admission_enabled || config_.schedule_stages.empty()) return true;
+    for (const auto& stage : config_.schedule_stages) {
+        if (stage.id == stage_id) return cycle_ >= stage.earliest_cycle;
+    }
+    throw std::logic_error(std::string("SchedulePlan descriptor is missing stage ") + stage_id);
 }
 
 std::uint64_t CorePipeline::effectiveLatency_(std::uint32_t latency) {
@@ -149,7 +215,12 @@ void CorePipeline::start(std::uint64_t timestep) {
 
 bool CorePipeline::submitSpike(const SpikeInput& spike) {
     if (!active_ || sealed_ || spike.timestep != active_timestep_) return false;
-    if (ingress_q_.size() >= config_.ingress_entries) {
+    const auto ingress_capacity = config_.schedule_stages.empty()
+        ? (config_.schedule_admission_enabled && config_.schedule_ingress_entries > 0
+            ? std::min(config_.ingress_entries, config_.schedule_ingress_entries)
+            : config_.ingress_entries)
+        : scheduleCapacity_("ingress", config_.ingress_entries);
+    if (ingress_q_.size() >= ingress_capacity) {
         ++stats_.ingress_full_cycles;
         return false;
     }
@@ -162,8 +233,13 @@ bool CorePipeline::submitSpike(const SpikeInput& spike) {
 }
 
 bool CorePipeline::acceptSynapseResponse(const SynapseResponse& response) {
+    const auto synapse_capacity = config_.schedule_stages.empty()
+        ? (config_.schedule_admission_enabled && config_.schedule_synapse_entries > 0
+            ? std::min(config_.synapse_entries, config_.schedule_synapse_entries)
+            : config_.synapse_entries)
+        : scheduleCapacity_("synapse-issue", config_.synapse_entries);
     if (!active_ || response.timestep != active_timestep_ ||
-        response.post_neuron >= config_.neurons || synapse_q_.size() >= config_.synapse_entries) {
+        response.post_neuron >= config_.neurons || synapse_q_.size() >= synapse_capacity) {
         return false;
     }
     const RowKey key = keyFor_(response.source_neuron, response.source_event_seq);
@@ -202,20 +278,50 @@ void CorePipeline::sealIngress() {
 
 void CorePipeline::processNeuron_() {
     if (!neuron_batch_pending_ || neuron_batch_ready_ > cycle_) return;
-    std::vector<LifNeuronResult> results;
-    results.reserve(neuron_batch_count_);
+    struct EvaluatedNeuron {
+        NeuronOperatorKind kind = NeuronOperatorKind::Lif;
+        LifNeuronResult lif;
+        CubaLifNeuronResult cuba_lif;
+        bool fired = false;
+    };
     std::size_t new_fires = 0;
+    std::vector<EvaluatedNeuron> results;
+    results.reserve(neuron_batch_count_);
     for (std::uint32_t i = 0; i < neuron_batch_count_; ++i) {
         const auto neuron = neuron_batch_begin_ + i;
-        LifNeuronState state;
+        const auto& binding = config_.neuron_bindings[neuron];
         std::vector<RetireEntry> ordered;
-        if (!storage_->readState(neuron, state) || !storage_->readDeltaEntries(neuron, ordered)) {
-            ++stats_.neuron.stall_cycles;
-            return;
-        }
         float delta = 0.0f;
-        for (const auto& entry : ordered) delta += entry.weight;
-        results.push_back(lif_.evaluate(state, delta));
+        if (binding.kind == NeuronOperatorKind::CubaLif) {
+            CubaLifNeuronState state;
+            if (!storage_->readCubaLifState(neuron, state) ||
+                !storage_->readDeltaEntries(neuron, ordered)) {
+                ++stats_.neuron.stall_cycles;
+                return;
+            }
+            for (const auto& entry : ordered) delta += entry.weight;
+            CubaLifNeuronOp op(binding.cuba_lif);
+            const auto result = op.evaluate(state, delta);
+            results.push_back(EvaluatedNeuron{binding.kind, {}, result, result.fired});
+        } else {
+            LifNeuronState state;
+            if (!storage_->readState(neuron, state) || !storage_->readDeltaEntries(neuron, ordered)) {
+                ++stats_.neuron.stall_cycles;
+                return;
+            }
+            for (const auto& entry : ordered) delta += entry.weight;
+            if (binding.kind == NeuronOperatorKind::Padding) {
+                results.push_back(EvaluatedNeuron{binding.kind, LifNeuronResult{state, false}, {}, false});
+            } else if (binding.kind == NeuronOperatorKind::If) {
+                IfNeuronOp op(binding.if_op);
+                const auto result = op.evaluate(state, delta);
+                results.push_back(EvaluatedNeuron{binding.kind, result, {}, result.fired});
+            } else {
+                LifNeuronOp op(binding.lif);
+                const auto result = op.evaluate(state, delta);
+                results.push_back(EvaluatedNeuron{binding.kind, result, {}, result.fired});
+            }
+        }
         if (results.back().fired) ++new_fires;
     }
     if (held_count_ + new_fires > config_.held_spike_entries) {
@@ -224,12 +330,16 @@ void CorePipeline::processNeuron_() {
     }
     for (std::uint32_t i = 0; i < neuron_batch_count_; ++i) {
         const auto neuron = neuron_batch_begin_ + i;
-        if (!storage_->writeState(neuron, results[i].state) || !storage_->clearDelta(neuron)) {
+        const bool state_written = results[i].kind == NeuronOperatorKind::CubaLif
+                                       ? storage_->writeCubaLifState(neuron, results[i].cuba_lif.state)
+                                       : storage_->writeState(neuron, results[i].lif.state);
+        if (!state_written || !storage_->clearDelta(neuron)) {
             throw std::logic_error("v5 CoreState/CoreDelta write failed");
         }
         ++stats_.neuron.issued;
         ++stats_.neuron.completed;
-        if (results[i].fired) {
+        const bool fired = results[i].fired;
+        if (fired) {
             const FiredSpike spike{active_timestep_ + 1, neuron, 0};
             held_spikes_[active_timestep_ + 1].push_back(spike);
             ++held_count_;
@@ -281,8 +391,9 @@ void CorePipeline::processRetire_() {
 }
 
 void CorePipeline::processSynapse_() {
+    if (!scheduleReady_("synapse-issue")) return;
     std::uint32_t processed = 0;
-    while (processed < config_.synapse.width && !synapse_q_.empty()) {
+    while (processed < scheduleWidth_("synapse-issue", config_.synapse.width) && !synapse_q_.empty()) {
         auto& item = synapse_q_.front();
         if (item.ready_cycle > cycle_) break;
         if (retire_q_.full()) {
@@ -308,8 +419,9 @@ void CorePipeline::processSynapse_() {
 }
 
 void CorePipeline::processRows_() {
+    if (!scheduleReady_("row-lookup")) return;
     std::uint32_t processed = 0;
-    while (processed < config_.row_lookup.width && !row_q_.empty()) {
+    while (processed < scheduleWidth_("row-lookup", config_.row_lookup.width) && !row_q_.empty()) {
         auto& item = row_q_.front();
         if (item.ready_cycle > cycle_) break;
         if (row_request_out_.size() >= config_.row_entries) {
@@ -341,9 +453,10 @@ void CorePipeline::processRows_() {
 }
 
 void CorePipeline::processIngress_() {
+    if (!scheduleReady_("ingress")) return;
     if (ingress_q_.size() >= config_.ingress_entries) ++stats_.ingress_full_cycles;
     std::uint32_t processed = 0;
-    while (processed < config_.ingress.width && !ingress_q_.empty()) {
+    while (processed < scheduleWidth_("ingress", config_.ingress.width) && !ingress_q_.empty()) {
         auto& item = ingress_q_.front();
         if (item.ready_cycle > cycle_) break;
         if (row_q_.size() >= config_.row_entries) {
@@ -374,13 +487,16 @@ bool CorePipeline::queuesEmpty_() const {
 }
 
 void CorePipeline::scheduleNeuron_() {
+    if (!scheduleReady_("neuron-update")) return;
     if (!sealed_ || !allRowsComplete_() || !queuesEmpty_() || scan_done_ || neuron_batch_pending_) return;
     if (next_neuron_ >= config_.neurons) {
         scan_done_ = true;
         return;
     }
     neuron_batch_begin_ = next_neuron_;
-    neuron_batch_count_ = std::min<std::uint32_t>(config_.neuron.width, config_.neurons - next_neuron_);
+    neuron_batch_count_ = std::min<std::uint32_t>(
+        static_cast<std::uint32_t>(scheduleWidth_("neuron-update", config_.neuron.width)),
+        config_.neurons - next_neuron_);
     neuron_batch_ready_ = cycle_ + effectiveLatency_(config_.neuron.latency_cycles);
     neuron_batch_pending_ = true;
     stats_.neuron.accepted += neuron_batch_count_;
@@ -440,6 +556,11 @@ std::size_t CorePipeline::pendingEntries() const {
 }
 
 const std::vector<LifNeuronState>& CorePipeline::state() const {
+    for (const auto& binding : config_.neuron_bindings) {
+        if (binding.kind != NeuronOperatorKind::Lif) {
+            throw std::logic_error("v5 CorePipeline state() is only valid for all-LIF bindings");
+        }
+    }
     for (std::uint32_t neuron = 0; neuron < config_.neurons; ++neuron) {
         if (!storage_->readState(neuron, state_snapshot_[neuron])) {
             throw std::logic_error("v5 CoreState snapshot read failed");
@@ -448,15 +569,46 @@ const std::vector<LifNeuronState>& CorePipeline::state() const {
     return state_snapshot_;
 }
 
+const std::vector<CubaLifNeuronState>& CorePipeline::cubaState() const {
+    for (const auto& binding : config_.neuron_bindings) {
+        if (binding.kind != NeuronOperatorKind::CubaLif) {
+            throw std::logic_error("v5 CorePipeline cubaState() is only valid for all-CubaLIF bindings");
+        }
+    }
+    for (std::uint32_t neuron = 0; neuron < config_.neurons; ++neuron) {
+        if (!storage_->readCubaLifState(neuron, cuba_state_snapshot_[neuron])) {
+            throw std::logic_error("v5 CubaLIF CoreState snapshot read failed");
+        }
+    }
+    return cuba_state_snapshot_;
+}
+
 std::uint64_t CorePipeline::functionalHash() const {
     std::uint64_t hash = 0x6a09e667f3bcc909ULL;
-    const auto& snapshot = state();
-    for (std::size_t neuron = 0; neuron < snapshot.size(); ++neuron) {
-        std::uint32_t membrane_bits = 0;
-        std::memcpy(&membrane_bits, &snapshot[neuron].membrane, sizeof(membrane_bits));
+    for (std::size_t neuron = 0; neuron < config_.neuron_bindings.size(); ++neuron) {
         hash = hashMix_(hash, neuron);
-        hash = hashMix_(hash, membrane_bits);
-        hash = hashMix_(hash, snapshot[neuron].refractory);
+        hash = hashMix_(hash, static_cast<std::uint8_t>(config_.neuron_bindings[neuron].kind));
+        if (config_.neuron_bindings[neuron].kind == NeuronOperatorKind::CubaLif) {
+            CubaLifNeuronState snapshot;
+            if (!storage_->readCubaLifState(static_cast<std::uint32_t>(neuron), snapshot)) {
+                throw std::logic_error("v5 CubaLIF CoreState hash read failed");
+            }
+            std::uint32_t current_bits = 0;
+            std::uint32_t membrane_bits = 0;
+            std::memcpy(&current_bits, &snapshot.synaptic_current, sizeof(current_bits));
+            std::memcpy(&membrane_bits, &snapshot.membrane, sizeof(membrane_bits));
+            hash = hashMix_(hash, current_bits);
+            hash = hashMix_(hash, membrane_bits);
+        } else {
+            LifNeuronState snapshot;
+            if (!storage_->readState(static_cast<std::uint32_t>(neuron), snapshot)) {
+                throw std::logic_error("v5 LIF CoreState hash read failed");
+            }
+            std::uint32_t membrane_bits = 0;
+            std::memcpy(&membrane_bits, &snapshot.membrane, sizeof(membrane_bits));
+            hash = hashMix_(hash, membrane_bits);
+            hash = hashMix_(hash, snapshot.refractory);
+        }
     }
     return hash;
 }

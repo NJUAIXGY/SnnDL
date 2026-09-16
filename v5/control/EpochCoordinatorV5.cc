@@ -7,6 +7,18 @@
 
 namespace SST { namespace SnnDL { namespace v5 {
 
+namespace {
+const char* phaseName(std::uint8_t phase) {
+    switch (phase) {
+    case 0: return "Preload";
+    case 1: return "Ingress";
+    case 2: return "CommitReady";
+    case 3: return "CommitDone";
+    default: return "Finished";
+    }
+}
+}
+
 EpochCoordinatorV5::EpochCoordinatorV5(SST::ComponentId_t id, SST::Params& params)
     : Component(id), out_("SnnDL.EpochCoordinatorV5", 0, 0, Output::STDOUT),
       pes_(std::max(1u, params.find<std::uint32_t>("mesh_pes", 1))),
@@ -16,9 +28,28 @@ EpochCoordinatorV5::EpochCoordinatorV5(SST::ComponentId_t id, SST::Params& param
       timeout_cycles_(std::max<std::uint64_t>(1, params.find<std::uint64_t>("timeout_cycles", 1000000))),
       epoch_(start_timestep_), output_json_(params.find<std::string>("output_json", "")) {
     out_.setVerboseLevel(params.find<int>("verbose", 0));
-    command_ = configureLink("command");
-    status_ = configureLink("status", new Event::Handler2<EpochCoordinatorV5, &EpochCoordinatorV5::handleStatus_>(this));
-    if (!command_ || !status_) out_.fatal(CALL_INFO, -1, "EpochCoordinatorV5 requires command and status links\n");
+    if (pes_ == 1) {
+        command_ = configureLink("command");
+        status_ = configureLink("status", new Event::Handler2<EpochCoordinatorV5, &EpochCoordinatorV5::handleStatus_>(this));
+        if (!command_ || !status_) {
+            out_.fatal(CALL_INFO, -1, "single-PE EpochCoordinatorV5 requires command and status links\n");
+        }
+    } else {
+        command_pe_links_.resize(pes_, nullptr);
+        status_pe_links_.resize(pes_, nullptr);
+        for (std::uint32_t pe = 0; pe < pes_; ++pe) {
+            command_pe_links_[pe] = configureLink("command_pe" + std::to_string(pe));
+            status_pe_links_[pe] = configureLink(
+                "status_pe" + std::to_string(pe),
+                new Event::Handler2<EpochCoordinatorV5, &EpochCoordinatorV5::handleStatus_>(this));
+        }
+        if (std::any_of(command_pe_links_.begin(), command_pe_links_.end(),
+                        [](SST::Link* link) { return link == nullptr; }) ||
+            std::any_of(status_pe_links_.begin(), status_pe_links_.end(),
+                        [](SST::Link* link) { return link == nullptr; })) {
+            out_.fatal(CALL_INFO, -1, "scaled EpochCoordinatorV5 requires command_pe/status_pe links per PE\n");
+        }
+    }
     seen_.resize(static_cast<std::size_t>(pes_) * cores_per_pe_, false);
     registerClock(params.find<std::string>("clock", "1GHz"), new Clock::Handler2<EpochCoordinatorV5, &EpochCoordinatorV5::tick_>(this));
     for (const char* name : {"sync.commands", "sync.reports", "sync.epochs_completed",
@@ -40,6 +71,10 @@ bool EpochCoordinatorV5::allReports_() const {
     return std::all_of(seen_.begin(), seen_.end(), [](bool value) { return value; });
 }
 
+std::size_t EpochCoordinatorV5::seenCount_() const {
+    return static_cast<std::size_t>(std::count(seen_.begin(), seen_.end(), true));
+}
+
 void EpochCoordinatorV5::resetReports_() {
     std::fill(seen_.begin(), seen_.end(), false);
     last_progress_cycle_ = cycle_;
@@ -57,7 +92,10 @@ void EpochCoordinatorV5::sendAll_(CoreControlOp operation, std::uint64_t epoch) 
             packet->source_core = 0;
             packet->destination_pe = pe;
             packet->destination_core = core;
-            command_->send(packet);
+            // Every epoch command is sent over the direct link for its PE.
+            // It never enters Merlin or either virtual network.
+            if (pes_ == 1) command_->send(packet);
+            else command_pe_links_[pe]->send(packet);
             ++commands_;
         }
     }
@@ -76,6 +114,8 @@ void EpochCoordinatorV5::handleStatus_(SST::Event* event) {
         delete event; out_.fatal(CALL_INFO, -1, "EpochCoordinatorV5 received an invalid status\n");
     }
     ++reports_;
+    const auto report_index = static_cast<std::size_t>(packet->operation);
+    if (report_index < report_counts_.size()) ++report_counts_[report_index];
     last_progress_cycle_ = cycle_;
 
     if (packet->operation == CoreControlOp::IngressProgress) {
@@ -83,6 +123,7 @@ void EpochCoordinatorV5::handleStatus_(SST::Event* event) {
             delete packet; out_.fatal(CALL_INFO, -1, "cross-epoch ingress delivery report\n");
         }
         delivered_data_ += packet->logical_count;
+        total_delivered_data_ += packet->logical_count;
         if (allReports_() && delivered_data_ == expected_data_) {
             phase_ = Phase::CommitReady;
             advance_(CoreControlOp::SealIngress);
@@ -111,7 +152,10 @@ void EpochCoordinatorV5::handleStatus_(SST::Event* event) {
         delete packet; out_.fatal(CALL_INFO, -1, "unexpected report for current epoch phase\n");
     }
     seen_[index] = true;
-    if (phase_ == Phase::Ingress) expected_data_ += packet->logical_count;
+    if (phase_ == Phase::Ingress) {
+        expected_data_ += packet->logical_count;
+        total_expected_data_ += packet->logical_count;
+    }
 
     if (allReports_()) {
         if (phase_ == Phase::Preload) {
@@ -162,6 +206,7 @@ void EpochCoordinatorV5::writeEvidence_() const {
     if (output_json_.empty()) return;
     std::ofstream out(output_json_);
     out << "{\n  \"protocol\": \"timed_control_vn\",\n"
+        << "  \"control_transport\": \"direct_sst_links\",\n"
         << "  \"data_vn\": " << kNocDataVn << ",\n"
         << "  \"control_vn\": " << kNocControlVn << ",\n"
         << "  \"participants\": " << seen_.size() << ",\n"
@@ -170,6 +215,25 @@ void EpochCoordinatorV5::writeEvidence_() const {
         << "  \"epochs_completed\": " << epochs_completed_ << ",\n"
         << "  \"commands\": " << commands_ << ",\n"
         << "  \"reports\": " << reports_ << ",\n"
+        << "  \"phase\": \"" << phaseName(static_cast<std::uint8_t>(phase_)) << "\",\n"
+        << "  \"phase_id\": " << static_cast<unsigned>(phase_) << ",\n"
+        // Keep the established field names for the run-wide contract.  The
+        // epoch-local values remain available for debugging the final barrier.
+        << "  \"expected_data\": " << total_expected_data_ << ",\n"
+        << "  \"delivered_data\": " << total_delivered_data_ << ",\n"
+        << "  \"epoch_expected_data\": " << expected_data_ << ",\n"
+        << "  \"epoch_delivered_data\": " << delivered_data_ << ",\n"
+        << "  \"seen_participants\": " << seenCount_() << ",\n"
+        << "  \"report_counts\": {"
+        << "\"Start\": " << report_counts_[0]
+        << ", \"SealIngress\": " << report_counts_[1]
+        << ", \"Commit\": " << report_counts_[2]
+        << ", \"Abort\": " << report_counts_[3]
+        << ", \"CommitReady\": " << report_counts_[4]
+        << ", \"CommitDone\": " << report_counts_[5]
+        << ", \"PreloadReady\": " << report_counts_[6]
+        << ", \"IngressReady\": " << report_counts_[7]
+        << ", \"IngressProgress\": " << report_counts_[8] << "},\n"
         << "  \"barrier_wait_ns\": " << barrier_wait_ns_ << ",\n"
         << "  \"timeouts\": " << timeouts_ << ",\n"
         << "  \"status\": \"" << (phase_ == Phase::Finished ? "PASS" : "INCOMPLETE") << "\"\n}\n";

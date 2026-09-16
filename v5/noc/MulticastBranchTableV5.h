@@ -41,7 +41,13 @@ inline MulticastBranchTableV5 parseMulticastBranchTableV5(const std::string& enc
         std::string local;
         std::string extra;
         if (!std::getline(fields, route, ':') || !std::getline(fields, outputs, ':') ||
-            !std::getline(fields, local, ':') || std::getline(fields, extra, ':')) {
+            !std::getline(fields, local, ':')) {
+            throw std::invalid_argument("invalid branch table record");
+        }
+        // The public encoding is route_id:output_mask:local_core_mask. Older
+        // generated plans occasionally appended an empty fourth field; accept
+        // that compatibility spelling but reject non-empty trailing data.
+        if (std::getline(fields, extra, ':') && !extra.empty()) {
             throw std::invalid_argument("invalid branch table record");
         }
         const auto route_id = parseMulticastUnsignedV5(route);

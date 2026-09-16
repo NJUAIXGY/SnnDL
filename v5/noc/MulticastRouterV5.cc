@@ -81,8 +81,16 @@ bool MulticastRouterV5::tick_(SST::Cycle_t) {
         if (inputs_[input].empty() || inputs_[input].front().ready_cycle > cycle_) continue;
         auto* packet = inputs_[input].front().packet;
         const auto found = branches_.find(packet->route_id);
-        if (found == branches_.end()) out_.fatal(CALL_INFO, -1, "missing branch action for route=%llu pe=%u\n",
-                                                  static_cast<unsigned long long>(packet->route_id), pe_id_);
+        if (found == branches_.end()) {
+            out_.fatal(CALL_INFO, -1,
+                      "missing branch action for route=%llu pe=%u packet=%llu event=%s token=%llu "
+                      "source=%u/%u destination=%u/%u mask=%llu\n",
+                      static_cast<unsigned long long>(packet->route_id), pe_id_,
+                      static_cast<unsigned long long>(packet->packet_id), packet->event_id.c_str(),
+                      static_cast<unsigned long long>(packet->event_token), packet->source_pe,
+                      packet->source_core, packet->destination_pe, packet->destination_core,
+                      static_cast<unsigned long long>(packet->destination_core_mask));
+        }
         ++route_lookups_;
         std::vector<Port> outputs;
         for (Port port : {Local, East, West, South, North})

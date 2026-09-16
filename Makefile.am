@@ -104,7 +104,7 @@ libSnnDL_la_LIBADD = \
 TEST_LINK = $(CXXLD) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) \
 	$(AM_CPPFLAGS) $(CPPFLAGS) $(CXXFLAGS)
 
-.PHONY: check-boundaries test-compile test-timestep-core test-v5-core-pipeline \
+.PHONY: check-boundaries test-compile test-timestep-core test-v5-core-pipeline test-v5-cuba-lif \
 	test-v5-core-storage test-v5-banked-sram \
 	test-bcsr-source-contract test-v5-address test-v5-statistics test-v5-multicast-tree \
 	test-banked-sram test-local-storage
@@ -139,17 +139,33 @@ test-v5-multicast-tree:
 
 test-v5-core-pipeline:
 	$(TEST_LINK) $(srcdir)/tests/v5/test_core_pipeline.cc \
-		$(srcdir)/v5/core/CorePipeline.cc \
-		$(srcdir)/v5/core/DeterministicRetireQueue.cc \
+	$(srcdir)/v5/core/CorePipeline.cc \
+	$(srcdir)/v5/core/DeterministicRetireQueue.cc \
 		$(srcdir)/v5/core/LifNeuronOp.cc \
+		$(srcdir)/v5/core/IfNeuronOp.cc \
+		$(srcdir)/v5/core/CubaLifNeuronOp.cc \
 		$(srcdir)/v5/storage/CoreStorageV5.cc \
 		$(srcdir)/v5/storage/BankedSramV5.cc \
 		-o $(builddir)/test_core_pipeline$(EXEEXT) && \
 	$(builddir)/test_core_pipeline$(EXEEXT)
 
+test-v5-cuba-lif:
+	$(TEST_LINK) $(srcdir)/tests/v5/test_cuba_lif_neuron_op.cc \
+		$(srcdir)/v5/core/CubaLifNeuronOp.cc \
+		-o $(builddir)/test_cuba_lif_neuron_op$(EXEEXT) && \
+	$(builddir)/test_cuba_lif_neuron_op$(EXEEXT)
+
+test-v5-if:
+	$(TEST_LINK) $(srcdir)/tests/v5/test_if_neuron_op.cc \
+		$(srcdir)/v5/core/IfNeuronOp.cc \
+		$(srcdir)/v5/core/LifNeuronOp.cc \
+		-o $(builddir)/test_if_neuron_op$(EXEEXT) && \
+	$(builddir)/test_if_neuron_op$(EXEEXT)
+
 test-v5-core-storage:
 	$(TEST_LINK) $(srcdir)/tests/v5/test_core_storage_v5.cc \
 		$(srcdir)/v5/storage/CoreStorageV5.cc \
+		$(srcdir)/v5/core/CubaLifNeuronOp.cc \
 		$(srcdir)/v5/storage/BankedSramV5.cc \
 		-o $(builddir)/test_core_storage_v5$(EXEEXT) && \
 	$(builddir)/test_core_storage_v5$(EXEEXT)

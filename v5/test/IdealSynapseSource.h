@@ -10,8 +10,10 @@
 
 #include <cstdint>
 #include <deque>
+#include <fstream>
 #include <map>
 #include <string>
+#include <sstream>
 #include <vector>
 
 namespace SST {
@@ -37,7 +39,7 @@ public:
         {"edges", "Semicolon-separated pre:post:weight:ordinal rows", "0:0:1.0:0"},
         {"stimuli", "Semicolon-separated timestep:source[:sequence] spikes", "0:0:1"},
         {"reverse_responses", "Return row responses in reverse order", "0"},
-        {"memory_backed_weights", "Read row records through StandardMem after DMA preload", "0"},
+        {"memory_backed_weights", "Read row records through StandardMem from the ChipDram hierarchy", "0"},
         {"external_control", "Receive Start/Seal/Commit from EpochCoordinatorV5", "0"},
         {"artifact_required", "Reject legacy edge-string mode", "0"},
         {"artifact_weight_file", "Validated canonical weight artifact file", ""},
@@ -47,8 +49,17 @@ public:
         {"artifact_stimuli", "Canonical timestep:source:sequence stimuli", ""},
         {"artifact_digest", "Canonical manifest graph digest", ""},
         {"weight_image_base", "ChipDram base address for the untimed weight image", "0"},
-        {"weight_read_base", "Local weight scratchpad base address", "0"},
+        {"weight_read_base", "ChipDram base address for timed row reads", "0"},
+        {"weight_cache_line_bytes", "Cache-line boundary used to split timed row reads", "64"},
+        {"weight_image_write_bytes", "Maximum bytes per untimed weight-image write", "64"},
+        {"weight_read_granularity_bytes", "Physical StandardMem row-read granularity (multiple of the 16-byte weight record)", "16"},
+        {"dram_bank_count", "Compiler logical chip-DRAM bank count for request evidence", "1"},
+        {"dram_bank_interleave_bytes", "Compiler logical chip-DRAM bank interleave", "64"},
+        {"dram_bank_policy", "Compiler logical chip-DRAM bank policy", "low_bits"},
         {"output_json", "Optional JSON evidence path", ""},
+        {"request_trace_json", "Optional JSONL path for canonical StandardMem request identity trace", ""},
+        {"readout_start", "Global first neuron in the classification readout population", "0"},
+        {"readout_count", "Number of neurons in the classification readout population; zero disables readout", "0"},
         {"clock", "Driver clock", "1GHz"},
         {"verbose", "Verbose logging level", "0"}
     )
@@ -101,12 +112,15 @@ private:
     void issueMemoryRead_();
     void buildWeightImage_();
     void sendNextProviderItem_();
+    void maybeFinish_();
     void writeEvidence_() const;
     static std::vector<std::string> split_(const std::string& value, char separator);
     void parseEdges_(const std::string& encoded);
     void parseStimuli_(const std::string& encoded);
     void parseArtifactRows_(const std::string& encoded);
     void loadArtifactWeights_(const std::string& path, std::uint64_t offset, std::uint64_t bytes);
+    void writeRequestTrace_() const;
+    void appendRequestTrace_() const;
 
     SST::Output out_;
     SST::Link* control_link_ = nullptr;
@@ -127,7 +141,14 @@ private:
     bool artifact_mode_ = false;
     std::uint64_t weight_image_base_ = 0;
     std::uint64_t weight_read_base_ = 0;
+    std::size_t weight_cache_line_bytes_ = 64;
+    std::size_t weight_image_write_bytes_ = 64;
+    std::size_t weight_read_granularity_bytes_ = 16;
+    std::size_t dram_bank_count_ = 1;
+    std::size_t dram_bank_interleave_bytes_ = 64;
+    std::string dram_bank_policy_ = "low_bits";
     std::string output_json_;
+    std::string request_trace_json_;
     std::vector<Edge> edges_;
     std::vector<Stimulus> stimuli_;
     std::map<std::uint64_t, std::vector<Edge>> edges_by_pre_;
@@ -158,22 +179,52 @@ private:
     bool stimuli_sent_ = false;
     bool seal_sent_ = false;
     bool finished_ = false;
+    bool final_commit_done_pending_ = false;
     bool preload_ready_ = false;
     bool image_initialized_ = false;
     bool preload_reported_ = false;
     bool ingress_ready_reported_ = false;
     std::string artifact_digest_;
     std::uint64_t pending_memory_request_ = 0;
+    std::size_t pending_memory_records_ = 0;
     bool pending_memory_ = false;
     std::uint64_t preload_ready_cycle_ = 0;
     std::uint64_t start_cycle_ = 0;
     std::uint64_t preload_wait_cycles_ = 0;
     std::uint64_t memory_reads_ = 0;
+    std::uint64_t memory_requests_ = 0;
     std::uint64_t memory_read_bytes_ = 0;
+    std::uint64_t next_memory_trace_sequence_ = 0;
+    struct MemoryRequestTrace {
+        std::string identity;
+        std::uint64_t request_id = 0;
+        std::uint64_t timestep = 0;
+        std::uint64_t source_neuron = 0;
+        std::uint64_t source_event_seq = 0;
+        std::uint64_t row_id = 0;
+        std::uint64_t sequence = 0;
+        std::uint64_t byte_address = 0;
+        std::uint64_t bytes = 0;
+        std::uint64_t records = 0;
+        std::uint64_t issue_cycle = 0;
+        std::uint64_t completion_cycle = 0;
+        std::uint64_t bank = 0;
+        bool completed = false;
+    };
+    // At most one StandardMem request is outstanding per provider. Keep only
+    // that mutable record; completed identities are streamed to JSONL so a
+    // long run does not retain millions of trace objects in RAM.
+    MemoryRequestTrace pending_memory_trace_;
+    bool pending_memory_trace_valid_ = false;
+    mutable std::ofstream request_trace_stream_;
     double image_weight_sum_ = 0.0;
     double decoded_weight_sum_ = 0.0;
     std::uint64_t output_spikes_ = 0;
     std::map<std::uint64_t, std::vector<std::uint32_t>> output_spikes_by_timestep_;
+    std::uint64_t readout_start_ = 0;
+    std::uint32_t readout_count_ = 0;
+    std::vector<std::uint64_t> readout_spike_counts_;
+    std::map<std::uint64_t, std::vector<std::uint32_t>> readout_spikes_by_timestep_;
     std::uint64_t rows_served_ = 0;
     std::uint64_t responses_served_ = 0;
     std::uint64_t response_attempts_ = 0;
