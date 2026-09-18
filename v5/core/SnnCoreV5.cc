@@ -224,6 +224,7 @@ SnnCoreV5::SnnCoreV5(SST::ComponentId_t id, SST::Params& params)
           parseOperatorBinding(params, config);
           config.storage.core_id = params.find<std::uint32_t>("core_id", 0);
           config.storage.pe_id = params.find<std::uint32_t>("pe_id", 0);
+          config.storage.trace_json = params.find<std::string>("storage_trace_json", "");
           config.storage.index_bytes = positive(params, "core_index_bytes", 4096);
           config.storage.route_bytes = positive(params, "pe_route_bytes", 4096);
           config.storage.max_delta_entries_per_neuron =

@@ -9,6 +9,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <fstream>
+#include <string>
 #include <vector>
 
 namespace SST {
@@ -26,6 +28,7 @@ struct CoreStorageV5Config {
     std::size_t max_delta_entries_per_neuron = 32;
     std::uint64_t index_bytes = 4096;
     std::uint64_t route_bytes = 4096;
+    std::string trace_json;
     BankedSramV5Config state_sram;
     BankedSramV5Config delta_sram;
     BankedSramV5Config index_sram;
@@ -106,6 +109,7 @@ private:
     std::uint64_t deltaEntryOffset_(std::uint32_t neuron, std::uint32_t slot) const;
 
     CoreStorageV5Config config_;
+    std::ofstream trace_stream_;
     Region state_;
     Region delta_;
     Region index_;

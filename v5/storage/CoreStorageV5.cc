@@ -163,7 +163,14 @@ CoreStorageV5::CoreStorageV5(const CoreStorageV5Config& config)
       state_(descriptor_(config_, AddressSpaceId::CoreState), sramConfig_(config_, AddressSpaceId::CoreState)),
       delta_(descriptor_(config_, AddressSpaceId::CoreDelta), sramConfig_(config_, AddressSpaceId::CoreDelta)),
       index_(descriptor_(config_, AddressSpaceId::CoreIndex), sramConfig_(config_, AddressSpaceId::CoreIndex)),
-      route_(descriptor_(config_, AddressSpaceId::PeRoute), sramConfig_(config_, AddressSpaceId::PeRoute)) {}
+      route_(descriptor_(config_, AddressSpaceId::PeRoute), sramConfig_(config_, AddressSpaceId::PeRoute)) {
+    if (!config_.trace_json.empty()) {
+        trace_stream_.open(config_.trace_json, std::ios::out | std::ios::trunc);
+        if (!trace_stream_.good()) {
+            throw std::invalid_argument("cannot open CoreStorageV5 execution trace: " + config_.trace_json);
+        }
+    }
+}
 
 CoreStorageV5::Region& CoreStorageV5::region_(AddressSpaceId space) {
     switch (space) {
@@ -201,7 +208,25 @@ bool CoreStorageV5::transfer_(Region& region, std::uint64_t byte_offset,
     request.data = input;
     request.write = write;
     BankedSramV5Response rejection;
-    if (!region.sram.accept(request, region.cycle, &rejection)) return false;
+    const auto issue_cycle = region.cycle;
+    if (!region.sram.accept(request, region.cycle, &rejection)) {
+        if (trace_stream_.good()) {
+            trace_stream_ << "{\"schema_version\":\"snndl-execution-sram-request/v1\""
+                          << ",\"request_id\":" << request.request_id
+                          << ",\"core_id\":" << config_.core_id
+                          << ",\"pe_id\":" << config_.pe_id
+                          << ",\"region_id\":" << static_cast<unsigned>(region.descriptor.space)
+                          << ",\"address\":" << byte_offset << ",\"bytes\":" << input.size()
+                          << ",\"write\":" << (write ? "true" : "false")
+                          << ",\"issue_cycle\":" << issue_cycle
+                          << ",\"accepted\":false,\"completed\":false"
+                          << ",\"retryable\":" << (rejection.retryable ? "true" : "false")
+                          << ",\"bank\":" << rejection.bank
+                          << ",\"service_cycle\":" << rejection.service_cycle
+                          << ",\"completion_cycle\":" << rejection.completion_cycle << "}\n";
+        }
+        return false;
+    }
 
     // The binding exposes a blocking typed operation to CorePipeline.  The
     // underlying model still performs finite-queue admission, bank service,
@@ -212,6 +237,22 @@ bool CoreStorageV5::transfer_(Region& region, std::uint64_t byte_offset,
         for (auto& response : responses) {
             if (response.request_id != request.request_id) continue;
             if (!response.accepted || !response.completed) return false;
+            if (trace_stream_.good()) {
+                trace_stream_ << "{\"schema_version\":\"snndl-execution-sram-request/v1\""
+                              << ",\"request_id\":" << request.request_id
+                              << ",\"core_id\":" << config_.core_id
+                              << ",\"pe_id\":" << config_.pe_id
+                              << ",\"region_id\":" << static_cast<unsigned>(region.descriptor.space)
+                              << ",\"address\":" << byte_offset << ",\"bytes\":" << input.size()
+                              << ",\"write\":" << (write ? "true" : "false")
+                              << ",\"issue_cycle\":" << issue_cycle
+                              << ",\"accepted\":true,\"completed\":true"
+                              << ",\"retryable\":false,\"bank\":" << response.bank
+                              << ",\"port\":" << response.port
+                              << ",\"service_cycle\":" << response.service_cycle
+                              << ",\"completion_cycle\":" << response.completion_cycle << "}\n";
+                trace_stream_.flush();
+            }
             output = std::move(response.data);
             return true;
         }

@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <array>
 #include <deque>
+#include <fstream>
 #include <map>
 #include <string>
 #include <vector>
@@ -48,6 +49,7 @@ public:
         {"coordinator_pe", "PE hosting EpochCoordinatorV5", "0"},
         {"core_held_spike_entries", "Attached Core held-spike capacity", "32"},
         {"output_json", "Endpoint evidence path", ""},
+        {"event_trace_json", "Optional execution-driven NoC source event JSONL path", ""},
         {"clock", "Endpoint clock", "1GHz"},
         {"verbose", "Verbose level", "0"})
     SST_ELI_DOCUMENT_PORTS(
@@ -159,6 +161,9 @@ private:
     void deliverControl_(NocControlV5Event*);
     void sendStatus_(CoreControlOp operation, std::uint64_t epoch, std::uint32_t core, std::uint64_t count = 0);
     void writeEvidence_() const;
+    void writeEventTrace_(std::uint32_t core_index, const CoreSpikeEvent& spike,
+                          std::uint64_t source_global, std::uint64_t route_id,
+                          const std::vector<RouteTarget>& targets) const;
     bool drainedForSeal_(std::size_t core) const;
     static std::vector<std::uint32_t> parseDestinations_(const std::string&, std::uint32_t count, std::uint32_t fallback);
     void parseRoutes_(const std::string&);
@@ -176,6 +181,8 @@ private:
     bool core_attached_=false, trace_attached_=false, timed_control_=false, legacy_ports_=false, native_tree_=false, route_contract_v2_=false;
     bool external_stimulus_to_network_=false;
     std::string output_json_;
+    std::string event_trace_json_;
+    mutable std::ofstream event_trace_stream_;
     std::uint64_t cycles_=0, tx_packets_=0, rx_packets_=0, logical_deliveries_=0;
     std::uint64_t control_tx_packets_=0, control_rx_packets_=0, control_deliveries_=0;
     std::uint64_t direct_command_packets_=0, direct_status_packets_=0;

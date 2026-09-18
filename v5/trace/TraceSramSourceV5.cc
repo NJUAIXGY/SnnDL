@@ -121,7 +121,6 @@ void TraceSramSourceV5::emit_(const Record& record, const char* phase, std::uint
         {"logical_bank", record.logical_bank}, {"physical_bank", bank}, {"port", port},
         {"service_cycle", service}, {"completion_cycle", completion}, {"write", record.write}
     }.dump() << '\n';
-    observation_stream_.flush();
 }
 
 void TraceSramSourceV5::sendStatus_(TraceStatusOp operation) {

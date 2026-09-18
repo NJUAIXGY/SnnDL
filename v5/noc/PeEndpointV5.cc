@@ -96,8 +96,16 @@ PeEndpointV5::PeEndpointV5(SST::ComponentId_t id, SST::Params& p)
       timed_control_(p.find<int>("timed_control", 0) != 0),
       route_contract_v2_(p.find<int>("route_contract_v2", 0) != 0),
       external_stimulus_to_network_(p.find<int>("external_stimulus_to_network", 0) != 0),
-      output_json_(p.find<std::string>("output_json", "")) {
+      output_json_(p.find<std::string>("output_json", "")),
+      event_trace_json_(p.find<std::string>("event_trace_json", "")) {
     out_.setVerboseLevel(p.find<int>("verbose", 0));
+    if (!event_trace_json_.empty()) {
+        event_trace_stream_.open(event_trace_json_, std::ios::out | std::ios::trunc);
+        if (!event_trace_stream_.good()) {
+            out_.fatal(CALL_INFO, -1, "PeEndpointV5 cannot open event trace %s\n",
+                       event_trace_json_.c_str());
+        }
+    }
     if (timed_control_ && flit_bytes_ != 32) out_.fatal(CALL_INFO, -1, "P5 wire contract requires flit_size_bytes=32\n");
     if (timed_control_ && !core_attached_) out_.fatal(CALL_INFO, -1, "timed control requires attached Cores\n");
     if (core_attached_ && tx_capacity_ < cores_per_pe_ * core_held_capacity_) {
@@ -213,6 +221,7 @@ PeEndpointV5::PeEndpointV5(SST::ComponentId_t id, SST::Params& p)
 }
 
 PeEndpointV5::~PeEndpointV5() {
+    if (event_trace_stream_.is_open()) event_trace_stream_.flush();
     for (auto* packet : data_tx_) delete packet;
     for (auto* packet : ingress_rx_) delete packet;
     for (auto* packet : control_tx_) delete packet;
@@ -221,6 +230,35 @@ PeEndpointV5::~PeEndpointV5() {
         delete core.pending_seal;
     }
     delete network_;
+}
+
+void PeEndpointV5::writeEventTrace_(std::uint32_t core_index, const CoreSpikeEvent& spike,
+                                    std::uint64_t source_global, std::uint64_t route_id,
+                                    const std::vector<RouteTarget>& targets) const {
+    if (!event_trace_stream_.good()) return;
+    const auto global_core = std::uint64_t(pe_id_) * cores_per_pe_ + core_index;
+    event_trace_stream_ << "{\"schema_version\":\"snndl-execution-noc-event/v1\""
+                        << ",\"event_id\":\"exec." << global_core << "."
+                        << spike.timestep << "." << spike.source_event_seq << "\""
+                        << ",\"source_pe\":" << pe_id_
+                        << ",\"source_core\":" << global_core
+                        << ",\"source_neuron\":" << source_global
+                        << ",\"source_event_seq\":" << spike.source_event_seq
+                        << ",\"timestep\":" << spike.timestep
+                        << ",\"release_cycle\":" << cycles_
+                        << ",\"route_id\":" << route_id << ",\"destinations\":[";
+    bool first = true;
+    for (const auto& target : targets) {
+        for (std::uint32_t destination_core = 0; destination_core < cores_per_pe_; ++destination_core) {
+            if ((target.core_mask & (std::uint64_t(1) << destination_core)) == 0) continue;
+            if (!first) event_trace_stream_ << ',';
+            first = false;
+            event_trace_stream_ << "{\"pe\":" << target.pe
+                                << ",\"core\":" << destination_core << "}";
+        }
+    }
+    event_trace_stream_ << "]}\n";
+    event_trace_stream_.flush();
 }
 
 void PeEndpointV5::init(unsigned int phase) { network_->init(phase); }
@@ -606,6 +644,7 @@ void PeEndpointV5::routeSourceSpike_(SST::Event* event, int core_index, bool mon
     }
     std::uint64_t deliveries = 0;
     for (const auto& target : targets) deliveries += static_cast<std::uint64_t>(__builtin_popcountll(target.core_mask));
+    writeEventTrace_(static_cast<std::uint32_t>(core_index), *spike, source_global, route_id, targets);
     const auto physical_packets = native_tree_ ? std::uint64_t(1) : deliveries;
     if (data_tx_.size() + physical_packets > tx_capacity_) {
         delete spike; out_.fatal(CALL_INFO, -1, "Core multicast egress exceeds finite endpoint TX capacity\n");

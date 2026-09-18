@@ -135,7 +135,6 @@ void TraceNoCSourceV5::emit_(const Record& record, const char* phase, std::uint6
         {"release_tick", record.release_tick}, {"physical_packets", physical_packets},
         {"multicast_mode", multicast_mode_}
     }.dump() << '\n';
-    observation_stream_.flush();
 }
 
 void TraceNoCSourceV5::sendStatus_(TraceStatusOp operation) {

@@ -92,6 +92,7 @@ public:
         {"schedule_admission_enabled", "Apply SchedulePlan queue reservations to Core admission", "0"},
         {"schedule_descriptor", "Compiler-owned SchedulePlan stage/DAG descriptor", ""},
         {"route_plan_digest", "Compiler-owned RoutePlan digest", ""},
+        {"storage_trace_json", "Optional execution-driven typed SRAM request trace", ""},
         {"verbose", "Verbose logging level", "0"}
     )
 

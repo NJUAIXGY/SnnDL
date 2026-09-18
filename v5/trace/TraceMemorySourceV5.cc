@@ -118,7 +118,6 @@ void TraceMemorySourceV5::emit_(const Record& record, const char* phase,
         {"bytes", record.bytes}, {"stream_sequence", record.stream_sequence},
         {"release_tick", record.release_tick}, {"region_id", record.region_id},
         {"request_class", record.request_class}}.dump() << '\n';
-    observation_stream_.flush();
 }
 
 void TraceMemorySourceV5::sendStatus_(TraceStatusOp operation) {
