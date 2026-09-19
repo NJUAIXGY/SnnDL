@@ -2,7 +2,10 @@
 
 #include <cassert>
 #include <cmath>
+#include <cstdio>
+#include <fstream>
 #include <iostream>
+#include <string>
 #include <vector>
 
 using namespace SST::SnnDL::v5;
@@ -99,12 +102,56 @@ void testCubaLifStateUsesExplicitTwoFloatCodec() {
     assert(lif_state.membrane == expected.synaptic_current);
 }
 
+void testExecutionTraceCarriesDeclaredTimestep() {
+    const std::string path = "/tmp/snndl_v5_core_storage_timestep_trace.jsonl";
+    std::remove(path.c_str());
+    CoreStorageV5Config value = config();
+    value.trace_json = path;
+    {
+        CoreStorageV5 storage(value);
+        std::vector<std::uint8_t> bytes;
+        assert(storage.readIndex(0, 4, bytes));
+        storage.beginTimestep(7);
+        LifNeuronState state;
+        assert(storage.readState(0, state));
+        storage.beginTimestep(8);
+        assert(storage.writeState(0, LifNeuronState{0.5f, 1}));
+        bool rejected = false;
+        try {
+            storage.beginTimestep(6);
+        } catch (const std::invalid_argument&) {
+            rejected = true;
+        }
+        assert(rejected);
+    }
+
+    std::ifstream trace(path);
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(trace, line)) {
+        if (!line.empty()) lines.push_back(line);
+    }
+    assert(lines.size() == 3);
+    for (const auto& record : lines) {
+        // Field names of the existing evidence parser contract are unchanged.
+        assert(record.find("\"schema_version\":\"snndl-execution-sram-request/v1\"") != std::string::npos);
+        assert(record.find("\"issue_cycle\":") != std::string::npos);
+        assert(record.find("\"completion_cycle\":") != std::string::npos);
+    }
+    // An access made before any timestep is declared stays explicitly null.
+    assert(lines[0].find("\"timestep\":null") != std::string::npos);
+    assert(lines[1].find("\"timestep\":7") != std::string::npos);
+    assert(lines[2].find("\"timestep\":8") != std::string::npos);
+    std::remove(path.c_str());
+}
+
 } // namespace
 
 int main() {
     testTypedRegionsAndState();
     testDeltaIsBackedAndBounded();
     testCubaLifStateUsesExplicitTwoFloatCodec();
+    testExecutionTraceCarriesDeclaredTimestep();
     std::cout << "v5 core storage binding: PASS\n";
     return 0;
 }

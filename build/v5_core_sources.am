@@ -41,6 +41,8 @@ SNNDL_V5_CORE_SOURCES = \
 	v5/test/SramProbeV5.h \
 	v5/test/SramProbeV5.cc \
 	v5/events/TraceEvents.h \
+	v5/trace/TraceJsonlReader.h \
+	v5/trace/TraceJsonlReader.cc \
 	v5/trace/TraceReplayCoordinatorV5.h \
 	v5/trace/TraceReplayCoordinatorV5.cc \
 	v5/trace/TraceMemorySourceV5.h \

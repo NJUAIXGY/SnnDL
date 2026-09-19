@@ -47,6 +47,14 @@ public:
     const ::SnnDL::v5::RegionDescriptor& region(::SnnDL::v5::AddressSpaceId space) const;
     const BankedSramV5Stats& stats(::SnnDL::v5::AddressSpaceId space) const;
 
+    // Declares the logical v5 pipeline timestep that owns every following
+    // typed access so the execution SRAM trace carries a real coordinate.
+    // This is the network timestep assigned by CorePipeline, never SST time:
+    // CoreStorageV5 holds no SST clock and each Region keeps its own local
+    // cycle counter.  Accesses made before the first declaration are traced
+    // with an explicit null timestep instead of an invented zero.
+    void beginTimestep(std::uint64_t timestep);
+
     // Timestep state is persistent; only the delta counts are reset here.
     void resetTimestep();
 
@@ -109,6 +117,8 @@ private:
     std::uint64_t deltaEntryOffset_(std::uint32_t neuron, std::uint32_t slot) const;
 
     CoreStorageV5Config config_;
+    bool have_timestep_ = false;
+    std::uint64_t current_timestep_ = 0;
     std::ofstream trace_stream_;
     Region state_;
     Region delta_;

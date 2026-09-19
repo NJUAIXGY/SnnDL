@@ -189,6 +189,10 @@ void CorePipeline::start(std::uint64_t timestep) {
     if (has_timestep_ && timestep != last_timestep_ + 1) {
         throw std::logic_error("v5 core timesteps must advance exactly by one");
     }
+    // Hand the declared timestep to the typed storage binding before any access
+    // it traces, so the delta-count reset and the PeRoute probe below are
+    // attributed to this timestep rather than to an invented zero.
+    storage_->beginTimestep(timestep);
     resetTimestep_();
     std::vector<std::uint8_t> route_byte;
     if (!storage_->readRoute(0, 1, route_byte)) {

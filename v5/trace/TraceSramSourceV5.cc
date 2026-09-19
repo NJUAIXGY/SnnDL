@@ -2,7 +2,9 @@
 
 #include "TraceSramSourceV5.h"
 
-#include "../../../../../../sst-core/external/nlohmann/json.hpp"
+#include "v5/trace/TraceJsonlReader.h"
+
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <cinttypes>
@@ -22,25 +24,25 @@ TraceSramSourceV5::TraceSramSourceV5(SST::ComponentId_t id, SST::Params& params)
       coordinator_source_id_(params.find<std::uint32_t>("coordinator_source_id", source_id_)),
       mixed_source_stream_(params.find<int>("mixed_source_stream", 0) != 0),
       external_control_(params.find<int>("external_control", 0) != 0),
-      max_line_bytes_(std::max<std::uint64_t>(128, params.find<std::uint64_t>("max_line_bytes", 1024 * 1024))),
+      max_line_bytes_(normalizeTraceMaxLineBytes(params.find<std::uint64_t>("max_line_bytes", kTraceMaxLineBytesDefault))),
       issue_width_(std::max<std::uint64_t>(1, params.find<std::uint64_t>("issue_width_per_source", 1))),
       max_outstanding_(std::max<std::uint64_t>(1, params.find<std::uint64_t>("max_outstanding_per_source", 1))),
       lookahead_limit_(std::max<std::uint64_t>(1, params.find<std::uint64_t>("lookahead_records", 64))) {
     out_.setVerboseLevel(params.find<int>("verbose", 0));
-    if (trace_file_.empty()) out_.fatal(CALL_INFO, -1, "TraceSramSourceV5 requires trace_file\n");
+    if (trace_file_.empty()) out_.fatal(CALL_INFO, -1, "TRACE-CONFIG: TraceSramSourceV5 requires trace_file\n");
     trace_stream_.open(trace_file_);
-    if (!trace_stream_.good()) out_.fatal(CALL_INFO, -1, "cannot open SRAM trace_file=%s\n", trace_file_.c_str());
+    if (!trace_stream_.good()) out_.fatal(CALL_INFO, -1, "TRACE-IO: cannot open SRAM trace_file=%s\n", trace_file_.c_str());
     if (!observation_json_.empty()) {
         observation_stream_.open(observation_json_, std::ios::out | std::ios::trunc);
-        if (!observation_stream_.good()) out_.fatal(CALL_INFO, -1, "cannot open observation_json=%s\n", observation_json_.c_str());
+        if (!observation_stream_.good()) out_.fatal(CALL_INFO, -1, "TRACE-IO: cannot open observation_json=%s\n", observation_json_.c_str());
     }
     request_link_ = configureLink("request");
     response_link_ = configureLink("response", new Event::Handler2<TraceSramSourceV5, &TraceSramSourceV5::handleResponse_>(this));
-    if (!request_link_ || !response_link_) out_.fatal(CALL_INFO, -1, "TraceSramSourceV5 requires request/response links\n");
+    if (!request_link_ || !response_link_) out_.fatal(CALL_INFO, -1, "TRACE-CONFIG: TraceSramSourceV5 requires request/response links\n");
     if (external_control_) {
         command_link_ = configureLink("command", new Event::Handler2<TraceSramSourceV5, &TraceSramSourceV5::handleControl_>(this));
         status_link_ = configureLink("status");
-        if (!command_link_ || !status_link_) out_.fatal(CALL_INFO, -1, "externally controlled TraceSramSourceV5 requires command/status links\n");
+        if (!command_link_ || !status_link_) out_.fatal(CALL_INFO, -1, "TRACE-CONFIG: externally controlled TraceSramSourceV5 requires command/status links\n");
     }
     registerClock(params.find<std::string>("clock", "1GHz"),
                   new Clock::Handler2<TraceSramSourceV5, &TraceSramSourceV5::clockTick_>(this));
@@ -54,50 +56,57 @@ TraceSramSourceV5::~TraceSramSourceV5() {
 }
 
 bool TraceSramSourceV5::readNext_(Record& result) {
-    std::string line;
-    while (std::getline(trace_stream_, line)) {
-        if (line.find_first_not_of(" \t\r\n") == std::string::npos) continue;
-        if (line.size() > max_line_bytes_) out_.fatal(CALL_INFO, -1, "SRAM trace record exceeds max_line_bytes=%" PRIu64 "\n", max_line_bytes_);
-        try {
-            const auto value = json::parse(line);
-            if (!value.is_object() || value.value("schema_version", std::string()) != "snndl-materialized-sram-request/v1")
-                out_.fatal(CALL_INFO, -1, "TraceSramSourceV5 requires snndl-materialized-sram-request/v1 records\n");
-            result.request_id = value.at("request_id").get<std::uint64_t>();
-            result.access_id = value.at("access_id").get<std::string>();
-            result.request_class = value.value("request_class", std::string("sram-read"));
-            result.region_id = value.at("region_id").get<std::string>();
-            result.source_pe = value.value("source_pe", 0U);
-            result.source_core = value.at("source_core").get<std::uint32_t>();
-            result.address = value.at("address").get<std::uint64_t>();
-            result.bytes = value.at("bytes").get<std::uint64_t>();
-            result.release_tick = value.value("release_tick", 0ULL);
-            result.timestep = value.value("timestep", 0ULL);
-            result.stream_sequence = value.at("stream_sequence").get<std::uint64_t>();
-            result.logical_bank = value.value("bank", 0U);
-            result.write = value.value("write", false);
-            const auto data = value.at("data");
-            if (!data.is_array() || data.size() != result.bytes) out_.fatal(CALL_INFO, -1, "SRAM trace data length does not match bytes\n");
-            result.data.clear();
-            result.data.reserve(data.size());
-            for (const auto& byte : data) {
-                const auto parsed = byte.get<unsigned int>();
-                if (parsed > 255) out_.fatal(CALL_INFO, -1, "SRAM trace payload byte is outside uint8 range\n");
-                result.data.push_back(static_cast<std::uint8_t>(parsed));
-            }
-            if (result.request_id == 0 || result.access_id.empty() || result.region_id.empty() || result.bytes == 0 ||
-                (!mixed_source_stream_ && result.source_core != source_id_))
-                out_.fatal(CALL_INFO, -1, "invalid materialized SRAM request identity or size\n");
-            if (!seen_request_ids_.insert(result.request_id).second)
-                out_.fatal(CALL_INFO, -1, "duplicate SRAM request_id=%" PRIu64 "\n", result.request_id);
-            if (have_sequence_ && result.stream_sequence <= last_stream_sequence_)
-                out_.fatal(CALL_INFO, -1, "SRAM stream_sequence is not strictly increasing for source=%u\n", source_id_);
-            have_sequence_ = true;
-            last_stream_sequence_ = result.stream_sequence;
-            ++records_;
-            return true;
-        } catch (const std::exception& error) {
-            out_.fatal(CALL_INFO, -1, "invalid materialized SRAM trace record: %s\n", error.what());
+    nlohmann::json value;
+    std::string parse_error;
+    const auto status = reader_.next(trace_stream_, max_line_bytes_, value, parse_error);
+    if (status == TraceJsonlReader::Status::End) return false;
+    if (status == TraceJsonlReader::Status::Oversize) out_.fatal(CALL_INFO, -1, "TRACE-LIMIT: SRAM trace record exceeds max_line_bytes=%" PRIu64 "\n", max_line_bytes_);
+    if (status == TraceJsonlReader::Status::ParseError) out_.fatal(CALL_INFO, -1, "TRACE-SCHEMA: invalid materialized SRAM trace record: %s\n", parse_error.c_str());
+    try {
+        if (!value.is_object() || value.value("schema_version", std::string()) != "snndl-materialized-sram-request/v1")
+            out_.fatal(CALL_INFO, -1, "TRACE-SCHEMA: TraceSramSourceV5 requires snndl-materialized-sram-request/v1 records\n");
+        result.request_id = value.at("request_id").get<std::uint64_t>();
+        result.access_id = value.at("access_id").get<std::string>();
+        // Every field that the SRAM contract declares mandatory is read with
+        // at(), so an absent key fails here rather than falling back to a
+        // component-side value that could disagree with the producer.  In
+        // particular request_class has no C++ default: the vocabulary belongs to
+        // snndl/plans/sram_trace.py, and the divergent "sram-read" fallback that
+        // used to live here silently rewrote the producer's class label.
+        result.request_class = value.at("request_class").get<std::string>();
+        result.region_id = value.at("region_id").get<std::string>();
+        result.source_pe = value.at("source_pe").get<std::uint32_t>();
+        result.source_core = value.at("source_core").get<std::uint32_t>();
+        result.address = value.at("address").get<std::uint64_t>();
+        result.bytes = value.at("bytes").get<std::uint64_t>();
+        result.release_tick = value.at("release_tick").get<std::uint64_t>();
+        result.timestep = value.at("timestep").get<std::uint64_t>();
+        result.stream_sequence = value.at("stream_sequence").get<std::uint64_t>();
+        result.logical_bank = value.at("bank").get<std::uint32_t>();
+        result.write = value.value("write", false);
+        const auto data = value.at("data");
+        if (!data.is_array() || data.size() != result.bytes) out_.fatal(CALL_INFO, -1, "TRACE-SCHEMA: SRAM trace data length does not match bytes\n");
+        result.data.clear();
+        result.data.reserve(data.size());
+        for (const auto& byte : data) {
+            const auto parsed = byte.get<unsigned int>();
+            if (parsed > 255) out_.fatal(CALL_INFO, -1, "TRACE-SCHEMA: SRAM trace payload byte is outside uint8 range\n");
+            result.data.push_back(static_cast<std::uint8_t>(parsed));
         }
+        if (result.request_id == 0 || result.access_id.empty() || result.request_class.empty() ||
+            result.region_id.empty() || result.bytes == 0 ||
+            (!mixed_source_stream_ && result.source_core != source_id_))
+            out_.fatal(CALL_INFO, -1, "TRACE-IDENTITY: invalid materialized SRAM request identity or size\n");
+        if (!seen_request_ids_.insert(result.request_id).second)
+            out_.fatal(CALL_INFO, -1, "TRACE-IDENTITY: duplicate SRAM request_id=%" PRIu64 "\n", result.request_id);
+        if (have_sequence_ && result.stream_sequence <= last_stream_sequence_)
+            out_.fatal(CALL_INFO, -1, "TRACE-ORDER: SRAM stream_sequence is not strictly increasing for source=%u\n", source_id_);
+        have_sequence_ = true;
+        last_stream_sequence_ = result.stream_sequence;
+        ++records_;
+        return true;
+    } catch (const std::exception& error) {
+        out_.fatal(CALL_INFO, -1, "TRACE-SCHEMA: invalid materialized SRAM trace record: %s\n", error.what());
     }
     return false;
 }
@@ -141,27 +150,27 @@ void TraceSramSourceV5::sendStatus_(TraceStatusOp operation) {
 
 void TraceSramSourceV5::handleControl_(SST::Event* raw) {
     auto* control = dynamic_cast<TraceControlEvent*>(raw);
-    if (!control) { delete raw; out_.fatal(CALL_INFO, -1, "TraceSramSourceV5 received an unexpected control event\n"); }
-    if (control->source_id != coordinator_source_id_) { delete control; out_.fatal(CALL_INFO, -1, "TraceSramSourceV5 received a command for another source\n"); }
+    if (!control) { delete raw; out_.fatal(CALL_INFO, -1, "TRACE-CONTROL: TraceSramSourceV5 received an unexpected control event\n"); }
+    if (control->source_id != coordinator_source_id_) { delete control; out_.fatal(CALL_INFO, -1, "TRACE-CONTROL: TraceSramSourceV5 received a command for another source\n"); }
     if (control->operation == TraceControlOp::Start) {
-        if (started_ || finished_) { delete control; out_.fatal(CALL_INFO, -1, "TraceSramSourceV5 received duplicate Start\n"); }
+        if (started_ || finished_) { delete control; out_.fatal(CALL_INFO, -1, "TRACE-CONTROL: TraceSramSourceV5 received duplicate Start\n"); }
         started_ = true;
     } else {
         delete control;
-        out_.fatal(CALL_INFO, -1, "TraceSramSourceV5 aborted by replay coordinator\n");
+        out_.fatal(CALL_INFO, -1, "TRACE-CONTROL: TraceSramSourceV5 aborted by replay coordinator\n");
     }
     delete control;
 }
 
 void TraceSramSourceV5::handleResponse_(SST::Event* raw) {
     auto* response = dynamic_cast<SramResponseEvent*>(raw);
-    if (!response) { delete raw; out_.fatal(CALL_INFO, -1, "TraceSramSourceV5 received an unexpected response\n"); }
+    if (!response) { delete raw; out_.fatal(CALL_INFO, -1, "TRACE-ADMISSION: TraceSramSourceV5 received an unexpected response\n"); }
     const auto found = outstanding_.find(response->request_id);
-    if (found == outstanding_.end()) { delete response; out_.fatal(CALL_INFO, -1, "TraceSramSourceV5 received unknown response id=%" PRIu64 "\n", response->request_id); }
+    if (found == outstanding_.end()) { delete response; out_.fatal(CALL_INFO, -1, "TRACE-IDENTITY: TraceSramSourceV5 received unknown response id=%" PRIu64 "\n", response->request_id); }
     InFlight flight = found->second;
-    if (response->address != flight.record.address) { delete response; out_.fatal(CALL_INFO, -1, "TraceSramSourceV5 response address mismatch\n"); }
+    if (response->address != flight.record.address) { delete response; out_.fatal(CALL_INFO, -1, "TRACE-IDENTITY: TraceSramSourceV5 response address mismatch\n"); }
     if (!response->accepted) {
-        if (!response->retryable) { delete response; out_.fatal(CALL_INFO, -1, "TraceSramSourceV5 SRAM request was permanently rejected\n"); }
+        if (!response->retryable) { delete response; out_.fatal(CALL_INFO, -1, "TRACE-ADMISSION: TraceSramSourceV5 SRAM request was permanently rejected\n"); }
         ++flight.retries;
         ++retries_;
         emit_(flight.record, "retry", 0, cycle_, flight.retries, response->bank, response->port, 0, 0, "retryable");
@@ -253,7 +262,7 @@ void TraceSramSourceV5::finish() {
     if (observation_stream_.is_open()) observation_stream_.flush();
     writeSummary_();
     if (!finished_ || !eligible_.empty() || !outstanding_.empty() || records_ != completed_)
-        out_.fatal(CALL_INFO, -1, "TraceSramSourceV5 finished before replay drained\n");
+        out_.fatal(CALL_INFO, -1, "TRACE-DRAIN: TraceSramSourceV5 finished before replay drained\n");
 }
 
 }}}

@@ -1,6 +1,7 @@
 #include <sst/core/sst_config.h>
 #include "TraceNoCSourceV5.h"
-#include "../../../../../../sst-core/external/nlohmann/json.hpp"
+#include "v5/trace/TraceJsonlReader.h"
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <cinttypes>
@@ -19,25 +20,25 @@ TraceNoCSourceV5::TraceNoCSourceV5(SST::ComponentId_t id, SST::Params& p)
       source_id_(p.find<std::uint32_t>("source_id", 0)),
       coordinator_source_id_(p.find<std::uint32_t>("coordinator_source_id", source_id_)),
       external_control_(p.find<int>("external_control", 0) != 0),
-      max_line_bytes_(std::max<std::uint64_t>(128, p.find<std::uint64_t>("max_line_bytes", 1024 * 1024))),
+      max_line_bytes_(normalizeTraceMaxLineBytes(p.find<std::uint64_t>("max_line_bytes", kTraceMaxLineBytesDefault))),
       issue_width_(std::max<std::uint64_t>(1, p.find<std::uint64_t>("issue_width_per_source", 1))),
       max_outstanding_(std::max<std::uint64_t>(1, p.find<std::uint64_t>("max_outstanding_per_source", 1))),
       lookahead_limit_(std::max<std::uint64_t>(1, p.find<std::uint64_t>("lookahead_records", 64))) {
     out_.setVerboseLevel(p.find<int>("verbose", 0));
-    if (trace_file_.empty()) out_.fatal(CALL_INFO, -1, "TraceNoCSourceV5 requires trace_file\n");
+    if (trace_file_.empty()) out_.fatal(CALL_INFO, -1, "TRACE-CONFIG: TraceNoCSourceV5 requires trace_file\n");
     trace_stream_.open(trace_file_);
-    if (!trace_stream_.good()) out_.fatal(CALL_INFO, -1, "cannot open NoC trace_file=%s\n", trace_file_.c_str());
+    if (!trace_stream_.good()) out_.fatal(CALL_INFO, -1, "TRACE-IO: cannot open NoC trace_file=%s\n", trace_file_.c_str());
     if (!observation_json_.empty()) {
         observation_stream_.open(observation_json_, std::ios::out | std::ios::trunc);
-        if (!observation_stream_.good()) out_.fatal(CALL_INFO, -1, "cannot open observation_json=%s\n", observation_json_.c_str());
+        if (!observation_stream_.good()) out_.fatal(CALL_INFO, -1, "TRACE-IO: cannot open observation_json=%s\n", observation_json_.c_str());
     }
     inject_ = configureLink("inject");
     ack_ = configureLink("ack", new Event::Handler2<TraceNoCSourceV5, &TraceNoCSourceV5::handleAck_>(this));
-    if (!inject_ || !ack_) out_.fatal(CALL_INFO, -1, "TraceNoCSourceV5 requires inject and ack links\n");
+    if (!inject_ || !ack_) out_.fatal(CALL_INFO, -1, "TRACE-CONFIG: TraceNoCSourceV5 requires inject and ack links\n");
     if (external_control_) {
         command_ = configureLink("command", new Event::Handler2<TraceNoCSourceV5, &TraceNoCSourceV5::handleControl_>(this));
         status_ = configureLink("status");
-        if (!command_ || !status_) out_.fatal(CALL_INFO, -1, "externally controlled TraceNoCSourceV5 requires command/status links\n");
+        if (!command_ || !status_) out_.fatal(CALL_INFO, -1, "TRACE-CONFIG: externally controlled TraceNoCSourceV5 requires command/status links\n");
     }
     registerClock(p.find<std::string>("clock", "1GHz"), new Clock::Handler2<TraceNoCSourceV5, &TraceNoCSourceV5::tick_>(this));
     registerAsPrimaryComponent();
@@ -50,56 +51,64 @@ TraceNoCSourceV5::~TraceNoCSourceV5() {
 
 bool TraceNoCSourceV5::readNext_(Record& result) {
     result = Record{};
-    std::string line;
-    while (std::getline(trace_stream_, line)) {
-        if (line.find_first_not_of(" \t\r\n") == std::string::npos) continue;
-        if (line.size() > max_line_bytes_)
-            out_.fatal(CALL_INFO, -1, "NoC trace record exceeds max_line_bytes=%" PRIu64 "\n", max_line_bytes_);
-        try {
-            const auto value = json::parse(line);
-            if (!value.is_object() || value.value("schema_version", std::string()) != "snndl-logical-noc-record/v1")
-                out_.fatal(CALL_INFO, -1, "TraceNoCSourceV5 requires snndl-logical-noc-record/v1\n");
-            const auto source = value.at("source");
-            const auto traffic = value.at("traffic");
-            const auto multicast = value.at("multicast");
-            const auto ordering = value.at("ordering");
-            const auto release = value.at("release");
-            result.event_id = value.at("event_id").get<std::string>();
-            result.token = value.value("event_token", 0ULL);
-            result.timestep = value.at("timestep").get<std::uint64_t>();
-            result.source_pe = source.at("pe").get<std::uint32_t>();
-            result.source_core = source.at("core").get<std::uint32_t>();
-            result.source_neuron = source.at("neuron").get<std::uint64_t>();
-            result.source_event_seq = source.at("event_sequence").get<std::uint64_t>();
-            result.payload_bytes = traffic.at("payload_bytes").get<std::uint32_t>();
-            result.virtual_network = traffic.at("virtual_network").get<std::uint32_t>();
-            if (multicast.contains("route_id") && !multicast.at("route_id").is_null())
-                result.route_id = multicast.at("route_id").get<std::uint64_t>();
-            result.stream_sequence = ordering.at("stream_sequence").get<std::uint64_t>();
-            result.release_tick = release.at("tick").get<std::uint64_t>();
-            if (release.contains("depends_on") && release.at("depends_on").is_array())
-                for (const auto& dependency : release.at("depends_on")) result.depends_on.push_back(dependency.get<std::string>());
-            if (result.source_pe != source_pe_ || result.source_core != source_core_ || result.event_id.empty() || result.token == 0)
-                out_.fatal(CALL_INFO, -1, "NoC trace record does not match source owner or token\n");
-            if (have_sequence_ && result.stream_sequence <= last_sequence_)
-                out_.fatal(CALL_INFO, -1, "NoC stream_sequence is not strictly increasing\n");
-            have_sequence_ = true;
-            last_sequence_ = result.stream_sequence;
-            for (const auto& destination : value.at("destinations")) {
-                result.destination_pes.push_back(destination.at("pe").get<std::uint32_t>());
-                result.destination_masks.push_back(destination.at("core_mask").get<std::uint64_t>());
-            }
-            if (result.destination_pes.empty() || result.destination_pes.size() != result.destination_masks.size())
-                out_.fatal(CALL_INFO, -1, "NoC trace record has no destination set\n");
-            if (multicast_mode_ == "unicast") result.mode = TraceNoCMulticastMode::Unicast;
-            else if (multicast_mode_ == "native_tree") result.mode = TraceNoCMulticastMode::NativeTree;
-            else if (multicast_mode_ == "source_replication") result.mode = TraceNoCMulticastMode::SourceReplication;
-            else out_.fatal(CALL_INFO, -1, "unknown NoC multicast_mode=%s\n", multicast_mode_.c_str());
-            ++records_;
-            return true;
-        } catch (const std::exception& error) {
-            out_.fatal(CALL_INFO, -1, "invalid logical NoC trace record: %s\n", error.what());
+    nlohmann::json value;
+    std::string parse_error;
+    const auto status = reader_.next(trace_stream_, max_line_bytes_, value, parse_error);
+    if (status == TraceJsonlReader::Status::End) return false;
+    if (status == TraceJsonlReader::Status::Oversize)
+        out_.fatal(CALL_INFO, -1, "TRACE-LIMIT: NoC trace record exceeds max_line_bytes=%" PRIu64 "\n", max_line_bytes_);
+    if (status == TraceJsonlReader::Status::ParseError)
+        out_.fatal(CALL_INFO, -1, "TRACE-SCHEMA: invalid logical NoC trace record: %s\n", parse_error.c_str());
+    try {
+        if (!value.is_object() || value.value("schema_version", std::string()) != "snndl-logical-noc-record/v1")
+            out_.fatal(CALL_INFO, -1, "TRACE-SCHEMA: TraceNoCSourceV5 requires snndl-logical-noc-record/v1\n");
+        const auto source = value.at("source");
+        const auto traffic = value.at("traffic");
+        const auto multicast = value.at("multicast");
+        const auto ordering = value.at("ordering");
+        const auto release = value.at("release");
+        result.event_id = value.at("event_id").get<std::string>();
+        result.token = value.value("event_token", 0ULL);
+        result.timestep = value.at("timestep").get<std::uint64_t>();
+        result.source_pe = source.at("pe").get<std::uint32_t>();
+        result.source_core = source.at("core").get<std::uint32_t>();
+        result.source_neuron = source.at("neuron").get<std::uint64_t>();
+        result.source_event_seq = source.at("event_sequence").get<std::uint64_t>();
+        result.payload_bytes = traffic.at("payload_bytes").get<std::uint32_t>();
+        result.virtual_network = traffic.at("virtual_network").get<std::uint32_t>();
+        if (multicast.contains("route_id") && !multicast.at("route_id").is_null())
+            result.route_id = multicast.at("route_id").get<std::uint64_t>();
+        result.stream_sequence = ordering.at("stream_sequence").get<std::uint64_t>();
+        result.release_tick = release.at("tick").get<std::uint64_t>();
+        if (release.contains("depends_on") && release.at("depends_on").is_array())
+            for (const auto& dependency : release.at("depends_on")) result.depends_on.push_back(dependency.get<std::string>());
+        if (result.source_pe != source_pe_ || result.source_core != source_core_ || result.event_id.empty() || result.token == 0)
+            out_.fatal(CALL_INFO, -1, "TRACE-IDENTITY: NoC trace record does not match source owner or token\n");
+        // traffic.payload_bytes is required by the record schema (a missing key
+        // already throws above); this rejects the one value the contract forbids
+        // instead of substituting a component-side default width.
+        if (result.payload_bytes == 0)
+            out_.fatal(CALL_INFO, -1, "TRACE-SCHEMA: NoC trace record payload_bytes must be positive\n");
+        if (!seen_event_ids_.insert(result.event_id).second)
+            out_.fatal(CALL_INFO, -1, "TRACE-IDENTITY: duplicate NoC event_id=%s\n", result.event_id.c_str());
+        if (have_sequence_ && result.stream_sequence <= last_sequence_)
+            out_.fatal(CALL_INFO, -1, "TRACE-ORDER: NoC stream_sequence is not strictly increasing\n");
+        have_sequence_ = true;
+        last_sequence_ = result.stream_sequence;
+        for (const auto& destination : value.at("destinations")) {
+            result.destination_pes.push_back(destination.at("pe").get<std::uint32_t>());
+            result.destination_masks.push_back(destination.at("core_mask").get<std::uint64_t>());
         }
+        if (result.destination_pes.empty() || result.destination_pes.size() != result.destination_masks.size())
+            out_.fatal(CALL_INFO, -1, "TRACE-SCHEMA: NoC trace record has no destination set\n");
+        if (multicast_mode_ == "unicast") result.mode = TraceNoCMulticastMode::Unicast;
+        else if (multicast_mode_ == "native_tree") result.mode = TraceNoCMulticastMode::NativeTree;
+        else if (multicast_mode_ == "source_replication") result.mode = TraceNoCMulticastMode::SourceReplication;
+        else out_.fatal(CALL_INFO, -1, "TRACE-CONFIG: unknown NoC multicast_mode=%s\n", multicast_mode_.c_str());
+        ++records_;
+        return true;
+    } catch (const std::exception& error) {
+        out_.fatal(CALL_INFO, -1, "TRACE-SCHEMA: invalid logical NoC trace record: %s\n", error.what());
     }
     return false;
 }
@@ -162,17 +171,17 @@ void TraceNoCSourceV5::handleControl_(SST::Event* raw) {
     auto* control = dynamic_cast<TraceControlEvent*>(raw);
     if (!control || control->source_id != coordinator_source_id_) {
         delete raw;
-        out_.fatal(CALL_INFO, -1, "TraceNoCSourceV5 received an invalid control event\n");
+        out_.fatal(CALL_INFO, -1, "TRACE-CONTROL: TraceNoCSourceV5 received an invalid control event\n");
     }
     if (control->operation == TraceControlOp::Start) {
         if (started_ || finished_) {
             delete control;
-            out_.fatal(CALL_INFO, -1, "TraceNoCSourceV5 received duplicate Start\n");
+            out_.fatal(CALL_INFO, -1, "TRACE-CONTROL: TraceNoCSourceV5 received duplicate Start\n");
         }
         started_ = true;
     } else {
         delete control;
-        out_.fatal(CALL_INFO, -1, "TraceNoCSourceV5 aborted by replay coordinator\n");
+        out_.fatal(CALL_INFO, -1, "TRACE-CONTROL: TraceNoCSourceV5 aborted by replay coordinator\n");
     }
     delete control;
 }
@@ -227,12 +236,12 @@ void TraceNoCSourceV5::handleAck_(SST::Event* raw) {
     auto* ack = dynamic_cast<TraceNoCInjectionAckV5Event*>(raw);
     if (!ack) {
         delete raw;
-        out_.fatal(CALL_INFO, -1, "TraceNoCSourceV5 received an invalid injection ACK\n");
+        out_.fatal(CALL_INFO, -1, "TRACE-ADMISSION: TraceNoCSourceV5 received an invalid injection ACK\n");
     }
     const auto found = outstanding_.find(ack->event_token);
     if (found == outstanding_.end() || ack->event_id != found->second.record.event_id) {
         delete ack;
-        out_.fatal(CALL_INFO, -1, "TraceNoCSourceV5 received an unknown injection ACK\n");
+        out_.fatal(CALL_INFO, -1, "TRACE-IDENTITY: TraceNoCSourceV5 received an unknown injection ACK\n");
     }
     InFlight flight = found->second;
     if (ack->accepted) {
@@ -253,7 +262,7 @@ void TraceNoCSourceV5::handleAck_(SST::Event* raw) {
         eligible_.push_front(flight.record);
     } else {
         delete ack;
-        out_.fatal(CALL_INFO, -1, "TraceNoCSourceV5 injection was permanently rejected\n");
+        out_.fatal(CALL_INFO, -1, "TRACE-ADMISSION: TraceNoCSourceV5 injection was permanently rejected\n");
     }
     delete ack;
 }
@@ -285,7 +294,7 @@ void TraceNoCSourceV5::finish() {
     if (observation_stream_.is_open()) observation_stream_.flush();
     writeEvidence_();
     if (!finished_ || !eligible_.empty() || !outstanding_.empty() || completed_ != records_ || offered_ != records_)
-        out_.fatal(CALL_INFO, -1, "TraceNoCSourceV5 finished before source replay drained\n");
+        out_.fatal(CALL_INFO, -1, "TRACE-DRAIN: TraceNoCSourceV5 finished before source replay drained\n");
 }
 
 }}}

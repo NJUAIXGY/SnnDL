@@ -17,7 +17,7 @@ TraceReplayCoordinatorV5::TraceReplayCoordinatorV5(SST::ComponentId_t id, SST::P
       output_json_(params.find<std::string>("output_json", "")) {
     out_.setVerboseLevel(params.find<int>("verbose", 0));
     if (execution_mode_ != "trace_open_loop" && execution_mode_ != "trace_dependency_closed_loop") {
-        out_.fatal(CALL_INFO, -1, "TraceReplayCoordinatorV5 received unsupported execution_mode=%s\n",
+        out_.fatal(CALL_INFO, -1, "TRACE-CONFIG: TraceReplayCoordinatorV5 received unsupported execution_mode=%s\n",
                    execution_mode_.c_str());
     }
     command_links_.reserve(sources_);
@@ -29,7 +29,7 @@ TraceReplayCoordinatorV5::TraceReplayCoordinatorV5(SST::ComponentId_t id, SST::P
             "status_source" + std::to_string(source),
             new SST::Event::Handler2<TraceReplayCoordinatorV5, &TraceReplayCoordinatorV5::handleStatus_>(this));
         if (!command || !status) {
-            out_.fatal(CALL_INFO, -1, "TraceReplayCoordinatorV5 requires command/status links for source=%u\n", source);
+            out_.fatal(CALL_INFO, -1, "TRACE-CONFIG: TraceReplayCoordinatorV5 requires command/status links for source=%u\n", source);
         }
         command_links_.push_back(command);
         status_links_.push_back(status);
@@ -59,11 +59,11 @@ void TraceReplayCoordinatorV5::handleStatus_(SST::Event* event) {
     auto* status = dynamic_cast<TraceStatusEvent*>(event);
     if (!status) {
         delete event;
-        out_.fatal(CALL_INFO, -1, "TraceReplayCoordinatorV5 received an unexpected status event\n");
+        out_.fatal(CALL_INFO, -1, "TRACE-CONTROL: TraceReplayCoordinatorV5 received an unexpected status event\n");
     }
     if (status->source_id >= sources_) {
         delete status;
-        out_.fatal(CALL_INFO, -1, "TraceReplayCoordinatorV5 received status from invalid source=%u\n",
+        out_.fatal(CALL_INFO, -1, "TRACE-IDENTITY: TraceReplayCoordinatorV5 received status from invalid source=%u\n",
                    status->source_id);
     }
     auto& state = sources_state_[status->source_id];
@@ -72,11 +72,11 @@ void TraceReplayCoordinatorV5::handleStatus_(SST::Event* event) {
     case TraceStatusOp::Ready:
         if (state.ready) {
             delete status;
-            out_.fatal(CALL_INFO, -1, "duplicate Ready status from source=%u\n", status->source_id);
+            out_.fatal(CALL_INFO, -1, "TRACE-CONTROL: duplicate Ready status from source=%u\n", status->source_id);
         }
         if (start_sent_) {
             delete status;
-            out_.fatal(CALL_INFO, -1, "Ready status arrived after replay start\n");
+            out_.fatal(CALL_INFO, -1, "TRACE-CONTROL: Ready status arrived after replay start\n");
         }
         state.ready = true;
         state.status = *status;
@@ -88,7 +88,7 @@ void TraceReplayCoordinatorV5::handleStatus_(SST::Event* event) {
     case TraceStatusOp::Drained:
         if (!start_sent_ || !state.ready || state.drained) {
             delete status;
-            out_.fatal(CALL_INFO, -1, "invalid Drained status from source=%u\n", status->source_id);
+            out_.fatal(CALL_INFO, -1, "TRACE-CONTROL: invalid Drained status from source=%u\n", status->source_id);
         }
         state.drained = true;
         state.status = *status;
@@ -102,7 +102,7 @@ void TraceReplayCoordinatorV5::handleStatus_(SST::Event* event) {
             const auto source = status->source_id;
             const auto error = status->error;
             delete status;
-            out_.fatal(CALL_INFO, -1, "Trace replay source=%u failed: %s\n", source, error.c_str());
+            out_.fatal(CALL_INFO, -1, "TRACE-CONTROL: Trace replay source=%u failed: %s\n", source, error.c_str());
         }
         break;
     }
@@ -124,7 +124,7 @@ void TraceReplayCoordinatorV5::complete_() {
     const auto manifest_match = expected_records_ == 0 || expected_records_ == expected;
     if (!manifest_match || expected != offered || offered != injected || injected != completed) {
         out_.fatal(CALL_INFO, -1,
-                   "Trace replay request conservation failed expected=%" PRIu64
+                   "TRACE-DRAIN: Trace replay request conservation failed expected=%" PRIu64
                    " offered=%" PRIu64 " injected=%" PRIu64 " completed=%" PRIu64 "\n",
                    expected, offered, injected, completed);
     }
@@ -138,7 +138,7 @@ bool TraceReplayCoordinatorV5::tick_(SST::Cycle_t) {
     if (!finished_ && cycle_ - last_progress_cycle_ > timeout_cycles_) {
         sendAbort_();
         writeSummary_();
-        out_.fatal(CALL_INFO, -1, "TraceReplayCoordinatorV5 timeout after %" PRIu64 " cycles\n", timeout_cycles_);
+        out_.fatal(CALL_INFO, -1, "TRACE-DRAIN: TraceReplayCoordinatorV5 timeout after %" PRIu64 " cycles\n", timeout_cycles_);
     }
     return false;
 }

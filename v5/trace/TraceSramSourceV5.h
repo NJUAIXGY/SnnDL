@@ -3,6 +3,7 @@
 
 #include "v5/events/StorageEvents.h"
 #include "v5/events/TraceEvents.h"
+#include "v5/trace/TraceJsonlReader.h"
 
 #include <sst/core/component.h>
 #include <sst/core/link.h>
@@ -34,6 +35,9 @@ public:
         {"issue_width_per_source", "Maximum requests offered per source tick", "1"},
         {"max_outstanding_per_source", "Maximum requests awaiting SRAM response", "1"},
         {"lookahead_records", "Bounded records held ahead of the issue cursor", "64"},
+        // The default below is a string literal only for the ELI table; it mirrors
+        // kTraceMaxLineBytesDefault in v5/trace/TraceJsonlReader.h, which is the value
+        // actually used when the parameter is absent.
         {"max_line_bytes", "Maximum accepted JSONL record length", "1048576"},
         {"clock", "Replay source clock", "1GHz"},
         {"verbose", "Verbose level", "0"})
@@ -89,13 +93,14 @@ private:
     SST::Link* command_link_ = nullptr;
     SST::Link* status_link_ = nullptr;
     std::ifstream trace_stream_;
+    TraceJsonlReader reader_;
     std::ofstream observation_stream_;
     std::string trace_file_, output_json_, observation_json_, execution_mode_ = "trace_open_loop";
     std::uint32_t source_id_ = 0;
     std::uint32_t coordinator_source_id_ = 0;
     bool mixed_source_stream_ = false;
     bool external_control_ = false;
-    std::uint64_t max_line_bytes_ = 1024 * 1024;
+    std::uint64_t max_line_bytes_ = kTraceMaxLineBytesDefault;
     std::uint64_t issue_width_ = 1, max_outstanding_ = 1, lookahead_limit_ = 64;
     std::uint64_t cycle_ = 0;
     std::uint64_t records_ = 0, eligible_records_ = 0, offered_ = 0, injected_ = 0;

@@ -1,3 +1,11 @@
+# The v5 trace sources parse JSONL with the nlohmann single-header library that
+# sst-core vendors under external/nlohmann.  sst-core distributes that header but
+# does not install it, so it is absent from $(SST_PREFIX)/include and must be
+# taken from the sibling sst-core checkout.  This is the only place that path is
+# recorded; override it for non-standard layouts, e.g.
+#   make SNNDL_SST_CORE_SRCDIR=/path/to/sst-core
+SNNDL_SST_CORE_SRCDIR ?= $(top_srcdir)/../sst-core
+
 AM_CPPFLAGS += \
 	-I$(top_srcdir)/src \
 	-I$(srcdir) \
@@ -12,7 +20,8 @@ AM_CPPFLAGS += \
 	-I$(srcdir)/snn/profiling \
 	-I$(srcdir)/snn/synapse/route \
 	-I$(srcdir)/research \
-	-I$(SST_PREFIX)/include
+	-I$(SST_PREFIX)/include \
+	-I$(SNNDL_SST_CORE_SRCDIR)/external
 
 compdir = $(pkglibdir)
 include build/core_sources.am
@@ -105,7 +114,7 @@ TEST_LINK = $(CXXLD) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) \
 	$(AM_CPPFLAGS) $(CPPFLAGS) $(CXXFLAGS)
 
 .PHONY: check-boundaries test-compile test-timestep-core test-v5-core-pipeline test-v5-cuba-lif \
-	test-v5-core-storage test-v5-banked-sram \
+	test-v5-core-storage test-v5-banked-sram test-v5-trace-jsonl-reader \
 	test-bcsr-source-contract test-v5-address test-v5-statistics test-v5-multicast-tree \
 	test-banked-sram test-local-storage
 
@@ -176,6 +185,15 @@ test-v5-banked-sram:
 		-o $(builddir)/test_banked_sram_v5$(EXEEXT) && \
 	$(builddir)/test_banked_sram_v5$(EXEEXT)
 
+# First direct unit test of the v5 trace runtime: the bounded JSONL record
+# reader shared by the three replay sources.  It has no SST dependency, so it
+# links standalone in the same style as the other test-v5-* targets.
+test-v5-trace-jsonl-reader:
+	$(TEST_LINK) $(srcdir)/tests/v5/test_trace_jsonl_reader_v5.cc \
+		$(srcdir)/v5/trace/TraceJsonlReader.cc \
+		-o $(builddir)/test_trace_jsonl_reader_v5$(EXEEXT) && \
+	$(builddir)/test_trace_jsonl_reader_v5$(EXEEXT)
+
 test-banked-sram:
 	$(TEST_LINK) $(srcdir)/tests/test_banked_sram_model.cc \
 		$(srcdir)/platform/memory/sram_sim/model/BankedSramModel.cc \
@@ -199,4 +217,5 @@ test-compile:
 	$(CXXCOMPILE) -c $(srcdir)/tests/v5/test_multicast_branch_table_v5.cc -o $(builddir)/test_multicast_branch_table_v5.o
 	$(CXXCOMPILE) -c $(srcdir)/tests/v5/test_core_pipeline.cc -o $(builddir)/test_core_pipeline.o
 	$(CXXCOMPILE) -c $(srcdir)/tests/v5/test_core_storage_v5.cc -o $(builddir)/test_core_storage_v5.o
+	$(CXXCOMPILE) -c $(srcdir)/tests/v5/test_trace_jsonl_reader_v5.cc -o $(builddir)/test_trace_jsonl_reader_v5.o
 	$(CXXCOMPILE) -c $(srcdir)/tests/test_timestep_core.cc -o $(builddir)/test_timestep_core.o

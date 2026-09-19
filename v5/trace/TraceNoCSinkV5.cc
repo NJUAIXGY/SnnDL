@@ -18,7 +18,7 @@ TraceNoCSinkV5::TraceNoCSinkV5(SST::ComponentId_t id, SST::Params& p)
     out_.setVerboseLevel(p.find<int>("verbose", 0));
     delivery_ = configureLink("delivery", new Event::Handler2<TraceNoCSinkV5, &TraceNoCSinkV5::handleDelivery_>(this));
     ack_ = configureLink("ack");
-    if (!delivery_ || !ack_) out_.fatal(CALL_INFO, -1, "TraceNoCSinkV5 requires delivery and ack links\n");
+    if (!delivery_ || !ack_) out_.fatal(CALL_INFO, -1, "TRACE-CONFIG: TraceNoCSinkV5 requires delivery and ack links\n");
     registerClock(p.find<std::string>("clock", "1GHz"), new Clock::Handler2<TraceNoCSinkV5, &TraceNoCSinkV5::tick_>(this));
     registerAsPrimaryComponent();
     primaryComponentDoNotEndSim();
@@ -32,7 +32,7 @@ void TraceNoCSinkV5::handleDelivery_(SST::Event* raw) {
     auto* event = dynamic_cast<TraceNoCDeliveryV5Event*>(raw);
     if (!event || event->format_version != TraceNoCInjectionV5Event::kFormatVersion ||
         event->destination_pe != destination_pe_ || event->destination_core != destination_core_) {
-        delete raw; out_.fatal(CALL_INFO, -1, "TraceNoCSinkV5 received an invalid destination event\n");
+        delete raw; out_.fatal(CALL_INFO, -1, "TRACE-IDENTITY: TraceNoCSinkV5 received an invalid destination event\n");
     }
     if (queue_.size() >= queue_entries_) {
         auto* ack = new TraceNoCDeliveryAckV5Event();
@@ -88,7 +88,7 @@ void TraceNoCSinkV5::writeEvidence_() const {
 void TraceNoCSinkV5::finish() {
     writeEvidence_();
     if (!queue_.empty() || (expected_deliveries_ != 0 && completed_ != expected_deliveries_))
-        out_.fatal(CALL_INFO, -1, "TraceNoCSinkV5 finished before expected deliveries drained\n");
+        out_.fatal(CALL_INFO, -1, "TRACE-DRAIN: TraceNoCSinkV5 finished before expected deliveries drained\n");
 }
 
 }}}

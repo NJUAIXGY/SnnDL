@@ -84,6 +84,16 @@ float floatOfBits(std::uint32_t bits) {
     return value;
 }
 
+// The execution SRAM record family has no SST-time coordinate: issue,
+// service and completion cycles below are region-local counters that this
+// binding advances itself.  The only workload coordinate a record can carry
+// is the pipeline timestep declared through CoreStorageV5::beginTimestep(),
+// and an access made outside a declared timestep stays explicitly null rather
+// than being reported as timestep 0.
+std::string timestepField(bool have_timestep, std::uint64_t timestep) {
+    return have_timestep ? std::to_string(timestep) : std::string("null");
+}
+
 } // namespace
 
 CoreStorageV5Config CoreStorageV5::normalize_(CoreStorageV5Config config) {
@@ -219,6 +229,7 @@ bool CoreStorageV5::transfer_(Region& region, std::uint64_t byte_offset,
                           << ",\"address\":" << byte_offset << ",\"bytes\":" << input.size()
                           << ",\"write\":" << (write ? "true" : "false")
                           << ",\"issue_cycle\":" << issue_cycle
+                          << ",\"timestep\":" << timestepField(have_timestep_, current_timestep_)
                           << ",\"accepted\":false,\"completed\":false"
                           << ",\"retryable\":" << (rejection.retryable ? "true" : "false")
                           << ",\"bank\":" << rejection.bank
@@ -246,6 +257,7 @@ bool CoreStorageV5::transfer_(Region& region, std::uint64_t byte_offset,
                               << ",\"address\":" << byte_offset << ",\"bytes\":" << input.size()
                               << ",\"write\":" << (write ? "true" : "false")
                               << ",\"issue_cycle\":" << issue_cycle
+                              << ",\"timestep\":" << timestepField(have_timestep_, current_timestep_)
                               << ",\"accepted\":true,\"completed\":true"
                               << ",\"retryable\":false,\"bank\":" << response.bank
                               << ",\"port\":" << response.port
@@ -273,6 +285,14 @@ bool CoreStorageV5::writeBytes_(Region& region, std::uint64_t byte_offset,
     if (input.empty()) return false;
     std::vector<std::uint8_t> ignored;
     return transfer_(region, byte_offset, input, true, ignored);
+}
+
+void CoreStorageV5::beginTimestep(std::uint64_t timestep) {
+    if (have_timestep_ && timestep < current_timestep_) {
+        throw std::invalid_argument("P2 storage timestep must not move backwards");
+    }
+    have_timestep_ = true;
+    current_timestep_ = timestep;
 }
 
 void CoreStorageV5::resetTimestep() {
