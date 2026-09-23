@@ -67,6 +67,15 @@ IdealSynapseSource::IdealSynapseSource(SST::ComponentId_t id, SST::Params& param
     if (dram_bank_policy_ != "low_bits") {
         out_.fatal(CALL_INFO, -1, "unsupported dram_bank_policy; only low_bits is legal\n");
     }
+    compiled_window_ = std::max<std::size_t>(1, params.find<std::size_t>("weight_provider_compiled_window", 1));
+    target_limit_ = std::max<std::size_t>(1, params.find<std::size_t>("weight_provider_target_limit", 1));
+    constexpr std::size_t kSameRowChunkLimit = 4;
+    if (compiled_window_ > kSameRowChunkLimit || target_limit_ > kSameRowChunkLimit) {
+        out_.fatal(CALL_INFO, -1, "weight provider window exceeds the same-row chunk limit of 4\n");
+    }
+    effective_window_ = std::min(compiled_window_, target_limit_);
+    forced_reject_attempts_ = params.find<std::uint32_t>("weight_provider_reject_attempts", 0);
+    complete_descending_ = params.find<int>("weight_provider_complete_descending", 0) != 0;
     current_timestep_ = start_timestep_;
     out_.setVerboseLevel(params.find<int>("verbose", 0));
     try {
@@ -290,6 +299,9 @@ void IdealSynapseSource::respondToRow_(const CoreRowRequestEvent& request) {
         provider_transactions_.push_back(std::move(transaction));
         ++rows_served_;
         issueMemoryRead_();
+        if (!provider_transactions_.empty() && provider_transactions_.front().memory_edges == 0) {
+            sendNextProviderItem_();
+        }
         return;
     }
     std::vector<Edge> row;
@@ -302,100 +314,180 @@ void IdealSynapseSource::respondToRow_(const CoreRowRequestEvent& request) {
 }
 
 void IdealSynapseSource::issueMemoryRead_() {
-    if (!memory_ || provider_transactions_.empty() || pending_memory_) return;
+    if (!memory_ || provider_transactions_.empty()) return;
     auto& transaction = provider_transactions_.front();
-    if (transaction.memory_reads_completed >= transaction.memory_edges) {
-        sendNextProviderItem_();
+    if (transaction.next_record >= transaction.memory_edges &&
+        (transaction.chunks.empty() || transaction.chunks.back().issued)) {
         return;
     }
+    const auto inflight_before = inflight_chunk_.size();
     static constexpr std::uint64_t record_bytes = sizeof(std::uint32_t) + sizeof(float) + sizeof(std::uint64_t);
-    const auto address = weight_read_base_ + transaction.memory_offset +
-                         transaction.memory_reads_completed * record_bytes;
-    const auto line_remaining = weight_cache_line_bytes_ - (address % weight_cache_line_bytes_);
-    const auto records = std::min<std::size_t>(
-        std::min(weight_read_granularity_bytes_ / record_bytes,
-                 static_cast<std::size_t>(line_remaining / record_bytes)),
-        transaction.memory_edges - transaction.memory_reads_completed);
-    if (records == 0) {
-        out_.fatal(CALL_INFO, -1, "IdealSynapseSource cannot issue a cache-line-bounded weight read\n");
+    while (inflight_chunk_.size() < effective_window_ &&
+           (transaction.next_record < transaction.memory_edges ||
+            (!transaction.chunks.empty() && !transaction.chunks.back().issued))) {
+        if (transaction.chunks.empty() || transaction.chunks.back().issued) {
+            const auto address = weight_read_base_ + transaction.memory_offset +
+                                 transaction.next_record * record_bytes;
+            const auto line_remaining = weight_cache_line_bytes_ - (address % weight_cache_line_bytes_);
+            const auto records = std::min<std::size_t>(
+                std::min(weight_read_granularity_bytes_ / record_bytes,
+                         static_cast<std::size_t>(line_remaining / record_bytes)),
+                transaction.memory_edges - transaction.next_record);
+            if (records == 0) {
+                out_.fatal(CALL_INFO, -1, "IdealSynapseSource cannot issue a cache-line-bounded weight read\n");
+            }
+            InFlightChunk chunk;
+            chunk.logical_operation_id = next_logical_operation_++;
+            chunk.record_cursor = transaction.next_record;
+            chunk.records = records;
+            chunk.address = address;
+            chunk.bytes = records * record_bytes;
+            transaction.next_record += records;
+            transaction.chunks.push_back(std::move(chunk));
+        }
+        auto& chunk = transaction.chunks.back();
+        ++chunk.attempt_id;
+        if (chunk.attempt_id <= forced_reject_attempts_) {
+            ++memory_request_retries_;
+            ++provider_stall_cycles_;
+            return;
+        }
+        const auto bank = (chunk.address / dram_bank_interleave_bytes_) % dram_bank_count_;
+        auto* request = new SST::Interfaces::StandardMem::Read(chunk.address, chunk.bytes);
+        chunk.physical_request_id = static_cast<std::uint64_t>(request->getID());
+        chunk.issued = true;
+        std::ostringstream identity;
+        identity << "t" << transaction.request.timestep << ".core" << core_id_
+                 << ".row" << transaction.request.row_id << ".chunk" << chunk.record_cursor;
+        chunk.trace = MemoryRequestTrace{
+            identity.str(), chunk.physical_request_id, chunk.logical_operation_id, chunk.attempt_id,
+            transaction.request.timestep, transaction.request.source_neuron,
+            transaction.request.source_event_seq, transaction.request.row_id, chunk.record_cursor,
+            chunk.address, chunk.bytes, static_cast<std::uint64_t>(chunk.records), tick_count_, 0, bank, false,
+        };
+        inflight_chunk_.emplace(chunk.physical_request_id, transaction.chunks.size() - 1);
+        inflight_peak_ = std::max<std::uint64_t>(inflight_peak_, inflight_chunk_.size());
+        memory_->send(request);
+        memory_reads_ += chunk.records;
+        ++memory_requests_;
+        memory_read_bytes_ += chunk.bytes;
     }
-    const auto request_bytes = records * record_bytes;
-    const auto bank = (address / dram_bank_interleave_bytes_) % dram_bank_count_;
-    auto* request = new SST::Interfaces::StandardMem::Read(address, request_bytes);
-    const auto request_id = static_cast<std::uint64_t>(request->getID());
-    pending_memory_request_ = request_id;
-    pending_memory_records_ = records;
-    pending_memory_ = true;
-    transaction.memory_read_in_flight = true;
-    memory_->send(request);
-    std::ostringstream identity;
-    identity << "t" << transaction.request.timestep << ".core" << core_id_
-             << ".row" << transaction.request.row_id << ".chunk"
-             << transaction.memory_reads_completed;
-    pending_memory_trace_ = MemoryRequestTrace{
-        identity.str(), request_id, transaction.request.timestep,
-        transaction.request.source_neuron, transaction.request.source_event_seq,
-        transaction.request.row_id,
-        transaction.memory_reads_completed, address,
-        static_cast<std::uint64_t>(request_bytes), static_cast<std::uint64_t>(records),
-        tick_count_, 0, bank, false,
-    };
-    pending_memory_trace_valid_ = true;
-    memory_reads_ += records;
-    ++memory_requests_;
-    memory_read_bytes_ += request_bytes;
+    if (inflight_chunk_.size() == inflight_before && transaction.next_record < transaction.memory_edges) {
+        ++provider_stall_cycles_;
+        ++row_wait_cycles_;
+    }
 }
 
-void IdealSynapseSource::handleMemory_(SST::Interfaces::StandardMem::Request* request) {
-    auto* response = dynamic_cast<SST::Interfaces::StandardMem::ReadResp*>(request);
-    if (!response || provider_transactions_.empty() ||
-        static_cast<std::uint64_t>(request->getID()) != pending_memory_request_) {
-        delete request;
+void IdealSynapseSource::publishReadyChunks_() {
+    if (provider_transactions_.empty()) return;
+    auto& transaction = provider_transactions_.front();
+    const bool was_complete = transaction.memory_reads_completed == transaction.memory_edges;
+    while (true) {
+        InFlightChunk* ready = nullptr;
+        for (auto& chunk : transaction.chunks) {
+            if (!chunk.published && chunk.record_cursor == transaction.memory_reads_completed) {
+                ready = &chunk;
+                break;
+            }
+        }
+        if (ready == nullptr || !ready->completed) break;
+        for (const auto& edge : ready->edges) transaction.row.push_back(edge);
+        transaction.memory_reads_completed += ready->records;
+        ready->published = true;
+    }
+    std::uint64_t waiting = 0;
+    for (const auto& chunk : transaction.chunks) {
+        if (chunk.completed && !chunk.published) ++waiting;
+    }
+    reorder_peak_ = std::max(reorder_peak_, waiting);
+    if (!was_complete && transaction.memory_reads_completed == transaction.memory_edges && reverse_responses_) {
+        std::reverse(transaction.row.begin(), transaction.row.end());
+    }
+}
+
+void IdealSynapseSource::applyMemoryResponse_(std::uint64_t request_id, const std::vector<std::uint8_t>& data) {
+    if (provider_transactions_.empty() || inflight_chunk_.count(request_id) == 0) {
         out_.fatal(CALL_INFO, -1, "IdealSynapseSource received an unexpected StandardMem response\n");
     }
-    static constexpr std::size_t record_bytes = sizeof(std::uint32_t) + sizeof(float) + sizeof(std::uint64_t);
     auto& transaction = provider_transactions_.front();
-    const auto records = pending_memory_records_;
-    const auto response_bytes = records * record_bytes;
-    if (response->data.size() < response_bytes) {
-        delete response;
+    auto& chunk = transaction.chunks.at(inflight_chunk_.at(request_id));
+    static constexpr std::size_t record_bytes = sizeof(std::uint32_t) + sizeof(float) + sizeof(std::uint64_t);
+    const auto response_bytes = chunk.records * record_bytes;
+    if (data.size() < response_bytes) {
         out_.fatal(CALL_INFO, -1, "IdealSynapseSource received a truncated weight record\n");
     }
-    for (std::size_t index = 0; index < records; ++index) {
-        const auto* record = response->data.data() + index * record_bytes;
+    chunk.edges.reserve(chunk.records);
+    for (std::size_t index = 0; index < chunk.records; ++index) {
+        const auto* record = data.data() + index * record_bytes;
         Edge edge;
         std::memcpy(&edge.post, record, sizeof(edge.post));
         std::memcpy(&edge.weight, record + sizeof(edge.post), sizeof(edge.weight));
         std::memcpy(&edge.ordinal, record + sizeof(edge.post) + sizeof(edge.weight), sizeof(edge.ordinal));
         if (edge.post >= neurons_) {
-            delete response;
             out_.fatal(CALL_INFO, -1,
                        "IdealSynapseSource decoded invalid post=%" PRIu32
-                       " core=%" PRIu32 " row_offset=%" PRIu64 " record=%zu\n",
+                       " core=%" PRIu32 " row_offset=%" PRIu64 " record=%" PRIu64 "\n",
                        edge.post, core_id_, transaction.memory_offset,
-                       transaction.memory_reads_completed + index);
+                       chunk.record_cursor + index);
         }
-        transaction.row.push_back(edge);
+        chunk.edges.push_back(edge);
         decoded_weight_sum_ += edge.weight;
     }
-    transaction.memory_reads_completed += records;
-    if (!pending_memory_trace_valid_ ||
-        pending_memory_trace_.request_id != pending_memory_request_) {
-        delete response;
-        out_.fatal(CALL_INFO, -1, "IdealSynapseSource memory trace state is inconsistent\n");
-    }
-    pending_memory_trace_.completion_cycle = tick_count_;
-    pending_memory_trace_.completed = true;
-    appendRequestTrace_();
-    pending_memory_trace_valid_ = false;
-    transaction.memory_read_in_flight = false;
-    if (transaction.memory_reads_completed == transaction.memory_edges && reverse_responses_) {
-        std::reverse(transaction.row.begin(), transaction.row.end());
-    }
-    pending_memory_ = false;
-    delete response;
+    chunk.completed = true;
+    chunk.trace.completion_cycle = tick_count_;
+    chunk.trace.completed = true;
+    chunk.trace.attempt_id = chunk.attempt_id;
+    appendRequestTrace_(chunk.trace);
+    inflight_chunk_.erase(request_id);
+    publishReadyChunks_();
     issueMemoryRead_();
+    if (transaction.memory_reads_completed == transaction.memory_edges) sendNextProviderItem_();
     maybeFinish_();
+}
+
+void IdealSynapseSource::releaseMemoryResponses_() {
+    if (held_responses_.empty()) return;
+    if (provider_transactions_.empty()) {
+        out_.fatal(CALL_INFO, -1, "IdealSynapseSource buffered a response without a provider row\n");
+    }
+    if (!complete_descending_) {
+        while (!held_responses_.empty()) {
+            auto held = std::move(held_responses_.front());
+            held_responses_.pop_front();
+            applyMemoryResponse_(held.request_id, held.data);
+        }
+        return;
+    }
+    std::size_t best = 0;
+    std::uint64_t best_cursor = 0;
+    for (std::size_t index = 0; index < held_responses_.size(); ++index) {
+        const auto cursor = provider_transactions_.front().chunks.at(
+            inflight_chunk_.at(held_responses_[index].request_id)).record_cursor;
+        if (index == 0 || cursor > best_cursor) {
+            best = index;
+            best_cursor = cursor;
+        }
+    }
+    for (const auto& item : inflight_chunk_) {
+        bool buffered = false;
+        for (const auto& held : held_responses_) if (held.request_id == item.first) buffered = true;
+        if (!buffered && provider_transactions_.front().chunks.at(item.second).record_cursor > best_cursor) return;
+    }
+    auto held = std::move(held_responses_[best]);
+    held_responses_.erase(held_responses_.begin() + static_cast<std::ptrdiff_t>(best));
+    applyMemoryResponse_(held.request_id, held.data);
+}
+
+void IdealSynapseSource::handleMemory_(SST::Interfaces::StandardMem::Request* request) {
+    auto* response = dynamic_cast<SST::Interfaces::StandardMem::ReadResp*>(request);
+    if (!response || inflight_chunk_.count(static_cast<std::uint64_t>(request->getID())) == 0) {
+        delete request;
+        out_.fatal(CALL_INFO, -1, "IdealSynapseSource received an unexpected StandardMem response\n");
+    }
+    held_responses_.push_back(HeldMemoryResponse{
+        static_cast<std::uint64_t>(response->getID()), std::move(response->data)});
+    delete response;
+    releaseMemoryResponses_();
 }
 
 void IdealSynapseSource::handlePreload_(SST::Event* event) {
@@ -554,11 +646,19 @@ void IdealSynapseSource::handleProvider_(SST::Event* event) {
     maybeFinish_();
 }
 
-void IdealSynapseSource::maybeFinish_() {
-    if (finished_ || !final_commit_done_pending_ || pending_memory_ ||
-        !provider_transactions_.empty()) {
-        return;
+bool IdealSynapseSource::providerBusy_() const {
+    if (!provider_transactions_.empty() || !inflight_chunk_.empty() || !held_responses_.empty()) return true;
+    for (const auto& transaction : provider_transactions_) {
+        for (const auto& chunk : transaction.chunks) {
+            if (!chunk.published) return true;
+        }
     }
+    return false;
+}
+
+void IdealSynapseSource::maybeFinish_() {
+    if (finished_ || !final_commit_done_pending_ || providerBusy_()) return;
+    provider_drain_cycle_ = tick_count_;
     finished_ = true;
     primaryComponentOKToEndSim();
 }
@@ -595,6 +695,10 @@ void IdealSynapseSource::handleStatus_(SST::Event* event) {
 
 bool IdealSynapseSource::clockTick_(SST::Cycle_t) {
     ++tick_count_;
+    if (memory_ && !finished_) {
+        releaseMemoryResponses_();
+        issueMemoryRead_();
+    }
     if (finished_) return false;
     if (!preload_ready_) {
         ++preload_wait_cycles_;
@@ -666,7 +770,20 @@ void IdealSynapseSource::writeEvidence_() const {
         << "  \"memory_requests\": " << memory_requests_ << ",\n"
         << "  \"memory_requests_issued\": " << memory_requests_ << ",\n"
         << "  \"memory_requests_accepted\": " << memory_requests_ << ",\n"
-        << "  \"memory_requests_retried\": 0,\n"
+        << "  \"memory_requests_retried\": " << memory_request_retries_ << ",\n"
+        << "  \"provider_compiled_window\": " << compiled_window_ << ",\n"
+        << "  \"provider_target_limit\": " << target_limit_ << ",\n"
+        << "  \"provider_effective_window\": " << effective_window_ << ",\n"
+        << "  \"provider_inflight_peak\": " << inflight_peak_ << ",\n"
+        << "  \"provider_reorder_peak\": " << reorder_peak_ << ",\n"
+        << "  \"provider_stall_cycles\": " << provider_stall_cycles_ << ",\n"
+        << "  \"row_wait_cycles\": " << row_wait_cycles_ << ",\n"
+        << "  \"provider_inflight_final\": " << inflight_chunk_.size() << ",\n"
+        << "  \"provider_drain_cycle\": " << provider_drain_cycle_ << ",\n"
+        << "  \"provider_capability\": {\"provider_window_scope\": \"same_row_chunks_only\""
+        << ", \"provider_target_limit\": 4, \"compiled_window_default\": 1"
+        << ", \"cross_row_concurrency\": \"unsupported\", \"reorder_policy\": \"cursor_order\""
+        << ", \"retry_policy\": \"same_logical_id_new_attempt\"},\n"
         << "  \"weight_record_bytes\": 16,\n"
         << "  \"weight_cache_line_bytes\": " << weight_cache_line_bytes_ << ",\n"
         << "  \"weight_image_write_bytes\": " << weight_image_write_bytes_ << ",\n"
@@ -751,16 +868,20 @@ void IdealSynapseSource::writeRequestTrace_() const {
     if (request_trace_stream_.is_open()) request_trace_stream_.flush();
 }
 
-void IdealSynapseSource::appendRequestTrace_() const {
-    if (!request_trace_stream_.good() || !pending_memory_trace_valid_) return;
-    const auto& trace = pending_memory_trace_;
+void IdealSynapseSource::appendRequestTrace_(const MemoryRequestTrace& trace) const {
+    if (!request_trace_stream_.good()) return;
+    const auto retried = trace.attempt_id > 0 ? trace.attempt_id - 1 : 0;
     request_trace_stream_ << "{\"id\": \"" << trace.identity << "\", \"request_id\": " << trace.request_id
+            << ", \"logical_operation_id\": " << trace.logical_operation_id
+            << ", \"attempt_id\": " << trace.attempt_id
             << ", \"timestep\": " << trace.timestep
             << ", \"source_neuron\": " << trace.source_neuron
             << ", \"source_event_seq\": " << trace.source_event_seq
             << ", \"source_core\": " << core_id_
+            << ", \"provider_core\": " << core_id_
             << ", \"row_id\": " << trace.row_id
             << ", \"sequence\": " << trace.sequence
+            << ", \"chunk_index\": " << trace.sequence
             << ", \"region_id\": \"Weights\""
             << ", \"request_class\": \"weight-read\""
             << ", \"issue_cycle_class\": \"synapse_issue\""
@@ -770,7 +891,10 @@ void IdealSynapseSource::appendRequestTrace_() const {
             << ", \"issue_cycle\": " << trace.issue_cycle
             << ", \"completion_cycle\": " << trace.completion_cycle
             << ", \"bank\": " << trace.bank
-            << ", \"accepted\": true, \"retried\": 0"
+            << ", \"accepted\": true, \"retried\": " << retried
+            << ", \"compiled_window\": " << compiled_window_
+            << ", \"target_limit\": " << target_limit_
+            << ", \"effective_window\": " << effective_window_
             << ", \"completed\": " << (trace.completed ? "true" : "false")
             // The provider owns the logical request identity, but it does not
             // observe cache/controller internals. Keep those dimensions
@@ -784,7 +908,7 @@ void IdealSynapseSource::appendRequestTrace_() const {
 
 void IdealSynapseSource::finish() {
     if (memory_) memory_->finish();
-    if (pending_memory_ || !provider_transactions_.empty()) {
+    if (providerBusy_()) {
         out_.fatal(CALL_INFO, -1, "IdealSynapseSource finished with outstanding memory/provider state\n");
     }
     writeEvidence_();

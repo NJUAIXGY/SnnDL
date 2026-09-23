@@ -282,13 +282,13 @@ am__objects_3 = v5/noc/MulticastRouterV5.lo v5/noc/PeEndpointV5.lo \
 	v5/core/CubaLifNeuronOp.lo v5/core/DeterministicRetireQueue.lo \
 	v5/core/CorePipeline.lo v5/core/SnnCoreV5.lo \
 	v5/storage/BankedSramV5.lo v5/storage/SnnDmaEngineV5.lo \
-	v5/storage/CoreStorageV5.lo \
+	v5/storage/CoreStorageV5.lo v5/storage/StateDeltaLayoutV5.lo \
 	v5/storage/BankedSramV5Component.lo \
 	v5/test/IdealSynapseSource.lo v5/test/DmaSourceV5.lo \
-	v5/test/SramProbeV5.lo v5/trace/TraceReplayCoordinatorV5.lo \
+	v5/test/SramProbeV5.lo v5/trace/TraceJsonlReader.lo \
+	v5/trace/TraceReplayCoordinatorV5.lo \
 	v5/trace/TraceMemorySourceV5.lo v5/trace/TraceSramSourceV5.lo \
-	v5/trace/TraceNoCSourceV5.lo \
-	v5/trace/TraceNoCSinkV5.lo
+	v5/trace/TraceNoCSourceV5.lo v5/trace/TraceNoCSinkV5.lo
 am_libSnnDLV5Core_la_OBJECTS = $(am__objects_3)
 libSnnDLV5Core_la_OBJECTS = $(am_libSnnDLV5Core_la_OBJECTS)
 libSnnDLV5Core_la_LINK = $(LIBTOOL) $(AM_V_lt) --tag=CXX \
@@ -364,11 +364,12 @@ am__depfiles_remade = components/$(DEPDIR)/MeshPE2D.Plo \
 	v5/test/$(DEPDIR)/DmaSourceV5.Plo \
 	v5/test/$(DEPDIR)/IdealSynapseSource.Plo \
 	v5/test/$(DEPDIR)/SramProbeV5.Plo \
+	v5/trace/$(DEPDIR)/TraceJsonlReader.Plo \
 	v5/trace/$(DEPDIR)/TraceMemorySourceV5.Plo \
-	v5/trace/$(DEPDIR)/TraceSramSourceV5.Plo \
 	v5/trace/$(DEPDIR)/TraceNoCSinkV5.Plo \
 	v5/trace/$(DEPDIR)/TraceNoCSourceV5.Plo \
-	v5/trace/$(DEPDIR)/TraceReplayCoordinatorV5.Plo
+	v5/trace/$(DEPDIR)/TraceReplayCoordinatorV5.Plo \
+	v5/trace/$(DEPDIR)/TraceSramSourceV5.Plo
 am__mv = mv -f
 CXXCOMPILE = $(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) \
 	$(AM_CPPFLAGS) $(CPPFLAGS) $(AM_CXXFLAGS) $(CXXFLAGS)
@@ -458,7 +459,7 @@ AM_CPPFLAGS =  -I/usr/include/python3.10 -I/usr/include/python3.10 -I/home/xgy/r
 	-I$(srcdir)/platform/core -I$(srcdir)/components/timestep \
 	-I$(srcdir)/snn/compute -I$(srcdir)/snn/profiling \
 	-I$(srcdir)/snn/synapse/route -I$(srcdir)/research \
-	-I$(SST_PREFIX)/include
+	-I$(SST_PREFIX)/include -I$(SNNDL_SST_CORE_SRCDIR)/external
 AM_CXXFLAGS =  -std=c++17 
 AM_DEFAULT_VERBOSITY = 0
 AM_LDFLAGS =  -L/usr/lib/python3.10/config-3.10-x86_64-linux-gnu -L/usr/lib/x86_64-linux-gnu -lpython3.10 -lcrypt -ldl  -lm -lm 
@@ -612,7 +613,7 @@ PINTOOL3_RUNTIME =
 PINTOOL_CPPFLAGS = 
 PINTOOL_DIR = 
 PINTOOL_LDFLAGS = 
-PINTOOL_PATH = /home/xgy/.opencode/bin:/home/xgy/.mimocode/bin:/home/xgy/.local/bin:/usr/local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path:/home/xgy/.codex/tmp/arg0/codex-arg0mGEtX7:/home/xgy/.local/bin:/home/xgy/.opencode/bin:/home/xgy/.mimocode/bin:/home/xgy/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin
+PINTOOL_PATH = /home/xgy/.qoder/entry:/home/xgy/.qoder-cn/entry:/home/xgy/.vscode-server/cli/servers/Stable-0f0d87fa9e96c856c5212fc86db137ac0d783365/server/bin/remote-cli:/home/xgy/.opencode/bin:/home/xgy/.mimocode/bin:/home/xgy/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/home/xgy/.vscode-server/data/User/globalStorage/github.copilot-chat/debugCommand
 PINTOOL_RUNTIME = 
 PIN_CPPFLAGS = -g   -Wall   -Werror   -Wno-unknown-pragmas   -D__PIN__=1 -DPIN_CRT=1   -fno-stack-protector   -fno-exceptions   -funwind-tables   -fasynchronous-unwind-tables   -fomit-frame-pointer   -fno-strict-aliasing   -fno-rtti   -faligned-new   -fpic   -DTARGET_IA32E   -DHOST_IA32E   -DTARGET_LINUX   -DPIN_VERSION_MINOR=
 PIN_CPPFLAGS_COMPILER = -fno-exceptions          -fabi-version=2
@@ -630,8 +631,8 @@ SET_MAKE =
 SHELL = /bin/bash
 SHM_LIB =  
 SSTELEMENTS_GIT_BRANCH = snndl_re
-SSTELEMENTS_GIT_COMMITCOUNT = 15412
-SSTELEMENTS_GIT_HEADSHA = 5b0b68ccd9244b8b9f31e7419d0e591dbbbf4bf1
+SSTELEMENTS_GIT_COMMITCOUNT = 15414
+SSTELEMENTS_GIT_HEADSHA = 4e417b4e723288ffb1d75a51e145d92090e60398
 SST_ACTIVE_ELEMENT_LIBRARIES =  ariel cacheTracer cassini cramSim ember firefly gensa golem hermes iris kingsley mask-mpi memHierarchy mercury merlin messier miranda mmu osseous prospero rdmaNic samba shogun simpleElementExample simpleSimulation SnnDL thornhill vanadis vaultsim zodiac
 SST_CONFIG_TOOL = /home/xgy/remote-20260430/remote/sst_install_mpi/bin/sst-config
 SST_DIST_ELEMENT_LIBRARIES =  ariel balar cacheTracer cassini cramSim ember firefly gensa golem hermes iris kingsley mask-mpi memHierarchy mercury merlin messier miranda mmu osseous prospero rdmaNic samba shogun simpleElementExample simpleSimulation SnnDL thornhill vanadis vaultsim zodiac
@@ -872,6 +873,8 @@ SNNDL_V5_CORE_SOURCES = \
 	v5/storage/SnnDmaEngineV5.cc \
 	v5/storage/CoreStorageV5.h \
 	v5/storage/CoreStorageV5.cc \
+	v5/storage/StateDeltaLayoutV5.h \
+	v5/storage/StateDeltaLayoutV5.cc \
 	v5/storage/BankedSramV5Component.h \
 	v5/storage/BankedSramV5Component.cc \
 	v5/test/IdealSynapseSource.h \
@@ -881,6 +884,8 @@ SNNDL_V5_CORE_SOURCES = \
 	v5/test/SramProbeV5.h \
 	v5/test/SramProbeV5.cc \
 	v5/events/TraceEvents.h \
+	v5/trace/TraceJsonlReader.h \
+	v5/trace/TraceJsonlReader.cc \
 	v5/trace/TraceReplayCoordinatorV5.h \
 	v5/trace/TraceReplayCoordinatorV5.cc \
 	v5/trace/TraceMemorySourceV5.h \
@@ -1310,6 +1315,8 @@ v5/storage/SnnDmaEngineV5.lo: v5/storage/$(am__dirstamp) \
 	v5/storage/$(DEPDIR)/$(am__dirstamp)
 v5/storage/CoreStorageV5.lo: v5/storage/$(am__dirstamp) \
 	v5/storage/$(DEPDIR)/$(am__dirstamp)
+v5/storage/StateDeltaLayoutV5.lo: v5/storage/$(am__dirstamp) \
+	v5/storage/$(DEPDIR)/$(am__dirstamp)
 v5/storage/BankedSramV5Component.lo: v5/storage/$(am__dirstamp) \
 	v5/storage/$(DEPDIR)/$(am__dirstamp)
 v5/test/$(am__dirstamp):
@@ -1330,6 +1337,8 @@ v5/trace/$(am__dirstamp):
 v5/trace/$(DEPDIR)/$(am__dirstamp):
 	@$(MKDIR_P) v5/trace/$(DEPDIR)
 	@: > v5/trace/$(DEPDIR)/$(am__dirstamp)
+v5/trace/TraceJsonlReader.lo: v5/trace/$(am__dirstamp) \
+	v5/trace/$(DEPDIR)/$(am__dirstamp)
 v5/trace/TraceReplayCoordinatorV5.lo: v5/trace/$(am__dirstamp) \
 	v5/trace/$(DEPDIR)/$(am__dirstamp)
 v5/trace/TraceMemorySourceV5.lo: v5/trace/$(am__dirstamp) \
@@ -1450,11 +1459,12 @@ include v5/storage/$(DEPDIR)/SnnDmaEngineV5.Plo # am--include-marker
 include v5/test/$(DEPDIR)/DmaSourceV5.Plo # am--include-marker
 include v5/test/$(DEPDIR)/IdealSynapseSource.Plo # am--include-marker
 include v5/test/$(DEPDIR)/SramProbeV5.Plo # am--include-marker
+include v5/trace/$(DEPDIR)/TraceJsonlReader.Plo # am--include-marker
 include v5/trace/$(DEPDIR)/TraceMemorySourceV5.Plo # am--include-marker
-include v5/trace/$(DEPDIR)/TraceSramSourceV5.Plo # am--include-marker
 include v5/trace/$(DEPDIR)/TraceNoCSinkV5.Plo # am--include-marker
 include v5/trace/$(DEPDIR)/TraceNoCSourceV5.Plo # am--include-marker
 include v5/trace/$(DEPDIR)/TraceReplayCoordinatorV5.Plo # am--include-marker
+include v5/trace/$(DEPDIR)/TraceSramSourceV5.Plo # am--include-marker
 
 $(am__depfiles_remade):
 	@$(MKDIR_P) $(@D)
@@ -1743,11 +1753,12 @@ distclean: distclean-am
 	-rm -f v5/test/$(DEPDIR)/DmaSourceV5.Plo
 	-rm -f v5/test/$(DEPDIR)/IdealSynapseSource.Plo
 	-rm -f v5/test/$(DEPDIR)/SramProbeV5.Plo
+	-rm -f v5/trace/$(DEPDIR)/TraceJsonlReader.Plo
 	-rm -f v5/trace/$(DEPDIR)/TraceMemorySourceV5.Plo
-	-rm -f v5/trace/$(DEPDIR)/TraceSramSourceV5.Plo
 	-rm -f v5/trace/$(DEPDIR)/TraceNoCSinkV5.Plo
 	-rm -f v5/trace/$(DEPDIR)/TraceNoCSourceV5.Plo
 	-rm -f v5/trace/$(DEPDIR)/TraceReplayCoordinatorV5.Plo
+	-rm -f v5/trace/$(DEPDIR)/TraceSramSourceV5.Plo
 	-rm -f Makefile
 distclean-am: clean-am distclean-compile distclean-generic \
 	distclean-tags
@@ -1847,11 +1858,12 @@ maintainer-clean: maintainer-clean-am
 	-rm -f v5/test/$(DEPDIR)/DmaSourceV5.Plo
 	-rm -f v5/test/$(DEPDIR)/IdealSynapseSource.Plo
 	-rm -f v5/test/$(DEPDIR)/SramProbeV5.Plo
+	-rm -f v5/trace/$(DEPDIR)/TraceJsonlReader.Plo
 	-rm -f v5/trace/$(DEPDIR)/TraceMemorySourceV5.Plo
-	-rm -f v5/trace/$(DEPDIR)/TraceSramSourceV5.Plo
 	-rm -f v5/trace/$(DEPDIR)/TraceNoCSinkV5.Plo
 	-rm -f v5/trace/$(DEPDIR)/TraceNoCSourceV5.Plo
 	-rm -f v5/trace/$(DEPDIR)/TraceReplayCoordinatorV5.Plo
+	-rm -f v5/trace/$(DEPDIR)/TraceSramSourceV5.Plo
 	-rm -f Makefile
 maintainer-clean-am: distclean-am maintainer-clean-generic
 
@@ -1895,8 +1907,16 @@ uninstall-am: uninstall-compLTLIBRARIES
 .PRECIOUS: Makefile
 
 
+# The v5 trace sources parse JSONL with the nlohmann single-header library that
+# sst-core vendors under external/nlohmann.  sst-core distributes that header but
+# does not install it, so it is absent from $(SST_PREFIX)/include and must be
+# taken from the sibling sst-core checkout.  This is the only place that path is
+# recorded; override it for non-standard layouts, e.g.
+#   make SNNDL_SST_CORE_SRCDIR=/path/to/sst-core
+SNNDL_SST_CORE_SRCDIR ?= $(top_srcdir)/../sst-core
+
 .PHONY: check-boundaries test-compile test-timestep-core test-v5-core-pipeline test-v5-cuba-lif \
-	test-v5-core-storage test-v5-banked-sram \
+	test-v5-core-storage test-v5-ca5a test-v5-ca5b test-v5-banked-sram test-v5-trace-jsonl-reader \
 	test-bcsr-source-contract test-v5-address test-v5-statistics test-v5-multicast-tree \
 	test-banked-sram test-local-storage
 
@@ -1936,6 +1956,7 @@ test-v5-core-pipeline:
 		$(srcdir)/v5/core/IfNeuronOp.cc \
 		$(srcdir)/v5/core/CubaLifNeuronOp.cc \
 		$(srcdir)/v5/storage/CoreStorageV5.cc \
+		$(srcdir)/v5/storage/StateDeltaLayoutV5.cc \
 		$(srcdir)/v5/storage/BankedSramV5.cc \
 		-o $(builddir)/test_core_pipeline$(EXEEXT) && \
 	$(builddir)/test_core_pipeline$(EXEEXT)
@@ -1956,16 +1977,53 @@ test-v5-if:
 test-v5-core-storage:
 	$(TEST_LINK) $(srcdir)/tests/v5/test_core_storage_v5.cc \
 		$(srcdir)/v5/storage/CoreStorageV5.cc \
+		$(srcdir)/v5/storage/StateDeltaLayoutV5.cc \
 		$(srcdir)/v5/core/CubaLifNeuronOp.cc \
 		$(srcdir)/v5/storage/BankedSramV5.cc \
 		-o $(builddir)/test_core_storage_v5$(EXEEXT) && \
 	$(builddir)/test_core_storage_v5$(EXEEXT)
+
+test-v5-ca5a:
+	$(TEST_LINK) $(srcdir)/tests/v5/test_ca5a_sram_completion.cc \
+		$(srcdir)/v5/core/CorePipeline.cc \
+		$(srcdir)/v5/core/DeterministicRetireQueue.cc \
+		$(srcdir)/v5/core/LifNeuronOp.cc \
+		$(srcdir)/v5/core/IfNeuronOp.cc \
+		$(srcdir)/v5/core/CubaLifNeuronOp.cc \
+		$(srcdir)/v5/storage/CoreStorageV5.cc \
+		$(srcdir)/v5/storage/StateDeltaLayoutV5.cc \
+		$(srcdir)/v5/storage/BankedSramV5.cc \
+		-o $(builddir)/test_ca5a_sram_completion$(EXEEXT) && \
+	$(builddir)/test_ca5a_sram_completion$(EXEEXT)
+
+test-v5-ca5b:
+	PYTHONPATH=$(abs_top_srcdir)/../.. python3 -c 'from snndl.plans.state_delta_layout import write_ca5b_fixtures; write_ca5b_fixtures("/tmp")'
+	$(TEST_LINK) $(srcdir)/tests/v5/test_ca5b_state_delta_layout.cc \
+		$(srcdir)/v5/core/CorePipeline.cc \
+		$(srcdir)/v5/core/DeterministicRetireQueue.cc \
+		$(srcdir)/v5/core/LifNeuronOp.cc \
+		$(srcdir)/v5/core/IfNeuronOp.cc \
+		$(srcdir)/v5/core/CubaLifNeuronOp.cc \
+		$(srcdir)/v5/storage/CoreStorageV5.cc \
+		$(srcdir)/v5/storage/StateDeltaLayoutV5.cc \
+		$(srcdir)/v5/storage/BankedSramV5.cc \
+		-o $(builddir)/test_ca5b_state_delta_layout$(EXEEXT) && \
+	$(builddir)/test_ca5b_state_delta_layout$(EXEEXT)
 
 test-v5-banked-sram:
 	$(TEST_LINK) $(srcdir)/tests/v5/test_banked_sram_v5.cc \
 		$(srcdir)/v5/storage/BankedSramV5.cc \
 		-o $(builddir)/test_banked_sram_v5$(EXEEXT) && \
 	$(builddir)/test_banked_sram_v5$(EXEEXT)
+
+# First direct unit test of the v5 trace runtime: the bounded JSONL record
+# reader shared by the three replay sources.  It has no SST dependency, so it
+# links standalone in the same style as the other test-v5-* targets.
+test-v5-trace-jsonl-reader:
+	$(TEST_LINK) $(srcdir)/tests/v5/test_trace_jsonl_reader_v5.cc \
+		$(srcdir)/v5/trace/TraceJsonlReader.cc \
+		-o $(builddir)/test_trace_jsonl_reader_v5$(EXEEXT) && \
+	$(builddir)/test_trace_jsonl_reader_v5$(EXEEXT)
 
 test-banked-sram:
 	$(TEST_LINK) $(srcdir)/tests/test_banked_sram_model.cc \
@@ -1990,6 +2048,7 @@ test-compile:
 	$(CXXCOMPILE) -c $(srcdir)/tests/v5/test_multicast_branch_table_v5.cc -o $(builddir)/test_multicast_branch_table_v5.o
 	$(CXXCOMPILE) -c $(srcdir)/tests/v5/test_core_pipeline.cc -o $(builddir)/test_core_pipeline.o
 	$(CXXCOMPILE) -c $(srcdir)/tests/v5/test_core_storage_v5.cc -o $(builddir)/test_core_storage_v5.o
+	$(CXXCOMPILE) -c $(srcdir)/tests/v5/test_trace_jsonl_reader_v5.cc -o $(builddir)/test_trace_jsonl_reader_v5.o
 	$(CXXCOMPILE) -c $(srcdir)/tests/test_timestep_core.cc -o $(builddir)/test_timestep_core.o
 
 # Tell versions [3.59,3.63) of GNU make to not export all variables.

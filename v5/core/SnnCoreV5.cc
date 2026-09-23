@@ -253,6 +253,15 @@ SnnCoreV5::SnnCoreV5(SST::ComponentId_t id, SST::Params& params)
           configureStorage(config.storage.delta_sram, "core_delta_sram_capacity_bytes", "core_delta_sram_banks");
           configureStorage(config.storage.index_sram, "core_index_sram_capacity_bytes", "core_index_sram_banks");
           configureStorage(config.storage.route_sram, "pe_route_sram_capacity_bytes", "pe_route_sram_banks");
+          config.storage.descriptor_json = params.find<std::string>("state_delta_layout_json", "");
+          const auto profile = params.find<std::string>("storage_execution_profile", "async");
+          if (profile == "async" || profile == "async_completion") {
+              config.execution_profile = CoreStorageExecutionProfile::AsyncCompletion;
+          } else if (profile == "legacy" || profile == "legacy_blocking") {
+              config.execution_profile = CoreStorageExecutionProfile::LegacyBlocking;
+          } else {
+              throw std::invalid_argument("storage_execution_profile must be async or legacy");
+          }
           parseScheduleDescriptor(params, config);
           return config;
       }()) {
@@ -501,6 +510,10 @@ void SnnCoreV5::sendStatus_(CoreControlOp operation) {
 }
 
 bool SnnCoreV5::clockTick_(SST::Cycle_t) {
+    // One SST clock edge is one CorePipeline logical tick.  Async SRAM
+    // advance runs inside that tick and is not invoked from any other handler.
+    // logical timestep stays on the control events; this cycle is physical
+    // only as the count of active pipeline ticks, not as SST Cycle_t.
     pipeline_.tick();
     sendRequests_();
     if (pipeline_.readyToCommit() && !commit_ready_sent_) {

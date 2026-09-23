@@ -114,7 +114,7 @@ TEST_LINK = $(CXXLD) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) \
 	$(AM_CPPFLAGS) $(CPPFLAGS) $(CXXFLAGS)
 
 .PHONY: check-boundaries test-compile test-timestep-core test-v5-core-pipeline test-v5-cuba-lif \
-	test-v5-core-storage test-v5-banked-sram test-v5-trace-jsonl-reader \
+	test-v5-core-storage test-v5-ca5a test-v5-ca5b test-v5-banked-sram test-v5-trace-jsonl-reader \
 	test-bcsr-source-contract test-v5-address test-v5-statistics test-v5-multicast-tree \
 	test-banked-sram test-local-storage
 
@@ -154,6 +154,7 @@ test-v5-core-pipeline:
 		$(srcdir)/v5/core/IfNeuronOp.cc \
 		$(srcdir)/v5/core/CubaLifNeuronOp.cc \
 		$(srcdir)/v5/storage/CoreStorageV5.cc \
+		$(srcdir)/v5/storage/StateDeltaLayoutV5.cc \
 		$(srcdir)/v5/storage/BankedSramV5.cc \
 		-o $(builddir)/test_core_pipeline$(EXEEXT) && \
 	$(builddir)/test_core_pipeline$(EXEEXT)
@@ -174,10 +175,38 @@ test-v5-if:
 test-v5-core-storage:
 	$(TEST_LINK) $(srcdir)/tests/v5/test_core_storage_v5.cc \
 		$(srcdir)/v5/storage/CoreStorageV5.cc \
+		$(srcdir)/v5/storage/StateDeltaLayoutV5.cc \
 		$(srcdir)/v5/core/CubaLifNeuronOp.cc \
 		$(srcdir)/v5/storage/BankedSramV5.cc \
 		-o $(builddir)/test_core_storage_v5$(EXEEXT) && \
 	$(builddir)/test_core_storage_v5$(EXEEXT)
+
+test-v5-ca5a:
+	$(TEST_LINK) $(srcdir)/tests/v5/test_ca5a_sram_completion.cc \
+		$(srcdir)/v5/core/CorePipeline.cc \
+		$(srcdir)/v5/core/DeterministicRetireQueue.cc \
+		$(srcdir)/v5/core/LifNeuronOp.cc \
+		$(srcdir)/v5/core/IfNeuronOp.cc \
+		$(srcdir)/v5/core/CubaLifNeuronOp.cc \
+		$(srcdir)/v5/storage/CoreStorageV5.cc \
+		$(srcdir)/v5/storage/StateDeltaLayoutV5.cc \
+		$(srcdir)/v5/storage/BankedSramV5.cc \
+		-o $(builddir)/test_ca5a_sram_completion$(EXEEXT) && \
+	$(builddir)/test_ca5a_sram_completion$(EXEEXT)
+
+test-v5-ca5b:
+	PYTHONPATH=$(abs_top_srcdir)/../.. python3 -c 'from snndl.plans.state_delta_layout import write_ca5b_fixtures; write_ca5b_fixtures("/tmp")'
+	$(TEST_LINK) $(srcdir)/tests/v5/test_ca5b_state_delta_layout.cc \
+		$(srcdir)/v5/core/CorePipeline.cc \
+		$(srcdir)/v5/core/DeterministicRetireQueue.cc \
+		$(srcdir)/v5/core/LifNeuronOp.cc \
+		$(srcdir)/v5/core/IfNeuronOp.cc \
+		$(srcdir)/v5/core/CubaLifNeuronOp.cc \
+		$(srcdir)/v5/storage/CoreStorageV5.cc \
+		$(srcdir)/v5/storage/StateDeltaLayoutV5.cc \
+		$(srcdir)/v5/storage/BankedSramV5.cc \
+		-o $(builddir)/test_ca5b_state_delta_layout$(EXEEXT) && \
+	$(builddir)/test_ca5b_state_delta_layout$(EXEEXT)
 
 test-v5-banked-sram:
 	$(TEST_LINK) $(srcdir)/tests/v5/test_banked_sram_v5.cc \

@@ -92,6 +92,14 @@ public:
     std::size_t responses() const { return responses_.size(); }
     std::uint32_t bankForAddress(std::uint64_t address) const;
 
+    // Observation of bytes whose SRAM write has already completed.  This does
+    // not admit a request and does not advance the SRAM clock.
+    bool copyCompletedBytes(std::uint64_t address, std::size_t bytes,
+                            std::vector<std::uint8_t>& out) const;
+
+    enum class Location : std::uint8_t { Absent = 0, Queued, InFlight };
+    Location locate(std::uint64_t request_id) const;
+
 private:
     struct Pending {
         BankedSramV5Request request;

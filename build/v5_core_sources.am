@@ -32,6 +32,8 @@ SNNDL_V5_CORE_SOURCES = \
 	v5/storage/SnnDmaEngineV5.cc \
 	v5/storage/CoreStorageV5.h \
 	v5/storage/CoreStorageV5.cc \
+	v5/storage/StateDeltaLayoutV5.h \
+	v5/storage/StateDeltaLayoutV5.cc \
 	v5/storage/BankedSramV5Component.h \
 	v5/storage/BankedSramV5Component.cc \
 	v5/test/IdealSynapseSource.h \

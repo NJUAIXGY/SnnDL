@@ -76,6 +76,8 @@ struct CorePipelineConfig {
     CubaLifNeuronOp::Config cuba_lif;
     IfNeuronOp::Config if_op;
     std::vector<NeuronBinding> neuron_bindings;
+    // CA-5A real path.  LegacyBlocking keeps the historical in-call SRAM spin.
+    CoreStorageExecutionProfile execution_profile = CoreStorageExecutionProfile::AsyncCompletion;
     CoreStorageV5Config storage;
 };
 
@@ -175,8 +177,8 @@ public:
     bool active() const { return active_; }
     std::size_t scheduleStageCount() const { return config_.schedule_stages.size(); }
     bool sealed() const { return sealed_; }
-    // Compatibility snapshot for tests and evidence only.  Functional reads
-    // in the pipeline go through CoreStorageV5, never through this vector.
+    // Compatibility snapshot for tests and evidence only.  The bytes come from
+    // SRAM writes that have already completed.  state() does not advance SRAM.
     const std::vector<LifNeuronState>& state() const;
     const std::vector<CubaLifNeuronState>& cubaState() const;
     const CoreStorageV5& storage() const { return *storage_; }
@@ -204,8 +206,70 @@ private:
         std::uint64_t ready_cycle = 0;
     };
 
+    enum class AppendPhase : std::uint8_t { ReadCount, WriteEntry, WriteCount, Done, Overflow };
+    enum class NeuronPhase : std::uint8_t { Load, LoadEntries, Ready, Write, Finished };
+
+    struct IndexWait {
+        SpikeInput spike;
+        StorageToken token;
+        bool done = false;
+    };
+    struct AppendTxn {
+        RetireEntry entry;
+        AppendPhase phase = AppendPhase::ReadCount;
+        StorageToken token;
+        bool submitted = false;
+        std::uint32_t count = 0;
+    };
+    struct NeuronTxn {
+        std::uint32_t neuron = 0;
+        NeuronPhase phase = NeuronPhase::Load;
+        struct SpanWait {
+            StorageToken token;
+            std::uint32_t logical_offset = 0;
+            std::uint32_t bytes = 0;
+            bool done = false;
+            std::vector<std::uint8_t> data;
+        };
+        std::vector<SpanWait> state_reads;
+        std::vector<SpanWait> state_writes;
+        StorageToken count_token;
+        bool state_done = false;
+        bool count_done = false;
+        std::uint32_t delta_count = 0;
+        bool entries_submitted = false;
+        std::vector<StorageToken> entry_tokens;
+        std::vector<std::uint8_t> entry_done;
+        std::vector<RetireEntry> deltas;
+        LifNeuronState lif_state;
+        CubaLifNeuronState cuba_state;
+        LifNeuronResult lif_result;
+        CubaLifNeuronResult cuba_result;
+        bool fired = false;
+        StorageToken clear_token;
+        bool write_submitted = false;
+        bool clear_submitted = false;
+        bool write_done = false;
+        bool clear_done = false;
+    };
+
     static std::uint64_t effectiveLatency_(std::uint32_t latency);
     static std::uint64_t hashMix_(std::uint64_t hash, std::uint64_t value);
+    bool asyncStorage_() const;
+    bool storageIdle_() const;
+    bool pollCompletion_(StorageToken token, StorageCompletion& completion);
+    void clearPipelineState_();
+    void submitEpochRequests_();
+    void tickAsync_();
+    void consumeEpochBarrier_();
+    void consumeIndexReads_();
+    void consumeAppends_();
+    void consumeNeuronChain_();
+    void issueIndexReads_();
+    void issueAppends_();
+    void issueNeuronChain_();
+    void evaluateReadyNeurons_();
+    void retireFinishedNeurons_();
     RowKey keyFor_(std::uint64_t source_neuron, std::uint64_t source_event_seq) const;
     bool allRowsComplete_() const;
     bool queuesEmpty_() const;
@@ -229,6 +293,9 @@ private:
     IfNeuronOp if_;
     std::uint64_t active_timestep_ = 0;
     std::uint64_t last_timestep_ = 0;
+    // cycle_ is the shared Core/SRAM logical clock and never restarts.
+    // timestep_origin_ makes SchedulePlan earliest_cycle timestep-local.
+    std::uint64_t timestep_origin_ = 0;
     bool has_timestep_ = false;
     bool active_ = false;
     bool sealed_ = false;
@@ -248,6 +315,18 @@ private:
     std::map<std::uint64_t, std::vector<FiredSpike>> held_spikes_;
     std::map<RowKey, RowState> rows_;
     std::unique_ptr<CoreStorageV5> storage_;
+    std::map<std::uint64_t, StorageCompletion> bound_;
+    std::vector<StorageToken> epoch_reset_tokens_;
+    std::vector<std::uint8_t> epoch_reset_done_;
+    StorageToken route_token_;
+    bool route_submitted_ = false;
+    bool route_done_ = false;
+    bool epoch_barrier_ready_ = false;
+    std::deque<IndexWait> index_waits_;
+    std::deque<AppendTxn> append_txns_;
+    std::vector<NeuronTxn> neuron_txns_;
+    bool neuron_evaluated_ = false;
+    std::vector<std::uint8_t> neuron_busy_;
     mutable std::vector<LifNeuronState> state_snapshot_;
     mutable std::vector<CubaLifNeuronState> cuba_state_snapshot_;
     std::uint32_t next_neuron_ = 0;

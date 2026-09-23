@@ -37,7 +37,7 @@ std::uint64_t runOne(bool reverse) {
     pipeline.start(0);
     assert(pipeline.submitSpike(SpikeInput{0, 0, 7}));
     std::vector<RowRequest> requests;
-    for (int i = 0; i < 16 && requests.empty(); ++i) {
+    for (int i = 0; i < 64 && requests.empty(); ++i) {
         pipeline.tick();
         requests = pipeline.takeRowRequests();
     }
@@ -55,7 +55,7 @@ std::uint64_t runOne(bool reverse) {
     }
     assert(pipeline.acceptRowDone(RowDone{0, 0, 7, 2}));
     pipeline.sealIngress();
-    for (int i = 0; i < 128 && !pipeline.readyToCommit(); ++i) pipeline.tick();
+    for (int i = 0; i < 8192 && !pipeline.readyToCommit(); ++i) pipeline.tick();
     assert(pipeline.readyToCommit());
     assert(pipeline.state()[1].membrane == 0.0f);
     assert(pipeline.stats().neurons_fired == 1);
@@ -71,7 +71,7 @@ std::uint64_t scanCycles(std::uint32_t neurons, std::uint32_t lanes) {
     CorePipeline pipeline(config);
     pipeline.start(0);
     pipeline.sealIngress();
-    for (int i = 0; i < 4096 && !pipeline.readyToCommit(); ++i) pipeline.tick();
+    for (int i = 0; i < 250000 && !pipeline.readyToCommit(); ++i) pipeline.tick();
     assert(pipeline.readyToCommit());
     return pipeline.stats().cycles;
 }
@@ -101,7 +101,7 @@ void testScheduleAdmissionReservations() {
     // SchedulePlan reservation exposes only one admission slot.
     assert(!pipeline.submitSpike(SpikeInput{0, 1, 32}));
     std::vector<RowRequest> requests;
-    for (int i = 0; i < 16 && requests.empty(); ++i) {
+    for (int i = 0; i < 64 && requests.empty(); ++i) {
         pipeline.tick();
         requests = pipeline.takeRowRequests();
     }
@@ -110,9 +110,13 @@ void testScheduleAdmissionReservations() {
         SynapseResponse{0, 0, 31, 1, 0, 1.0f, false, 0}));
     assert(!pipeline.acceptSynapseResponse(
         SynapseResponse{0, 0, 31, 2, 1, 1.0f, false, 0}));
-    pipeline.tick();
-    assert(pipeline.acceptSynapseResponse(
-        SynapseResponse{0, 0, 31, 2, 1, 1.0f, true, 2}));
+    bool released = false;
+    for (int i = 0; i < 8 && !released; ++i) {
+        pipeline.tick();
+        released = pipeline.acceptSynapseResponse(
+            SynapseResponse{0, 0, 31, 2, 1, 1.0f, true, 2});
+    }
+    assert(released);
 }
 
 void testScheduleEarliestCycleAndStageWidth() {
@@ -152,7 +156,7 @@ void testScheduleEarliestCycleAndStageWidth() {
     assert(pipeline.acceptSynapseResponse(
         SynapseResponse{0, 0, 41, 1, 0, 1.0f, true, 1}));
     pipeline.sealIngress();
-    for (int cycle = 0; cycle < 256 && !pipeline.readyToCommit(); ++cycle) pipeline.tick();
+    for (int cycle = 0; cycle < 8192 && !pipeline.readyToCommit(); ++cycle) pipeline.tick();
     assert(pipeline.readyToCommit());
 }
 
@@ -177,7 +181,7 @@ void testStageBackpressureAndCounters() {
     assert(pipeline.submitSpike(SpikeInput{0, 0, 3}));
 
     std::vector<RowRequest> requests;
-    for (int i = 0; i < 32 && requests.size() < 3; ++i) {
+    for (int i = 0; i < 128 && requests.size() < 3; ++i) {
         pipeline.tick();
         auto batch = pipeline.takeRowRequests();
         requests.insert(requests.end(), batch.begin(), batch.end());
@@ -192,7 +196,7 @@ void testStageBackpressureAndCounters() {
         for (int i = 0; i < 8; ++i) pipeline.tick();
     }
     pipeline.sealIngress();
-    for (int i = 0; i < 512 && !pipeline.readyToCommit(); ++i) pipeline.tick();
+    for (int i = 0; i < 20000 && !pipeline.readyToCommit(); ++i) pipeline.tick();
     assert(pipeline.readyToCommit());
     assert(pipeline.stats().ingress.full_cycles > 0 || pipeline.stats().ingress.stall_cycles > 0);
     assert(pipeline.stats().row_lookup.full_cycles > 0 || pipeline.stats().row_lookup.stall_cycles > 0);
@@ -212,7 +216,7 @@ void testDeltaCapacityIsIndependentOfRetireQueue() {
     assert(pipeline.submitSpike(SpikeInput{0, 0, 11}));
 
     std::vector<RowRequest> requests;
-    for (int i = 0; i < 32 && requests.empty(); ++i) {
+    for (int i = 0; i < 128 && requests.empty(); ++i) {
         pipeline.tick();
         requests = pipeline.takeRowRequests();
     }
@@ -223,7 +227,7 @@ void testDeltaCapacityIsIndependentOfRetireQueue() {
         SynapseResponse{0, 0, 11, 1, 1, 0.5f, false, 0}));
     assert(pipeline.acceptRowDone(RowDone{0, 0, 11, 2}));
     pipeline.sealIngress();
-    for (int i = 0; i < 512 && !pipeline.readyToCommit(); ++i) pipeline.tick();
+    for (int i = 0; i < 20000 && !pipeline.readyToCommit(); ++i) pipeline.tick();
     assert(pipeline.readyToCommit());
     assert(pipeline.stats().retire_retired == 2);
 }
@@ -234,7 +238,7 @@ void testUnrelatedStageIsolation() {
     CorePipeline first(baseline);
     first.start(0);
     first.sealIngress();
-    for (int i = 0; i < 512 && !first.readyToCommit(); ++i) first.tick();
+    for (int i = 0; i < 20000 && !first.readyToCommit(); ++i) first.tick();
     assert(first.readyToCommit());
 
     auto changed = baseline;
@@ -244,7 +248,7 @@ void testUnrelatedStageIsolation() {
     CorePipeline second(changed);
     second.start(0);
     second.sealIngress();
-    for (int i = 0; i < 512 && !second.readyToCommit(); ++i) second.tick();
+    for (int i = 0; i < 20000 && !second.readyToCommit(); ++i) second.tick();
     assert(second.readyToCommit());
     assert(first.stats().cycles == second.stats().cycles);
 }
@@ -273,7 +277,7 @@ void testCubaLifOperatorPath() {
     pipeline.start(0);
     assert(pipeline.submitSpike(SpikeInput{0, 0, 19}));
     std::vector<RowRequest> requests;
-    for (int i = 0; i < 32 && requests.empty(); ++i) {
+    for (int i = 0; i < 128 && requests.empty(); ++i) {
         pipeline.tick();
         requests = pipeline.takeRowRequests();
     }
@@ -281,7 +285,7 @@ void testCubaLifOperatorPath() {
     assert(pipeline.acceptSynapseResponse(
         SynapseResponse{0, 0, 19, 1, 0, 1.0f, true, 1}));
     pipeline.sealIngress();
-    for (int i = 0; i < 256 && !pipeline.readyToCommit(); ++i) pipeline.tick();
+    for (int i = 0; i < 8192 && !pipeline.readyToCommit(); ++i) pipeline.tick();
     assert(pipeline.readyToCommit());
     assert(pipeline.stats().neurons_fired == 1);
     assert(pipeline.cubaState()[1].synaptic_current == 1.0f);
@@ -312,7 +316,7 @@ void testMixedLocalOperatorBinding() {
     pipeline.start(0);
     assert(pipeline.submitSpike(SpikeInput{0, 0, 23}));
     std::vector<RowRequest> requests;
-    for (int i = 0; i < 32 && requests.empty(); ++i) {
+    for (int i = 0; i < 128 && requests.empty(); ++i) {
         pipeline.tick();
         requests = pipeline.takeRowRequests();
     }
@@ -321,7 +325,7 @@ void testMixedLocalOperatorBinding() {
         SynapseResponse{0, 0, 23, 2, 0, 1.0f, false, 0}));
     assert(pipeline.acceptRowDone(RowDone{0, 0, 23, 1}));
     pipeline.sealIngress();
-    for (int i = 0; i < 256 && !pipeline.readyToCommit(); ++i) pipeline.tick();
+    for (int i = 0; i < 8192 && !pipeline.readyToCommit(); ++i) pipeline.tick();
     assert(pipeline.readyToCommit());
     assert(pipeline.stats().neurons_evaluated == 4);
     assert(pipeline.stats().neurons_fired == 1);
@@ -372,7 +376,7 @@ int main() {
         for (auto& pipeline : bank) {
             pipeline.start(0);
             pipeline.sealIngress();
-            for (int i = 0; i < 256 && !pipeline.readyToCommit(); ++i) pipeline.tick();
+            for (int i = 0; i < 8192 && !pipeline.readyToCommit(); ++i) pipeline.tick();
             assert(pipeline.readyToCommit());
             pipeline.commit();
         }

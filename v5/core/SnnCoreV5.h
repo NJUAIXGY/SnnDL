@@ -93,6 +93,8 @@ public:
         {"schedule_descriptor", "Compiler-owned SchedulePlan stage/DAG descriptor", ""},
         {"route_plan_digest", "Compiler-owned RoutePlan digest", ""},
         {"storage_trace_json", "Optional execution-driven typed SRAM request trace", ""},
+        {"storage_execution_profile", "CA-5A SRAM profile: async or legacy", "async"},
+        {"state_delta_layout_json", "CA-5B typed state/delta descriptor; requires async", ""},
         {"verbose", "Verbose logging level", "0"}
     )
 

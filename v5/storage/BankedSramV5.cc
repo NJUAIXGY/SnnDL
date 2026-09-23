@@ -168,6 +168,28 @@ void BankedSramV5::tick(std::uint64_t cycle) {
     issue_(cycle);
 }
 
+bool BankedSramV5::copyCompletedBytes(std::uint64_t address, std::size_t bytes,
+                                      std::vector<std::uint8_t>& out) const {
+    if (bytes == 0 || address >= config_.capacity_bytes ||
+        bytes > config_.capacity_bytes - address || address > backing_.size() ||
+        bytes > backing_.size() - static_cast<std::size_t>(address)) {
+        return false;
+    }
+    const auto begin = backing_.begin() + static_cast<std::size_t>(address);
+    out.assign(begin, begin + bytes);
+    return true;
+}
+
+BankedSramV5::Location BankedSramV5::locate(std::uint64_t request_id) const {
+    for (const auto& item : pending_) {
+        if (item.request.request_id == request_id) return Location::Queued;
+    }
+    for (const auto& item : in_flight_) {
+        if (item.pending.request.request_id == request_id) return Location::InFlight;
+    }
+    return Location::Absent;
+}
+
 std::vector<BankedSramV5Response> BankedSramV5::takeResponses() {
     std::vector<BankedSramV5Response> result;
     result.reserve(responses_.size());

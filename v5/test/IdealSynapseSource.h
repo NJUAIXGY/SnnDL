@@ -53,6 +53,10 @@ public:
         {"weight_cache_line_bytes", "Cache-line boundary used to split timed row reads", "64"},
         {"weight_image_write_bytes", "Maximum bytes per untimed weight-image write", "64"},
         {"weight_read_granularity_bytes", "Physical StandardMem row-read granularity (multiple of the 16-byte weight record)", "16"},
+        {"weight_provider_compiled_window", "Compiler same-row chunk window", "1"},
+        {"weight_provider_target_limit", "Provider same-row chunk limit", "1"},
+        {"weight_provider_reject_attempts", "Admission rejects before the first successful issue of each chunk", "0"},
+        {"weight_provider_complete_descending", "Release buffered completions from the highest record cursor first", "0"},
         {"dram_bank_count", "Compiler logical chip-DRAM bank count for request evidence", "1"},
         {"dram_bank_interleave_bytes", "Compiler logical chip-DRAM bank interleave", "64"},
         {"dram_bank_policy", "Compiler logical chip-DRAM bank policy", "low_bits"},
@@ -110,6 +114,9 @@ private:
     void sendStimuli_();
     void respondToRow_(const CoreRowRequestEvent& request);
     void issueMemoryRead_();
+    void releaseMemoryResponses_();
+    void publishReadyChunks_();
+    void applyMemoryResponse_(std::uint64_t request_id, const std::vector<std::uint8_t>& data);
     void buildWeightImage_();
     void sendNextProviderItem_();
     void maybeFinish_();
@@ -120,7 +127,7 @@ private:
     void parseArtifactRows_(const std::string& encoded);
     void loadArtifactWeights_(const std::string& path, std::uint64_t offset, std::uint64_t bytes);
     void writeRequestTrace_() const;
-    void appendRequestTrace_() const;
+    bool providerBusy_() const;
 
     SST::Output out_;
     SST::Link* control_link_ = nullptr;
@@ -158,6 +165,39 @@ private:
     };
     std::map<std::uint64_t, RowLocation> row_locations_;
     std::vector<std::uint8_t> weight_image_;
+    struct MemoryRequestTrace {
+        std::string identity;
+        std::uint64_t request_id = 0;
+        std::uint64_t logical_operation_id = 0;
+        std::uint32_t attempt_id = 1;
+        std::uint64_t timestep = 0;
+        std::uint64_t source_neuron = 0;
+        std::uint64_t source_event_seq = 0;
+        std::uint64_t row_id = 0;
+        std::uint64_t sequence = 0;
+        std::uint64_t byte_address = 0;
+        std::uint64_t bytes = 0;
+        std::uint64_t records = 0;
+        std::uint64_t issue_cycle = 0;
+        std::uint64_t completion_cycle = 0;
+        std::uint64_t bank = 0;
+        bool completed = false;
+    };
+    struct InFlightChunk {
+        std::uint64_t logical_operation_id = 0;
+        std::uint32_t attempt_id = 0;
+        std::uint64_t record_cursor = 0;
+        std::size_t records = 0;
+        std::uint64_t address = 0;
+        std::uint64_t bytes = 0;
+        std::uint64_t physical_request_id = 0;
+        bool issued = false;
+        bool completed = false;
+        bool published = false;
+        std::vector<Edge> edges;
+        MemoryRequestTrace trace;
+    };
+    void appendRequestTrace_(const MemoryRequestTrace& trace) const;
     struct ProviderTransaction {
         CoreRowRequestEvent request;
         std::vector<Edge> row;
@@ -167,7 +207,12 @@ private:
         std::uint64_t memory_offset = 0;
         std::size_t memory_edges = 0;
         std::size_t memory_reads_completed = 0;
-        bool memory_read_in_flight = false;
+        std::size_t next_record = 0;
+        std::vector<InFlightChunk> chunks;
+    };
+    struct HeldMemoryResponse {
+        std::uint64_t request_id = 0;
+        std::vector<std::uint8_t> data;
     };
     std::deque<ProviderTransaction> provider_transactions_;
     std::size_t stimulus_cursor_ = 0;
@@ -185,9 +230,20 @@ private:
     bool preload_reported_ = false;
     bool ingress_ready_reported_ = false;
     std::string artifact_digest_;
-    std::uint64_t pending_memory_request_ = 0;
-    std::size_t pending_memory_records_ = 0;
-    bool pending_memory_ = false;
+    std::size_t compiled_window_ = 1;
+    std::size_t target_limit_ = 1;
+    std::size_t effective_window_ = 1;
+    std::uint32_t forced_reject_attempts_ = 0;
+    bool complete_descending_ = false;
+    std::map<std::uint64_t, std::size_t> inflight_chunk_;
+    std::deque<HeldMemoryResponse> held_responses_;
+    std::uint64_t next_logical_operation_ = 1;
+    std::uint64_t inflight_peak_ = 0;
+    std::uint64_t reorder_peak_ = 0;
+    std::uint64_t provider_stall_cycles_ = 0;
+    std::uint64_t row_wait_cycles_ = 0;
+    std::uint64_t memory_request_retries_ = 0;
+    std::uint64_t provider_drain_cycle_ = 0;
     std::uint64_t preload_ready_cycle_ = 0;
     std::uint64_t start_cycle_ = 0;
     std::uint64_t preload_wait_cycles_ = 0;
@@ -195,27 +251,6 @@ private:
     std::uint64_t memory_requests_ = 0;
     std::uint64_t memory_read_bytes_ = 0;
     std::uint64_t next_memory_trace_sequence_ = 0;
-    struct MemoryRequestTrace {
-        std::string identity;
-        std::uint64_t request_id = 0;
-        std::uint64_t timestep = 0;
-        std::uint64_t source_neuron = 0;
-        std::uint64_t source_event_seq = 0;
-        std::uint64_t row_id = 0;
-        std::uint64_t sequence = 0;
-        std::uint64_t byte_address = 0;
-        std::uint64_t bytes = 0;
-        std::uint64_t records = 0;
-        std::uint64_t issue_cycle = 0;
-        std::uint64_t completion_cycle = 0;
-        std::uint64_t bank = 0;
-        bool completed = false;
-    };
-    // At most one StandardMem request is outstanding per provider. Keep only
-    // that mutable record; completed identities are streamed to JSONL so a
-    // long run does not retain millions of trace objects in RAM.
-    MemoryRequestTrace pending_memory_trace_;
-    bool pending_memory_trace_valid_ = false;
     mutable std::ofstream request_trace_stream_;
     double image_weight_sum_ = 0.0;
     double decoded_weight_sum_ = 0.0;

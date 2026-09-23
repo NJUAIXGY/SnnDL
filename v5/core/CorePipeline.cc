@@ -1,6 +1,7 @@
 #include "CorePipeline.h"
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -72,6 +73,7 @@ CorePipeline::CorePipeline(const CorePipelineConfig& config)
         throw std::invalid_argument("v5 neuron_bindings must cover every local neuron");
     }
     config_.storage.neurons = config_.neurons;
+    config_.storage.execution_profile = config_.execution_profile;
     // CoreDelta is resident state, not a transient retire queue.  Keep its
     // fallback independent from pipeline backpressure so a small retire queue
     // cannot make a valid multi-edge row impossible to commit.
@@ -80,6 +82,28 @@ CorePipeline::CorePipeline(const CorePipelineConfig& config)
             CoreStorageV5Config{}.max_delta_entries_per_neuron;
     }
     storage_ = std::make_unique<CoreStorageV5>(config_.storage);
+    neuron_busy_.assign(config_.neurons, 0);
+}
+
+bool CorePipeline::asyncStorage_() const {
+    return config_.execution_profile == CoreStorageExecutionProfile::AsyncCompletion;
+}
+
+bool CorePipeline::storageIdle_() const {
+    return epoch_barrier_ready_ && index_waits_.empty() && append_txns_.empty() && neuron_txns_.empty();
+}
+
+bool CorePipeline::pollCompletion_(StorageToken token, StorageCompletion& completion) {
+    if (!token) return false;
+    const auto found = bound_.find(token.id);
+    if (found == bound_.end()) return false;
+    completion = std::move(found->second);
+    bound_.erase(found);
+    if (!storage_->consume(token)) throw std::logic_error("CA-5A completion consumed twice");
+    if (!completion.ok) {
+        throw std::logic_error("CA-5A SRAM request failed closed: " + completion.stall_reason);
+    }
+    return true;
 }
 
 std::size_t CorePipeline::scheduleCapacity_(const char* stage_id, std::size_t fallback) const {
@@ -101,7 +125,7 @@ std::size_t CorePipeline::scheduleWidth_(const char* stage_id, std::size_t fallb
 bool CorePipeline::scheduleReady_(const char* stage_id) const {
     if (!config_.schedule_admission_enabled || config_.schedule_stages.empty()) return true;
     for (const auto& stage : config_.schedule_stages) {
-        if (stage.id == stage_id) return cycle_ >= stage.earliest_cycle;
+        if (stage.id == stage_id) return cycle_ - timestep_origin_ >= stage.earliest_cycle;
     }
     throw std::logic_error(std::string("SchedulePlan descriptor is missing stage ") + stage_id);
 }
@@ -122,7 +146,7 @@ CorePipeline::RowKey CorePipeline::keyFor_(std::uint64_t source_neuron,
     return RowKey{source_neuron, source_event_seq};
 }
 
-void CorePipeline::resetTimestep_() {
+void CorePipeline::clearPipelineState_() {
     ingress_q_.clear();
     row_q_.clear();
     row_request_out_.clear();
@@ -130,9 +154,7 @@ void CorePipeline::resetTimestep_() {
     retire_q_.clear();
     accumulator_q_.clear();
     rows_.clear();
-    storage_->resetTimestep();
     stats_ = CorePipelineStats{};
-    cycle_ = 0;
     next_row_id_ = 1;
     rows_issued_ = 0;
     next_neuron_ = 0;
@@ -142,6 +164,441 @@ void CorePipeline::resetTimestep_() {
     neuron_batch_ready_ = 0;
     scan_done_ = false;
     sealed_ = false;
+    bound_.clear();
+    epoch_reset_tokens_.clear();
+    epoch_reset_done_.clear();
+    route_token_ = {};
+    route_submitted_ = false;
+    route_done_ = false;
+    epoch_barrier_ready_ = false;
+    index_waits_.clear();
+    append_txns_.clear();
+    neuron_txns_.clear();
+    neuron_evaluated_ = false;
+    neuron_busy_.assign(config_.neurons, 0);
+}
+
+void CorePipeline::resetTimestep_() {
+    clearPipelineState_();
+    storage_->resetTimestep();
+}
+
+void CorePipeline::submitEpochRequests_() {
+    using AddressSpaceId = ::SnnDL::v5::AddressSpaceId;
+    const auto route = storage_->submitRead(
+        AddressSpaceId::PeRoute, storage_->requireRouteOffset(0, 1), 1, cycle_);
+    if (!route.token) throw std::logic_error("v5 PeRoute binding is not readable");
+    route_token_ = route.token;
+    route_submitted_ = true;
+    const auto zeros = CoreStorageV5::encodeCountRecord(0);
+    epoch_reset_tokens_.assign(config_.neurons, StorageToken{});
+    epoch_reset_done_.assign(config_.neurons, 0);
+    for (std::uint32_t neuron = 0; neuron < config_.neurons; ++neuron) {
+        const auto submitted = storage_->submitWrite(
+            AddressSpaceId::CoreDelta, storage_->deltaCountByteOffset(neuron), zeros, cycle_);
+        if (!submitted.token) throw std::logic_error("P2 CoreDelta reset request failed");
+        epoch_reset_tokens_[neuron] = submitted.token;
+    }
+}
+
+void CorePipeline::tickAsync_() {
+    storage_->advance(cycle_);
+    for (auto& completion : storage_->takeCompletions()) {
+        const auto inserted = bound_.emplace(completion.token.id, std::move(completion));
+        if (!inserted.second) throw std::logic_error("CA-5A duplicate completion token");
+    }
+    consumeEpochBarrier_();
+    consumeIndexReads_();
+    consumeAppends_();
+    consumeNeuronChain_();
+    storage_->admit(cycle_);
+    issueIndexReads_();
+    issueAppends_();
+    issueNeuronChain_();
+    processRetire_();
+    processSynapse_();
+    processIngress_();
+    scheduleNeuron_();
+}
+
+void CorePipeline::consumeEpochBarrier_() {
+    if (!route_submitted_ || epoch_barrier_ready_) return;
+    if (!route_done_) {
+        StorageCompletion completion;
+        if (pollCompletion_(route_token_, completion)) route_done_ = true;
+    }
+    bool all = route_done_;
+    for (std::size_t index = 0; index < epoch_reset_tokens_.size(); ++index) {
+        if (epoch_reset_done_[index]) continue;
+        StorageCompletion completion;
+        if (pollCompletion_(epoch_reset_tokens_[index], completion)) epoch_reset_done_[index] = 1;
+        else all = false;
+    }
+    if (!route_done_) all = false;
+    if (all && epoch_reset_tokens_.size() == config_.neurons) epoch_barrier_ready_ = true;
+}
+
+void CorePipeline::consumeIndexReads_() {
+    for (auto& wait : index_waits_) {
+        if (wait.done) continue;
+        StorageCompletion completion;
+        if (!pollCompletion_(wait.token, completion)) continue;
+        wait.done = true;
+    }
+    while (!index_waits_.empty() && index_waits_.front().done) {
+        if (row_request_out_.size() >= config_.row_entries) {
+            ++stats_.row_stall_cycles;
+            ++stats_.row_lookup.stall_cycles;
+            break;
+        }
+        const auto spike = index_waits_.front().spike;
+        const RowKey key = keyFor_(spike.source_neuron, spike.source_event_seq);
+        if (rows_.find(key) != rows_.end()) throw std::logic_error("duplicate v5 row request");
+        rows_.emplace(key, RowState{});
+        row_request_out_.push_back(RowRequest{
+            spike.timestep, spike.source_neuron, spike.source_event_seq, next_row_id_++});
+        index_waits_.pop_front();
+        ++rows_issued_;
+        ++stats_.row_requests;
+        ++stats_.row_lookup.issued;
+    }
+}
+
+void CorePipeline::consumeAppends_() {
+    for (auto& txn : append_txns_) {
+        if (!txn.submitted || txn.phase == AppendPhase::Done || txn.phase == AppendPhase::Overflow) continue;
+        StorageCompletion completion;
+        if (!pollCompletion_(txn.token, completion)) continue;
+        txn.submitted = false;
+        if (txn.phase == AppendPhase::ReadCount) {
+            txn.count = CoreStorageV5::decodeCountRecord(completion.data);
+            txn.phase = txn.count >= config_.storage.max_delta_entries_per_neuron
+                            ? AppendPhase::Overflow : AppendPhase::WriteEntry;
+        } else if (txn.phase == AppendPhase::WriteEntry) {
+            txn.phase = AppendPhase::WriteCount;
+        } else if (txn.phase == AppendPhase::WriteCount) {
+            neuron_busy_[txn.entry.key.post_neuron] = 0;
+            txn.phase = AppendPhase::Done;
+            ++stats_.accumulator_updates;
+            ++stats_.accumulator.issued;
+            ++stats_.accumulator.completed;
+        }
+    }
+    std::deque<AppendTxn> kept;
+    for (auto& txn : append_txns_) {
+        if (txn.phase != AppendPhase::Done) kept.push_back(std::move(txn));
+    }
+    append_txns_.swap(kept);
+}
+
+void CorePipeline::evaluateReadyNeurons_() {
+    if (neuron_evaluated_ || neuron_txns_.empty()) return;
+    for (const auto& txn : neuron_txns_) {
+        if (txn.phase != NeuronPhase::Ready) return;
+    }
+    std::size_t fires = 0;
+    for (auto& txn : neuron_txns_) {
+        float delta = 0.0f;
+        for (const auto& entry : txn.deltas) delta += entry.weight;
+        const auto& binding = config_.neuron_bindings[txn.neuron];
+        if (binding.kind == NeuronOperatorKind::CubaLif) {
+            CubaLifNeuronOp op(binding.cuba_lif);
+            txn.cuba_result = op.evaluate(txn.cuba_state, delta);
+            txn.fired = txn.cuba_result.fired;
+        } else if (binding.kind == NeuronOperatorKind::Padding) {
+            txn.lif_result = LifNeuronResult{txn.lif_state, false};
+            txn.fired = false;
+        } else if (binding.kind == NeuronOperatorKind::If) {
+            IfNeuronOp op(binding.if_op);
+            txn.lif_result = op.evaluate(txn.lif_state, delta);
+            txn.fired = txn.lif_result.fired;
+        } else {
+            LifNeuronOp op(binding.lif);
+            txn.lif_result = op.evaluate(txn.lif_state, delta);
+            txn.fired = txn.lif_result.fired;
+        }
+        if (txn.fired) ++fires;
+    }
+    if (held_count_ + fires > config_.held_spike_entries) {
+        ++stats_.held_full_cycles;
+        ++stats_.neuron.stall_cycles;
+        return;
+    }
+    neuron_evaluated_ = true;
+    for (auto& txn : neuron_txns_) txn.phase = NeuronPhase::Write;
+}
+
+void CorePipeline::retireFinishedNeurons_() {
+    if (neuron_txns_.empty() || !neuron_evaluated_) return;
+    for (const auto& txn : neuron_txns_) {
+        if (txn.phase != NeuronPhase::Finished) return;
+    }
+    for (const auto& txn : neuron_txns_) {
+        ++stats_.neuron.issued;
+        ++stats_.neuron.completed;
+        if (txn.fired) {
+            held_spikes_[active_timestep_ + 1].push_back(
+                FiredSpike{active_timestep_ + 1, txn.neuron, 0});
+            ++held_count_;
+            ++stats_.neurons_fired;
+            ++stats_.held_spike.accepted;
+        }
+        ++stats_.neurons_evaluated;
+        neuron_busy_[txn.neuron] = 0;
+    }
+    next_neuron_ += neuron_batch_count_;
+    neuron_batch_pending_ = false;
+    neuron_txns_.clear();
+    neuron_evaluated_ = false;
+}
+
+void CorePipeline::consumeNeuronChain_() {
+    for (auto& txn : neuron_txns_) {
+        if (txn.phase == NeuronPhase::Load) {
+            if (!txn.state_done) {
+                bool ready = !txn.state_reads.empty();
+                for (auto& span : txn.state_reads) {
+                    if (span.done) continue;
+                    StorageCompletion completion;
+                    if (!pollCompletion_(span.token, completion)) {
+                        ready = false;
+                        continue;
+                    }
+                    span.data = std::move(completion.data);
+                    span.done = true;
+                }
+                if (ready) {
+                    std::vector<std::uint8_t> logical(CoreStorageV5::kStateBytes, 0);
+                    for (const auto& span : txn.state_reads) {
+                        if (span.data.size() != span.bytes || span.logical_offset + span.bytes > logical.size()) {
+                            throw std::logic_error("v5 CoreState read failed");
+                        }
+                        std::copy(span.data.begin(), span.data.end(), logical.begin() + span.logical_offset);
+                    }
+                    const auto& binding = config_.neuron_bindings[txn.neuron];
+                    if (binding.kind == NeuronOperatorKind::CubaLif) {
+                        if (!CubaLifNeuronOp::decodeState(logical.data(), logical.size(), txn.cuba_state)) {
+                            throw std::logic_error("v5 CubaLIF CoreState read failed");
+                        }
+                    } else {
+                        txn.lif_state = CoreStorageV5::decodeLifRecord(logical);
+                    }
+                    txn.state_done = true;
+                }
+            }
+            if (!txn.count_done) {
+                StorageCompletion completion;
+                if (pollCompletion_(txn.count_token, completion)) {
+                    txn.delta_count = CoreStorageV5::decodeCountRecord(completion.data);
+                    if (txn.delta_count > config_.storage.max_delta_entries_per_neuron) {
+                        throw std::logic_error("v5 CoreDelta count is out of range");
+                    }
+                    txn.count_done = true;
+                }
+            }
+            if (txn.state_done && txn.count_done) {
+                txn.phase = txn.delta_count == 0 ? NeuronPhase::Ready : NeuronPhase::LoadEntries;
+            }
+        } else if (txn.phase == NeuronPhase::LoadEntries) {
+            for (std::size_t slot = 0; slot < txn.entry_tokens.size(); ++slot) {
+                if (txn.entry_done[slot]) continue;
+                StorageCompletion completion;
+                if (!pollCompletion_(txn.entry_tokens[slot], completion)) continue;
+                txn.deltas[slot] = CoreStorageV5::decodeDeltaRecord(txn.neuron, completion.data);
+                txn.entry_done[slot] = 1;
+            }
+            bool all = txn.entries_submitted && !txn.entry_done.empty();
+            for (const auto done : txn.entry_done) if (!done) all = false;
+            if (all) {
+                std::stable_sort(txn.deltas.begin(), txn.deltas.end(),
+                                 [](const RetireEntry& lhs, const RetireEntry& rhs) {
+                                     return lhs.key < rhs.key;
+                                 });
+                txn.phase = NeuronPhase::Ready;
+            }
+        } else if (txn.phase == NeuronPhase::Write) {
+            if (txn.write_submitted && !txn.write_done) {
+                bool ready = !txn.state_writes.empty();
+                for (auto& span : txn.state_writes) {
+                    if (span.done) continue;
+                    StorageCompletion completion;
+                    if (!pollCompletion_(span.token, completion)) {
+                        ready = false;
+                        continue;
+                    }
+                    span.done = true;
+                }
+                if (ready) txn.write_done = true;
+            }
+            if (txn.clear_submitted && !txn.clear_done) {
+                StorageCompletion completion;
+                if (pollCompletion_(txn.clear_token, completion)) txn.clear_done = true;
+            }
+            if (txn.write_done && txn.clear_done) txn.phase = NeuronPhase::Finished;
+        }
+    }
+    evaluateReadyNeurons_();
+    retireFinishedNeurons_();
+}
+
+void CorePipeline::issueIndexReads_() {
+    if (!scheduleReady_("row-lookup")) return;
+    std::size_t outstanding = 0;
+    for (const auto& wait : index_waits_) if (!wait.done) ++outstanding;
+    const auto width = scheduleWidth_("row-lookup", config_.row_lookup.width);
+    while (outstanding < width && !row_q_.empty()) {
+        auto& item = row_q_.front();
+        if (item.ready_cycle > cycle_) break;
+        if (row_request_out_.size() >= config_.row_entries) {
+            ++stats_.row_stall_cycles;
+            ++stats_.row_lookup.stall_cycles;
+            break;
+        }
+        const auto submitted = storage_->submitRead(
+            ::SnnDL::v5::AddressSpaceId::CoreIndex, storage_->requireIndexOffset(0, 1), 1, cycle_);
+        if (!submitted.token) throw std::logic_error("v5 CoreIndex binding is not readable");
+        IndexWait wait;
+        wait.spike = item.value;
+        wait.token = submitted.token;
+        index_waits_.push_back(wait);
+        row_q_.pop_front();
+        ++outstanding;
+    }
+}
+
+void CorePipeline::issueAppends_() {
+    using AddressSpaceId = ::SnnDL::v5::AddressSpaceId;
+    std::uint32_t started = 0;
+    bool stalled = false;
+    while (started < config_.accumulator.width && !accumulator_q_.empty()) {
+        auto& item = accumulator_q_.front();
+        if (item.ready_cycle > cycle_) break;
+        if (!epoch_barrier_ready_ || neuron_busy_[item.value.key.post_neuron]) {
+            stalled = true;
+            break;
+        }
+        AppendTxn txn;
+        txn.entry = item.value;
+        txn.phase = AppendPhase::ReadCount;
+        neuron_busy_[item.value.key.post_neuron] = 1;
+        append_txns_.push_back(std::move(txn));
+        accumulator_q_.pop_front();
+        ++started;
+    }
+    if (stalled) ++stats_.accumulator_stall_cycles;
+    for (auto& txn : append_txns_) {
+        if (txn.submitted || txn.phase == AppendPhase::Done || txn.phase == AppendPhase::Overflow) continue;
+        StorageSubmitResult submitted;
+        if (txn.phase == AppendPhase::ReadCount) {
+            submitted = storage_->submitRead(
+                AddressSpaceId::CoreDelta, storage_->deltaCountByteOffset(txn.entry.key.post_neuron),
+                CoreStorageV5::kDeltaCountBytes, cycle_);
+        } else if (txn.phase == AppendPhase::WriteEntry) {
+            submitted = storage_->submitWrite(
+                AddressSpaceId::CoreDelta,
+                storage_->deltaEntryByteOffset(txn.entry.key.post_neuron, txn.count),
+                CoreStorageV5::encodeDeltaRecord(txn.entry), cycle_);
+        } else {
+            submitted = storage_->submitWrite(
+                AddressSpaceId::CoreDelta, storage_->deltaCountByteOffset(txn.entry.key.post_neuron),
+                CoreStorageV5::encodeCountRecord(txn.count + 1), cycle_);
+        }
+        if (!submitted.token) throw std::logic_error("v5 CoreDelta append request rejected");
+        txn.token = submitted.token;
+        txn.submitted = true;
+    }
+}
+
+void CorePipeline::issueNeuronChain_() {
+    using AddressSpaceId = ::SnnDL::v5::AddressSpaceId;
+    if (!neuron_batch_pending_ || neuron_batch_ready_ > cycle_) return;
+    if (!epoch_barrier_ready_) {
+        ++stats_.neuron.stall_cycles;
+        return;
+    }
+    if (neuron_txns_.empty()) {
+        for (std::uint32_t index = 0; index < neuron_batch_count_; ++index) {
+            if (neuron_busy_[neuron_batch_begin_ + index]) {
+                ++stats_.neuron.stall_cycles;
+                return;
+            }
+        }
+        neuron_txns_.reserve(neuron_batch_count_);
+        for (std::uint32_t index = 0; index < neuron_batch_count_; ++index) {
+            const auto neuron = neuron_batch_begin_ + index;
+            NeuronTxn txn;
+            txn.neuron = neuron;
+            for (const auto& span : storage_->stateSpans(neuron)) {
+                const auto state = storage_->submitRead(
+                    AddressSpaceId::CoreState, span.offset, span.bytes, cycle_);
+                if (!state.token) throw std::logic_error("v5 CoreState/CoreDelta read rejected");
+                NeuronTxn::SpanWait wait;
+                wait.token = state.token;
+                wait.logical_offset = span.logical_offset;
+                wait.bytes = span.bytes;
+                txn.state_reads.push_back(std::move(wait));
+            }
+            const auto count = storage_->submitRead(
+                AddressSpaceId::CoreDelta, storage_->deltaCountByteOffset(neuron),
+                CoreStorageV5::kDeltaCountBytes, cycle_);
+            if (!count.token || txn.state_reads.empty()) {
+                throw std::logic_error("v5 CoreState/CoreDelta read rejected");
+            }
+            txn.count_token = count.token;
+            neuron_busy_[neuron] = 1;
+            neuron_txns_.push_back(std::move(txn));
+        }
+        return;
+    }
+    for (auto& txn : neuron_txns_) {
+        if (txn.phase == NeuronPhase::LoadEntries && !txn.entries_submitted) {
+            txn.entry_tokens.resize(txn.delta_count);
+            txn.entry_done.assign(txn.delta_count, 0);
+            txn.deltas.resize(txn.delta_count);
+            for (std::uint32_t slot = 0; slot < txn.delta_count; ++slot) {
+                const auto submitted = storage_->submitRead(
+                    AddressSpaceId::CoreDelta, storage_->deltaEntryByteOffset(txn.neuron, slot),
+                    CoreStorageV5::kDeltaEntryBytes, cycle_);
+                if (!submitted.token) throw std::logic_error("v5 CoreDelta entry read rejected");
+                txn.entry_tokens[slot] = submitted.token;
+            }
+            txn.entries_submitted = true;
+        }
+        if (txn.phase == NeuronPhase::Write && !txn.write_submitted) {
+            std::vector<std::uint8_t> bytes;
+            if (config_.neuron_bindings[txn.neuron].kind == NeuronOperatorKind::CubaLif) {
+                std::array<std::uint8_t, CubaLifNeuronOp::kStateBytes> encoded{};
+                CubaLifNeuronOp::encodeState(txn.cuba_result.state, encoded);
+                bytes.assign(encoded.begin(), encoded.end());
+            } else {
+                bytes = CoreStorageV5::encodeLifRecord(txn.lif_result.state);
+            }
+            for (const auto& span : storage_->stateSpans(txn.neuron)) {
+                if (span.logical_offset + span.bytes > bytes.size()) {
+                    throw std::logic_error("v5 CoreState/CoreDelta write failed");
+                }
+                const std::vector<std::uint8_t> slice(bytes.begin() + span.logical_offset,
+                                                      bytes.begin() + span.logical_offset + span.bytes);
+                const auto submitted = storage_->submitWrite(
+                    AddressSpaceId::CoreState, span.offset, slice, cycle_);
+                if (!submitted.token) throw std::logic_error("v5 CoreState/CoreDelta write failed");
+                NeuronTxn::SpanWait wait;
+                wait.token = submitted.token;
+                wait.logical_offset = span.logical_offset;
+                wait.bytes = span.bytes;
+                txn.state_writes.push_back(std::move(wait));
+            }
+            txn.write_submitted = true;
+        }
+        if (txn.phase == NeuronPhase::Write && !txn.clear_submitted) {
+            const auto submitted = storage_->submitWrite(
+                AddressSpaceId::CoreDelta, storage_->deltaCountByteOffset(txn.neuron),
+                CoreStorageV5::encodeCountRecord(0), cycle_);
+            if (!submitted.token) throw std::logic_error("v5 CoreState/CoreDelta write failed");
+            txn.clear_token = submitted.token;
+            txn.clear_submitted = true;
+        }
+    }
 }
 
 void CorePipeline::recordOccupancy_() {
@@ -193,11 +650,21 @@ void CorePipeline::start(std::uint64_t timestep) {
     // it traces, so the delta-count reset and the PeRoute probe below are
     // attributed to this timestep rather than to an invented zero.
     storage_->beginTimestep(timestep);
-    resetTimestep_();
-    std::vector<std::uint8_t> route_byte;
-    if (!storage_->readRoute(0, 1, route_byte)) {
-        throw std::logic_error("v5 PeRoute binding is not readable");
+    if (asyncStorage_()) {
+        if (!storage_->drained()) {
+            throw std::logic_error("CA-5A refuses a new epoch while SRAM requests are outstanding");
+        }
+        storage_->beginEpoch();
+        clearPipelineState_();
+        submitEpochRequests_();
+    } else {
+        resetTimestep_();
+        std::vector<std::uint8_t> route_byte;
+        if (!storage_->readRoute(0, 1, route_byte)) {
+            throw std::logic_error("v5 PeRoute binding is not readable");
+        }
     }
+    timestep_origin_ = cycle_;
     active_timestep_ = timestep;
     last_timestep_ = timestep;
     has_timestep_ = true;
@@ -493,6 +960,7 @@ bool CorePipeline::queuesEmpty_() const {
 void CorePipeline::scheduleNeuron_() {
     if (!scheduleReady_("neuron-update")) return;
     if (!sealed_ || !allRowsComplete_() || !queuesEmpty_() || scan_done_ || neuron_batch_pending_) return;
+    if (asyncStorage_() && !storageIdle_()) return;
     if (next_neuron_ >= config_.neurons) {
         scan_done_ = true;
         return;
@@ -510,15 +978,22 @@ bool CorePipeline::tick() {
     if (!active_) return false;
     const auto before = pendingEntries();
     recordStageCycles_();
-    // Reverse order is intentional: newly produced items cannot be observed by
-    // a later stage until the next clock tick.
-    processNeuron_();
-    processAccumulator_();
-    processRetire_();
-    processSynapse_();
-    processRows_();
-    processIngress_();
-    scheduleNeuron_();
+    if (asyncStorage_()) {
+        // One logical tick, one SRAM advance per region:
+        // advance, collect, bind, consume, admit/issue, then the caller
+        // increments the Core cycle.
+        tickAsync_();
+    } else {
+        // Reverse order is intentional: newly produced items cannot be observed by
+        // a later stage until the next clock tick.
+        processNeuron_();
+        processAccumulator_();
+        processRetire_();
+        processSynapse_();
+        processRows_();
+        processIngress_();
+        scheduleNeuron_();
+    }
     recordOccupancy_();
     ++cycle_;
     ++stats_.cycles;
@@ -526,7 +1001,11 @@ bool CorePipeline::tick() {
 }
 
 bool CorePipeline::readyToCommit() const {
-    return active_ && sealed_ && scan_done_ && !neuron_batch_pending_ && allRowsComplete_() && queuesEmpty_();
+    const bool structural = active_ && sealed_ && scan_done_ && !neuron_batch_pending_ &&
+                            allRowsComplete_() && queuesEmpty_();
+    if (!structural) return false;
+    if (!asyncStorage_()) return true;
+    return storageIdle_() && storage_->drained();
 }
 
 void CorePipeline::commit() {
@@ -556,7 +1035,8 @@ std::vector<FiredSpike> CorePipeline::takeReleasedSpikes() {
 
 std::size_t CorePipeline::pendingEntries() const {
     return ingress_q_.size() + row_q_.size() + row_request_out_.size() + synapse_q_.size() +
-           retire_q_.size() + accumulator_q_.size() + (neuron_batch_pending_ ? 1u : 0u);
+           retire_q_.size() + accumulator_q_.size() + index_waits_.size() + append_txns_.size() +
+           (neuron_batch_pending_ ? 1u : 0u);
 }
 
 const std::vector<LifNeuronState>& CorePipeline::state() const {
@@ -565,8 +1045,11 @@ const std::vector<LifNeuronState>& CorePipeline::state() const {
             throw std::logic_error("v5 CorePipeline state() is only valid for all-LIF bindings");
         }
     }
+    if (asyncStorage_() && !storage_->drained()) {
+        throw std::logic_error("v5 state() requires CoreStorage to be drained");
+    }
     for (std::uint32_t neuron = 0; neuron < config_.neurons; ++neuron) {
-        if (!storage_->readState(neuron, state_snapshot_[neuron])) {
+        if (!storage_->readCompletedState(neuron, state_snapshot_[neuron])) {
             throw std::logic_error("v5 CoreState snapshot read failed");
         }
     }
@@ -579,8 +1062,11 @@ const std::vector<CubaLifNeuronState>& CorePipeline::cubaState() const {
             throw std::logic_error("v5 CorePipeline cubaState() is only valid for all-CubaLIF bindings");
         }
     }
+    if (asyncStorage_() && !storage_->drained()) {
+        throw std::logic_error("v5 cubaState() requires CoreStorage to be drained");
+    }
     for (std::uint32_t neuron = 0; neuron < config_.neurons; ++neuron) {
-        if (!storage_->readCubaLifState(neuron, cuba_state_snapshot_[neuron])) {
+        if (!storage_->readCompletedCubaLifState(neuron, cuba_state_snapshot_[neuron])) {
             throw std::logic_error("v5 CubaLIF CoreState snapshot read failed");
         }
     }
@@ -588,13 +1074,16 @@ const std::vector<CubaLifNeuronState>& CorePipeline::cubaState() const {
 }
 
 std::uint64_t CorePipeline::functionalHash() const {
+    if (asyncStorage_() && !storage_->drained()) {
+        throw std::logic_error("v5 functionalHash() requires CoreStorage to be drained");
+    }
     std::uint64_t hash = 0x6a09e667f3bcc909ULL;
     for (std::size_t neuron = 0; neuron < config_.neuron_bindings.size(); ++neuron) {
         hash = hashMix_(hash, neuron);
         hash = hashMix_(hash, static_cast<std::uint8_t>(config_.neuron_bindings[neuron].kind));
         if (config_.neuron_bindings[neuron].kind == NeuronOperatorKind::CubaLif) {
             CubaLifNeuronState snapshot;
-            if (!storage_->readCubaLifState(static_cast<std::uint32_t>(neuron), snapshot)) {
+            if (!storage_->readCompletedCubaLifState(static_cast<std::uint32_t>(neuron), snapshot)) {
                 throw std::logic_error("v5 CubaLIF CoreState hash read failed");
             }
             std::uint32_t current_bits = 0;
@@ -605,7 +1094,7 @@ std::uint64_t CorePipeline::functionalHash() const {
             hash = hashMix_(hash, membrane_bits);
         } else {
             LifNeuronState snapshot;
-            if (!storage_->readState(static_cast<std::uint32_t>(neuron), snapshot)) {
+            if (!storage_->readCompletedState(static_cast<std::uint32_t>(neuron), snapshot)) {
                 throw std::logic_error("v5 LIF CoreState hash read failed");
             }
             std::uint32_t membrane_bits = 0;
